@@ -624,6 +624,60 @@ uam_status uam_bus_load_bytes(uam_bus *bus, uint64_t addr, const void *data, siz
     return UAM_OK;
 }
 
+/* ---- DMA --------------------------------------------------------------- */
+
+/* Resolve one DMA chunk: at most the rest of addr's page within one backed region. */
+static uam_status dma_chunk(uam_bus *bus, uint64_t addr, size_t len, bool write, hit *h, size_t *n)
+{
+    if (resolve(bus, addr, 1, h) != RES_ONE)
+        return UAM_ERR_FAULT;
+    bool ok = write ? h->r->kind == UAM_REGION_RAM
+                    : h->r->kind == UAM_REGION_RAM || h->r->kind == UAM_REGION_ROM
+                          || (h->r->kind == UAM_REGION_ROMD && h->r->rom_mode);
+    if (!ok)
+        return UAM_ERR_FAULT;
+    uint64_t room = UAM_PAGE_SIZE - (addr & (UAM_PAGE_SIZE - 1));
+    if (room > h->r->size - h->off)
+        room = h->r->size - h->off;
+    *n = (size_t)room < len ? (size_t)room : len;
+    return UAM_OK;
+}
+
+uam_status uam_bus_dma_read(uam_bus *bus, uint64_t addr, void *buf, size_t len)
+{
+    uint8_t *dst = buf;
+    while (len) {
+        hit h;
+        size_t n;
+        uam_status st = dma_chunk(bus, addr, len, false, &h, &n);
+        if (st != UAM_OK)
+            return st;
+        memcpy(dst, h.r->host + h.off, n);
+        addr += n;
+        dst += n;
+        len -= n;
+    }
+    return UAM_OK;
+}
+
+uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_t len)
+{
+    const uint8_t *src = buf;
+    while (len) {
+        hit h;
+        size_t n;
+        uam_status st = dma_chunk(bus, addr, len, true, &h, &n);
+        if (st != UAM_OK)
+            return st;
+        memcpy(h.r->host + h.off, src, n);
+        note_code_change(bus, h.r, h.off);
+        addr += n;
+        src += n;
+        len -= n;
+    }
+    return UAM_OK;
+}
+
 /* ---- ROMD -------------------------------------------------------------- */
 
 static void drop_code_pages(uam_bus *bus, uam_region *r, uint64_t off, uint64_t len)

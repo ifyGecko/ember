@@ -1,7 +1,7 @@
 /*
  * ext_board.c - "ext-mips": a board defined outside the UAM tree.
  *
- * The same memory map as the stock mipssim board (so the MIPS self-test runs
+ * The same memory map as the stock mips-ref board (so the MIPS self-test runs
  * on it), plus what out-of-tree boards typically need: a 24Kc CPU model chosen
  * by the board, a catch-all window for the not-yet-modelled peripheral block
  * under the real devices, a board option (-o banner=TEXT) and a named image
@@ -80,6 +80,6 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
 
 const uam_board ext_board_mips = {
     .name = "ext-mips",
-    .description = "out-of-tree example: MIPS32 BE, mipssim-like map",
+    .description = "out-of-tree example: MIPS32 BE, mips-ref-like map",
     .build = build,
 };

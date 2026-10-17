@@ -14,7 +14,7 @@
  *   kseg3 0xe0000000-0xffffffff  mapped, kernel only
  *
  * The TLB is an R4K-style joint TLB of even/odd page pairs with ASIDs and
- * variable page sizes. Entries reset to zero (as in QEMU), so with an
+ * variable page sizes. Entries reset to zero, so with an
  * uninitialised TLB an access to 0x0000-0x1fff hits entry 0 and raises a
  * TLB-invalid exception, while other mapped addresses raise a TLB refill.
  *
@@ -339,7 +339,8 @@ static uint64_t helper_tlbp(void *env, uint64_t a, uint64_t b, uint64_t c, uam_s
     if (i >= 0)
         s->c.index = (uint32_t)i;
     else
-        s->c.index |= 0x80000000u;  /* P: probe failed (low bits kept, as QEMU) */
+        s->c.index |= 0x80000000u;  /* P: probe failed (the index bits are unpredictable;
+                                     * they are left unchanged) */
     return 0;
 }
 

@@ -1,5 +1,5 @@
 /* Linker script for the self-test firmware: everything in DRAM at 0x80000000
- * (the reset/entry address of both UAM's and QEMU's `virt` board). */
+ * (the reset/entry address of the UAM rv32-ref board). */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 

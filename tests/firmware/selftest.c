@@ -1,5 +1,5 @@
 /*
- * selftest.c - Bare-metal RV32IMAC self-test for the UAM `virt` board.
+ * selftest.c - Bare-metal RV32IMAC self-test for the UAM `rv32-ref` board.
  *
  * Exercises the emulator end to end: UART output, base ISA, M/A/C extensions,
  * Zicsr, synchronous exceptions (with precise mepc/mcause/mtval), timer,
@@ -7,7 +7,7 @@
  * semantics, and self-modifying code with fence.i.
  *
  * Output is deterministic (no timestamps or counters are printed), so the
- * console log can be diffed against the same image running under QEMU.
+ * console log can be compared between runs and execution backends.
  * The result is reported through the sifive,test finisher.
  */
 #include <stddef.h>
@@ -525,7 +525,7 @@ static void test_smc(void)
 int main(void);
 int main(void)
 {
-    puts_("UAM self-test (rv32imac, virt)\n");
+    puts_("UAM self-test (rv32imac, rv32-ref)\n");
     run_test("alu", test_alu);
     run_test("branches", test_branches);
     run_test("muldiv", test_muldiv);

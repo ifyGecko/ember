@@ -15,27 +15,30 @@ void uam_netdev_init(uam_netdev *nd, const uam_netdev_ops *ops)
     nd->link_up = true;
 }
 
-bool uam_netdev_send(uam_netdev *nd, const void *frame, size_t len)
-{
-    if (!nd || len > UAM_NETDEV_MTU)
-        return false;
-    if (nd->tap)
-        nd->tap(nd->tap_ctx, frame, len, true);
-    bool ok = nd->link_up && nd->ops->send && nd->ops->send(nd, frame, len);
-    if (!ok)
-        nd->tx_dropped++;
-    return ok;
-}
-
 static void deliver(uam_netdev *nd)
 {
-    while (nd->q_len && nd->receive && (!nd->can_receive || nd->can_receive(nd->fe_ctx))) {
+    while (!nd->in_send && nd->q_len && nd->receive && (!nd->can_receive || nd->can_receive(nd->fe_ctx))) {
         uam_netdev_frame f = nd->q[nd->q_head];
         nd->q_head = (nd->q_head + 1) % UAM_NETDEV_QUEUE;
         nd->q_len--;
         nd->receive(nd->fe_ctx, f.data, f.len);
         free(f.data);
     }
+}
+
+bool uam_netdev_send(uam_netdev *nd, const void *frame, size_t len)
+{
+    if (!nd || len > UAM_NETDEV_MTU)
+        return false;
+    if (nd->tap)
+        nd->tap(nd->tap_ctx, frame, len, true);
+    nd->in_send = true;
+    bool ok = nd->link_up && nd->ops->send && nd->ops->send(nd, frame, len);
+    nd->in_send = false;
+    if (!ok)
+        nd->tx_dropped++;
+    deliver(nd);   /* anything the backend answered meanwhile */
+    return ok;
 }
 
 void uam_netdev_set_frontend(uam_netdev *nd, bool (*can_receive)(void *ctx),
@@ -67,7 +70,8 @@ void uam_netdev_input(uam_netdev *nd, const void *frame, size_t len)
     }
     if (nd->tap)
         nd->tap(nd->tap_ctx, frame, len, false);
-    if (nd->receive && !nd->q_len && (!nd->can_receive || nd->can_receive(nd->fe_ctx))) {
+    if (nd->receive && !nd->q_len && !nd->in_send
+        && (!nd->can_receive || nd->can_receive(nd->fe_ctx))) {
         nd->receive(nd->fe_ctx, frame, len);
         return;
     }
@@ -81,6 +85,11 @@ void uam_netdev_input(uam_netdev *nd, const void *frame, size_t len)
     nd->q[(nd->q_head + nd->q_len) % UAM_NETDEV_QUEUE] = (uam_netdev_frame){ (uint16_t)len, copy };
     nd->q_len++;
     deliver(nd);
+}
+
+bool uam_netdev_can_input(const uam_netdev *nd)
+{
+    return nd->q_len < UAM_NETDEV_QUEUE;
 }
 
 void uam_netdev_set_link(uam_netdev *nd, bool up)

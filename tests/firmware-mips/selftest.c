@@ -1,5 +1,5 @@
 /*
- * selftest.c - Bare-metal MIPS32 self-test for the UAM mipssim board.
+ * selftest.c - Bare-metal MIPS32 self-test for the UAM mips-ref / mipsel-ref boards.
  *
  * Exercises the emulator end to end: UART output, the integer ISA (ALU, shifts,
  * mul/div with HI/LO, MADD/MSUB, CLZ/CLO, EXT/INS/SEB/SEH/WSBH, ROTR), branch
@@ -10,9 +10,9 @@
  * pages), exceptions in branch delay slots (Cause.BD, EPC = branch), user-mode
  * address errors, Cause.CE, and CP0 identification registers.
  *
- * Output is endian-independent and deterministic, so the console can be diffed
- * against the same image under qemu-system-mips(el) -M mipssim. The result is
- * reported through a test finisher that QEMU ignores (it just keeps spinning).
+ * Output is endian-independent and deterministic (the same console text on
+ * both byte orders). The result is reported through the board's test
+ * finisher.
  */
 #include <stdint.h>
 
@@ -508,7 +508,7 @@ static void t_delay_slot(void)
         "li    %0, 0\n"
         "li    $9, 0x5000\n"
         "la    %2, 2f\n"
-        "li    $10, 0\n"           /* a real compare: QEMU folds bne $0,$0 to a nop */
+        "li    $10, 0\n"           /* compare a register: a branch evaluated at run time */
         "2: bne $10, $zero, 1f\n"
         "lw    $8, 0($9)\n"        /* delay slot: TLB refill */
         "addiu %0, %0, 100\n"     /* executed: branch not taken */
@@ -622,7 +622,7 @@ int main(void)
     union { uint32_t w; uint8_t b[4]; } u = { .w = 1 };
     be = (u.b[0] == 0);
 
-    puts_("UAM self-test (mips32, mipssim)\n");
+    puts_("UAM self-test (mips32, mips-ref)\n");
     run("alu", t_alu);
     run("branch", t_branch);
     run("muldiv", t_muldiv);

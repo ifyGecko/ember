@@ -6,12 +6,21 @@
  *
  * Devices depend only on this header:
  *
- *     uam_netdev_set_frontend(nd, can_receive, receive, link_changed, mac);
+ *     uam_netdev_set_frontend(nd, can_receive, receive, link_changed, ctx);
  *     uam_netdev_send(nd, frame, len);           guest transmits
  *     uam_netdev_accept_input(nd);               the guest freed RX descriptors
  *
- * Frames the frontend cannot take yet are queued (up to UAM_NETDEV_QUEUE,
- * then dropped, as a real link would) and delivered on accept_input.
+ * Frames are whole Ethernet frames without preamble or FCS. `receive` is
+ * never called while a backend is still inside its `send`: frames a backend
+ * produces while sending (a local answer, a loopback) are delivered just
+ * before uam_netdev_send returns, as uam_netdev_accept_input would. A device's MAC
+ * address is the device's (or board's) business, not the link's.
+ *
+ * Frames the frontend cannot take yet are queued (up to UAM_NETDEV_QUEUE)
+ * and delivered on accept_input. Backends with a host fd stop reading it
+ * while the queue is full (uam_netdev_can_input), so the host kernel holds
+ * back further frames; frames pushed into a full queue anyway are dropped,
+ * as a real link would.
  *
  * Dependencies: common.h.
  */
@@ -22,6 +31,7 @@
 
 #define UAM_NETDEV_MTU   9216u   /* largest frame carried (jumbo-safe) */
 #define UAM_NETDEV_QUEUE 64u
+#define UAM_NETDEV_MIN_FRAME 60u /* shortest Ethernet frame on a wire (without FCS) */
 
 typedef struct uam_netdev uam_netdev;
 
@@ -51,6 +61,7 @@ struct uam_netdev {
     uam_netdev_frame q[UAM_NETDEV_QUEUE];
     unsigned         q_head, q_len;
     uint64_t         rx_dropped, tx_dropped;
+    bool             in_send;    /* inside uam_netdev_send: defer deliveries */
     /* optional observer of every frame in both directions (e.g. pcap capture) */
     void           (*tap)(void *ctx, const uint8_t *frame, size_t len, bool to_host);
     void           (*tap_release)(void *ctx);   /* called on destroy / replacement */
@@ -68,6 +79,8 @@ void uam_netdev_accept_input(uam_netdev *nd);
 
 /* ---- backend side ---- */
 void uam_netdev_input(uam_netdev *nd, const void *frame, size_t len);
+/* Room in the host -> guest queue: a backend should read more host frames. */
+bool uam_netdev_can_input(const uam_netdev *nd);
 void uam_netdev_set_link(uam_netdev *nd, bool up);
 
 /* ---- owner side ---- */

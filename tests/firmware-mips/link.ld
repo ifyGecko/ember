@@ -1,6 +1,5 @@
 /* MIPS32 self-test: linked into kseg0 at 0x80100000 (physical 0x00100000),
- * matching where QEMU's mipssim -kernel places an ELF and where the UAM
- * mipssim board maps RAM. The exception vectors sit at fixed offsets from
+ * inside the RAM of the UAM mips-ref boards. The exception vectors sit at fixed offsets from
  * EBase (0x80100000): general exceptions at +0x180. */
 OUTPUT_ARCH(mips)
 ENTRY(_start)

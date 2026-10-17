@@ -3,8 +3,8 @@
 #   make                 build $(BUILD)/uam-run and the libraries
 #   make lib             only the libraries (for out-of-tree projects)
 #   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE), external-board example
-#   make qemu-check      run the RISC-V self-test under qemu-system-riscv32 and diff the console
-#   make qemu-check-mips the same for MIPS under qemu-system-mips(el)
+#   make net-check       boot the network test on rv32-ref against a real tap and tun interface
+#                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
 #   make clean
 #
@@ -14,7 +14,7 @@
 # Libraries, one per module group (each is also contained in libuam.a):
 #   libuam-core.a     IR, bus, scheduler, signals/chardev/netdev plumbing, executor, loader, machine
 #   libuam-riscv.a    RISC-V ISA module          libuam-mips.a   MIPS32 ISA module
-#   libuam-devices.a  stock device models        libuam-boards.a stock boards (virt, mipssim)
+#   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref)
 #   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main)
 
 CC      ?= cc
@@ -38,8 +38,8 @@ MACHINE_SRC := src/machine/machine.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/sifive_test.c \
-               devices/unknown_mmio.c devices/unimp.c
-BOARD_SRC   := boards/virt.c boards/mipssim.c boards/stock.c
+               devices/unknown_mmio.c devices/unimp.c devices/virtio_net.c
+BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/stock.c
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c
 
@@ -61,7 +61,7 @@ FW_MIPS_EL := $(BUILD)/firmware-mips/selftest-el.elf
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test unit-test firmware-test firmware firmware-mips mips-test example-test \
-        qemu-check qemu-check-mips install clean
+        net-check install clean
 
 all: $(RUN) lib
 
@@ -123,8 +123,8 @@ firmware-test: $(RUN) firmware
 	$(RUN) --stats $(FIRMWARE) < /dev/null
 
 mips-test: $(RUN) firmware-mips
-	$(RUN) -b mipssim --stats $(FW_MIPS_BE) < /dev/null
-	$(RUN) -b mipssim-el --stats $(FW_MIPS_EL) < /dev/null
+	$(RUN) -b mips-ref --stats $(FW_MIPS_BE) < /dev/null
+	$(RUN) -b mipsel-ref --stats $(FW_MIPS_EL) < /dev/null
 
 # The out-of-tree example builds against `make lib` output only, as an external project would.
 example-test: lib firmware-mips
@@ -134,12 +134,8 @@ example-test: lib firmware-mips
 
 test: unit-test firmware-test mips-test example-test
 
-qemu-check: $(RUN) firmware
-	tests/firmware/qemu-check.sh $(RUN) $(FIRMWARE)
-
-qemu-check-mips: $(RUN) firmware-mips
-	tests/firmware-mips/qemu-check.sh $(RUN) mipssim $(FW_MIPS_BE) qemu-system-mips
-	tests/firmware-mips/qemu-check.sh $(RUN) mipssim-el $(FW_MIPS_EL) qemu-system-mipsel
+net-check: $(RUN) firmware
+	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include

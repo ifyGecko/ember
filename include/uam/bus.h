@@ -45,7 +45,7 @@
 #define UAM_PAGE_MASK  (~(UAM_PAGE_SIZE - 1))
 #define UAM_BUS_TLB_SIZE 64u
 
-/* Priority for catch-all windows such as devices/unimp.c (cf. QEMU's -1000). */
+/* Priority for catch-all windows such as devices/unimp.c, below every real device. */
 #define UAM_PRIO_BACKGROUND (-1000)
 
 struct uam_device;
@@ -148,6 +148,17 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
 
 /* Loader access: copy bytes into RAM/ROM/ROMD, ignoring ROM write protection. */
 uam_status uam_bus_load_bytes(uam_bus *bus, uint64_t addr, const void *data, size_t len);
+
+/*
+ * DMA master access, for devices (NIC descriptor rings and frame buffers, ...):
+ * copy guest bytes in memory order, with no byte-order conversion. Reads come
+ * from RAM, ROM, or ROMD in ROM mode; writes go to RAM only, and translated
+ * code from the written bytes is discarded. Any other target (MMIO, unmapped)
+ * fails with UAM_ERR_FAULT, possibly after part of the transfer. Watchpoints
+ * are not triggered (they observe the CPU's accesses).
+ */
+uam_status uam_bus_dma_read(uam_bus *bus, uint64_t addr, void *buf, size_t len);
+uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_t len);
 
 /* Watchpoints on physical ranges, for guest data accesses (not fetches or
  * debug accesses). Returns an id (> 0), or a negative value on failure. */

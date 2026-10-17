@@ -19,6 +19,7 @@
 #include "uam/device.h"
 #include "uam/exec.h"
 #include "uam/isa.h"
+#include "uam/netdev.h"
 #include "uam/sched.h"
 
 typedef enum uam_unknown_mmio_policy {
@@ -37,6 +38,17 @@ typedef struct uam_board_image {
     const char *name, *path;
 } uam_board_image;
 
+/*
+ * A network attachment for a board port ("--nic wan=tap:tap0"). Boards look
+ * ports up by their own names (uam_board_config_netdev); a port with no
+ * attachment is a cable left unplugged. The netdev is owned by the caller and
+ * must outlive the machine; the caller also services it (uam_host_add_netdev).
+ */
+typedef struct uam_board_netdev {
+    const char *name;
+    uam_netdev *nd;
+} uam_board_netdev;
+
 typedef struct uam_board_config {
     uint64_t                ram_size;      /* 0 = board default */
     uam_unknown_mmio_policy unknown_mmio;
@@ -46,18 +58,21 @@ typedef struct uam_board_config {
     size_t                  n_options;
     const uam_board_image  *images;
     size_t                  n_images;
+    const uam_board_netdev *netdevs;
+    size_t                  n_netdevs;
 } uam_board_config;
 
 /* Lookups for boards: the last matching entry, or NULL. */
 const char *uam_board_config_option(const uam_board_config *cfg, const char *key);
 const char *uam_board_config_image(const uam_board_config *cfg, const char *name);
+uam_netdev *uam_board_config_netdev(const uam_board_config *cfg, const char *name);
 
 typedef struct uam_machine uam_machine;
 
 /*
  * Board hook run when the guest (or the host) requests a reset, before the
- * machine is reset. Typical work: re-load boot images into RAM (QEMU's "ROM
- * reset"), or choose m->reset_pc. Devices are reset by their own `reset` op.
+ * machine is reset. Typical work: re-load boot images into RAM (a reboot may
+ * have overwritten them), or choose m->reset_pc. Devices are reset by their own `reset` op.
  */
 typedef void (*uam_machine_reset_hook)(uam_machine *m, uam_reset_kind kind, void *ctx);
 

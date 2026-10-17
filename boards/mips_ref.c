@@ -1,11 +1,11 @@
 /*
- * mipssim.c - "mipssim" / "mipssim-el": a MIPS32 board whose memory map
- * matches QEMU's `mipssim` machine, so the same firmware ELF runs under both
- * and `make qemu-check-mips` can diff the console output.
+ * mips_ref.c - "mips-ref" / "mipsel-ref": the MIPS32 reference boards
+ * (big- and little-endian), RAM plus a 16550 console and a simulation
+ * finisher.
  *
  *   phys 0x00000000  RAM (32 MiB), reached via kseg0 0x80000000 / kseg1 0xa0000000
  *   phys 0x1fd003f8  NS16550A UART (byte registers), kseg1 0xbfd003f8
- *   phys 0x1fd00010  test finisher (UAM only; QEMU ignores writes here)
+ *   phys 0x1fd00010  test finisher (sifive,test protocol)
  *
  * The UART interrupt is wired to hardware interrupt 0 (Cause.IP2). The CP0
  * Count/Compare timer is internal to the CPU and needs no wiring.
@@ -22,12 +22,12 @@
 #define MIPS_TEST_PHYS  UINT64_C(0x1fd00010)
 #define MIPS_UART_IRQ   UAM_MIPS_IRQ_HW0  /* Cause.IP2 */
 
-static uam_status mipssim_build_isa(uam_machine *m, const uam_board_config *cfg, const uam_isa *isa)
+static uam_status mips_ref_build_isa(uam_machine *m, const uam_board_config *cfg, const uam_isa *isa)
 {
     uam_status st = uam_machine_init(m, isa);
     if (st != UAM_OK)
         return st;
-    m->board_name = isa->default_endian & UAM_ACC_BE ? "mipssim" : "mipssim-el";
+    m->board_name = isa->default_endian & UAM_ACC_BE ? "mips-ref" : "mipsel-ref";
     m->reset_pc = 0xBFC00000u; /* overridden by the loaded image's entry */
 
     st = uam_bus_map_ram(&m->bus, "ram", MIPS_RAM_BASE, cfg->ram_size ? cfg->ram_size : MIPS_RAM_SIZE);
@@ -63,24 +63,24 @@ static uam_status mipssim_build_isa(uam_machine *m, const uam_board_config *cfg,
     return UAM_OK;
 }
 
-static uam_status mipssim_build_be(uam_machine *m, const uam_board_config *cfg)
+static uam_status mips_ref_build_be(uam_machine *m, const uam_board_config *cfg)
 {
-    return mipssim_build_isa(m, cfg, &uam_isa_mips32be);
+    return mips_ref_build_isa(m, cfg, &uam_isa_mips32be);
 }
 
-static uam_status mipssim_build_le(uam_machine *m, const uam_board_config *cfg)
+static uam_status mips_ref_build_le(uam_machine *m, const uam_board_config *cfg)
 {
-    return mipssim_build_isa(m, cfg, &uam_isa_mips32le);
+    return mips_ref_build_isa(m, cfg, &uam_isa_mips32le);
 }
 
-const uam_board uam_board_mipssim = {
-    .name = "mipssim",
-    .description = "MIPS32 big-endian, QEMU mipssim-compatible map (NS16550A UART)",
-    .build = mipssim_build_be,
+const uam_board uam_board_mips_ref = {
+    .name = "mips-ref",
+    .description = "MIPS32 big-endian reference board (NS16550A UART, test finisher)",
+    .build = mips_ref_build_be,
 };
 
-const uam_board uam_board_mipssim_el = {
-    .name = "mipssim-el",
-    .description = "MIPS32 little-endian, QEMU mipssim-compatible map (NS16550A UART)",
-    .build = mipssim_build_le,
+const uam_board uam_board_mipsel_ref = {
+    .name = "mipsel-ref",
+    .description = "MIPS32 little-endian reference board (NS16550A UART, test finisher)",
+    .build = mips_ref_build_le,
 };

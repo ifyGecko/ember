@@ -5,7 +5,7 @@
 
 void uam_boards_register_stock(void)
 {
-    uam_board_register(&uam_board_virt);
-    uam_board_register(&uam_board_mipssim);
-    uam_board_register(&uam_board_mipssim_el);
+    uam_board_register(&uam_board_rv32_ref);
+    uam_board_register(&uam_board_mips_ref);
+    uam_board_register(&uam_board_mipsel_ref);
 }

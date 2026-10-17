@@ -1,8 +1,9 @@
 /*
  * test_host.c - Unit tests for the host side and its interfaces: chardev
  * buffering and flow control, the 16550 over a chardev, netdev pairs and
- * pcap capture, the host loop (idle hart woken by socket input, deadlock
- * detection), the board registry and board configuration lookups.
+ * pcap capture, the tun Ethernet adapter, bus DMA and the virtio-net device,
+ * the host loop (idle hart woken by socket input, deadlock detection), the
+ * board registry and board configuration lookups.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 
 #include "uam/boards.h"
 #include "uam/dev/uart16550.h"
+#include "uam/dev/virtio_net.h"
 #include "uam/host.h"
 #include "uam/isa/mips32.h"
 #include "uam/machine.h"
@@ -140,6 +142,261 @@ static void test_netdev(const char *dir)
           "pcap holds 3 frames (size %lld)", (long long)st.st_size);
 }
 
+/* ---- tun adapter (over a datagram socketpair standing in for /dev/net/tun) -- */
+
+typedef struct grab {
+    unsigned frames;
+    size_t   len;
+    uint8_t  f[UAM_NETDEV_MTU];
+} grab;
+
+static bool grab_can(void *ctx) { (void)ctx; return true; }
+static void grab_rx(void *ctx, const uint8_t *f, size_t len)
+{
+    grab *g = ctx;
+    g->frames++;
+    g->len = len;
+    memcpy(g->f, f, len);
+}
+
+static const uint8_t GUEST_MAC[6] = { 0x02, 0x75, 0x61, 0x6d, 0x01, 0x00 };
+
+static size_t eth(uint8_t *f, const uint8_t *dst, uint16_t type)
+{
+    memcpy(f, dst, 6);
+    memcpy(f + 6, GUEST_MAC, 6);
+    f[12] = (uint8_t)(type >> 8);
+    f[13] = (uint8_t)type;
+    return 14;
+}
+
+static uint16_t sum16(const uint8_t *p, size_t n, uint32_t sum)
+{
+    for (size_t i = 0; i + 1 < n; i += 2)
+        sum += (uint32_t)(p[i] << 8 | p[i + 1]);
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)sum;
+}
+
+static void test_tun_adapter(void)
+{
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0, "socketpair");
+    uam_netdev *nd = uam_netdev_tap_fd_create(sv[0], true);
+    CHECK(nd != NULL && !strcmp(nd->ops->type, "tun"), "tun over an fd");
+    if (!nd)
+        return;
+    grab g = { 0 };
+    uam_netdev_set_frontend(nd, grab_can, grab_rx, NULL, &g);
+    static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    uint8_t f[128], r[128];
+
+    /* ARP request 10.0.0.2 -> who has 10.0.0.1: answered locally, after send returns. */
+    memset(f, 0, sizeof(f));
+    size_t n = eth(f, bcast, 0x0806);
+    static const uint8_t arp[28] = { 0, 1, 8, 0, 6, 4, 0, 1, 0x02, 0x75, 0x61, 0x6d, 0x01, 0x00,
+                                     10, 0, 0, 2, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1 };
+    memcpy(f + n, arp, 28);
+    CHECK(uam_netdev_send(nd, f, 60), "ARP request accepted");
+    CHECK(g.frames == 1 && g.len == 60, "ARP reply delivered, padded (%u, %zu)", g.frames, g.len);
+    CHECK(!memcmp(g.f, GUEST_MAC, 6) && g.f[12] == 0x08 && g.f[13] == 0x06 && g.f[21] == 2,
+          "ARP reply to the guest");
+    CHECK(!memcmp(g.f + 14 + 8, g.f + 6, 6) && !memcmp(g.f + 14 + 14, arp + 24, 4)
+          && !memcmp(g.f + 14 + 24, arp + 14, 4), "ARP reply: target IP is at the host MAC");
+    CHECK(recv(sv[1], r, sizeof(r), MSG_DONTWAIT) < 0, "ARP never reaches the tun");
+
+    /* A probe (sender 0.0.0.0) is duplicate-address detection: no answer. */
+    memset(f + n + 14, 0, 4);
+    uam_netdev_send(nd, f, 60);
+    CHECK(g.frames == 1, "ARP probe not answered");
+
+    /* IPv4 frame -> tun packet, Ethernet padding removed. */
+    memset(f, 0, sizeof(f));
+    n = eth(f, g.f + 6, 0x0800);
+    f[n] = 0x45;
+    f[n + 3] = 28;                   /* total length */
+    f[n + 9] = 17;
+    CHECK(uam_netdev_send(nd, f, 60), "IPv4 sent");
+    CHECK(recv(sv[1], r, sizeof(r), MSG_DONTWAIT) == 28 && r[0] == 0x45, "tun got the bare packet");
+
+    /* Tun packet -> guest frame addressed to the learned MAC. */
+    memset(r, 0, 28);
+    r[0] = 0x45;
+    r[3] = 28;
+    r[16] = 10; r[19] = 2;
+    CHECK(send(sv[1], r, 28, 0) == 28, "host packet");
+    uam_netdev_poll(nd);
+    CHECK(g.frames == 2 && g.len == 60 && !memcmp(g.f, GUEST_MAC, 6) && g.f[12] == 0x08
+          && g.f[13] == 0 && g.f[14] == 0x45, "host packet framed for the guest");
+
+    /* IPv6 neighbour solicitation -> advertisement with a valid checksum. */
+    memset(f, 0, sizeof(f));
+    n = eth(f, bcast, 0x86DD);
+    uint8_t *ip = f + n;
+    ip[0] = 0x60;
+    ip[5] = 24;
+    ip[6] = 58;
+    ip[7] = 255;
+    ip[8] = 0xfe; ip[9] = 0x80; ip[23] = 2;     /* src fe80::2 */
+    ip[24] = 0xff; ip[25] = 0x02; ip[39] = 1;   /* dst (any multicast) */
+    ip[40] = 135;
+    ip[48] = 0xfe; ip[49] = 0x80; ip[63] = 1;   /* target fe80::1 */
+    CHECK(uam_netdev_send(nd, f, n + 64), "NS accepted");
+    CHECK(g.frames == 3 && g.f[12] == 0x86 && g.f[14 + 40] == 136, "NA delivered");
+    uint32_t pseudo = 32 + 58 + sum16(g.f + 14 + 8, 32, 0);
+    CHECK(sum16(g.f + 14 + 40, 32, pseudo) == 0xffff, "NA checksum valid");
+    CHECK(recv(sv[1], r, sizeof(r), MSG_DONTWAIT) < 0, "NS never reaches the tun");
+
+    /* Other ethertypes have no meaning on a tun link. */
+    eth(f, bcast, 0x88cc);
+    CHECK(!uam_netdev_send(nd, f, 60), "LLDP dropped");
+
+    uam_netdev_set_frontend(nd, NULL, NULL, NULL, NULL);
+    uam_netdev_destroy(nd);
+    close(sv[1]);
+}
+
+/* ---- bus DMA and virtio-net ------------------------------------------------ */
+
+#define VQ_RAM    0x1000u
+#define RXQ_DESC  0x1000u
+#define RXQ_AVAIL 0x1100u
+#define RXQ_USED  0x1200u
+#define TXQ_DESC  0x2000u
+#define TXQ_AVAIL 0x2100u
+#define TXQ_USED  0x2200u
+#define RX_BUF    0x3000u
+#define TX_BUF    0x4000u
+
+static int irq_level;
+static void irq_sink(void *ctx, unsigned in, int level) { (void)ctx; (void)in; irq_level = level; }
+
+static uint32_t reg(uam_device *d, unsigned off)
+{
+    uint64_t v = 0;
+    d->ops->read(d, off, 4, &v);
+    return (uint32_t)v;
+}
+static void wreg(uam_device *d, unsigned off, uint32_t v) { d->ops->write(d, off, 4, v); }
+
+static void put_le16(uam_bus *bus, uint64_t a, uint16_t v)
+{
+    uint8_t b[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
+    uam_bus_dma_write(bus, a, b, 2);
+}
+static uint16_t get_le16(uam_bus *bus, uint64_t a)
+{
+    uint8_t b[2] = { 0 };
+    uam_bus_dma_read(bus, a, b, 2);
+    return (uint16_t)(b[0] | b[1] << 8);
+}
+static void put_desc(uam_bus *bus, uint64_t a, uint32_t addr, uint32_t len, uint16_t flags)
+{
+    uint8_t d[16] = { (uint8_t)addr, (uint8_t)(addr >> 8), (uint8_t)(addr >> 16), (uint8_t)(addr >> 24),
+                      0, 0, 0, 0, (uint8_t)len, (uint8_t)(len >> 8), 0, 0, (uint8_t)flags, 0, 0, 0 };
+    uam_bus_dma_write(bus, a, d, 16);
+}
+
+static void setup_queue(uam_device *d, unsigned i, uint32_t desc, uint32_t avail, uint32_t used)
+{
+    wreg(d, 0x030, i);
+    CHECK(reg(d, 0x034) >= 8, "queue %u max", i);
+    wreg(d, 0x038, 8);
+    wreg(d, 0x080, desc);
+    wreg(d, 0x090, avail);
+    wreg(d, 0x0a0, used);
+    wreg(d, 0x044, 1);
+}
+
+static void test_virtio_net(void)
+{
+    uam_bus bus;
+    uam_bus_init(&bus);
+    CHECK(uam_bus_map_ram(&bus, "ram", 0, 0x10000) == UAM_OK, "ram");
+    uint8_t x[4] = { 1, 2, 3, 4 }, y[4] = { 0 };
+    CHECK(uam_bus_dma_write(&bus, 0xfffe, x, 2) == UAM_OK, "dma write");
+    CHECK(uam_bus_dma_read(&bus, 0xfffe, y, 2) == UAM_OK && y[1] == 2, "dma read back");
+    CHECK(uam_bus_dma_write(&bus, 0xfffe, x, 4) == UAM_ERR_FAULT, "dma past RAM faults");
+
+    CHECK(uam_virtio_net_create("virtio1", &bus, NULL, NULL) == NULL, "a netdev is required");
+
+    uam_netdev *a, *b;
+    uam_netdev_pair_create(&a, &b);
+    grab peer = { 0 };
+    uam_netdev_set_frontend(b, grab_can, grab_rx, NULL, &peer);
+    uam_device *d = uam_virtio_net_create("virtio0", &bus, a, NULL);
+    uam_signal_connect(uam_virtio_net_irq_line(d), irq_sink, NULL, 0);
+    CHECK(reg(d, 0x004) == 2 && reg(d, 0x008) == 1, "version 2, net");
+    uint64_t mac = 0;
+    d->ops->read(d, 0x100, 1, &mac);
+    CHECK(mac == 0x02, "config MAC byte 0");
+    wreg(d, 0x014, 1);
+    CHECK(reg(d, 0x010) & 1, "VERSION_1 offered");
+
+    /* Driver bring-up: ACK | DRIVER, features, FEATURES_OK, queues, DRIVER_OK. */
+    wreg(d, 0x070, 3);
+    wreg(d, 0x024, 0); wreg(d, 0x020, (1u << 5) | (1u << 16));
+    wreg(d, 0x024, 1); wreg(d, 0x020, 1);
+    wreg(d, 0x070, 0xb);
+    setup_queue(d, 0, RXQ_DESC, RXQ_AVAIL, RXQ_USED);
+    setup_queue(d, 1, TXQ_DESC, TXQ_AVAIL, TXQ_USED);
+    wreg(d, 0x070, 0xf);
+
+    /* Host -> guest before any receive buffer: held in the netdev queue. */
+    uint8_t frame[60];
+    for (unsigned i = 0; i < sizeof(frame); i++)
+        frame[i] = (uint8_t)i;
+    CHECK(uam_netdev_send(b, frame, sizeof(frame)), "peer sends");
+    CHECK(get_le16(&bus, RXQ_USED + 2) == 0, "no buffer, nothing received yet");
+    put_desc(&bus, RXQ_DESC, RX_BUF, 1526, 2 /* WRITE */);
+    put_le16(&bus, RXQ_AVAIL + 4, 0);
+    put_le16(&bus, RXQ_AVAIL + 2, 1);
+    wreg(d, 0x050, 0);
+    CHECK(get_le16(&bus, RXQ_USED + 2) == 1, "frame received into the new buffer");
+    uint8_t got[12 + 60];
+    uam_bus_dma_read(&bus, RX_BUF, got, sizeof(got));
+    CHECK(get_le16(&bus, RXQ_USED + 8) == 72 && got[10] == 1 && !memcmp(got + 12, frame, 60),
+          "header (num_buffers 1) and frame");
+    CHECK(irq_level == 1 && (reg(d, 0x060) & 1), "used-buffer interrupt");
+    wreg(d, 0x064, 1);
+    CHECK(irq_level == 0, "interrupt acknowledged");
+
+    /* Guest -> host: header and frame in two descriptors. */
+    uam_bus_dma_write(&bus, TX_BUF, got, 12);
+    uam_bus_dma_write(&bus, TX_BUF + 0x100, frame, 42);
+    put_desc(&bus, TXQ_DESC, TX_BUF, 12, 1 /* NEXT */);
+    uint8_t nx[2] = { 1, 0 };
+    uam_bus_dma_write(&bus, TXQ_DESC + 14, nx, 2);
+    put_desc(&bus, TXQ_DESC + 16, TX_BUF + 0x100, 42, 0);
+    put_le16(&bus, TXQ_AVAIL + 4, 0);
+    put_le16(&bus, TXQ_AVAIL + 2, 1);
+    wreg(d, 0x050, 1);
+    CHECK(peer.frames == 1 && peer.len == 42 && !memcmp(peer.f, frame, 42), "frame transmitted");
+    CHECK(get_le16(&bus, TXQ_USED + 2) == 1, "tx buffer returned");
+
+    /* Link down: config status and a configuration-change interrupt. */
+    wreg(d, 0x064, 3);
+    uam_netdev_set_link(a, false);
+    uint64_t st = 1;
+    d->ops->read(d, 0x106, 2, &st);
+    CHECK(st == 0 && (reg(d, 0x060) & 2), "link down reported");
+
+    /* A ring pointing outside RAM: the device stops rather than crashing. */
+    put_desc(&bus, TXQ_DESC, 0x900000, 60, 0);
+    put_le16(&bus, TXQ_AVAIL + 6, 0);
+    put_le16(&bus, TXQ_AVAIL + 2, 2);
+    wreg(d, 0x050, 1);
+    CHECK(reg(d, 0x070) & 0x40, "DEVICE_NEEDS_RESET on a DMA fault");
+    wreg(d, 0x070, 0);
+    CHECK(reg(d, 0x070) == 0 && irq_level == 0, "status 0 resets");
+
+    d->ops->destroy(d);
+    uam_netdev_destroy(a);
+    uam_netdev_destroy(b);
+    uam_bus_fini(&bus);
+}
+
 /* ---- host loop: an idle hart woken by socket input ----------------------- */
 
 typedef struct wake_dev {
@@ -231,11 +488,11 @@ static void test_host_loop(const char *dir)
 
 static void test_registry(void)
 {
-    CHECK(uam_board_find("virt") == NULL, "library has no boards by default");
+    CHECK(uam_board_find("rv32-ref") == NULL, "library has no boards by default");
     uam_boards_register_stock();
-    CHECK(uam_board_find("virt") == &uam_board_virt, "stock boards registered");
-    CHECK(uam_board_find("mipssim-el") != NULL, "mipssim-el registered");
-    CHECK(uam_board_register(&uam_board_virt) == UAM_OK, "re-registering replaces");
+    CHECK(uam_board_find("rv32-ref") == &uam_board_rv32_ref, "stock boards registered");
+    CHECK(uam_board_find("mipsel-ref") != NULL, "mipsel-ref registered");
+    CHECK(uam_board_register(&uam_board_rv32_ref) == UAM_OK, "re-registering replaces");
 
     uam_board_option opts[] = { { "boot", "flash" }, { "boot", "ram" } };
     uam_board_image imgs[] = { { "flash", "fw.bin" } };
@@ -243,6 +500,11 @@ static void test_registry(void)
     CHECK(!strcmp(uam_board_config_option(&cfg, "boot"), "ram"), "last option wins");
     CHECK(uam_board_config_option(&cfg, "x") == NULL, "missing option");
     CHECK(!strcmp(uam_board_config_image(&cfg, "flash"), "fw.bin"), "named image");
+    uam_board_netdev nds[] = { { "wan", (uam_netdev *)&opts[0] } };
+    cfg.netdevs = nds;
+    cfg.n_netdevs = 1;
+    CHECK(uam_board_config_netdev(&cfg, "wan") == (uam_netdev *)&opts[0], "named network port");
+    CHECK(uam_board_config_netdev(&cfg, "lan1") == NULL, "unattached port is unplugged");
 }
 
 int main(void)
@@ -255,6 +517,8 @@ int main(void)
     test_chardev_flow();
     test_uart_chardev();
     test_netdev(dir);
+    test_tun_adapter();
+    test_virtio_net();
     test_host_loop(dir);
     test_registry();
 

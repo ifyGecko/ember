@@ -9,9 +9,9 @@
 
 #include "uam/machine.h"
 
-extern const uam_board uam_board_virt;        /* RV32IMAC, QEMU virt-compatible */
-extern const uam_board uam_board_mipssim;     /* MIPS32 BE, QEMU mipssim-compatible */
-extern const uam_board uam_board_mipssim_el;  /* MIPS32 LE, QEMU mipssim-compatible */
+extern const uam_board uam_board_rv32_ref;    /* "rv32-ref": RV32IMAC */
+extern const uam_board uam_board_mips_ref;    /* "mips-ref": MIPS32 big-endian */
+extern const uam_board uam_board_mipsel_ref;  /* "mipsel-ref": MIPS32 little-endian */
 
 /* Register every stock board with uam_board_register(). */
 void uam_boards_register_stock(void);

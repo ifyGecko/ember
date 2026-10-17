@@ -25,7 +25,7 @@ static void usage(FILE *out)
 {
     fprintf(out,
         "usage: uam-run [options] [IMAGE]\n"
-        "  -b, --board NAME        board to build (default: virt); --board list shows all\n"
+        "  -b, --board NAME        board to build (default: rv32-ref); --board list shows all\n"
         "      --raw-base ADDR     load address for raw (non-ELF) images (default: board reset pc)\n"
         "      --image NAME=PATH   named image for the board to place (repeatable)\n"
         "  -o, --option KEY=VALUE  board-specific option (repeatable)\n"
@@ -35,7 +35,13 @@ static void usage(FILE *out)
         "      --console SPEC      console backend: stdio (default), stdio-raw, null, pty,\n"
         "                          tcp:[HOST:]PORT, unix:PATH, file:OUT[,in=FILE], string:TEXT\n"
         "      --uart-input STR    shorthand for --console string:STR\n"
-        "      --realtime[=TPS]    pace virtual time to the host clock (TPS ticks/s, default 100M)\n"
+        "      --nic PORT=SPEC     attach the board's network port PORT (repeatable; port names\n"
+        "                          are the board's) to a backend: tap:[IFNAME], tun:[IFNAME],\n"
+        "                          tap-fd:FD, tun-fd:FD, udp:LPORT:RHOST:RPORT, null;\n"
+        "                          append ,pcap=FILE to capture. Ports left out are unplugged\n"
+        "      --realtime[=TPS]    pace virtual time to the host clock (TPS ticks/s, default 100M);\n"
+        "                          implied by a --nic with a host interface\n"
+        "      --virtual-time      keep virtual pacing even with host network interfaces\n"
         "      --block-insns N     max guest instructions per block (default 32)\n"
         "  -t, --trace LIST        comma list of: blocks, ir, exc\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
@@ -131,7 +137,7 @@ int uam_run_main(int argc, char **argv)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_BLOCK_INSNS,
            OPT_IMAGE, OPT_CONSOLE, OPT_REALTIME, OPT_TRACE_RANGE, OPT_TRACE_AFTER, OPT_LOG_PC,
-           OPT_BREAK, OPT_GDB, OPT_MAP };
+           OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -143,6 +149,8 @@ int uam_run_main(int argc, char **argv)
         { "console", required_argument, NULL, OPT_CONSOLE },
         { "uart-input", required_argument, NULL, OPT_UART_IN },
         { "realtime", optional_argument, NULL, OPT_REALTIME },
+        { "nic", required_argument, NULL, OPT_NIC },
+        { "virtual-time", no_argument, NULL, OPT_VIRTUAL_TIME },
         { "block-insns", required_argument, NULL, OPT_BLOCK_INSNS },
         { "trace", required_argument, NULL, 't' },
         { "trace-range", required_argument, NULL, OPT_TRACE_RANGE },
@@ -161,17 +169,20 @@ int uam_run_main(int argc, char **argv)
         { 0 },
     };
 
-    const char *board_name = "virt", *console_spec = "stdio", *gdb_port = NULL;
+    const char *board_name = "rv32-ref", *console_spec = "stdio", *gdb_port = NULL;
     char *uart_input_spec = NULL;
     uint64_t raw_base = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
     uint64_t realtime_tps = 0, log_pcs[MAX_LIST], break_pcs[MAX_LIST], log_hits[MAX_LIST] = { 0 };
     unsigned n_log = 0, n_break = 0;
     bool have_raw_base = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, realtime = false;
-    bool show_map = false;
+    bool show_map = false, virtual_time = false;
     unsigned trace = 0, block_insns = 0;
     uam_board_option options[MAX_LIST];
     uam_board_image images[MAX_LIST];
-    uam_board_config cfg = { .unknown_mmio = UAM_UNKNOWN_FAULT, .options = options, .images = images };
+    uam_board_netdev nics[MAX_LIST];
+    const char *nic_specs[MAX_LIST];
+    uam_board_config cfg = { .unknown_mmio = UAM_UNKNOWN_FAULT, .options = options, .images = images,
+                             .netdevs = nics };
 
     optind = 1;
     int c;
@@ -200,6 +211,23 @@ int uam_run_main(int argc, char **argv)
             }
             cfg.n_images++;
             break;
+        case OPT_NIC: {
+            const char *spec;
+            if (cfg.n_netdevs == MAX_LIST || !split_kv(optarg, &nics[cfg.n_netdevs].name, &spec)) {
+                fprintf(stderr, "uam-run: bad --nic '%s' (expected PORT=SPEC)\n", optarg);
+                return 2;
+            }
+            for (size_t i = 0; i < cfg.n_netdevs; i++) {
+                if (!strcmp(nics[i].name, nics[cfg.n_netdevs].name)) {
+                    fprintf(stderr, "uam-run: port '%s' given twice\n", nics[i].name);
+                    return 2;
+                }
+            }
+            nic_specs[cfg.n_netdevs] = spec;
+            nics[cfg.n_netdevs++].nd = NULL;
+            break;
+        }
+        case OPT_VIRTUAL_TIME: virtual_time = true; break;
         case OPT_RAW_BASE: raw_base = strtoull(optarg, NULL, 0); have_raw_base = true; break;
         case OPT_RAM: cfg.ram_size = parse_size(optarg); break;
         case OPT_CONSOLE: console_spec = optarg; break;
@@ -269,6 +297,17 @@ int uam_run_main(int argc, char **argv)
         goto out_host;
     }
     cfg.console = console;
+    bool host_net = false;   /* a port is wired to a host interface */
+    for (size_t i = 0; i < cfg.n_netdevs; i++) {
+        nics[i].nd = uam_netdev_open(nic_specs[i]);
+        if (!nics[i].nd) {
+            fprintf(stderr, "uam-run: cannot open network backend '%s' for port '%s'\n",
+                    nic_specs[i], nics[i].name);
+            goto out_host;
+        }
+        uam_host_add_netdev(host, nics[i].nd);
+        host_net |= uam_netdev_fd(nics[i].nd) >= 0;
+    }
 
     uam_machine m;
     uam_status st = board->build(&m, &cfg);
@@ -277,6 +316,10 @@ int uam_run_main(int argc, char **argv)
         uam_machine_fini(&m);
         goto out_host;
     }
+    for (size_t i = 0; i < cfg.n_netdevs; i++)
+        if (!nics[i].nd->receive)
+            fprintf(stderr, "uam-run: board '%s' has no network port '%s'; --nic %s=... is unused\n",
+                    board_name, nics[i].name, nics[i].name);
     if (show_map) {
         fprintf(stderr, "bus map of '%s':\n", board_name);
         uam_bus_dump_map(&m.bus, stderr);
@@ -309,6 +352,13 @@ int uam_run_main(int argc, char **argv)
         uam_exec_add_pc_hook(&m.exec, break_pcs[i], break_hook, NULL);
 
     uam_host_add_chardev(host, console);
+    /* Guest network stacks time out in virtual time: with virtual pacing an idle
+     * guest's retransmit/ARP timers would expire before any host reply arrived. */
+    if (host_net && !realtime && !virtual_time) {
+        uam_log(UAM_LOG_INFO, "uam-run", "host network attached: pacing virtual time to the host "
+                "clock (--virtual-time to keep it deterministic)");
+        realtime = true;
+    }
     uam_host_set_pacing(host, realtime ? UAM_PACE_REALTIME : UAM_PACE_VIRTUAL, realtime_tps, 0);
     uam_host_attach(host, &m.exec);
     uam_chardev_set_quit_handler(console, on_console_quit, &m);
@@ -389,6 +439,8 @@ int uam_run_main(int argc, char **argv)
     uam_machine_fini(&m);
 out_host:
     uam_host_destroy(host);
+    for (size_t i = 0; i < cfg.n_netdevs; i++)
+        uam_netdev_destroy(nics[i].nd);   /* after the machine: devices detach first */
     uam_chardev_destroy(console);
     free(uart_input_spec);
     return rc;

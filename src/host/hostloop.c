@@ -81,6 +81,17 @@ void uam_host_set_pacing(uam_host *h, uam_pacing pacing, uint64_t ticks_per_sec,
     h->started = false;
 }
 
+static bool has_fds(uam_host *h)
+{
+    for (unsigned i = 0; i < h->n_cds; i++)
+        if (uam_chardev_fd(h->cds[i]) >= 0)
+            return true;
+    for (unsigned i = 0; i < h->n_nds; i++)
+        if (uam_netdev_fd(h->nds[i]) >= 0)
+            return true;
+    return false;
+}
+
 /* Service every source; wait up to timeout_ms for one with a host fd. */
 void uam_host_poll(uam_host *h, int timeout_ms)
 {
@@ -91,11 +102,15 @@ void uam_host_poll(uam_host *h, int timeout_ms)
         if (fd >= 0)
             pfd[n++] = (struct pollfd){ .fd = fd, .events = POLLIN };
     }
+    /* A netdev whose guest queue is full is not watched: the host kernel holds
+     * its frames until the guest takes some (backpressure). */
     for (unsigned i = 0; i < h->n_nds; i++) {
         int fd = uam_netdev_fd(h->nds[i]);
-        if (fd >= 0)
+        if (fd >= 0 && uam_netdev_can_input(h->nds[i]))
             pfd[n++] = (struct pollfd){ .fd = fd, .events = POLLIN };
     }
+    if (!n && timeout_ms < 0 && has_fds(h))
+        timeout_ms = 100;   /* every source is held back: wait without spinning */
     if (n || timeout_ms > 0) {
         int rc = poll(pfd, n, timeout_ms);
         (void)rc;  /* EINTR (e.g. SIGINT -> uam_exec_stop) simply returns early */
@@ -105,17 +120,6 @@ void uam_host_poll(uam_host *h, int timeout_ms)
         uam_chardev_poll(h->cds[i]);
     for (unsigned i = 0; i < h->n_nds; i++)
         uam_netdev_poll(h->nds[i]);
-}
-
-static bool has_fds(uam_host *h)
-{
-    for (unsigned i = 0; i < h->n_cds; i++)
-        if (uam_chardev_fd(h->cds[i]) >= 0)
-            return true;
-    for (unsigned i = 0; i < h->n_nds; i++)
-        if (uam_netdev_fd(h->nds[i]) >= 0)
-            return true;
-    return false;
 }
 
 /* ---- real-time pacing ------------------------------------------------------ */

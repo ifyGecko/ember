@@ -124,6 +124,15 @@ const char *uam_board_config_image(const uam_board_config *cfg, const char *name
     return v;
 }
 
+uam_netdev *uam_board_config_netdev(const uam_board_config *cfg, const char *name)
+{
+    uam_netdev *nd = NULL;
+    for (size_t i = 0; cfg && i < cfg->n_netdevs; i++)
+        if (strcmp(cfg->netdevs[i].name, name) == 0)
+            nd = cfg->netdevs[i].nd;
+    return nd;
+}
+
 /* ---- board registry ---------------------------------------------------- */
 
 static const uam_board *registry[UAM_MAX_BOARDS];

@@ -1,8 +1,8 @@
 # UAM Firmware Emulator — Architecture
 
 Status: phase 1 implemented, plus a second ISA (MIPS32 with a TLB). IR, interpreter, bus
-(priorities, device byte order, ROM devices, aliases, watchpoints), RV32IMAC (`virt` board) and
-MIPS32 big/little-endian (`mipssim` board), host I/O backends, a gdb stub, and a reusable runner.
+(priorities, device byte order, ROM devices, aliases, watchpoints), RV32IMAC (`rv32-ref` board) and
+MIPS32 big/little-endian (`mips-ref` / `mipsel-ref` boards), host I/O backends, a gdb stub, and a reusable runner.
 Language: C11 (no C++). Goal: analysis and fuzzing of raw firmware images.
 
 ## 1. Core idea
@@ -39,13 +39,13 @@ plus opaque handles. Implementations are selected at run time by the board.
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
 | `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian`, optional `translate` (v->p, with fault sub-causes), optional `gdb` register view | `isa/riscv`, `isa/mips32` |
-| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities, software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access | the core |
+| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities, software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`; declared `endian` and implemented access sizes (`save` / `restore` and declarative register tables are planned) | one file per device |
 | `sched.h` | Instruction-count clock, event queue, exit requests, list consistency checks | the core |
 | `signal.h` | Interrupt, GPIO and reset lines: raise, lower, connect; edge and level | the core |
 | `chardev.h` | Byte streams between a device and the host (UART consoles) | core plumbing; backends in `src/host` |
 | `netdev.h` | Ethernet frames between a device and the host (NICs, switches, radio "air") | core plumbing; backends in `src/host` |
-| `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images) | `src/machine`, `boards/*` |
+| `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports) | `src/machine`, `boards/*` |
 | `cpu.h` | ISA-neutral hart state and the core services ISA modules may call (`uam_cpu_xlate_changed`, ...) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
 | `exec.h` | Run a hart: translation cache, block execution (interpreter or JIT), result handling, reset requests, PC hooks, the host bridge (polling, idle) | `exec/interp`, `exec/jit_x86` |
@@ -89,7 +89,7 @@ Implemented:
 ```
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
                   loader.h machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
-include/uam/dev/  clint.h plic.h uart16550.h sifive_test.h unknown_mmio.h unimp.h
+include/uam/dev/  clint.h plic.h uart16550.h sifive_test.h unknown_mmio.h unimp.h virtio_net.h
 include/uam/isa/  riscv.h mips32.h
 src/ir/           builder.c verify.c print.c opt.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c
@@ -101,13 +101,14 @@ src/debug/        gdbstub.c
 src/runner/       runner.c
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips.h (private)
-devices/          clint.c plic.c uart16550.c sifive_test.c unknown_mmio.c unimp.c
-boards/           virt.c mipssim.c stock.c
+devices/          clint.c plic.c uart16550.c sifive_test.c unknown_mmio.c unimp.c virtio_net.c
+boards/           rv32_ref.c mips_ref.c stock.c
 tools/            uam-run.c
 examples/         external-board/ (an out-of-tree board built against `make lib`)
 tests/unit/       test_ir.c test_core.c test_host.c
-tests/firmware/       start.S selftest.c link.ld qemu-check.sh  (RISC-V)
-tests/firmware-mips/  start.S selftest.c link.ld qemu-check.sh  (MIPS32)
+tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
+tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
+tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
 ```
 
 Planned: `src/core/snapshot.c`, `analysis/` (coverage, cmp-log, taint),
@@ -127,9 +128,8 @@ Planned: `src/core/snapshot.c`, `analysis/` (coverage, cmp-log, taint),
   resets the machine between instructions and keeps running (RAM preserved, board reset
   hook for re-loading images).
 - **HAL interception**: replace a firmware function, by address or symbol, with a native handler.
-- **First board**: `virt`, an RV32IMAC M-mode board whose memory map matches QEMU's `virt` machine
-  (CLINT, PLIC, NS16550A UART, sifive,test finisher, RAM at 0x80000000). The same firmware
-  ELF runs under QEMU, which `make qemu-check` uses as a differential reference.
+- **First board**: `rv32-ref`, an RV32IMAC M-mode reference board (CLINT, PLIC, NS16550A UART,
+  sifive,test finisher, virtio-net ports, RAM at 0x80000000).
 
 ## 6. Analysis and fuzzing
 
@@ -145,8 +145,14 @@ Planned: `src/core/snapshot.c`, `analysis/` (coverage, cmp-log, taint),
 - **GDB stub** against the abstract state (`--gdb PORT`): breakpoints are PC hooks, watchpoints
   are bus watches, registers come from `isa->gdb`.
 - **Host I/O** is outside the machine: devices use `chardev.h` / `netdev.h`; backends (stdio,
-  pty, sockets, tap, UDP, in-process pairs, pcap capture) and the host loop live in `src/host`.
-  Virtual-time pacing (the default) keeps runs deterministic; real-time pacing is opt-in.
+  pty, sockets, tap, tun, UDP, in-process pairs, pcap capture) and the host loop live in `src/host`.
+  Virtual-time pacing (the default) keeps runs deterministic; real-time pacing is opt-in, and
+  implied by the runner when a port is attached to a host network interface.
+- **Networking** follows the console's path. A board names its ports and looks them up in its
+  config (`uam_board_config_netdev`); a missing port is an unplugged cable. The NIC model
+  (any MAC, switch or radio) is a netdev frontend and moves frames with bus DMA. The netdev
+  carries Ethernet frames; a tun backend adapts them to IP packets. The host loop stops
+  reading a backend while the guest's queue is full, so the host kernel applies backpressure.
 
 ## 7. Phasing
 
@@ -157,8 +163,8 @@ Planned: `src/core/snapshot.c`, `analysis/` (coverage, cmp-log, taint),
 
 ## 8. Verification
 
-- Per-instruction differential testing against QEMU/Unicorn: random instruction and state,
-  then compare the register file and memory.
+- Per-instruction differential testing between the interpreter and the JIT: random
+  instruction and state, then compare the register file and memory.
 - riscv-tests / riscv-arch-test under the interpreter.
 - IR verifier enabled on every block in debug builds, plus golden text-form tests for the lifter.
 - Determinism: identical traces across runs, and identical re-execution after a snapshot restore.
