@@ -17,6 +17,13 @@
  * fixed input (uam_chardev_buffer_create) delivers it as soon as a frontend
  * is attached, which keeps runs deterministic.
  *
+ * Holding: the owner can hold input back (uam_chardev_hold) while the
+ * machine is being set up. Fixed input is otherwise handed to the device
+ * when the board attaches it, and a device reset that clears its receive
+ * FIFO, or a snapshot restore that replaces it, would discard it. Hold the
+ * chardev from creation until the run starts, then release it: input queued
+ * meanwhile is delivered then.
+ *
  * Dependencies: common.h.
  */
 #ifndef UAM_CHARDEV_H
@@ -49,6 +56,7 @@ struct uam_chardev {
     /* host input not yet taken by the frontend */
     uint8_t  rx[UAM_CHARDEV_RXBUF];
     size_t   rx_head, rx_len;
+    bool     held;   /* uam_chardev_hold: queue input, deliver nothing */
     /* the backend asks to end the session (escape key, EOF on a script) */
     void   (*on_quit)(void *ctx);
     void    *quit_ctx;
@@ -72,6 +80,9 @@ void   uam_chardev_quit(uam_chardev *cd);
 /* ---- owner side ---- */
 void   uam_chardev_set_quit_handler(uam_chardev *cd, void (*fn)(void *ctx), void *ctx);
 int    uam_chardev_fd(uam_chardev *cd);
+/* Hold input back from the frontend (it stays queued), or release it and
+ * deliver what is queued. */
+void   uam_chardev_hold(uam_chardev *cd, bool hold);
 void   uam_chardev_poll(uam_chardev *cd);
 void   uam_chardev_destroy(uam_chardev *cd);
 

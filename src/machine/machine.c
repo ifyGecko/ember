@@ -34,8 +34,45 @@ void uam_machine_reset_sink(void *ctx, unsigned input, int level)
         uam_exec_request_reset(&m->exec, input == UAM_RESET_CPU ? UAM_RESET_CPU : UAM_RESET_SYSTEM);
 }
 
-uam_status uam_machine_init(uam_machine *m, const uam_isa *isa)
+/* ---- ABI handshake ------------------------------------------------------ */
+
+bool uam_abi_check(const uam_abi_layout *caller, const char *entry)
 {
+    static const char *const names[] = { "uam_machine", "uam_exec", "uam_cpu", "uam_bus",
+                                         "uam_sched", "uam_timer", "uam_device", "uam_chardev",
+                                         "uam_netdev", "uam_board", "uam_board_config" };
+    const uam_abi_layout *lib = UAM_ABI_LAYOUT;
+    if (caller->version != lib->version || caller->self != lib->self) {
+        uam_log(UAM_LOG_ERROR, "abi", "%s: caller compiled against UAM ABI %u, library is ABI %u; "
+                "rebuild one against the other's headers", entry, (unsigned)caller->version,
+                (unsigned)lib->version);
+        return false;
+    }
+    const uint32_t *got = &caller->machine, *want = &lib->machine;
+    bool ok = true;
+    for (size_t i = 0; i < UAM_ARRAY_LEN(names); i++) {
+        if (got[i] != want[i]) {
+            uam_log(UAM_LOG_ERROR, "abi", "%s: sizeof(%s) is %u in the caller, %u in the library",
+                    entry, names[i], (unsigned)got[i], (unsigned)want[i]);
+            ok = false;
+        }
+    }
+    if (!ok)
+        uam_log(UAM_LOG_ERROR, "abi", "%s: the caller and libuam were built from different UAM "
+                "headers (same ABI version %u); rebuild both from one tree", entry,
+                (unsigned)lib->version);
+    return ok;
+}
+
+static void abi_require(const uam_abi_layout *caller, const char *entry)
+{
+    if (!uam_abi_check(caller, entry))
+        abort();
+}
+
+uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_abi_layout *abi)
+{
+    abi_require(abi, "uam_machine_init");
     memset(m, 0, sizeof(*m));
     uam_bus_init(&m->bus);
 
@@ -72,6 +109,11 @@ void uam_machine_fini(uam_machine *m)
         d = n;
     }
     m->devices = NULL;
+    for (uint32_t i = 0; i < m->n_state_parts; i++)
+        free(m->state_parts[i].name);
+    free(m->state_parts);
+    m->state_parts = NULL;
+    m->n_state_parts = m->cap_state_parts = 0;
     if (m->cpu.isa && m->cpu.isa_state)
         m->cpu.isa->fini(&m->cpu);
     free(m->cpu.regfile);
@@ -79,8 +121,9 @@ void uam_machine_fini(uam_machine *m)
     uam_bus_fini(&m->bus);
 }
 
-void uam_machine_add_device(uam_machine *m, uam_device *dev)
+void uam_machine_add_device_abi(uam_machine *m, uam_device *dev, const uam_abi_layout *abi)
 {
+    abi_require(abi, "uam_machine_add_device");
     /* Append, so devices reset in creation order. */
     uam_device **pp = &m->devices;
     while (*pp)
@@ -96,6 +139,29 @@ void uam_machine_reset(uam_machine *m, uint64_t entry)
         if (d->ops->reset)
             d->ops->reset(d);
     m->cpu.isa->reset(&m->cpu, entry);
+}
+
+uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_save_fn save,
+                                 uam_state_restore_fn restore, void *ctx)
+{
+    if (!name || !*name || !save || !restore)
+        return UAM_ERR_INVALID;
+    for (uint32_t i = 0; i < m->n_state_parts; i++)
+        if (strcmp(m->state_parts[i].name, name) == 0)
+            return UAM_ERR_INVALID;
+    if (m->n_state_parts == m->cap_state_parts) {
+        uint32_t ncap = m->cap_state_parts ? m->cap_state_parts * 2 : 4;
+        uam_state_part *np = realloc(m->state_parts, sizeof(*np) * ncap);
+        if (!np)
+            return UAM_ERR_NOMEM;
+        m->state_parts = np;
+        m->cap_state_parts = ncap;
+    }
+    char *copy = strdup(name);
+    if (!copy)
+        return UAM_ERR_NOMEM;
+    m->state_parts[m->n_state_parts++] = (uam_state_part){ copy, save, restore, ctx };
+    return UAM_OK;
 }
 
 void uam_machine_stop_cb(void *ctx, int64_t status)
@@ -138,8 +204,9 @@ uam_netdev *uam_board_config_netdev(const uam_board_config *cfg, const char *nam
 static const uam_board *registry[UAM_MAX_BOARDS];
 static size_t n_registered;
 
-uam_status uam_board_register(const uam_board *board)
+uam_status uam_board_register_abi(const uam_board *board, const uam_abi_layout *abi)
 {
+    abi_require(abi, "uam_board_register");
     if (!board || !board->name || !board->build)
         return UAM_ERR_INVALID;
     for (size_t i = 0; i < n_registered; i++) {

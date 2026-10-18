@@ -21,6 +21,7 @@
 #include "uam/isa.h"
 #include "uam/netdev.h"
 #include "uam/sched.h"
+#include "uam/state.h"
 
 typedef enum uam_unknown_mmio_policy {
     UAM_UNKNOWN_FAULT, /* unmapped access faults (like real hardware bus errors) */
@@ -76,6 +77,16 @@ typedef struct uam_machine uam_machine;
  */
 typedef void (*uam_machine_reset_hook)(uam_machine *m, uam_reset_kind kind, void *ctx);
 
+/* Extra state saved in snapshots (uam_machine_add_state). */
+typedef void (*uam_state_save_fn)(void *ctx, uam_state_writer *w);
+typedef void (*uam_state_restore_fn)(void *ctx, uam_state_reader *r);
+typedef struct uam_state_part {
+    char                *name;
+    uam_state_save_fn    save;
+    uam_state_restore_fn restore;
+    void                *ctx;
+} uam_state_part;
+
 struct uam_machine {
     const char *board_name;
     uam_bus     bus;
@@ -89,15 +100,55 @@ struct uam_machine {
     void                  *on_reset_ctx;
     void       *board_data;              /* board-private state, if any */
     void      (*board_fini)(uam_machine *m); /* frees board_data; runs before devices */
+    /* Snapshots (snapshot.h). */
+    uam_state_part *state_parts;         /* registered with uam_machine_add_state */
+    uint32_t        n_state_parts, cap_state_parts;
+    uint64_t        snap_base;           /* snapshot the bus's dirty pages are relative to */
 };
 
-uam_status uam_machine_init(uam_machine *m, const uam_isa *isa);
+/*
+ * ABI handshake. A board is compiled against these headers but may be linked
+ * against a libuam built from other ones; if the struct layouts differ, the
+ * two sides disagree on field offsets and memory is silently corrupted. So
+ * the entry points a board calls first (uam_board_register, uam_machine_init,
+ * uam_machine_add_device) are macros that pass the layout the caller was
+ * compiled with. On a mismatch the library logs each differing item and
+ * aborts: a mixed build is never usable, and an error status could be ignored.
+ * A board built against headers older than this handshake fails to link.
+ */
+typedef struct uam_abi_layout {
+    uint32_t version;   /* UAM_ABI_VERSION; always the first member */
+    uint32_t self;      /* sizeof(uam_abi_layout) */
+    uint32_t machine, exec, cpu, bus, sched, timer, device, chardev, netdev,
+             board, board_config;
+} uam_abi_layout;
+
+#define UAM_ABI_LAYOUT (&(const uam_abi_layout){                                  \
+        UAM_ABI_VERSION, sizeof(uam_abi_layout), sizeof(uam_machine),           \
+        sizeof(uam_exec), sizeof(uam_cpu), sizeof(uam_bus), sizeof(uam_sched),  \
+        sizeof(uam_timer), sizeof(uam_device), sizeof(uam_chardev),             \
+        sizeof(uam_netdev), sizeof(uam_board), sizeof(uam_board_config) })
+
+/* True if `caller` matches the library; otherwise logs every difference,
+ * attributed to `entry`, and returns false. */
+bool uam_abi_check(const uam_abi_layout *caller, const char *entry);
+
+uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_abi_layout *abi);
+#define uam_machine_init(m, isa) uam_machine_init_abi((m), (isa), UAM_ABI_LAYOUT)
 void       uam_machine_fini(uam_machine *m);
 /* Take ownership of a device (reset/destroy with the machine). */
-void       uam_machine_add_device(uam_machine *m, uam_device *dev);
+void       uam_machine_add_device_abi(uam_machine *m, uam_device *dev, const uam_abi_layout *abi);
+#define uam_machine_add_device(m, dev) uam_machine_add_device_abi((m), (dev), UAM_ABI_LAYOUT)
 /* Reset the hart and every device; start executing at `entry` (which becomes
  * the machine's reset_pc). RAM and the translation cache are preserved. */
 void       uam_machine_reset(uam_machine *m, uint64_t entry);
+/*
+ * Register state that is neither a device nor the hart - board-private data,
+ * state an analysis keeps alongside the guest - so snapshots save and restore
+ * it (snapshot.h). `name` identifies it in a snapshot and must be unique.
+ */
+uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_save_fn save,
+                                 uam_state_restore_fn restore, void *ctx);
 /* Stop callback usable by devices: ctx is the machine. */
 void       uam_machine_stop_cb(void *ctx, int64_t status);
 /*
@@ -120,7 +171,8 @@ typedef struct uam_board {
  * Registering a name twice replaces the earlier board.
  */
 #define UAM_MAX_BOARDS 64u
-uam_status       uam_board_register(const uam_board *board);
+uam_status       uam_board_register_abi(const uam_board *board, const uam_abi_layout *abi);
+#define uam_board_register(board) uam_board_register_abi((board), UAM_ABI_LAYOUT)
 const uam_board *uam_board_find(const char *name);
 void             uam_board_list(FILE *out);
 

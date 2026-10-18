@@ -552,11 +552,13 @@ static uam_status mips_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     case CP0_STATUS:
         s->c.status = (s->c.status & ~s->cfg.status_rw) | (v & s->cfg.status_rw);
         mode_update(cpu);
+        uam_cpu_request_exit(cpu); /* IE/IM may have enabled a pending interrupt (EI too) */
         break;
     case CP0_CAUSE:
         /* Only IV and software interrupt bits IP1:0 are writable. */
         s->c.cause = (s->c.cause & ~(CAUSE_IV | (0x3u << CAUSE_IP_SHIFT)))
                    | (v & (CAUSE_IV | (0x3u << CAUSE_IP_SHIFT)));
+        uam_cpu_request_exit(cpu); /* a software interrupt may now be pending */
         break;
     case CP0_EPC:      s->c.epc = v; break;
     case CP0_ERROREPC: s->c.errorepc = v; break;
@@ -688,6 +690,67 @@ static void mips_dump_state(uam_cpu *cpu, FILE *out)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Snapshots                                                                 */
+/* ------------------------------------------------------------------------ */
+
+static void mips_save(uam_cpu *cpu, uam_state_writer *w)
+{
+    const mips_state *s = mips_st(cpu);
+    const mips_cp0 *c = &s->c;
+    uam_state_put_u32(w, s->cfg.prid);
+    uam_state_put_u32(w, s->cfg.tlb_entries);
+    uam_state_put_u32(w, s->hwlines);
+    uam_state_put_u8(w, s->endian);
+    uam_state_put_bool(w, s->erl_seen);
+    const uint32_t regs[] = { c->status, c->cause, c->epc, c->errorepc, c->badvaddr, c->ebase,
+                              c->compare, c->config, c->intctl, c->index, c->entrylo0,
+                              c->entrylo1, c->context, c->pagemask, c->wired, c->entryhi };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(regs); i++)
+        uam_state_put_u32(w, regs[i]);
+    uam_state_put_u64(w, c->count_bias);
+    uam_state_put_bool(w, c->timer_ip);
+    for (unsigned i = 0; i < MIPS_TLB_MAX; i++) {
+        const mips_tlb_entry *e = &c->tlb[i];
+        uam_state_put_u32(w, e->vpn2);
+        uam_state_put_u32(w, e->mask);
+        uam_state_put_u8(w, e->asid);
+        uam_state_put_bool(w, e->g);
+        uam_state_put_u32(w, e->lo[0]);
+        uam_state_put_u32(w, e->lo[1]);
+    }
+    uam_state_put_timer(w, &s->timer);
+}
+
+static void mips_restore(uam_cpu *cpu, uam_state_reader *r)
+{
+    mips_state *s = mips_st(cpu);
+    mips_cp0 *c = &s->c;
+    uam_state_expect_u32(r, s->cfg.prid, "MIPS PRId");
+    uam_state_expect_u32(r, s->cfg.tlb_entries, "MIPS TLB size");
+    s->hwlines = uam_state_get_u32(r);
+    s->endian = uam_state_get_u8(r);
+    s->erl_seen = uam_state_get_bool(r);
+    uint32_t *const regs[] = { &c->status, &c->cause, &c->epc, &c->errorepc, &c->badvaddr,
+                               &c->ebase, &c->compare, &c->config, &c->intctl, &c->index,
+                               &c->entrylo0, &c->entrylo1, &c->context, &c->pagemask, &c->wired,
+                               &c->entryhi };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(regs); i++)
+        *regs[i] = uam_state_get_u32(r);
+    c->count_bias = uam_state_get_u64(r);
+    c->timer_ip = uam_state_get_bool(r);
+    for (unsigned i = 0; i < MIPS_TLB_MAX; i++) {
+        mips_tlb_entry *e = &c->tlb[i];
+        e->vpn2 = uam_state_get_u32(r);
+        e->mask = uam_state_get_u32(r);
+        e->asid = uam_state_get_u8(r);
+        e->g = uam_state_get_bool(r);
+        e->lo[0] = uam_state_get_u32(r);
+        e->lo[1] = uam_state_get_u32(r);
+    }
+    uam_state_get_timer(r, &s->timer);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Debugger view (gdb: mips:isa32r2 register numbering)                      */
 /* ------------------------------------------------------------------------ */
 
@@ -794,7 +857,9 @@ static const uam_gdb_arch mips_gdb = {
     .sysreg_write   = mips_sysreg_write,              \
     .translate      = mips_translate,                 \
     .gdb            = &mips_gdb,                      \
-    .dump_state     = mips_dump_state
+    .dump_state     = mips_dump_state,                \
+    .save           = mips_save,                      \
+    .restore        = mips_restore
 
 const uam_isa uam_isa_mips32be = {
     .name = "mips32be", .default_endian = UAM_ACC_BE, MIPS_COMMON,

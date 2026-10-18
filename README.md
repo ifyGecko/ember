@@ -37,8 +37,31 @@ build/uam-run build/firmware/selftest.elf
 build/uam-run --stats --trace exc --unknown-mmio zero path/to/firmware.elf
 build/uam-run --raw-base 0x80000000 path/to/image.bin
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
+build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
 build/uam-run --help
+```
+
+With `--jit`, compiled blocks jump straight into each other (block chaining) instead of
+returning to the run loop after every block, which pays off most on firmware with short
+blocks: a VxWorks boot on a MIPS board ran 7.5x faster (19.8 s to 2.6 s for 3e9 instructions).
+Results are bit-identical with and without it, and to the interpreter. `--stats` reports how
+many blocks were entered by chaining.
+
+A run always ends. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual
+time, which also advances while the hart idles in WFI/WAIT (both exit 124). When a hart
+waits for an interrupt that the device timers can never deliver (an interrupt line left
+unwired, say), `--max-stall N` timer events with no instruction retired (default 4194304)
+end the time skipping: with a console or network input attached, the run sleeps until
+input arrives (typing still wakes the guest, SIGINT/SIGTERM still stop it); with none,
+nothing can ever wake the hart and the run stops as a livelock (exit 128). Virtual time never passes 2^62 ticks.
+All of these are counted in virtual time, so runs stay deterministic.
+The other exit statuses: the firmware's own status when it ends the run, 125 deadlock (waiting with
+nothing that could wake it), 126 internal error or fetch-fault loop, 127 breakpoint or debug trap,
+130 SIGINT/SIGTERM.
+
+```bash
+build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructions and idle time
 ```
 
 `--unknown-mmio zero|echo` keeps firmware running past unmodelled peripherals and
@@ -55,6 +78,54 @@ build/uam-run --console pty fw.elf            # console on a pseudo-terminal (al
 build/uam-run --realtime fw.elf               # pace virtual time to the host clock
 build/uam-run --map -b mips-ref               # print the bus map
 ```
+
+Fixed console input (`string:TEXT`, `file:OUT,in=FILE`) reaches the guest when the run starts,
+after the board's power-on reset and any `--load-snapshot`, never while the board is being built.
+Firmware that drains its UART while booting discards input typed ahead like this, as real
+hardware does. To script a shell, save a snapshot at the prompt and resume from it with the
+input (`--load-snapshot shell.snap --console 'string:help\n'`).
+
+## Snapshots
+
+Boot once, then start every later run from the booted state:
+
+```bash
+build/uam-run --break 0x8023f00c --save-snapshot booted.snap fw.elf   # stop where "booted" is, save
+build/uam-run --snapshot-at 0x8023f00c --save-snapshot booted.snap fw.elf  # or save there and run on
+build/uam-run -n 100000000 --save-snapshot booted.snap fw.elf         # or after N instructions
+build/uam-run --load-snapshot booted.snap -n 5000000                  # resume (same board and options)
+```
+
+A run split by `--save-snapshot` / `--load-snapshot` is bit-identical to the uninterrupted run,
+whichever backend (interpreter or `--jit`) runs each half. Without `--snapshot-at`, the snapshot
+is saved when the run stops, Ctrl-C included.
+
+In-process, `uam/snapshot.h` restores a machine in microseconds. Writes are tracked per 4 KiB
+page, so restoring the last snapshot copies back only what the guest changed, and translated or
+JIT-compiled code is kept for unchanged pages:
+
+```c
+#include "uam/snapshot.h"
+
+uam_snapshot *booted;
+uam_exec_run(&m.exec, boot_insns);       /* the slow part, once */
+uam_snapshot_take(&m, &booted);          /* or uam_snapshot_load("booted.snap", &booted) */
+for (int i = 0; i < n_tests; i++) {
+    uam_snapshot_restore(&m, booted);
+    /* ... feed input, uam_exec_run(&m.exec, budget), check the outcome ... */
+}
+uam_snapshot_save(booted, "booted.snap");
+uam_snapshot_free(booted);
+```
+
+Every device must take part. Implement `save` and `restore` in its `uam_device_ops` with the
+state stream in `uam/state.h`, or set `.flags = UAM_DEVICE_STATELESS` if it holds no
+guest-visible state. Save registers, FIFOs, latched conditions and counters, and timers
+(`uam_state_put_timer`) and output lines (`uam_state_put_signal`). Don't save wiring,
+configuration or host handles. Board-private state goes in with `uam_machine_add_state`.
+Taking a snapshot fails, naming the culprit, if a device has neither, or if an armed timer is
+not saved by its owner. Code that writes a RAM/ROMD backing store directly, rather than through
+the bus or `uam_bus_romd_dirty`, must report it with `uam_bus_mark_dirty`.
 
 ## Networking
 
@@ -98,6 +169,10 @@ int main(int argc, char **argv)
 
 Build with `make -C path/to/uam BUILD=$PWD/build/uam lib` and link
 `build/uam/libuam.a` (or `pkg-config --cflags --libs uam` after `make install`).
+Compile against the headers of the same tree the library was built from. A board
+built from different headers is stopped at `uam_board_register` / `uam_machine_init`
+with an `abi:` error that names each struct whose size differs, instead of corrupting
+memory. Rebuild the library and the board together after updating UAM.
 Only the modules you reference are linked: a MIPS-only board pulls in neither
 the RISC-V lifter nor the stock boards.
 

@@ -22,6 +22,11 @@ const char *uam_status_str(uam_status st)
     return "?";
 }
 
+unsigned uam_abi_version(void)
+{
+    return UAM_ABI_VERSION;
+}
+
 void uam_log(uam_log_level lvl, const char *module, const char *fmt, ...)
 {
     static const char *const names[] = { "error", "warn", "info", "debug" };

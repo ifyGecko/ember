@@ -2,7 +2,8 @@
 #
 #   make                 build $(BUILD)/uam-run and the libraries
 #   make lib             only the libraries (for out-of-tree projects)
-#   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE), external-board example
+#   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE), external-board example,
+#                        snapshot round trips through the runner
 #   make net-check       boot the network test on rv32-ref against a real tap and tun interface
 #                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
@@ -31,10 +32,11 @@ BUILD ?= build
 
 # One list per module, mirroring the dependency rules in docs/architecture.md.
 IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c
-CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c
+CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
+               src/core/state.c
 EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit_x86.c
 LOADER_SRC  := src/loader/loader.c
-MACHINE_SRC := src/machine/machine.c
+MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/sifive_test.c \
@@ -55,13 +57,15 @@ RUN       := $(BUILD)/uam-run
 TEST_IR   := $(BUILD)/test_ir
 TEST_CORE := $(BUILD)/test_core
 TEST_HOST := $(BUILD)/test_host
+TEST_SNAP := $(BUILD)/test_snapshot
+TEST_JIT  := $(BUILD)/test_jit
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
 FW_MIPS_BE := $(BUILD)/firmware-mips/selftest-be.elf
 FW_MIPS_EL := $(BUILD)/firmware-mips/selftest-el.elf
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test unit-test firmware-test firmware firmware-mips mips-test example-test \
-        net-check install clean
+        snapshot-test net-check install clean
 
 all: $(RUN) lib
 
@@ -106,6 +110,12 @@ $(TEST_CORE): $(BUILD)/obj/tests/unit/test_core.o $(LIB)
 $(TEST_HOST): $(BUILD)/obj/tests/unit/test_host.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^
 
+$(TEST_SNAP): $(BUILD)/obj/tests/unit/test_snapshot.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(TEST_JIT): $(BUILD)/obj/tests/unit/test_jit.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^
+
 firmware:
 	$(MAKE) -C tests/firmware OUT=$(abspath $(BUILD))/firmware
 
@@ -114,10 +124,12 @@ firmware-mips:
 
 $(FIRMWARE): firmware
 
-unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST)
+unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT)
 	$(TEST_IR)
 	$(TEST_CORE)
 	$(TEST_HOST)
+	$(TEST_SNAP)
+	$(TEST_JIT)
 
 firmware-test: $(RUN) firmware
 	$(RUN) --stats $(FIRMWARE) < /dev/null
@@ -132,7 +144,15 @@ example-test: lib firmware-mips
 	        OUT=$(abspath $(BUILD))/examples/external-board
 	$(EXAMPLE) -b ext-mips -o banner=external --stats $(FW_MIPS_BE) < /dev/null
 
-test: unit-test firmware-test mips-test example-test
+# A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
+# on the stock boards and on the out-of-tree example board.
+snapshot-test: $(RUN) firmware firmware-mips example-test
+	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
+	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
+	sh tests/snapshot/snapshot-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL) 5000
+	sh tests/snapshot/snapshot-check.sh $(EXAMPLE) ext-mips $(FW_MIPS_BE) 4000
+
+test: unit-test firmware-test mips-test example-test snapshot-test
 
 net-check: $(RUN) firmware
 	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both
@@ -148,4 +168,6 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(LIB_OBJ:.o=.d) $(BUILD)/obj/tools/uam-run.d $(BUILD)/obj/tests/unit/test_ir.d \
-         $(BUILD)/obj/tests/unit/test_core.d $(BUILD)/obj/tests/unit/test_host.d
+         $(BUILD)/obj/tests/unit/test_core.d $(BUILD)/obj/tests/unit/test_host.d \
+         $(BUILD)/obj/tests/unit/test_snapshot.d \
+         $(BUILD)/obj/tests/unit/test_jit.d

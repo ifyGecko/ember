@@ -8,7 +8,7 @@
  *   - interrupts arrive through irq_input (wired by the board)
  *   - faults and traps arrive through take_exception
  *
- * Dependencies: ir.h, cpu.h.
+ * Dependencies: ir.h, cpu.h, state.h.
  */
 #ifndef UAM_ISA_H
 #define UAM_ISA_H
@@ -17,6 +17,7 @@
 
 #include "uam/cpu.h"
 #include "uam/ir.h"
+#include "uam/state.h"
 
 /*
  * Debugger view of an ISA's registers (gdb remote protocol). Registers are
@@ -118,7 +119,12 @@ typedef struct uam_isa {
 
     /* Enter the guest exception handler for a synchronous event. */
     void       (*take_exception)(uam_cpu *cpu, const uam_exception *exc);
-    /* Between blocks: if an enabled interrupt is pending, enter it; return true if taken. */
+    /* Between blocks: if an enabled interrupt is pending, enter it; return true if taken.
+     * Executors only ask again after an exit request: any state change that can make
+     * this newly return true (an interrupt-enable or software-interrupt sysreg write)
+     * must call uam_cpu_request_exit(), and so must a change of cpu->priv outside a
+     * helper or exception. (Line changes through uam_cpu_irq_sink already do.) The JIT
+     * chains blocks on this guarantee, so a missing request delays the interrupt. */
     bool       (*irq_take)(uam_cpu *cpu);
     /* WAIT wake condition (pending & enabled, regardless of global enable). */
     bool       (*irq_wakeup)(uam_cpu *cpu);
@@ -144,6 +150,12 @@ typedef struct uam_isa {
     const uam_gdb_arch *gdb;
 
     void       (*dump_state)(uam_cpu *cpu, FILE *out);
+
+    /* Optional, together: save / restore the ISA-private hart state
+     * (isa_state, including its timers) for snapshots. The core saves the
+     * uam_cpu fields itself and calls uam_cpu_xlate_changed() after restore. */
+    void       (*save)(uam_cpu *cpu, uam_state_writer *w);
+    void       (*restore)(uam_cpu *cpu, uam_state_reader *r);
 } uam_isa;
 
 #endif /* UAM_ISA_H */

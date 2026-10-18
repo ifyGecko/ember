@@ -59,6 +59,7 @@ static const uam_device_ops test_ops = {
     .read = test_read,
     .write = test_write,
     .destroy = test_destroy,
+    .flags = UAM_DEVICE_STATELESS,
 };
 
 uam_device *uam_sifive_test_create(const char *name, uam_finish_fn finish, void *ctx)

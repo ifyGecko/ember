@@ -45,6 +45,7 @@ void uam_tcache_flush(uam_tcache *tc)
         tc->buckets[i] = NULL;
     }
     tc->n_blocks = 0;
+    tc->gen++;
 }
 
 void uam_tcache_fini(uam_tcache *tc)
@@ -82,6 +83,7 @@ uam_block *uam_tcache_lookup(uam_tcache *tc, uint64_t pc, unsigned priv, uint32_
         uam_block_free(e->blk);
         free(e);
         tc->n_blocks--;
+        tc->gen++;
         return NULL;
     }
     return NULL;
@@ -96,6 +98,7 @@ uam_status uam_tcache_insert(uam_tcache *tc, uam_block *blk, unsigned priv, bool
     for (struct uam_tc_entry *e = *head; e; e = e->next) {
         if (e->pc == blk->guest_pc) {
             uam_block_free(e->blk);
+            tc->gen++;
             e->blk = blk;
             e->priv = priv;
             e->mapped = mapped;

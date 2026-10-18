@@ -11,6 +11,10 @@
  * timer comes due. While a hart waits (WFI) with nothing else to do, the
  * executor skips time forward to the next timer.
  *
+ * Virtual time never passes UAM_SCHED_TIME_MAX, which leaves ample headroom
+ * for the `now + period` arithmetic devices use to re-arm timers: a deadline
+ * computed from any reachable `now` cannot wrap past 2^64.
+ *
  * Dependencies: common.h.
  */
 #ifndef UAM_SCHED_H
@@ -44,6 +48,14 @@ typedef struct uam_sched {
 void     uam_sched_init(uam_sched *s, const uint64_t *icount);
 void     uam_sched_set_kick(uam_sched *s, uam_sched_kick_fn fn, void *ctx);
 
+/* The virtual-time horizon: uam_sched_skip_to saturates here, and the executor
+ * stops (UAM_STOP_TIME_LIMIT) instead of running past it. */
+#define UAM_SCHED_TIME_MAX (UINT64_C(1) << 62)
+
+/* At most this many timers fire per uam_sched_run_due call, so that a timer
+ * re-arming itself at or before `now` cannot trap the caller. */
+#define UAM_SCHED_MAX_FIRE 4096u
+
 static inline uint64_t uam_sched_now(const uam_sched *s) { return *s->icount + s->idle; }
 
 /* Initialise a timer once, when its owner is created. Never re-initialise an
@@ -52,12 +64,17 @@ static inline uint64_t uam_sched_now(const uam_sched *s) { return *s->icount + s
 void     uam_timer_init(uam_timer *t, uam_timer_fn fn, void *ctx);
 void     uam_timer_arm(uam_sched *s, uam_timer *t, uint64_t when);
 void     uam_timer_cancel(uam_sched *s, uam_timer *t);
+/* Disarm every timer (snapshot restore: owners re-arm their own). */
+void     uam_sched_cancel_all(uam_sched *s);
 
 /* Earliest armed deadline, or UINT64_MAX if none. */
 uint64_t uam_sched_next(const uam_sched *s);
-/* Fire every timer whose deadline is <= now. Returns the number fired. */
+/* Fire timers whose deadline is <= now, in deadline order, at most
+ * UAM_SCHED_MAX_FIRE of them. Returns the number fired; more may still be due
+ * (uam_sched_next() <= now) when it returns UAM_SCHED_MAX_FIRE. */
 unsigned uam_sched_run_due(uam_sched *s);
-/* Idle: advance time to `when` (no-op if in the past). */
+/* Idle: advance time to `when` (no-op if in the past), saturating at
+ * UAM_SCHED_TIME_MAX. */
 void     uam_sched_skip_to(uam_sched *s, uint64_t when);
 
 /* Consistency checks for tests: the timer list is acyclic, sorted, and every

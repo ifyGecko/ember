@@ -8,7 +8,11 @@
  *   -> act on the block result (next pc, trap, fault, wait, interrupted)
  *
  * The interpreter is the reference backend: a direct implementation of the
- * semantics in docs/uam-isa.md. A JIT, if added, must agree with it.
+ * semantics in docs/uam-isa.md. The JIT must agree with it. With `chain` on,
+ * native code runs from one compiled block into the next while the loop above
+ * would do nothing in between (no exit request, deadline not reached); see
+ * src/exec/jit.h. Interrupts are taken only between dispatched blocks, so ISA
+ * modules must request an exit when an interrupt may newly be taken (isa.h).
  *
  * Dependencies: ir.h, isa.h, cpu.h, bus.h, sched.h.
  */
@@ -65,6 +69,8 @@ typedef struct uam_tcache {
     struct uam_tc_entry **buckets;  /* chained hash on guest pc */
     uint32_t              n_buckets;/* power of two */
     uint32_t              n_blocks;
+    uint32_t              gen;      /* bumped whenever a block is freed or may have gone
+                                     * stale (code write); JIT block links depend on it */
     uam_bus              *bus;
 } uam_tcache;
 
@@ -91,6 +97,8 @@ typedef enum uam_stop_reason {
     UAM_STOP_FAULT_LOOP,  /* a fetch fault re-raised itself with no progress */
     UAM_STOP_HOOK,        /* a PC hook returned UAM_HOOK_STOP (breakpoint) */
     UAM_STOP_RESET,       /* reset requested and no reset handler installed */
+    UAM_STOP_TIME_LIMIT,  /* virtual time reached max_time or UAM_SCHED_TIME_MAX */
+    UAM_STOP_LIVELOCK,    /* timers keep firing, no instruction retires, nothing else can wake the hart */
 } uam_stop_reason;
 
 const char *uam_stop_reason_str(uam_stop_reason r);
@@ -112,6 +120,7 @@ typedef struct uam_exec_stats {
     uint64_t blocks_native;      /* executed via the JIT */
     uint64_t blocks_compiled;    /* compiled to native code */
     uint64_t blocks_interp;      /* marked to run interpreted */
+    uint64_t blocks_chained;     /* native blocks entered straight from another (no dispatch) */
 } uam_exec_stats;
 
 /* --- reset requests ------------------------------------------------------- */
@@ -164,6 +173,8 @@ typedef struct uam_exec_host {
     uint32_t poll_interval;
 } uam_exec_host;
 
+#define UAM_EXEC_DEFAULT_MAX_STALL (UINT64_C(1) << 22)
+
 typedef struct uam_exec {
     uam_cpu         *cpu;
     uam_sched       *sched;
@@ -175,13 +186,14 @@ typedef struct uam_exec {
     bool             verify;          /* run the IR verifier on every new block */
     bool             optimize;        /* run uam_optimize on every new block (default on) */
     bool             use_jit;         /* compile blocks to native code when available */
+    bool             chain;           /* JIT: jump straight from block to block (default on) */
     struct uam_jit  *jit;             /* native backend, or NULL (interpreter only) */
     uint32_t         seen_dgen, seen_xgen;  /* dtlb is flushed when these fall behind */
     unsigned         trace;           /* enum uam_trace_flag */
     FILE            *trace_out;
     uint64_t         trace_lo, trace_hi;  /* UAM_TRACE_BLOCKS: only pcs in [lo, hi) (hi=0: all) */
     uint64_t         trace_after;     /* UAM_TRACE_BLOCKS: only once icount >= this */
-    bool             stop_request;
+    volatile bool    stop_request;    /* set by uam_exec_stop, possibly from a signal handler */
     int64_t          stop_status;     /* status from uam_exec_stop / TRAP HALT */
     uam_exec_stats   stats;
 
@@ -201,6 +213,24 @@ typedef struct uam_exec {
     /* host bridge */
     uam_exec_host    host;
     uint32_t         blocks_since_poll;
+
+    /* Bounds on virtual time, which (unlike icount) advances while the hart
+     * waits. Both are deterministic: no host time is involved.
+     *   max_time:  stop with UAM_STOP_TIME_LIMIT once uam_sched_now() reaches
+     *              this absolute tick (0 = only at UAM_SCHED_TIME_MAX).
+     *   max_stall: after this many consecutive stall rounds - an idle skip
+     *              to the next timer, or a uam_sched_run_due that left timers
+     *              due - without a single instruction retiring, the timers
+     *              are taken to be unable to wake the hart (a WAIT whose
+     *              interrupt line is not wired, say). A waiting hart then
+     *              blocks on host input through host.idle(ticks = UINT64_MAX)
+     *              instead of skipping time; if nothing could deliver input
+     *              (no host bridge, or it reports a deadlock), and for a
+     *              timer storm, the run stops with UAM_STOP_LIVELOCK.
+     *              0 = never. Default UAM_EXEC_DEFAULT_MAX_STALL. */
+    uint64_t         max_time;
+    uint64_t         max_stall;
+    uint64_t         stall, stall_icount;
 
     /* fault-loop detection */
     bool             last_fetch_fault_valid;

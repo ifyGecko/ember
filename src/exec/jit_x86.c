@@ -13,8 +13,15 @@
  *
  * Host register use (System V AMD64, all callee-saved so they survive bridge calls):
  *   rbx = jc    rbp = jc->temps    r14 = jc->cpu    r15 = jc->cpu->regfile
+ *   r13 = icount (flushed to cpu->icount before bridges and at the epilogue)
+ *   r12 = cpu->icount_deadline (fixed while native code runs)
  * rax/rcx/rdx/rsi/rdi/r8 are scratch. Guest temporaries live in jc->temps[], 64-bit,
  * masked to their width (the interpreter's invariant). Immediates are materialized.
+ *
+ * Layout of a compiled block: prologue | body | epilogue | link slots. Every block
+ * keeps the same frame and register assignment, so a chained jump (jit.h) goes from an
+ * EXIT straight to the next block's body, skipping its prologue; the last block's
+ * epilogue returns to the run loop.
  *
  * This file builds only on x86-64; elsewhere uam_jit_create returns NULL and the
  * executor uses the interpreter.
@@ -26,8 +33,9 @@
 uam_jit *uam_jit_create(uam_exec *x) { (void)x; return NULL; }
 void     uam_jit_destroy(uam_jit *j) { (void)j; }
 bool     uam_jit_compile(uam_jit *j, uam_block *blk) { (void)j; (void)blk; blk->backend = UAM_JIT_INTERP; return true; }
-void     uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *t, uam_block_result *r)
-{ (void)j; (void)blk; (void)t; (void)r; }
+void     uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *t, uam_jit_chain *c,
+                     uam_block_result *r)
+{ (void)j; (void)blk; (void)t; (void)c; (void)r; }
 
 #else
 
@@ -44,6 +52,15 @@ void     uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *t, uam_block_re
 
 /* ---- runtime context and C bridges ------------------------------------ */
 
+/* A chaining link, one per EXIT, stored after the block's code. */
+typedef struct jit_slot {
+    uint64_t entry;   /* host address of the target block's body (valid if epoch matches) */
+    uint64_t epoch;   /* jc.epoch when linked; LINK_NONE when empty */
+    uint64_t pc;      /* guest pc of the target */
+} jit_slot;
+
+#define LINK_NONE UINT64_MAX
+
 typedef struct uam_jit_ctx {
     uam_cpu                *cpu;
     uint64_t               *temps;
@@ -55,7 +72,24 @@ typedef struct uam_jit_ctx {
     uint64_t                scratch;     /* bridge load destination */
     uint64_t                cont;        /* 1 if the current instruction is a continuation */
     uam_block_result        res;
+    /* chaining */
+    uint64_t                epoch;       /* links made in another epoch are dead */
+    jit_slot               *link_slot;   /* out: the EXIT slot that missed (to be linked) */
+    uint32_t                chain_left;  /* chained jumps still allowed */
+    uint32_t                hops;        /* chained jumps taken */
+    uint32_t                dgen;        /* bus->direct_gen at entry */
+    uam_sched              *sched;
+    uint64_t                next_when;   /* next timer at entry */
 } uam_jit_ctx;
+
+/* After a bridge: if the bus mapping or the timer queue changed, the run loop has work
+ * to do (data-TLB flush, a new deadline) before the next block, so stop chaining. A
+ * timer armed earlier usually requests an exit too (the machine's scheduler kick). */
+static void chain_check(uam_jit_ctx *jc)
+{
+    if (jc->cpu->bus->direct_gen != jc->dgen || uam_sched_next(jc->sched) != jc->next_when)
+        jc->chain_left = 0;
+}
 
 static int jit_fault(uam_jit_ctx *jc, uam_status st, uint64_t addr, uint32_t xf, bool store)
 {
@@ -105,6 +139,7 @@ static int jit_br_load(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, uint32_t 
 {
     uint32_t xf = 0;
     uam_status st = uam_execops_load(jc->cpu, addr, flags, size, &jc->scratch, &xf);
+    chain_check(jc);
     if (st != UAM_OK)
         return jit_fault(jc, st, addr, xf, false);
     if (!(flags & UAM_ACC_X))
@@ -116,6 +151,7 @@ static int jit_br_store(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t f
 {
     uint32_t xf = 0;
     uam_status st = uam_execops_store(jc->cpu, addr, val, flags, size, &xf);
+    chain_check(jc);
     if (st != UAM_OK)
         return jit_fault(jc, st, addr, xf, true);
     dtlb_fill(jc->cpu, addr, flags, size, true);
@@ -140,6 +176,7 @@ static int jit_br_sysrd(uam_jit_ctx *jc, uint32_t id)
 {
     uint64_t v = 0;
     uam_status st = jc->cpu->isa->sysreg_read(jc->cpu, id, &v);
+    chain_check(jc);
     if (st != UAM_OK)
         return jit_fault_simple(jc, UAM_EXC_SYSREG, id);
     jc->scratch = v;
@@ -149,6 +186,7 @@ static int jit_br_sysrd(uam_jit_ctx *jc, uint32_t id)
 static int jit_br_syswr(uam_jit_ctx *jc, uint32_t id, uint64_t val)
 {
     uam_status st = jc->cpu->isa->sysreg_write(jc->cpu, id, val);
+    chain_check(jc);
     return st == UAM_OK ? 0 : jit_fault_simple(jc, UAM_EXC_SYSREG, id);
 }
 
@@ -165,6 +203,7 @@ static uint64_t jit_br_eval(uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 
 #define ARENA_SIZE (64u << 20)
 #define CBUF_MAX   (64u << 10)   /* scratch code buffer per block */
+#define MAX_SLOTS  64u           /* EXITs per block that get a link (more just return) */
 
 /* Host registers. */
 enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, RDI = 7, R8 = 8,
@@ -174,17 +213,30 @@ struct uam_jit {
     uam_exec    *x;
     uint8_t     *arena;
     size_t       arena_used;
-    uam_jit_ctx  jc;         /* reused across block runs (only temps changes) */
+    uam_jit_ctx  jc;         /* reused across block runs */
+    size_t       body_off;   /* prologue length: chained jumps enter here */
+    uint32_t     arena_gen;  /* bumped when the arena is recycled */
+    /* what the link epoch was last computed from */
+    bool         key_valid;
+    uint32_t     key_tc, key_xgen;
+    unsigned     key_priv;
+    /* an EXIT that missed its link in the last native run, to link to the next block */
+    jit_slot    *pend_slot;
+    uint64_t     pend_pc;
+    uint32_t     pend_arena;
     /* per-compile scratch */
     uint8_t      cb[CBUF_MAX];
     size_t       n;
     bool         overflow;
+    struct { size_t lea; uint64_t pc; } slot[MAX_SLOTS];  /* lea rel32 position, target */
+    unsigned     n_slots;
 };
 
 #define OFF(f)  ((int32_t)offsetof(uam_jit_ctx, f))
 #define RES(f)  ((int32_t)(offsetof(uam_jit_ctx, res) + offsetof(uam_block_result, f)))
 #define CPU(f)  ((int32_t)offsetof(uam_cpu, f))
 #define REXC(f) ((int32_t)(offsetof(uam_jit_ctx, res) + offsetof(uam_block_result, exc) + offsetof(uam_exception, f)))
+#define SLOT(f) ((int32_t)offsetof(jit_slot, f))
 
 static void g8(uam_jit *j, uint8_t b)
 {
@@ -394,6 +446,51 @@ static void set_res_pc_imm(uam_jit *j, uint32_t kind, uint64_t pc)
 }
 
 /*
+ * After an EXIT has stored res (NEXT, pc): jump straight into the next block if its
+ * link is current and the run loop has nothing to do (jit.h), else go to the epilogue.
+ * A miss records the slot in jc->link_slot so uam_jit_run can link it. `target` is the
+ * EXIT's pc operand: for a constant the slot only ever links that pc; for a computed
+ * one the slot caches the last target and res.pc is compared against it.
+ */
+static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t *epi,
+                       unsigned *n_epi)
+{
+    bool fixed = uam_ref_is_imm(target);
+    /* if (exit_request || icount >= deadline || !chain_left) goto epilogue */
+    g8(j, 0x41); g8(j, 0x0F); g8(j, 0xB6); modrm_mem(j, RAX, R14, CPU(exit_request));
+    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX);       /* test rax, rax */
+    epi[(*n_epi)++] = jcc_fwd(j, 0x85);                             /* jnz */
+    g8(j, 0x4D); g8(j, 0x39); modrm_reg(j, R12, R13);               /* cmp r13, r12 */
+    epi[(*n_epi)++] = jcc_fwd(j, 0x83);                             /* jae */
+    g8(j, 0x83); modrm_mem(j, 7, RBX, OFF(chain_left)); g8(j, 0);   /* cmp dword [chain_left], 0 */
+    epi[(*n_epi)++] = jcc_fwd(j, 0x84);                             /* je */
+    /* rax = &slot (rip-relative; the slot follows the code, patched at the end) */
+    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x05);
+    j->slot[j->n_slots].lea = j->n;
+    j->slot[j->n_slots].pc = fixed ? blk->imm[uam_ref_index(target)] & uam_mask(blk->addr_width)
+                                   : LINK_NONE;
+    j->n_slots++;
+    g32(j, 0);
+    size_t miss_pc = 0;
+    if (!fixed) {
+        ld_mem(j, RCX, RBX, RES(pc));
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));   /* cmp rcx, [slot.pc] */
+        miss_pc = jcc_fwd(j, 0x85);
+    }
+    ld_mem(j, RCX, RBX, OFF(epoch));
+    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(epoch));    /* cmp rcx, [slot.epoch] */
+    size_t miss = jcc_fwd(j, 0x85);
+    g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));             /* dec dword [chain_left] */
+    g8(j, 0xFF); modrm_mem(j, 0, RBX, OFF(hops));                   /* inc dword [hops] */
+    g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));                 /* jmp [slot.entry] */
+    patch(j, miss);
+    if (!fixed)
+        patch(j, miss_pc);
+    st_mem(j, RAX, RBX, OFF(link_slot));
+    epi[(*n_epi)++] = jmp_fwd(j);
+}
+
+/*
  * Opcodes the native compiler emits inline. A block with any other op runs
  * interpreted. (Pure ops not listed here are emitted as a call to jit_br_eval.)
  */
@@ -552,6 +649,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     const unsigned aw = blk->addr_width;
     j->n = 0;
     j->overflow = false;
+    j->n_slots = 0;
 
     for (uint32_t i = 0; i < blk->n_insn; i++) {
         uam_opcode op = (uam_opcode)blk->insn[i].op;
@@ -575,8 +673,10 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     ld_mem(j, R15, RBX, OFF(regfile));
     ld_mem(j, R13, R14, CPU(icount));              /* r13 = icount (kept in a register) */
     ld_mem(j, R12, R14, CPU(icount_deadline));     /* r12 = deadline (constant per block) */
+    j->body_off = j->n;                            /* chained jumps enter here */
 
-    size_t *epi = malloc(sizeof(size_t) * (blk->n_insn + 1));
+    /* epilogue jumps: up to 4 per EXIT (chain checks), 1 per other op */
+    size_t *epi = malloc(sizeof(size_t) * (4 * blk->n_insn + 1));
     if (!epi)
         return false;
     unsigned n_epi = 0;
@@ -739,7 +839,10 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         }
         case UAM_OP_EXIT:
             set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
-            epi[n_epi++] = jmp_fwd(j);
+            if (j->n_slots < MAX_SLOTS)
+                emit_chain(j, blk, in->a, epi, &n_epi);
+            else
+                epi[n_epi++] = jmp_fwd(j);
             break;
         case UAM_OP_SYSRD:
             st_mem(j, R13, R14, CPU(icount));
@@ -812,6 +915,18 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     g8(j, 0x5B);                                         /* pop rbx */
     g8(j, 0xC3);                                         /* ret */
 
+    /* link slots, 8-byte aligned after the code (the code itself starts 16-aligned) */
+    while (j->n & 7)
+        g8(j, 0xCC);                                     /* int3 padding */
+    for (unsigned k = 0; k < j->n_slots; k++) {
+        int32_t rel = (int32_t)(j->n - (j->slot[k].lea + 4));
+        if (j->slot[k].lea + 4 <= CBUF_MAX)
+            memcpy(&j->cb[j->slot[k].lea], &rel, 4);
+        g64(j, 0);                                       /* entry */
+        g64(j, LINK_NONE);                               /* epoch: never linked */
+        g64(j, j->slot[k].pc);                           /* pc */
+    }
+
     return !j->overflow;
 }
 
@@ -833,6 +948,7 @@ uam_jit *uam_jit_create(uam_exec *x)
     j->jc.cpu = x->cpu;
     j->jc.regfile = x->cpu->regfile;
     j->jc.helpers = &x->cpu->isa->helpers;
+    j->jc.sched = x->sched;
     return j;
 }
 
@@ -853,9 +969,10 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
     if (j->n > ARENA_SIZE)
         return false;   /* a single block larger than the arena: impossible in practice */
     if (j->arena_used + j->n > ARENA_SIZE) {
-        /* Arena full: drop every compiled block, then restart this one. */
+        /* Arena full: drop every compiled block (and every link), then restart this one. */
         uam_tcache_flush(&j->x->tc);
         j->arena_used = 0;
+        j->arena_gen++;
     }
     uint8_t *code = j->arena + j->arena_used;
     memcpy(code, j->cb, j->n);
@@ -865,11 +982,48 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
     return true;
 }
 
-void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_block_result *res)
+void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chain *chain,
+                 uam_block_result *res)
 {
-    j->jc.temps = temps;   /* the only field that varies (the executor may grow it) */
-    ((void (*)(uam_jit_ctx *))blk->backend)(&j->jc);
-    *res = j->jc.res;
+    uam_jit_ctx *jc = &j->jc;
+    uam_exec *x = j->x;
+    uam_cpu *cpu = x->cpu;
+
+    /* A linked block may have become invalid since the epoch was set: kill all links. */
+    if (!j->key_valid || x->tc.gen != j->key_tc || cpu->xlate_gen != j->key_xgen
+        || cpu->priv != j->key_priv) {
+        jc->epoch++;
+        j->key_valid = true;
+        j->key_tc = x->tc.gen;
+        j->key_xgen = cpu->xlate_gen;
+        j->key_priv = cpu->priv;
+    }
+    /* The last native block's EXIT missed its link and led here: link it. The run loop
+     * just validated blk for the current epoch and has nothing to do before entering it
+     * that it would not also check at the EXIT (no hook on blk: chain->link). */
+    if (j->pend_slot) {
+        if (chain->link && j->pend_arena == j->arena_gen && blk->guest_pc == j->pend_pc) {
+            j->pend_slot->entry = (uint64_t)(uintptr_t)blk->backend + j->body_off;
+            j->pend_slot->pc = blk->guest_pc;
+            j->pend_slot->epoch = jc->epoch;
+        }
+        j->pend_slot = NULL;
+    }
+
+    jc->temps = temps;   /* the executor may grow it between runs */
+    jc->chain_left = chain->budget;
+    jc->hops = 0;
+    jc->link_slot = NULL;
+    jc->dgen = cpu->bus->direct_gen;
+    jc->next_when = uam_sched_next(x->sched);
+    ((void (*)(uam_jit_ctx *))blk->backend)(jc);
+    *res = jc->res;
+    chain->hops = jc->hops;
+    if (jc->link_slot && res->kind == UAM_BR_NEXT) {
+        j->pend_slot = jc->link_slot;
+        j->pend_pc = res->pc;
+        j->pend_arena = j->arena_gen;
+    }
 }
 
 #endif /* __x86_64__ */

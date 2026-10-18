@@ -105,12 +105,36 @@ static void clint_destroy(uam_device *d)
     free(c);
 }
 
+static void clint_save(uam_device *d, uam_state_writer *w)
+{
+    clint *c = to_clint(d);
+    uam_state_put_u32(w, c->msip);
+    uam_state_put_u64(w, c->mtimecmp);
+    uam_state_put_u64(w, c->time_offset);
+    uam_state_put_timer(w, &c->timer);
+    uam_state_put_signal(w, &c->msip_line);
+    uam_state_put_signal(w, &c->mtip_line);
+}
+
+static void clint_restore(uam_device *d, uam_state_reader *r)
+{
+    clint *c = to_clint(d);
+    c->msip = uam_state_get_u32(r);
+    c->mtimecmp = uam_state_get_u64(r);
+    c->time_offset = uam_state_get_u64(r);
+    uam_state_get_timer(r, &c->timer);
+    uam_state_get_signal(r, &c->msip_line);
+    uam_state_get_signal(r, &c->mtip_line);
+}
+
 static const uam_device_ops clint_ops = {
     .type = "sifive,clint0",
     .read = clint_read,
     .write = clint_write,
     .reset = clint_reset,
     .destroy = clint_destroy,
+    .save = clint_save,
+    .restore = clint_restore,
 };
 
 uam_device *uam_clint_create(const char *name, uam_sched *sched)

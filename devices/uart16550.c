@@ -149,12 +149,49 @@ static void uart_destroy(uam_device *d)
     free(u);
 }
 
+static void uart_save(uam_device *d, uam_state_writer *w)
+{
+    uart *u = to_uart(d);
+    const uint8_t regs[] = { u->ier, u->lcr, u->mcr, u->scr, u->fcr, u->dll, u->dlm };
+    uam_state_put_bytes(w, regs, sizeof(regs));
+    uam_state_put_bool(w, u->thr_pending);
+    /* The receive FIFO, oldest byte first. */
+    uint8_t fifo[RX_CAP];
+    for (unsigned i = 0; i < u->rx_count; i++)
+        fifo[i] = u->rx[(u->rx_head + i) % RX_CAP];
+    uam_state_put_u32(w, u->rx_count);
+    uam_state_put_bytes(w, fifo, u->rx_count);
+    uam_state_put_signal(w, &u->irq);
+}
+
+static void uart_restore(uam_device *d, uam_state_reader *r)
+{
+    uart *u = to_uart(d);
+    uint8_t regs[7];
+    uam_state_get_bytes(r, regs, sizeof(regs));
+    u->ier = regs[0]; u->lcr = regs[1]; u->mcr = regs[2]; u->scr = regs[3];
+    u->fcr = regs[4]; u->dll = regs[5]; u->dlm = regs[6];
+    u->thr_pending = uam_state_get_bool(r);
+    uint32_t n = uam_state_get_u32(r);
+    if (n > RX_CAP)
+        uam_state_fail(r, "receive FIFO holds %u bytes, more than its %u", (unsigned)n, RX_CAP);
+    if (!uam_state_ok(r))
+        return;
+    uam_state_get_bytes(r, u->rx, n);
+    u->rx_head = 0;
+    u->rx_count = n;
+    uam_state_get_signal(r, &u->irq);
+    uam_chardev_accept_input(u->cd);   /* the FIFO's free space changed */
+}
+
 static const uam_device_ops uart_ops = {
     .type = "ns16550a",
     .read = uart_read,
     .write = uart_write,
     .reset = uart_reset,
     .destroy = uart_destroy,
+    .save = uart_save,
+    .restore = uart_restore,
 };
 
 static size_t uart_can_receive(void *ctx)

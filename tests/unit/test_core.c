@@ -1,13 +1,17 @@
 /*
  * test_core.c - Unit tests for the bus (priorities, device byte order and
  * access widths, ROMD, aliases, watchpoints), the scheduler under resets,
- * device-requested machine resets, and executor PC hooks.
+ * device-requested machine resets, executor PC hooks, and the executor's
+ * virtual-time and livelock bounds, and the ABI handshake.
  *
  * The machine-level tests run tiny hand-encoded MIPS32 big-endian programs.
  */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "uam/bus.h"
 #include "uam/dev/unimp.h"
@@ -534,6 +538,162 @@ static void test_romd_exec(void)
     uam_machine_fini(&m);
 }
 
+/* ------------------------------------------------------------------------ */
+/* #8 WAIT whose wakeup never comes while a timer keeps re-arming itself     */
+/* ------------------------------------------------------------------------ */
+
+/* A free-running counter's compare match: re-arms itself on every fire, but
+ * its interrupt line is not connected to the hart. */
+typedef struct rearm_timer {
+    uam_timer  t;
+    uam_sched *s;
+    uam_exec  *x;
+    uint64_t   period;     /* 0: re-arm at now (a timer storm) */
+    uint64_t   fires;
+    uint64_t   stop_at;    /* call uam_exec_stop (a signal stand-in) at this fire; 0 = never */
+} rearm_timer;
+
+static void rearm_fire(void *ctx)
+{
+    rearm_timer *r = ctx;
+    if (++r->fires == r->stop_at)
+        uam_exec_stop(r->x, 130);
+    uam_timer_arm(r->s, &r->t, uam_sched_now(r->s) + r->period);
+}
+
+/* A hart parked in WAIT with interrupts enabled but no line ever raised. */
+static void wait_machine(uam_machine *m, rearm_timer *r, uint64_t period)
+{
+    mips_machine(m);
+    put32(m, 0x000, 0x42000020u);    /* wait */
+    put32(m, 0x004, 0x1000FFFFu);    /* b . */
+    put32(m, 0x008, 0x00000000u);    /* nop */
+    uam_machine_reset(m, 0x80000000u);
+    sysw(m, CP0(12, 0), (1u << 10) | 1u);   /* IM2 | IE: enabled, never pending */
+    *r = (rearm_timer){ .s = &m->sched, .x = &m->exec, .period = period };
+    uam_timer_init(&r->t, rearm_fire, r);
+    uam_timer_arm(&m->sched, &r->t, uam_sched_now(&m->sched) + period);
+}
+
+static void test_wait_livelock(void)
+{
+    uam_machine m;
+    rearm_timer r;
+
+    /* Livelock: with no host bridge nothing but the timers could wake the
+     * hart. Stall rounds are counted per idle skip, without host time. */
+    wait_machine(&m, &r, 100);
+    m.exec.max_stall = 1000;
+    uam_stop_reason why = uam_exec_run(&m.exec, 1000000);
+    EQ64(why, UAM_STOP_LIVELOCK, "WAIT + unwired re-arming timer is a livelock");
+    EQ64(m.cpu.icount, 1, "only the WAIT retired");
+    EQ64(r.fires, 1000, "timer fired after each idle skip");
+    EQ64(m.exec.stats.idle_ticks, 1000 * 100 - 1, "idle time skipped (WAIT took one tick)");
+    CHECK(m.cpu.waiting, "still waiting");
+    CHECK(uam_sched_check(&m.sched), "timer list well formed");
+    /* Deterministic: the same machine stops at the same point again. */
+    uam_machine_fini(&m);
+    wait_machine(&m, &r, 100);
+    m.exec.max_stall = 1000;
+    uam_exec_run(&m.exec, 1000000);
+    EQ64(r.fires, 1000, "same stop point on a second run");
+    uam_machine_fini(&m);
+
+    /* Default bound: the run ends without any limit set by the caller. */
+    wait_machine(&m, &r, 7);
+    why = uam_exec_run(&m.exec, 0);
+    EQ64(why, UAM_STOP_LIVELOCK, "default max_stall ends an unbounded run");
+    EQ64(r.fires, UAM_EXEC_DEFAULT_MAX_STALL, "after the default stall budget");
+    uam_machine_fini(&m);
+
+    /* A virtual-time budget stops exactly at max_time. */
+    wait_machine(&m, &r, 100);
+    m.exec.max_stall = 0;
+    m.exec.max_time = 12345;
+    why = uam_exec_run(&m.exec, 0);
+    EQ64(why, UAM_STOP_TIME_LIMIT, "virtual-time budget");
+    EQ64(uam_sched_now(&m.sched), 12345, "stopped at max_time");
+    EQ64(r.fires, 123, "timer fires up to the limit");
+    uam_machine_fini(&m);
+
+    /* With no bound at all, time saturates at the horizon instead of wrapping. */
+    wait_machine(&m, &r, UINT64_C(1) << 60);
+    m.exec.max_stall = 0;
+    why = uam_exec_run(&m.exec, 0);
+    EQ64(why, UAM_STOP_TIME_LIMIT, "time horizon");
+    EQ64(uam_sched_now(&m.sched), UAM_SCHED_TIME_MAX, "stopped at UAM_SCHED_TIME_MAX");
+    EQ64(r.fires, 3, "fires below the horizon");
+    EQ64(uam_sched_next(&m.sched), UAM_SCHED_TIME_MAX, "re-armed deadline did not wrap");
+    uam_sched_skip_to(&m.sched, UINT64_MAX);
+    EQ64(uam_sched_now(&m.sched), UAM_SCHED_TIME_MAX, "skip_to saturates");
+    uam_machine_fini(&m);
+
+    /* A stop request (what SIGINT/SIGTERM send) from a timer while idling. */
+    wait_machine(&m, &r, 1);
+    m.exec.max_stall = 0;
+    r.stop_at = 5000;
+    why = uam_exec_run(&m.exec, 0);
+    EQ64(why, UAM_STOP_REQUEST, "stop request while idling");
+    EQ64(r.fires, 5000, "stopped at the requesting fire");
+    uam_machine_fini(&m);
+
+    /* A timer storm (re-arms at now): run_due returns after its firing budget,
+     * so a stop request is seen, and the stall bound still ends the run. */
+    wait_machine(&m, &r, 0);
+    m.exec.max_stall = 0;
+    r.stop_at = 10000;
+    why = uam_exec_run(&m.exec, 0);
+    EQ64(why, UAM_STOP_REQUEST, "stop request during a timer storm");
+    CHECK(r.fires >= 10000 && r.fires < 10000 + UAM_SCHED_MAX_FIRE,
+          "stopped within one firing budget (%llu fires)", (unsigned long long)r.fires);
+    uam_machine_fini(&m);
+
+    wait_machine(&m, &r, 0);
+    m.exec.max_stall = 3;
+    why = uam_exec_run(&m.exec, 0);
+    EQ64(why, UAM_STOP_LIVELOCK, "timer storm is a livelock");
+    EQ64(r.fires, 3 * UAM_SCHED_MAX_FIRE, "three firing budgets");
+    uam_machine_fini(&m);
+}
+
+/* ------------------------------------------------------------------------ */
+/* #9 ABI handshake: a caller built from other headers is refused            */
+/* ------------------------------------------------------------------------ */
+
+/* Run uam_machine_init with `abi` in a child; true if the child aborted. */
+static bool init_aborts(const uam_abi_layout *abi)
+{
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        uam_machine m;
+        uam_machine_init_abi(&m, &uam_isa_mips32be, abi);
+        _exit(0);
+    }
+    int ws = 0;
+    CHECK(pid > 0 && waitpid(pid, &ws, 0) == pid, "fork/wait");
+    return WIFSIGNALED(ws) && WTERMSIG(ws) == SIGABRT;
+}
+
+static void test_abi(void)
+{
+    EQ64(uam_abi_version(), UAM_ABI_VERSION, "library ABI version");
+    CHECK(uam_abi_check(UAM_ABI_LAYOUT, "test"), "matching layout accepted");
+
+    /* A field added to uam_exec: the case that moved uam_machine.on_reset. */
+    uam_abi_layout grown = *UAM_ABI_LAYOUT;
+    grown.exec += 16;
+    grown.machine += 16;
+    fprintf(stderr, "(expected ABI errors follow)\n");
+    CHECK(!uam_abi_check(&grown, "test"), "grown uam_exec refused");
+    uam_abi_layout old = *UAM_ABI_LAYOUT;
+    old.version--;
+    CHECK(!uam_abi_check(&old, "test"), "other ABI version refused");
+
+    CHECK(!init_aborts(UAM_ABI_LAYOUT), "uam_machine_init runs with matching headers");
+    CHECK(init_aborts(&grown), "uam_machine_init aborts on a layout mismatch");
+}
+
 int main(void)
 {
     test_device_endian();
@@ -543,6 +703,8 @@ int main(void)
     test_timer_reset();
     test_device_reset();
     test_romd_exec();
+    test_wait_livelock();
+    test_abi();
     printf("test_core: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

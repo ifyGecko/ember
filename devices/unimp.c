@@ -102,6 +102,8 @@ static const uam_device_ops unimp_ops = {
     .read = unimp_read,
     .write = unimp_write,
     .destroy = unimp_destroy,
+    /* Reads are always zero: the table is diagnostics, not guest-visible state. */
+    .flags = UAM_DEVICE_STATELESS,
 };
 
 uam_device *uam_unimp_create(const char *name, uint64_t base)

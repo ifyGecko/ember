@@ -32,14 +32,25 @@
  * With every field left 0 the bus passes accesses through unchanged and treats
  * the device as little-endian.
  *
- * Dependencies: common.h.
+ * Snapshots (snapshot.h): a device takes part by implementing `save` and
+ * `restore` with the state stream in state.h, or by setting
+ * UAM_DEVICE_STATELESS when it holds no guest-visible state. Taking a snapshot
+ * of a machine with any other device fails, naming the device.
+ *
+ * Dependencies: common.h, state.h.
  */
 #ifndef UAM_DEVICE_H
 #define UAM_DEVICE_H
 
 #include "uam/common.h"
+#include "uam/state.h"
 
 typedef struct uam_device uam_device;
+
+/* uam_device_ops.flags */
+enum uam_device_flag {
+    UAM_DEVICE_STATELESS = 1u << 0,  /* nothing to save: snapshots skip the device */
+};
 
 typedef struct uam_device_ops {
     const char *type;
@@ -53,6 +64,10 @@ typedef struct uam_device_ops {
                                uint64_t mask);
     void       (*reset)(uam_device *dev);    /* optional */
     void       (*destroy)(uam_device *dev);  /* frees the device */
+    /* Optional, together: write / read back the device's state (state.h). */
+    void       (*save)(uam_device *dev, uam_state_writer *w);
+    void       (*restore)(uam_device *dev, uam_state_reader *r);
+    unsigned    flags;                       /* enum uam_device_flag */
 } uam_device_ops;
 
 struct uam_device {

@@ -23,15 +23,19 @@ const char *uam_stop_reason_str(uam_stop_reason r)
     case UAM_STOP_FAULT_LOOP: return "fetch fault loop (exception handler not fetchable)";
     case UAM_STOP_HOOK:       return "stopped by a pc hook";
     case UAM_STOP_RESET:      return "reset requested (no reset handler)";
+    case UAM_STOP_TIME_LIMIT: return "virtual time limit reached";
+    case UAM_STOP_LIVELOCK:   return "livelock (timers keep firing, the hart never wakes)";
     }
     return "?";
 }
 
-/* Bus hook: the running block may just have overwritten its own code. */
+/* Bus hook: the running block may just have overwritten its own code, and blocks
+ * on that page are stale (so are JIT links into them). */
 static void on_code_write(void *ctx, uint64_t page)
 {
     (void)page;
     uam_exec *x = ctx;
+    x->tc.gen++;
     uam_cpu_request_exit(x->cpu);
 }
 
@@ -43,8 +47,10 @@ uam_status uam_exec_init(uam_exec *x, uam_cpu *cpu, uam_sched *sched)
     x->max_block_insns = DEFAULT_MAX_BLOCK_INSNS;
     x->verify = true;
     x->optimize = true;
+    x->chain = true;
     x->trace_out = stderr;
     x->host.poll_interval = 1024;
+    x->max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
     uam_builder_init(&x->b, cpu->isa->addr_width);
     uam_bus_set_code_write_hook(cpu->bus, on_code_write, x);
     return uam_tcache_init(&x->tc, cpu->bus);
@@ -387,26 +393,70 @@ static bool trace_block(const uam_exec *x, uint64_t pc)
         && pc >= x->trace_lo && (x->trace_hi == 0 || pc < x->trace_hi);
 }
 
-/* The hart is idle: advance virtual time, or block on host input. Returns
- * false on deadlock. */
-static bool idle(uam_exec *x)
+/* Virtual time at which a run stops with UAM_STOP_TIME_LIMIT. */
+static uint64_t time_limit(const uam_exec *x)
+{
+    return x->max_time && x->max_time < UAM_SCHED_TIME_MAX ? x->max_time : UAM_SCHED_TIME_MAX;
+}
+
+/* Stall rounds (timers fired or time advanced) in a row with no instruction
+ * retired; the count restarts whenever one has. */
+static uint64_t stall_rounds(uam_exec *x)
+{
+    if (x->cpu->icount != x->stall_icount) {
+        x->stall_icount = x->cpu->icount;
+        x->stall = 0;
+    }
+    return x->stall;
+}
+
+static bool stalled(const uam_exec *x)
+{
+    return x->max_stall && x->stall >= x->max_stall;
+}
+
+/* The hart is idle: advance virtual time (never past tlimit, which is above
+ * now), or block on host input. Returns UAM_STOP_NONE to keep running. */
+static uam_stop_reason idle(uam_exec *x, uint64_t tlimit)
 {
     uint64_t next = uam_sched_next(x->sched), now = uam_sched_now(x->sched);
     uint64_t ticks = next == UINT64_MAX ? UINT64_MAX : (next > now ? next - now : 0);
     uint64_t skip = ticks;
-    if (x->host.idle) {
+    stall_rounds(x);
+    if (stalled(x)) {
+        /* max_stall timer events have not woken the hart: only host input
+         * can. Wait for it as if no timer were armed (no CPU spent; a signal
+         * interrupts the wait), then give the timers another max_stall rounds,
+         * since the input may need them to reach the hart. With nothing that
+         * could deliver input this is a livelock, decided in virtual time. */
+        if (!x->host.idle || !x->host.idle(x->host.ctx, UINT64_MAX, &skip))
+            return UAM_STOP_LIVELOCK;
+        x->stall = 0;
+        if (skip > ticks)
+            skip = ticks;
+    } else if (x->host.idle) {
         if (!x->host.idle(x->host.ctx, ticks, &skip))
-            return false;
+            return UAM_STOP_DEADLOCK;
         if (skip > ticks)
             skip = ticks;
     } else if (ticks == UINT64_MAX) {
-        return false;
+        return UAM_STOP_DEADLOCK;
     }
-    if (skip && skip != UINT64_MAX) {
+    /* Reaching the next timer is a stall round: it fires, and if that cannot
+     * wake the hart we are back here with nothing retired. Waiting on host
+     * input alone (no timer) is not. */
+    bool to_timer = ticks != UINT64_MAX && skip == ticks;
+    if (skip == UINT64_MAX)
+        skip = 0;
+    if (skip > tlimit - now)
+        skip = tlimit - now;
+    if (skip) {
         uam_sched_skip_to(x->sched, now + skip);
         x->stats.idle_ticks += skip;
     }
-    return true;
+    if (to_timer)
+        x->stall++;
+    return UAM_STOP_NONE;
 }
 
 uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
@@ -414,6 +464,7 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
     uam_cpu *cpu = x->cpu;
     const uam_isa *isa = cpu->isa;
     const uint64_t limit = max_insns ? cpu->icount + max_insns : UINT64_MAX;
+    const uint64_t tlimit = time_limit(x);
 
     for (;;) {
         if (x->stop_request)
@@ -437,6 +488,8 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
         }
         if (cpu->icount >= limit)
             return UAM_STOP_INSN_LIMIT;
+        if (uam_sched_now(x->sched) >= tlimit)
+            return UAM_STOP_TIME_LIMIT;
 
         /* Keep the JIT data-TLB coherent with the bus: any mapping, code-page or
          * ROMD change bumps bus->direct_gen, any TLB/ASID change bumps xlate_gen. */
@@ -446,8 +499,17 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             x->seen_xgen = cpu->xlate_gen;
         }
 
-        /* 1. Time: fire due timers. Host input is polled periodically. */
-        uam_sched_run_due(x->sched);
+        /* 1. Time: fire due timers. Host input is polled periodically. A timer
+         * that keeps re-arming itself in the past fills the firing budget:
+         * go round again, so that stop requests (signals) are still seen. */
+        if (uam_sched_run_due(x->sched) == UAM_SCHED_MAX_FIRE
+            && uam_sched_next(x->sched) <= uam_sched_now(x->sched)) {
+            /* No host input is delivered in here: a storm is stuck either way. */
+            x->stall = stall_rounds(x) + 1;
+            if (stalled(x))
+                return UAM_STOP_LIVELOCK;
+            continue;
+        }
         if (x->host.poll && ++x->blocks_since_poll >= x->host.poll_interval) {
             x->blocks_since_poll = 0;
             x->host.poll(x->host.ctx);
@@ -467,8 +529,9 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             if (isa->irq_wakeup(cpu)) {
                 cpu->waiting = false;
             } else {
-                if (!idle(x))
-                    return UAM_STOP_DEADLOCK;
+                uam_stop_reason why = idle(x, tlimit);
+                if (why != UAM_STOP_NONE)
+                    return why;
                 continue;
             }
         }
@@ -510,22 +573,39 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             }
         }
 
-        /* 6. Deadline: stop the block when the next timer comes due. */
+        /* 6. Deadline: stop the block when the next timer comes due, or at
+         * the time limit (now < tlimit <= UAM_SCHED_TIME_MAX: no overflow). */
         uint64_t next = uam_sched_next(x->sched), now = uam_sched_now(x->sched);
         uint64_t deadline = next == UINT64_MAX ? UINT64_MAX
                           : next <= now        ? cpu->icount
                                                : cpu->icount + (next - now);
+        if (deadline - cpu->icount > tlimit - now)
+            deadline = cpu->icount + (tlimit - now);
         cpu->icount_deadline = deadline < limit ? deadline : limit;
 
         if (x->trace && trace_block(x, blk->guest_pc))
             fprintf(x->trace_out, "blk 0x%llx icount=%llu\n", (unsigned long long)blk->guest_pc,
                     (unsigned long long)cpu->icount);
 
-        /* 7. Execute (native if compiled, else interpreted) and act on the result. */
+        /* 7. Execute (native if compiled, else interpreted) and act on the result.
+         * Native code may run on into further blocks without coming back here
+         * (jit.h, chaining) while nothing would make this loop act differently:
+         * up to the next host poll, and never while tracing blocks. */
         uam_block_result r;
         if (blk->backend && blk->backend != UAM_JIT_INTERP) {
-            uam_jit_run(x->jit, blk, x->temps, &r);
-            x->stats.blocks_native++;
+            uam_jit_chain ch = { .budget = 0, .link = false };
+            if (x->chain && !(x->trace & UAM_TRACE_BLOCKS)) {
+                ch.budget = !x->host.poll ? UINT32_C(1) << 30
+                          : x->blocks_since_poll < x->host.poll_interval
+                              ? x->host.poll_interval - 1 - x->blocks_since_poll : 0;
+                ch.link = !(x->n_hooks && uam_exec_has_pc_hook(x, blk->guest_pc));
+            }
+            uam_jit_run(x->jit, blk, x->temps, &ch, &r);
+            x->stats.blocks_native += 1 + ch.hops;
+            x->stats.blocks_executed += ch.hops;
+            x->stats.blocks_chained += ch.hops;
+            if (x->host.poll)
+                x->blocks_since_poll += ch.hops;
         }
         else
             r = uam_interp_block(cpu, blk, &isa->helpers, x->temps);

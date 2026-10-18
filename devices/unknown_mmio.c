@@ -69,11 +69,52 @@ static void um_destroy(uam_device *d)
     free(u);
 }
 
+/* The echo policy makes the last value written to each address visible. */
+static void um_save(uam_device *d, uam_state_writer *w)
+{
+    unknown_mmio *u = to_um(d);
+    uam_state_put_u32(w, (uint32_t)u->count);
+    for (uint32_t i = 0; i < TABLE_SIZE; i++) {
+        const entry *e = &u->table[i];
+        if (!e->used)
+            continue;
+        uam_state_put_u32(w, i);
+        uam_state_put_u64(w, e->addr);
+        uam_state_put_u64(w, e->value);
+    }
+}
+
+static void um_restore(uam_device *d, uam_state_reader *r)
+{
+    unknown_mmio *u = to_um(d);
+    uint32_t n = uam_state_get_u32(r);
+    if (n > TABLE_SIZE)
+        uam_state_fail(r, "%u addresses saved, the table holds %u", (unsigned)n, TABLE_SIZE);
+    if (!uam_state_ok(r))
+        return;
+    for (uint32_t i = 0; i < TABLE_SIZE; i++)
+        u->table[i].used = false;
+    u->count = n;
+    for (uint32_t k = 0; k < n && uam_state_ok(r); k++) {
+        uint32_t i = uam_state_get_u32(r);
+        if (i >= TABLE_SIZE) {
+            uam_state_fail(r, "table slot %u out of range", (unsigned)i);
+            return;
+        }
+        entry *e = &u->table[i];
+        e->used = true;
+        e->addr = uam_state_get_u64(r);
+        e->value = uam_state_get_u64(r);
+    }
+}
+
 static const uam_device_ops um_ops = {
     .type = "uam,unknown-mmio",
     .read = um_read,
     .write = um_write,
     .destroy = um_destroy,
+    .save = um_save,
+    .restore = um_restore,
 };
 
 uam_device *uam_unknown_mmio_create(const char *name, uam_unknown_policy policy)

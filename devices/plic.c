@@ -177,12 +177,60 @@ static void plic_destroy(uam_device *d)
     free(p);
 }
 
+static void put_words(uam_state_writer *w, const uint32_t *v, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++)
+        uam_state_put_u32(w, v[i]);
+}
+
+static void get_words(uam_state_reader *r, uint32_t *v, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++)
+        v[i] = uam_state_get_u32(r);
+}
+
+static void plic_save(uam_device *d, uam_state_writer *w)
+{
+    plic *p = to_plic(d);
+    const unsigned words = WORDS(p->n_sources);
+    uam_state_put_u32(w, p->n_sources);
+    uam_state_put_u32(w, p->n_contexts);
+    put_words(w, p->priority, p->n_sources);
+    put_words(w, p->level, words);
+    put_words(w, p->pending, words);
+    put_words(w, p->in_service, words);
+    put_words(w, p->enable, p->n_contexts * words);
+    put_words(w, p->threshold, p->n_contexts);
+    for (unsigned c = 0; c < p->n_contexts; c++)
+        uam_state_put_signal(w, &p->out[c]);
+}
+
+static void plic_restore(uam_device *d, uam_state_reader *r)
+{
+    plic *p = to_plic(d);
+    const unsigned words = WORDS(p->n_sources);
+    uam_state_expect_u32(r, p->n_sources, "PLIC source count");
+    uam_state_expect_u32(r, p->n_contexts, "PLIC context count");
+    if (!uam_state_ok(r))
+        return;
+    get_words(r, p->priority, p->n_sources);
+    get_words(r, p->level, words);
+    get_words(r, p->pending, words);
+    get_words(r, p->in_service, words);
+    get_words(r, p->enable, p->n_contexts * words);
+    get_words(r, p->threshold, p->n_contexts);
+    for (unsigned c = 0; c < p->n_contexts; c++)
+        uam_state_get_signal(r, &p->out[c]);
+}
+
 static const uam_device_ops plic_ops = {
     .type = "sifive,plic-1.0.0",
     .read = plic_read,
     .write = plic_write,
     .reset = plic_reset,
     .destroy = plic_destroy,
+    .save = plic_save,
+    .restore = plic_restore,
 };
 
 uam_device *uam_plic_create(const char *name, unsigned n_sources, unsigned n_contexts)

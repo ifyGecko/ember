@@ -377,6 +377,9 @@ static void report(uam_gdb *g, uam_stop_reason why, bool *done)
     case UAM_STOP_FAULT_LOOP:
         put_packet(g, "T06");  /* SIGABRT: inspect the state */
         return;
+    case UAM_STOP_TIME_LIMIT:
+        put_packet(g, "T0e");      /* SIGALRM: the virtual time budget is spent */
+        return;
     case UAM_STOP_INSN_LIMIT:
         if (g->m->cpu.icount >= g->end_icount) {
             put_packet(g, "T0e");  /* SIGALRM: the instruction budget is spent */

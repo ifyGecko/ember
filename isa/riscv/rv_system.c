@@ -352,6 +352,28 @@ static void rv_dump_state(uam_cpu *cpu, FILE *out)
             s->mstatus, s->mie, mip_value(s), s->mtvec, s->mepc, s->mcause, s->mtval);
 }
 
+/* ---- snapshots ------------------------------------------------------------ */
+
+static void rv_save(uam_cpu *cpu, uam_state_writer *w)
+{
+    const rv_state *s = rv_st(cpu);
+    const uint32_t csrs[] = { s->mstatus, s->mie, s->lines, s->mtvec, s->mscratch, s->mepc,
+                              s->mcause, s->mtval, s->mcounteren, s->mcountinhibit };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(csrs); i++)
+        uam_state_put_u32(w, csrs[i]);
+    uam_state_put_u64(w, s->counter_bias);
+}
+
+static void rv_restore(uam_cpu *cpu, uam_state_reader *r)
+{
+    rv_state *s = rv_st(cpu);
+    uint32_t *const csrs[] = { &s->mstatus, &s->mie, &s->lines, &s->mtvec, &s->mscratch, &s->mepc,
+                               &s->mcause, &s->mtval, &s->mcounteren, &s->mcountinhibit };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(csrs); i++)
+        *csrs[i] = uam_state_get_u32(r);
+    s->counter_bias = uam_state_get_u64(r);
+}
+
 const uam_isa uam_isa_rv32 = {
     .name           = "rv32imac",
     .addr_width     = 32,
@@ -372,4 +394,6 @@ const uam_isa uam_isa_rv32 = {
     .sysreg_write   = rv_sysreg_write,
     .gdb            = &rv_gdb,
     .dump_state     = rv_dump_state,
+    .save           = rv_save,
+    .restore        = rv_restore,
 };

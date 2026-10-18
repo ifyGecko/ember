@@ -422,6 +422,51 @@ static void vnet_destroy(uam_device *d)
     free(s);
 }
 
+static void vnet_save(uam_device *d, uam_state_writer *w)
+{
+    vnet *s = to_vnet(d);
+    const uint32_t regs[] = { s->dev_feat_sel, s->drv_feat_sel, s->queue_sel, s->status, s->isr };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(regs); i++)
+        uam_state_put_u32(w, regs[i]);
+    uam_state_put_u64(w, s->driver_features);
+    for (unsigned i = 0; i < 2; i++) {
+        const vq *q = &s->q[i];
+        uam_state_put_u32(w, q->num);
+        uam_state_put_bool(w, q->ready);
+        uam_state_put_u64(w, q->desc);
+        uam_state_put_u64(w, q->avail);
+        uam_state_put_u64(w, q->used);
+        uam_state_put_u16(w, q->last_avail);
+        uam_state_put_u16(w, q->used_idx);
+    }
+    uam_state_put_bool(w, s->link_up);
+    uam_state_put_signal(w, &s->irq);
+}
+
+static void vnet_restore(uam_device *d, uam_state_reader *r)
+{
+    vnet *s = to_vnet(d);
+    uint32_t *const regs[] = { &s->dev_feat_sel, &s->drv_feat_sel, &s->queue_sel, &s->status,
+                               &s->isr };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(regs); i++)
+        *regs[i] = uam_state_get_u32(r);
+    s->driver_features = uam_state_get_u64(r);
+    for (unsigned i = 0; i < 2; i++) {
+        vq *q = &s->q[i];
+        q->num = uam_state_get_u32(r);
+        q->ready = uam_state_get_bool(r);
+        q->desc = uam_state_get_u64(r);
+        q->avail = uam_state_get_u64(r);
+        q->used = uam_state_get_u64(r);
+        q->last_avail = uam_state_get_u16(r);
+        q->used_idx = uam_state_get_u16(r);
+    }
+    s->link_up = uam_state_get_bool(r);
+    uam_state_get_signal(r, &s->irq);
+    if (s->nd)
+        uam_netdev_accept_input(s->nd);   /* the receive queue may have room now */
+}
+
 static const uam_device_ops vnet_ops = {
     .type = "virtio-net-mmio",
     .endian = UAM_ACC_LE,
@@ -430,6 +475,8 @@ static const uam_device_ops vnet_ops = {
     .write = vnet_write,
     .reset = vnet_reset,
     .destroy = vnet_destroy,
+    .save = vnet_save,
+    .restore = vnet_restore,
 };
 
 uam_device *uam_virtio_net_create(const char *name, uam_bus *bus, uam_netdev *nd,

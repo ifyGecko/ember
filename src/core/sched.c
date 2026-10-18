@@ -86,6 +86,16 @@ void uam_timer_cancel(uam_sched *s, uam_timer *t)
         unlink_timer(s, t);
 }
 
+void uam_sched_cancel_all(uam_sched *s)
+{
+    while (s->head) {
+        uam_timer *t = s->head;
+        s->head = t->next;
+        t->next = NULL;
+        t->armed = false;
+    }
+}
+
 uint64_t uam_sched_next(const uam_sched *s)
 {
     return s->head ? s->head->when : UINT64_MAX;
@@ -94,7 +104,7 @@ uint64_t uam_sched_next(const uam_sched *s)
 unsigned uam_sched_run_due(uam_sched *s)
 {
     unsigned fired = 0;
-    while (s->head && s->head->when <= uam_sched_now(s)) {
+    while (fired < UAM_SCHED_MAX_FIRE && s->head && s->head->when <= uam_sched_now(s)) {
         uam_timer *t = s->head;
         s->head = t->next;
         t->next = NULL;
@@ -108,6 +118,8 @@ unsigned uam_sched_run_due(uam_sched *s)
 void uam_sched_skip_to(uam_sched *s, uint64_t when)
 {
     uint64_t now = uam_sched_now(s);
+    if (when > UAM_SCHED_TIME_MAX)
+        when = UAM_SCHED_TIME_MAX;
     if (when > now)
         s->idle += when - now;
 }

@@ -71,6 +71,8 @@ typedef struct uam_region {
     uint32_t          *page_gen;     /* RAM/ROM/ROMD: per-page generation */
     uint8_t           *code_page;    /* RAM/ROM/ROMD: 1 if the page holds translated code */
     uint64_t           n_code_pages; /* number of code_page entries set */
+    uint64_t          *dirty;        /* RAM/ROM/ROMD: bitmap of pages written since the last
+                                      * uam_bus_dirty_reset (snapshots) */
     bool               rom_mode;     /* ROMD: reads and fetches use the backing store */
     struct uam_region *target;       /* ALIAS: the aliased region (never an alias) */
     uint64_t           target_off;   /* ALIAS: offset of `base` within the target */
@@ -108,6 +110,7 @@ typedef struct uam_bus {
     uint32_t           n_watches, cap_watches;
     int                next_watch_id;
     uint32_t           direct_gen;         /* bumped when uam_bus_page_host answers may change */
+    bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
 } uam_bus;
 
 void       uam_bus_init(uam_bus *bus);
@@ -175,6 +178,32 @@ bool       uam_bus_remove_watch(uam_bus *bus, int id);
  * Answers stay valid until bus->direct_gen changes.
  */
 uint8_t   *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write);
+
+/*
+ * Dirty-page tracking, for snapshots (snapshot.h). Every write to a RAM, ROM
+ * or ROMD backing store through the bus - guest stores, loader, DMA, and ROMD
+ * updates reported with uam_bus_romd_dirty - marks its pages dirty. Once
+ * tracking is on, uam_bus_page_host refuses write access to clean pages, so
+ * an executor's first store to a page takes the uam_bus_write path, which
+ * marks it; later stores to it run on the fast path again.
+ *
+ * Code that writes a backing store directly (through region->host or
+ * uam_bus_romd_backing) must report it with uam_bus_mark_dirty or
+ * uam_bus_romd_dirty, or a snapshot restore will not undo the change.
+ */
+/* Mark every page clean and turn tracking on. Executors must drop cached
+ * write access (the bus bumps direct_gen). */
+void       uam_bus_dirty_reset(uam_bus *bus);
+static inline bool uam_region_page_dirty(const uam_region *r, uint64_t page_index)
+{
+    return (r->dirty[page_index >> 6] >> (page_index & 63)) & 1;
+}
+/* Report a direct write to the backing store at physical [addr, addr+len). */
+void       uam_bus_mark_dirty(uam_bus *bus, uint64_t addr, uint64_t len);
+/* Copy `len` bytes into r's backing store at `off` (RAM, ROM or ROMD; ROM
+ * protection does not apply), dropping code translated from those pages. */
+void       uam_bus_region_store(uam_bus *bus, uam_region *r, uint64_t off, const void *src,
+                                uint64_t len);
 
 /* Code-page tracking for the translation cache. */
 void       uam_bus_mark_code(uam_bus *bus, uint64_t addr);

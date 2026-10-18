@@ -3,8 +3,10 @@
  *
  * Exit status:
  *   finisher/halt status (0 = pass) when the firmware ends the simulation,
- *   124 instruction limit, 125 deadlock, 126 internal error or fault loop,
- *   127 debug trap or breakpoint, 130 interrupted (SIGINT/SIGTERM),
+ *   124 instruction or virtual-time limit, 125 deadlock, 126 internal error or
+ *   fault loop, 127 debug trap or breakpoint, 128 livelock (waiting while timers
+ *   keep firing, and no console or network input that could wake the hart),
+ *   130 interrupted (SIGINT/SIGTERM),
  *   2 usage or setup error.
  */
 #include <getopt.h>
@@ -18,6 +20,7 @@
 #include "uam/loader.h"
 #include "uam/machine.h"
 #include "uam/runner.h"
+#include "uam/snapshot.h"
 
 #define MAX_LIST 64
 
@@ -30,6 +33,13 @@ static void usage(FILE *out)
         "      --image NAME=PATH   named image for the board to place (repeatable)\n"
         "  -o, --option KEY=VALUE  board-specific option (repeatable)\n"
         "  -n, --max-insns N       stop after N guest instructions (0 = unlimited)\n"
+        "      --max-ticks N       stop after N ticks of virtual time, idle time included\n"
+        "                          (0 = unlimited; exit 124 like --max-insns)\n"
+        "      --max-stall N       after N consecutive timer events with no instruction\n"
+        "                          retired (e.g. WAIT whose interrupt is not wired), wait\n"
+        "                          for console/network input instead of skipping time; with\n"
+        "                          no input source, stop (exit 128, livelock)\n"
+        "                          (default 4194304; 0 = never)\n"
         "      --ram SIZE          RAM size in bytes (suffix K/M/G allowed)\n"
         "      --unknown-mmio P    unmapped accesses: fault (default), zero, echo\n"
         "      --console SPEC      console backend: stdio (default), stdio-raw, null, pty,\n"
@@ -49,10 +59,17 @@ static void usage(FILE *out)
         "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
         "      --gdb PORT          wait for a gdb connection on localhost:PORT\n"
+        "      --load-snapshot FILE  start from a snapshot instead of the reset state (same\n"
+        "                          board and options; IMAGE is not needed)\n"
+        "      --save-snapshot FILE  save a snapshot when the run stops (-n, --max-ticks,\n"
+        "                          --break, SIGINT, ...), unless --snapshot-at saved one\n"
+        "      --snapshot-at ADDR  save the --save-snapshot FILE when ADDR is first reached,\n"
+        "                          then keep running (add --break ADDR to stop there)\n"
         "      --map               print the bus map after building the board\n"
         "      --no-verify         skip IR verification of translated blocks\n"
         "      --no-opt            do not optimize translated blocks\n"
         "      --jit               compile blocks to native code (x86-64 host)\n"
+        "      --no-chain          with --jit, return to the run loop after every block\n"
         "  -s, --stats             print execution statistics at exit\n"
         "  -d, --dump-state        print hart state at exit\n"
         "  -v, --verbose           more logging (repeatable)\n"
@@ -125,6 +142,27 @@ static uam_hook_action log_pc_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
     return UAM_HOOK_CONTINUE;
 }
 
+/* --snapshot-at: save once, on the first arrival. */
+typedef struct snap_at {
+    uam_machine *m;
+    const char  *path;
+    bool         done;
+} snap_at;
+
+static uam_hook_action snapshot_at_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    snap_at *sa = ctx;
+    if (sa->done)
+        return UAM_HOOK_CONTINUE;
+    sa->done = true;
+    if (uam_machine_save_snapshot(sa->m, sa->path) == UAM_OK)
+        fprintf(stderr, "uam-run: snapshot saved to %s at pc 0x%llx (icount %llu)\n", sa->path,
+                (unsigned long long)pc, (unsigned long long)cpu->icount);
+    else
+        fprintf(stderr, "uam-run: saving a snapshot to %s failed\n", sa->path);
+    return UAM_HOOK_CONTINUE;
+}
+
 static uam_hook_action break_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
     (void)ctx;
@@ -135,15 +173,18 @@ static uam_hook_action break_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 
 int uam_run_main(int argc, char **argv)
 {
-    enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_BLOCK_INSNS,
+    enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
            OPT_IMAGE, OPT_CONSOLE, OPT_REALTIME, OPT_TRACE_RANGE, OPT_TRACE_AFTER, OPT_LOG_PC,
-           OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME };
+           OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL,
+           OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
         { "image", required_argument, NULL, OPT_IMAGE },
         { "option", required_argument, NULL, 'o' },
         { "max-insns", required_argument, NULL, 'n' },
+        { "max-ticks", required_argument, NULL, OPT_MAX_TICKS },
+        { "max-stall", required_argument, NULL, OPT_MAX_STALL },
         { "ram", required_argument, NULL, OPT_RAM },
         { "unknown-mmio", required_argument, NULL, OPT_UNKNOWN },
         { "console", required_argument, NULL, OPT_CONSOLE },
@@ -158,10 +199,14 @@ int uam_run_main(int argc, char **argv)
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
         { "gdb", required_argument, NULL, OPT_GDB },
+        { "load-snapshot", required_argument, NULL, OPT_LOAD_SNAP },
+        { "save-snapshot", required_argument, NULL, OPT_SAVE_SNAP },
+        { "snapshot-at", required_argument, NULL, OPT_SNAP_AT },
         { "map", no_argument, NULL, OPT_MAP },
         { "no-verify", no_argument, NULL, OPT_NO_VERIFY },
         { "no-opt", no_argument, NULL, OPT_NO_OPT },
         { "jit", no_argument, NULL, OPT_JIT },
+        { "no-chain", no_argument, NULL, OPT_NO_CHAIN },
         { "stats", no_argument, NULL, 's' },
         { "dump-state", no_argument, NULL, 'd' },
         { "verbose", no_argument, NULL, 'v' },
@@ -170,11 +215,15 @@ int uam_run_main(int argc, char **argv)
     };
 
     const char *board_name = "rv32-ref", *console_spec = "stdio", *gdb_port = NULL;
+    const char *load_snap = NULL, *save_snap = NULL;
+    uint64_t snap_at_pc = 0;
+    bool have_snap_at = false;
     char *uart_input_spec = NULL;
     uint64_t raw_base = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
+    uint64_t max_ticks = 0, max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
     uint64_t realtime_tps = 0, log_pcs[MAX_LIST], break_pcs[MAX_LIST], log_hits[MAX_LIST] = { 0 };
     unsigned n_log = 0, n_break = 0;
-    bool have_raw_base = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, realtime = false;
+    bool have_raw_base = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
     bool show_map = false, virtual_time = false;
     unsigned trace = 0, block_insns = 0;
     uam_board_option options[MAX_LIST];
@@ -228,6 +277,8 @@ int uam_run_main(int argc, char **argv)
             break;
         }
         case OPT_VIRTUAL_TIME: virtual_time = true; break;
+        case OPT_MAX_TICKS: max_ticks = strtoull(optarg, NULL, 0); break;
+        case OPT_MAX_STALL: max_stall = strtoull(optarg, NULL, 0); break;
         case OPT_RAW_BASE: raw_base = strtoull(optarg, NULL, 0); have_raw_base = true; break;
         case OPT_RAM: cfg.ram_size = parse_size(optarg); break;
         case OPT_CONSOLE: console_spec = optarg; break;
@@ -245,6 +296,7 @@ int uam_run_main(int argc, char **argv)
         case OPT_NO_VERIFY: verify = false; break;
         case OPT_NO_OPT: optimize = false; break;
         case OPT_JIT: use_jit = true; break;
+        case OPT_NO_CHAIN: chain = false; break;
         case OPT_BLOCK_INSNS: block_insns = (unsigned)strtoul(optarg, NULL, 0); break;
         case OPT_TRACE_RANGE: {
             char *end;
@@ -262,6 +314,9 @@ int uam_run_main(int argc, char **argv)
                 break_pcs[n_break++] = strtoull(optarg, NULL, 0);
             break;
         case OPT_GDB: gdb_port = optarg; break;
+        case OPT_LOAD_SNAP: load_snap = optarg; break;
+        case OPT_SAVE_SNAP: save_snap = optarg; break;
+        case OPT_SNAP_AT: snap_at_pc = strtoull(optarg, NULL, 0); have_snap_at = true; break;
         case OPT_MAP: show_map = true; break;
         case OPT_UNKNOWN:
             if (!strcmp(optarg, "fault"))     cfg.unknown_mmio = UAM_UNKNOWN_FAULT;
@@ -282,6 +337,10 @@ int uam_run_main(int argc, char **argv)
         return 2;
     }
     const char *image = optind < argc ? argv[optind] : NULL;
+    if (have_snap_at && !save_snap) {
+        fprintf(stderr, "uam-run: --snapshot-at needs --save-snapshot FILE\n");
+        return 2;
+    }
     const uam_board *board = uam_board_find(board_name);
     if (!board) {
         fprintf(stderr, "uam-run: unknown board '%s'; available:\n", board_name);
@@ -297,6 +356,11 @@ int uam_run_main(int argc, char **argv)
         goto out_host;
     }
     cfg.console = console;
+    /* No console input reaches the guest until the run starts: the board's
+     * power-on reset, or a snapshot restore, would otherwise discard fixed
+     * input (--console string:..., file:...,in=...) handed over while the
+     * board attaches its UART. */
+    uam_chardev_hold(console, true);
     bool host_net = false;   /* a port is wired to a host interface */
     for (size_t i = 0; i < cfg.n_netdevs; i++) {
         nics[i].nd = uam_netdev_open(nic_specs[i]);
@@ -335,6 +399,24 @@ int uam_run_main(int argc, char **argv)
         }
         uam_machine_reset(&m, info.entry);
     }
+    if (load_snap) {
+        uam_snapshot *snap;
+        st = uam_snapshot_load(load_snap, &snap);
+        if (st == UAM_OK) {
+            uam_snapshot_info si;
+            uam_snapshot_get_info(snap, &si);
+            st = uam_snapshot_restore(&m, snap);
+            if (st == UAM_OK)
+                fprintf(stderr, "uam-run: resumed from %s at pc 0x%llx (icount %llu)\n", load_snap,
+                        (unsigned long long)si.pc, (unsigned long long)si.icount);
+            uam_snapshot_free(snap);
+        }
+        if (st != UAM_OK) {
+            fprintf(stderr, "uam-run: cannot resume from snapshot %s\n", load_snap);
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+    }
 
     m.exec.trace = trace;
     m.exec.trace_lo = trace_lo;
@@ -342,12 +424,16 @@ int uam_run_main(int argc, char **argv)
     m.exec.trace_after = trace_after;
     m.exec.verify = verify;
     m.exec.optimize = optimize;
+    m.exec.chain = chain;
     if (use_jit && !uam_exec_enable_jit(&m.exec))
         fprintf(stderr, "uam-run: the JIT is unavailable on this host; using the interpreter\n");
     if (block_insns)
         m.exec.max_block_insns = block_insns;
     for (unsigned i = 0; i < n_log; i++)
         uam_exec_add_pc_hook(&m.exec, log_pcs[i], log_pc_hook, &log_hits[i]);
+    snap_at snap_hook = { .m = &m, .path = save_snap };
+    if (have_snap_at)
+        uam_exec_add_pc_hook(&m.exec, snap_at_pc, snapshot_at_hook, &snap_hook);
     for (unsigned i = 0; i < n_break; i++)
         uam_exec_add_pc_hook(&m.exec, break_pcs[i], break_hook, NULL);
 
@@ -360,6 +446,11 @@ int uam_run_main(int argc, char **argv)
         realtime = true;
     }
     uam_host_set_pacing(host, realtime ? UAM_PACE_REALTIME : UAM_PACE_VIRTUAL, realtime_tps, 0);
+    m.exec.max_stall = max_stall;
+    if (max_ticks) {
+        uint64_t now = uam_sched_now(&m.sched);
+        m.exec.max_time = max_ticks < UAM_SCHED_TIME_MAX - now ? now + max_ticks : UAM_SCHED_TIME_MAX;
+    }
     uam_host_attach(host, &m.exec);
     uam_chardev_set_quit_handler(console, on_console_quit, &m);
 
@@ -375,6 +466,7 @@ int uam_run_main(int argc, char **argv)
     sigaction(SIGTERM, &sa, &old_term);
 
     uam_stop_reason why;
+    uam_chardev_hold(console, false);   /* the machine is set up: input may flow */
     if (gdb_port) {
         uam_gdb *g = uam_gdb_create(&m);
         if (!g || uam_gdb_listen(g, gdb_port) != UAM_OK) {
@@ -407,8 +499,10 @@ int uam_run_main(int argc, char **argv)
         else
             rc = 1;
         break;
-    case UAM_STOP_INSN_LIMIT: rc = 124; break;
+    case UAM_STOP_INSN_LIMIT:
+    case UAM_STOP_TIME_LIMIT: rc = 124; break;
     case UAM_STOP_DEADLOCK:   rc = 125; break;
+    case UAM_STOP_LIVELOCK:   rc = 128; break;
     case UAM_STOP_DEBUG:
     case UAM_STOP_HOOK:       rc = 127; break;
     default:                  rc = 126; break;
@@ -426,13 +520,28 @@ int uam_run_main(int argc, char **argv)
                 (unsigned long long)s->exceptions, (unsigned long long)s->interrupts,
                 (unsigned long long)s->resets, (unsigned long long)s->idle_ticks,
                 (unsigned long long)uam_sched_now(&m.sched));
-        fprintf(stderr, "stats: blocks native=%llu interp=%llu  compiled=%llu interp-marked=%llu\n",
-                (unsigned long long)s->blocks_native,
+        fprintf(stderr, "stats: blocks native=%llu (chained=%llu) interp=%llu  compiled=%llu "
+                "interp-marked=%llu\n",
+                (unsigned long long)s->blocks_native, (unsigned long long)s->blocks_chained,
                 (unsigned long long)(s->blocks_executed - s->blocks_native),
                 (unsigned long long)s->blocks_compiled, (unsigned long long)s->blocks_interp);
     }
     if (dump)
         m.cpu.isa->dump_state(&m.cpu, stderr);
+    if (save_snap && !have_snap_at) {
+        if (why == UAM_STOP_ERROR || why == UAM_STOP_FAULT_LOOP)
+            fprintf(stderr, "uam-run: not saving a snapshot after an internal error\n");
+        else if (uam_machine_save_snapshot(&m, save_snap) == UAM_OK)
+            fprintf(stderr, "uam-run: snapshot saved to %s\n", save_snap);
+        else {
+            fprintf(stderr, "uam-run: saving a snapshot to %s failed\n", save_snap);
+            if (rc == 0)
+                rc = 2;
+        }
+    }
+    if (have_snap_at && !snap_hook.done)
+        fprintf(stderr, "uam-run: --snapshot-at 0x%llx was never reached; no snapshot saved\n",
+                (unsigned long long)snap_at_pc);
 
     uam_host_destroy(host);  /* detach from the executor before it goes away */
     host = NULL;

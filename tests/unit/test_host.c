@@ -2,15 +2,18 @@
  * test_host.c - Unit tests for the host side and its interfaces: chardev
  * buffering and flow control, the 16550 over a chardev, netdev pairs and
  * pcap capture, the tun Ethernet adapter, bus DMA and the virtio-net device,
- * the host loop (idle hart woken by socket input, deadlock detection), the
+ * the host loop (idle hart woken by socket input, deadlock detection, a
+ * stalled hart blocking on host input instead of livelocking), the
  * board registry and board configuration lookups.
  */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "uam/boards.h"
@@ -20,6 +23,7 @@
 #include "uam/isa/mips32.h"
 #include "uam/machine.h"
 #include "uam/signal.h"
+#include "uam/snapshot.h"
 
 static int n_checks, n_failed;
 
@@ -90,6 +94,83 @@ static void test_uart_chardev(void)
     rewind(out);
     CHECK(fgetc(out) == 'Z', "THR reaches the chardev output");
     fclose(out);
+}
+
+/* ---- held console input ------------------------------------------------- */
+
+/* Fixed input held while the machine is set up survives whatever setup does
+ * to the UART's receive FIFO (a device reset, a snapshot restore). */
+static void test_console_hold(void)
+{
+    uam_chardev *cd = uam_chardev_buffer_create(NULL, "ok", 2);
+    uam_chardev_hold(cd, true);
+    uam_device *u = uam_uart16550_create("uart", cd);
+    uint64_t v = 0;
+    u->ops->read(u, 5, 1, &v);
+    CHECK(!(v & 1), "held: nothing delivered when the UART attaches");
+    u->ops->write(u, 2, 1, 0x03);        /* FCR: FIFO on, clear RX (what a reset may do) */
+    uam_chardev_hold(cd, false);
+    u->ops->read(u, 5, 1, &v);
+    CHECK(v & 1, "released: input delivered");
+    u->ops->read(u, 0, 1, &v);
+    CHECK(v == 'o', "first byte after release");
+    u->ops->read(u, 0, 1, &v);
+    CHECK(v == 'k', "second byte after release");
+    u->ops->destroy(u);
+    uam_chardev_destroy(cd);
+}
+
+#define RV32REF_UART UINT64_C(0x10000000)
+
+/* rv32-ref with `cd` as its console, restored to `snap`; returns the bytes
+ * then waiting in the UART (up to cap). */
+static size_t restored_uart_input(uam_chardev *cd, const uam_snapshot *snap, bool hold, char *buf,
+                                  size_t cap)
+{
+    uam_board_config cfg = { .console = cd };
+    uam_machine m;
+    if (hold)
+        uam_chardev_hold(cd, true);
+    CHECK(uam_board_find("rv32-ref")->build(&m, &cfg) == UAM_OK, "build rv32-ref");
+    CHECK(uam_snapshot_restore(&m, snap) == UAM_OK, "restore");
+    if (hold)
+        uam_chardev_hold(cd, false);
+    size_t n = 0;
+    uint64_t lsr = 0, c = 0;
+    while (n < cap && uam_bus_read(&m.bus, RV32REF_UART + 5, 1, 0, &lsr) == UAM_OK && (lsr & 1)) {
+        uam_bus_read(&m.bus, RV32REF_UART, 1, 0, &c);
+        buf[n++] = (char)c;
+    }
+    uam_machine_fini(&m);
+    return n;
+}
+
+static void test_console_snapshot(void)
+{
+    uam_boards_register_stock();
+    uam_chardev *quiet = uam_chardev_buffer_create(NULL, NULL, 0);
+    uam_board_config cfg = { .console = quiet };
+    uam_machine m;
+    CHECK(uam_board_find("rv32-ref")->build(&m, &cfg) == UAM_OK, "build rv32-ref");
+    uam_snapshot *snap = NULL;
+    CHECK(uam_snapshot_take(&m, &snap) == UAM_OK, "take");
+    uam_machine_fini(&m);
+    uam_chardev_destroy(quiet);
+    if (!snap)
+        return;
+
+    char buf[16];
+    uam_chardev *cd = uam_chardev_buffer_create(NULL, "help\n", 5);
+    size_t n = restored_uart_input(cd, snap, true, buf, sizeof(buf));
+    CHECK(n == 5 && !memcmp(buf, "help\n", 5), "held input survives the restore (%zu bytes)", n);
+    uam_chardev_destroy(cd);
+
+    /* Unheld, the restore replaces the FIFO the input went into at build time. */
+    cd = uam_chardev_buffer_create(NULL, "help\n", 5);
+    n = restored_uart_input(cd, snap, false, buf, sizeof(buf));
+    CHECK(n == 0, "unheld input is lost to the restore (the bug holding prevents)");
+    uam_chardev_destroy(cd);
+    uam_snapshot_free(snap);
 }
 
 /* ---- netdev ------------------------------------------------------------- */
@@ -484,6 +565,126 @@ static void test_host_loop(const char *dir)
     close(c);
 }
 
+/* ---- host loop: a stalled hart blocks on host input ---------------------- */
+
+/* A compare match that re-arms itself forever, its interrupt line unwired. */
+typedef struct rearm {
+    uam_timer  t;
+    uam_sched *s;
+    uint64_t   fires;
+} rearm;
+
+static void rearm_fire(void *ctx)
+{
+    rearm *r = ctx;
+    r->fires++;
+    uam_timer_arm(r->s, &r->t, uam_sched_now(r->s) + 100);
+}
+
+static void stalled_machine(uam_machine *m, rearm *r)
+{
+    waiting_machine(m);
+    m->exec.max_stall = 1000;
+    *r = (rearm){ .s = &m->sched };
+    uam_timer_init(&r->t, rearm_fire, r);
+    uam_timer_arm(&m->sched, &r->t, 100);
+}
+
+static uam_machine *volatile g_sig_machine;
+static void on_sigusr1(int sig) { (void)sig; uam_exec_stop(&g_sig_machine->exec, 130); }
+
+/* Fork a child that, after 300 ms, writes '!' to fd (fd >= 0) or signals us. */
+static pid_t later(int fd)
+{
+    pid_t parent = getpid(), pid = fork();
+    if (pid == 0) {
+        usleep(300000);
+        if (fd >= 0) {
+            if (write(fd, "!", 1) != 1)
+                _exit(1);
+        } else {
+            kill(parent, SIGUSR1);
+        }
+        _exit(0);
+    }
+    CHECK(pid > 0, "fork");
+    return pid;
+}
+
+static void test_host_stall(const char *dir)
+{
+    /* No input source: timers cannot wake the hart, nothing else can. */
+    uam_machine m;
+    rearm r;
+    stalled_machine(&m, &r);
+    uam_host *h = uam_host_create();
+    uam_host_attach(h, &m.exec);
+    uam_stop_reason why = uam_exec_run(&m.exec, 1000);
+    CHECK(why == UAM_STOP_LIVELOCK, "livelock with an fd-less host (why=%d)", why);
+    CHECK(r.fires == 1000, "after max_stall timer events (%llu)", (unsigned long long)r.fires);
+    uam_host_destroy(h);
+    uam_machine_fini(&m);
+
+    /* A console that may still deliver input: after max_stall timer events
+     * the hart stops skipping time and sleeps until input arrives. */
+    char path[512], spec[520];
+    snprintf(path, sizeof(path), "%s/stall.sock", dir);
+    snprintf(spec, sizeof(spec), "unix:%s", path);
+    uam_chardev *cd = uam_chardev_open(spec);
+    CHECK(cd != NULL, "unix socket chardev");
+    if (!cd)
+        return;
+    stalled_machine(&m, &r);
+    wake_dev *w = calloc(1, sizeof(*w));
+    uam_device_init(&w->dev, &wake_ops, "wake");
+    w->m = &m;
+    uam_machine_add_device(&m, &w->dev);
+    uam_chardev_set_frontend(cd, wake_can, wake_rx, w);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    if (strlen(path) < sizeof(a.sun_path))
+        memcpy(a.sun_path, path, strlen(path) + 1);
+    CHECK(connect(c, (struct sockaddr *)&a, sizeof(a)) == 0, "client connects");
+    h = uam_host_create();
+    uam_host_add_chardev(h, cd);
+    uam_host_attach(h, &m.exec);
+
+    pid_t pid = later(c);
+    why = uam_exec_run(&m.exec, 1000);
+    waitpid(pid, NULL, 0);
+    CHECK(why == UAM_STOP_REQUEST && w->got == '!', "late input reached the stalled guest "
+          "(why=%d got=%d)", why, w->got);
+    /* Spinning for 300 ms would have skipped far more than max_stall periods. */
+    CHECK(r.fires <= 1001, "blocked instead of spinning (%llu timer events)",
+          (unsigned long long)r.fires);
+
+    /* A signal interrupts that wait (SIGINT/SIGTERM in the runner). */
+    w->got = 0;
+    m.exec.stop_request = false;
+    r.fires = 0;
+    g_sig_machine = &m;
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigusr1;      /* no SA_RESTART: poll() returns EINTR */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, &old);
+    pid = later(-1);
+    why = uam_exec_run(&m.exec, 1000);
+    waitpid(pid, NULL, 0);
+    sigaction(SIGUSR1, &old, NULL);
+    g_sig_machine = NULL;
+    CHECK(why == UAM_STOP_REQUEST && m.exec.stop_status == 130 && w->got == 0,
+          "a signal ends the wait (why=%d)", why);
+    CHECK(r.fires <= 1001, "blocked until the signal (%llu timer events)",
+          (unsigned long long)r.fires);
+
+    uam_host_destroy(h);
+    uam_chardev_set_frontend(cd, NULL, NULL, NULL);
+    uam_machine_fini(&m);
+    uam_chardev_destroy(cd);
+    close(c);
+}
+
 /* ---- registry and board configuration ---------------------------------- */
 
 static void test_registry(void)
@@ -516,11 +717,14 @@ int main(void)
     }
     test_chardev_flow();
     test_uart_chardev();
+    test_console_hold();
     test_netdev(dir);
     test_tun_adapter();
     test_virtio_net();
     test_host_loop(dir);
+    test_host_stall(dir);
     test_registry();
+    test_console_snapshot();   /* uses the stock boards test_registry registers */
 
     char cmd[600];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);

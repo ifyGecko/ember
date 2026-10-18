@@ -23,7 +23,7 @@ size_t uam_chardev_write(uam_chardev *cd, const void *buf, size_t len)
 /* Hand queued input to the frontend, as much as it accepts. */
 static void deliver(uam_chardev *cd)
 {
-    if (!cd->receive)
+    if (!cd->receive || cd->held)
         return;
     while (cd->rx_len) {
         size_t room = cd->can_receive ? cd->can_receive(cd->fe_ctx) : cd->rx_len;
@@ -85,6 +85,15 @@ void uam_chardev_set_quit_handler(uam_chardev *cd, void (*fn)(void *ctx), void *
 {
     cd->on_quit = fn;
     cd->quit_ctx = ctx;
+}
+
+void uam_chardev_hold(uam_chardev *cd, bool hold)
+{
+    if (!cd)
+        return;
+    cd->held = hold;
+    if (!hold)
+        uam_chardev_accept_input(cd);   /* fixed input refills, then delivers */
 }
 
 int uam_chardev_fd(uam_chardev *cd)

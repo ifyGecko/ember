@@ -42,6 +42,18 @@ static inline int64_t uam_sext(uint64_t v, unsigned width)
     return (int64_t)((v ^ sign) - sign);
 }
 
+/*
+ * Version of the binary interface between libuam and code compiled against
+ * these headers (boards, devices, host backends). Bump it whenever a public
+ * struct's layout, an enum's values, or a public function's signature
+ * changes. Entry points check it together with the struct sizes the caller
+ * was compiled with (uam_abi_layout in uam/machine.h).
+ */
+#define UAM_ABI_VERSION 2u
+
+/* The UAM_ABI_VERSION the library itself was built with. */
+unsigned uam_abi_version(void);
+
 #define UAM_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 /* Recover the enclosing struct from a pointer to one of its members. */
