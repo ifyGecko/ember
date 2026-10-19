@@ -7,6 +7,9 @@
  */
     .section .text.init, "ax"
     .option norvc
+    /* No linker relaxation either: it would shrink `call main` to a 2-byte c.jal when
+     * main is near, moving trap_entry off the 4-byte alignment mtvec requires. */
+    .option norelax
     .globl _start
 _start:
     la      sp, __stack_top

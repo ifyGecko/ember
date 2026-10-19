@@ -7,9 +7,11 @@
  *
  * Pacing:
  *   UAM_PACE_VIRTUAL  (default) virtual time never waits for the host. Idle
- *                     periods are skipped instantly; with no timer pending the
- *                     hart blocks until host input arrives. Runs without host
- *                     input are deterministic.
+ *                     periods are skipped instantly (host input is looked at
+ *                     every 64 skips); with no timer pending, or once the
+ *                     executor decides the timers cannot wake the hart
+ *                     (max_stall), the hart blocks until host input arrives.
+ *                     Runs without host input are deterministic.
  *   UAM_PACE_REALTIME virtual time is held to at most `max_ahead` ticks ahead of
  *                     the host clock at `ticks_per_sec`, and idle periods take
  *                     real time, so host input arrives at a plausible guest time

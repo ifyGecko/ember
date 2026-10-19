@@ -660,8 +660,9 @@ static void test_wait_livelock(void)
 /* #9 ABI handshake: a caller built from other headers is refused            */
 /* ------------------------------------------------------------------------ */
 
-/* Run uam_machine_init with `abi` in a child; true if the child aborted. */
-static bool init_aborts(const uam_abi_layout *abi)
+/* Run uam_machine_init with `abi` in a child; true if the child was stopped with
+ * the ABI error status (a plain exit, no signal, no core dump). */
+static bool init_refused(const uam_abi_layout *abi)
 {
     fflush(NULL);
     pid_t pid = fork();
@@ -672,7 +673,7 @@ static bool init_aborts(const uam_abi_layout *abi)
     }
     int ws = 0;
     CHECK(pid > 0 && waitpid(pid, &ws, 0) == pid, "fork/wait");
-    return WIFSIGNALED(ws) && WTERMSIG(ws) == SIGABRT;
+    return WIFEXITED(ws) && WEXITSTATUS(ws) == UAM_ABI_EXIT_STATUS;
 }
 
 static void test_abi(void)
@@ -690,8 +691,9 @@ static void test_abi(void)
     old.version--;
     CHECK(!uam_abi_check(&old, "test"), "other ABI version refused");
 
-    CHECK(!init_aborts(UAM_ABI_LAYOUT), "uam_machine_init runs with matching headers");
-    CHECK(init_aborts(&grown), "uam_machine_init aborts on a layout mismatch");
+    CHECK(!init_refused(UAM_ABI_LAYOUT), "uam_machine_init runs with matching headers");
+    CHECK(init_refused(&grown), "uam_machine_init exits with status %d on a layout mismatch",
+          UAM_ABI_EXIT_STATUS);
 }
 
 int main(void)

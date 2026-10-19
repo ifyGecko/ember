@@ -25,6 +25,8 @@ const char *uam_stop_reason_str(uam_stop_reason r)
     case UAM_STOP_RESET:      return "reset requested (no reset handler)";
     case UAM_STOP_TIME_LIMIT: return "virtual time limit reached";
     case UAM_STOP_LIVELOCK:   return "livelock (timers keep firing, the hart never wakes)";
+    case UAM_STOP_EXC_HOOK:   return "stopped by the exception observer";
+    case UAM_STOP_IRQ_HOOK:   return "stopped by the interrupt observer";
     }
     return "?";
 }
@@ -67,6 +69,12 @@ void uam_exec_fini(uam_exec *x)
     free(x->hooks);
     x->hooks = NULL;
     x->n_hooks = x->cap_hooks = 0;
+    free(x->passes);
+    x->passes = NULL;
+    x->n_passes = x->cap_passes = 0;
+    uam_cov_pass_destroy(x->cov_pass);
+    x->cov_pass = NULL;
+    x->cpu->cov = NULL;
 }
 
 bool uam_exec_enable_jit(uam_exec *x)
@@ -176,6 +184,79 @@ bool uam_exec_remove_pc_hook(uam_exec *x, uint64_t pc, uam_pc_hook_fn fn, void *
         }
     }
     return false;
+}
+
+/* ---- IR passes ---------------------------------------------------------- */
+
+uam_status uam_exec_add_pass(uam_exec *x, const uam_pass *p)
+{
+    if (!p || !p->run)
+        return UAM_ERR_INVALID;
+    for (uint32_t i = 0; i < x->n_passes; i++)
+        if (x->passes[i] == p)
+            return UAM_ERR_INVALID;
+    if (x->n_passes == x->cap_passes) {
+        uint32_t ncap = x->cap_passes ? x->cap_passes * 2 : 4;
+        const uam_pass **np = realloc(x->passes, sizeof(*np) * ncap);
+        if (!np)
+            return UAM_ERR_NOMEM;
+        x->passes = np;
+        x->cap_passes = ncap;
+    }
+    x->passes[x->n_passes++] = p;
+    uam_tcache_flush(&x->tc);   /* every block must go through the new pass */
+    uam_cpu_request_exit(x->cpu);
+    return UAM_OK;
+}
+
+bool uam_exec_remove_pass(uam_exec *x, const uam_pass *p)
+{
+    for (uint32_t i = 0; i < x->n_passes; i++) {
+        if (x->passes[i] == p) {
+            memmove(&x->passes[i], &x->passes[i + 1], sizeof(*x->passes) * (x->n_passes - i - 1));
+            x->n_passes--;
+            uam_tcache_flush(&x->tc);
+            uam_cpu_request_exit(x->cpu);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Run the registered passes over a new block. A pass may only insert ops, so the guest
+ * instruction count must survive it; the block is verified after each pass. */
+static uam_status run_passes(uam_exec *x, uam_block *blk)
+{
+    const uam_isa *isa = x->cpu->isa;
+    for (uint32_t i = 0; i < x->n_passes; i++) {
+        const uam_pass *p = x->passes[i];
+        const uint32_t n_guest = blk->n_guest;
+        uam_status st = p->run(p->ctx, blk);
+        if (st != UAM_OK) {
+            uam_log(UAM_LOG_ERROR, "exec", "pass '%s' failed on the block at 0x%llx: %s",
+                    p->name, (unsigned long long)blk->guest_pc, uam_status_str(st));
+            return st;
+        }
+        char err[256] = "";
+        bool ok = blk->n_guest == n_guest;
+        if (!ok)
+            snprintf(err, sizeof(err), "guest instruction count changed (%u -> %u)",
+                     n_guest, blk->n_guest);
+        if (ok && x->verify) {
+            uam_verify_ctx vc = { .regfile_size = isa->regfile_size, .helpers = &isa->helpers,
+                                  .max_guest_insns = x->max_block_insns };
+            ok = uam_verify(blk, &vc, err, sizeof(err));
+        }
+        if (!ok) {
+            uam_print_ctx pc_ctx = { .regs = isa->regs, .n_regs = isa->n_regs,
+                                     .helpers = &isa->helpers };
+            uam_log(UAM_LOG_ERROR, "exec", "pass '%s' produced an invalid block at 0x%llx: %s",
+                    p->name, (unsigned long long)blk->guest_pc, err);
+            uam_print_block(stderr, blk, &pc_ctx);
+            return UAM_ERR_INVALID;
+        }
+    }
+    return UAM_OK;
 }
 
 /* Mark the IMARKs of hooked instructions so the block stops before them. */
@@ -340,6 +421,13 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
             }
         }
     }
+    if (x->n_passes) {
+        *st = run_passes(x, blk);
+        if (*st != UAM_OK) {
+            uam_block_free(blk);
+            return NULL;
+        }
+    }
     if (x->n_hooks)
         mark_hooked_imarks(x, blk);
     /* A block with a PC hook on a non-first instruction is broken at that IMARK and
@@ -377,14 +465,34 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
 
 /* ---- run loop ---------------------------------------------------------- */
 
-static void deliver(uam_exec *x, const uam_exception *exc)
+/* Take a synchronous exception. Returns false if the observer stopped the run
+ * instead (the exception is not delivered; cpu->pc is where it would restart). */
+static bool deliver(uam_exec *x, const uam_exception *exc)
 {
-    x->stats.exceptions++;
     if (x->trace & UAM_TRACE_EXC)
         fprintf(x->trace_out, "exc: kind=%d pc=0x%llx cause=0x%llx tval=0x%llx\n", exc->kind,
                 (unsigned long long)exc->pc, (unsigned long long)exc->cause,
                 (unsigned long long)exc->tval);
+    if (x->exc_hook) {
+        x->cpu->pc = (exc->flags & UAM_EXC_F_CONT) ? exc->parent_pc : exc->pc;
+        if (x->exc_hook(x->exc_hook_ctx, x->cpu, exc) == UAM_HOOK_STOP)
+            return false;
+    }
+    x->stats.exceptions++;
     x->cpu->isa->take_exception(x->cpu, exc);
+    return true;
+}
+
+void uam_exec_set_exc_hook(uam_exec *x, uam_exc_hook_fn fn, void *ctx)
+{
+    x->exc_hook = fn;
+    x->exc_hook_ctx = fn ? ctx : NULL;
+}
+
+void uam_exec_set_irq_hook(uam_exec *x, uam_irq_hook_fn fn, void *ctx)
+{
+    x->irq_hook = fn;
+    x->irq_hook_ctx = fn ? ctx : NULL;
 }
 
 static bool trace_block(const uam_exec *x, uint64_t pc)
@@ -517,11 +625,18 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
         cpu->exit_request = false;
 
         /* 2. Interrupts: only ever taken between blocks. */
+        const uint64_t from_pc = cpu->pc;
         if (isa->irq_take(cpu)) {
             x->stats.interrupts++;
             cpu->waiting = false;
             if (x->trace & UAM_TRACE_EXC)
                 fprintf(x->trace_out, "irq: entered handler at 0x%llx\n", (unsigned long long)cpu->pc);
+            if (x->irq_hook) {
+                const uam_interrupt irq = { .from_pc = from_pc, .handler_pc = cpu->pc,
+                                            .lines = isa->irq_lines ? isa->irq_lines(cpu) : 0 };
+                if (x->irq_hook(x->irq_hook_ctx, cpu, &irq) == UAM_HOOK_STOP)
+                    return UAM_STOP_IRQ_HOOK;
+            }
         }
 
         /* 3. Idle: skip virtual time to the next event (or wait for the host). */
@@ -564,7 +679,8 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
                     x->last_fetch_fault_valid = true;
                     x->last_fetch_fault_pc = cpu->pc;
                     x->last_fetch_fault_icount = cpu->icount;
-                    deliver(x, &exc);
+                    if (!deliver(x, &exc))
+                        return UAM_STOP_EXC_HOOK;
                     continue;
                 }
                 uam_log(UAM_LOG_ERROR, "exec", "translation failed at 0x%llx: %s",
@@ -621,12 +737,14 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             cpu->waiting = true;
             break;
         case UAM_BR_FAULT:
-            deliver(x, &r.exc);
+            if (!deliver(x, &r.exc))
+                return UAM_STOP_EXC_HOOK;
             break;
         case UAM_BR_TRAP:
             switch (r.trap_class) {
             case UAM_TRAP_EXCEPTION:
-                deliver(x, &r.exc);
+                if (!deliver(x, &r.exc))
+                    return UAM_STOP_EXC_HOOK;
                 break;
             case UAM_TRAP_DEBUG:
                 cpu->pc = r.pc;

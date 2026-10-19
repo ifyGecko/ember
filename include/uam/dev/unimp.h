@@ -13,6 +13,8 @@
  *                         &(uam_map_attrs){ .prio = UAM_PRIO_BACKGROUND });
  *
  * The global fallback for addresses no window covers stays unknown_mmio.h.
+ * Per-register rules (uam/dev/mmio_stub.h) are mapped above windows, so a rule
+ * can answer one register inside a window without changing the board.
  */
 #ifndef UAM_DEV_UNIMP_H
 #define UAM_DEV_UNIMP_H

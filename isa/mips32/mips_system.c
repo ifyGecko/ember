@@ -462,6 +462,14 @@ static bool mips_irq_take(uam_cpu *cpu)
     return true;
 }
 
+/* MIPS has no fixed priority among interrupt lines (the handler reads Cause.IP): report
+ * every pending, enabled line (IP0..IP7, bit i = line i; IP7 includes the CP0 timer). */
+static uint64_t mips_irq_lines(uam_cpu *cpu)
+{
+    const mips_state *s = mips_st(cpu);
+    return cause_ip(s) & ((s->c.status & ST_IM_MASK) >> ST_IM_SHIFT);
+}
+
 static bool mips_irq_wakeup(uam_cpu *cpu)
 {
     /* WAIT wakes on any pending+enabled line even if Status.IE is clear. */
@@ -859,7 +867,8 @@ static const uam_gdb_arch mips_gdb = {
     .gdb            = &mips_gdb,                      \
     .dump_state     = mips_dump_state,                \
     .save           = mips_save,                      \
-    .restore        = mips_restore
+    .restore        = mips_restore,                   \
+    .irq_lines      = mips_irq_lines
 
 const uam_isa uam_isa_mips32be = {
     .name = "mips32be", .default_endian = UAM_ACC_BE, MIPS_COMMON,

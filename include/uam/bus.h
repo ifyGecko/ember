@@ -47,6 +47,9 @@
 
 /* Priority for catch-all windows such as devices/unimp.c, below every real device. */
 #define UAM_PRIO_BACKGROUND (-1000)
+/* Lowest priority for per-register stubs (devices/mmio_stub.c): above catch-all
+ * windows, below every real device. Stubs use UAM_PRIO_STUB .. UAM_PRIO_STUB + 511. */
+#define UAM_PRIO_STUB       (-900)
 
 struct uam_device;
 

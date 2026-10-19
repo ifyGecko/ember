@@ -156,6 +156,12 @@ typedef struct uam_isa {
      * uam_cpu fields itself and calls uam_cpu_xlate_changed() after restore. */
     void       (*save)(uam_cpu *cpu, uam_state_writer *w);
     void       (*restore)(uam_cpu *cpu, uam_state_reader *r);
+
+    /* Optional: right after irq_take returned true, the interrupt input lines (as
+     * numbered for irq_input) that caused the interrupt it entered, as a bitmask.
+     * Where the hardware leaves the choice among pending lines to software (MIPS),
+     * every pending enabled line. For the executor's interrupt observer (exec.h). */
+    uint64_t   (*irq_lines)(uam_cpu *cpu);
 } uam_isa;
 
 #endif /* UAM_ISA_H */

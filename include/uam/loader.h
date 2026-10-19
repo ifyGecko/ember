@@ -17,6 +17,8 @@ typedef struct uam_image_info {
     uint16_t elf_machine;   /* EM_* for ELF images, 0 for raw */
     uint8_t  elf_class;     /* 32 or 64; 0 for raw */
     uint32_t n_segments;
+    uint64_t link_base;     /* lowest virtual address of a loaded segment (ELF PT_LOAD
+                             * p_vaddr; the base for a raw image): the image's link base */
 } uam_image_info;
 
 /*

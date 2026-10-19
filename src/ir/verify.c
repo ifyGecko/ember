@@ -253,6 +253,18 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
         return define(v, in->dst, hd->result_width);
     }
 
+    case UAM_OP_COV: {
+        const uam_insn *prev = v->idx ? &v->blk->insn[v->idx - 1] : NULL;
+        if (W != 32)
+            return fail(v, "cov width must be 32");
+        if (!prev || prev->op != UAM_OP_IMARK || (prev->flags & UAM_IMARK_CONT))
+            return fail(v, "cov must directly follow a non-continuation imark");
+        if (!uam_ref_is_imm(in->a) || !uam_ref_is_imm(in->b))
+            return fail(v, "cov operands must be immediates");
+        return use(v, in->a, 32, "a") && use(v, in->b, 32, "b") && none(v, in->c, "c")
+            && define(v, in->dst, 0);
+    }
+
     case UAM_OP__COUNT:
         break;
     }

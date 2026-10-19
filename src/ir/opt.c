@@ -21,7 +21,8 @@
  *
  * Nothing that has a side effect is moved or removed (except unreachable code and ops
  * whose guard is constant false), IMARKs are kept, and PUTs are never reordered, so the
- * commit rule (section 8.5) and precise exceptions are preserved.
+ * commit rule (section 8.5) and precise exceptions are preserved. COV, an unguarded
+ * effect op, therefore stays directly after its IMARK (section 8 rule 8).
  */
 #include <stdlib.h>
 #include <string.h>

@@ -114,6 +114,13 @@ static bool rv_irq_take(uam_cpu *cpu)
     return false;
 }
 
+/* mcause holds the interrupt rv_irq_take just entered; its code is the line number. */
+static uint64_t rv_irq_lines(uam_cpu *cpu)
+{
+    uint32_t mcause = rv_st(cpu)->mcause;
+    return (mcause & 0x80000000u) ? UINT64_C(1) << (mcause & 31) : 0;
+}
+
 static bool rv_irq_wakeup(uam_cpu *cpu)
 {
     rv_state *s = rv_st(cpu);
@@ -396,4 +403,5 @@ const uam_isa uam_isa_rv32 = {
     .dump_state     = rv_dump_state,
     .save           = rv_save,
     .restore        = rv_restore,
+    .irq_lines      = rv_irq_lines,
 };

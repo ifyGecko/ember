@@ -1,0 +1,718 @@
+/*
+ * harness.c - Persistent-mode fuzz harness (uam/fuzz.h).
+ *
+ * Built only on public interfaces: PC hooks for the iteration boundaries and crash
+ * pcs, the exception observer, the machine's reset hook, edge coverage, snapshots and
+ * named machine inputs. No device, ISA or fuzzer format is named here.
+ */
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "uam/fuzz.h"
+#include "uam/snapshot.h"
+
+typedef enum { PH_IDLE, PH_BOOT, PH_ITER } phase;
+
+typedef struct route {
+    char               *name;
+    uam_fuzz_deliver_fn fn;
+    void               *ctx;
+} route;
+
+typedef struct mem_route {
+    uint64_t addr, len_addr, max;
+    bool     has_len;
+} mem_route;
+
+struct uam_fuzz {
+    uam_machine   *m;
+    uam_fuzz_config cfg;
+    uint64_t      *crash_pcs;
+    uint64_t      *end_pcs;        /* distinct, copied from cfg */
+    size_t         n_end_pcs;
+    uint8_t       *map;
+    uam_cov_state  cov;
+    const char    *scheme;
+    char           scheme_buf[32];
+    bool           has_cov;
+
+    route         *routes;
+    size_t         n_routes;
+    uam_fuzz_deliver_fn deliver;
+    void          *deliver_ctx;
+    mem_route      mem;
+
+    uam_snapshot  *snap;
+    bool           booted;
+    phase          ph;
+    volatile sig_atomic_t aborted;
+
+    /* what ended the current run */
+    bool           at_begin, ended, oracle, reset, exc_crash, irq_crash;
+    uam_interrupt  irq;
+    unsigned       depth;          /* nested levels open (paired + nested) */
+    uint64_t       oracle_pc;
+    uam_exception  exc;
+
+    uam_machine_reset_hook prev_reset;
+    void          *prev_reset_ctx;
+
+    uam_fuzz_boot_fn     boot_fn;
+    void                *boot_ctx;
+    uam_fuzz_observer_fn obs_fn;
+    void                *obs_ctx;
+
+    uam_fuzz_result last;
+    uam_fuzz_stats  stats;
+};
+
+void uam_fuzz_set_boot_hook(uam_fuzz *f, uam_fuzz_boot_fn fn, void *ctx)
+{
+    f->boot_fn = fn;
+    f->boot_ctx = ctx;
+}
+
+void uam_fuzz_set_observer(uam_fuzz *f, uam_fuzz_observer_fn fn, void *ctx)
+{
+    f->obs_fn = fn;
+    f->obs_ctx = ctx;
+}
+
+const char *uam_fuzz_verdict_str(uam_fuzz_verdict v)
+{
+    switch (v) {
+    case UAM_FUZZ_OK:           return "ok";
+    case UAM_FUZZ_CRASH_FAULT:  return "crash-fault";
+    case UAM_FUZZ_CRASH_ORACLE: return "crash-oracle";
+    case UAM_FUZZ_HANG:         return "hang";
+    case UAM_FUZZ_TIMEOUT:      return "timeout";
+    }
+    return "?";
+}
+
+int uam_fuzz_exit_status(uam_fuzz_verdict v)
+{
+    switch (v) {
+    case UAM_FUZZ_OK:           return UAM_FUZZ_EXIT_OK;
+    case UAM_FUZZ_CRASH_FAULT:  return UAM_FUZZ_EXIT_CRASH_FAULT;
+    case UAM_FUZZ_CRASH_ORACLE: return UAM_FUZZ_EXIT_CRASH_ORACLE;
+    case UAM_FUZZ_HANG:         return UAM_FUZZ_EXIT_HANG;
+    case UAM_FUZZ_TIMEOUT:      return UAM_FUZZ_EXIT_TIMEOUT;
+    }
+    return 1;
+}
+
+bool uam_fuzz_parse_exc_classes(const char *s, unsigned *out)
+{
+    static const struct { const char *name; unsigned bits; } names[] = {
+        { "fetch", UAM_FUZZ_EXC_FETCH }, { "load", UAM_FUZZ_EXC_LOAD },
+        { "store", UAM_FUZZ_EXC_STORE }, { "align", UAM_FUZZ_EXC_ALIGN },
+        { "xlate", UAM_FUZZ_EXC_XLATE }, { "trap", UAM_FUZZ_EXC_TRAP },
+        { "sysreg", UAM_FUZZ_EXC_SYSREG }, { "all", UAM_FUZZ_EXC_ALL },
+        { "default", UAM_FUZZ_EXC_DEFAULT }, { "none", 0 },
+    };
+    unsigned bits = 0;
+    const char *p = s;
+    while (*p) {
+        size_t n = strcspn(p, ",");
+        bool found = false;
+        for (size_t i = 0; i < UAM_ARRAY_LEN(names); i++) {
+            if (strlen(names[i].name) == n && !strncmp(p, names[i].name, n)) {
+                bits |= names[i].bits;
+                found = true;
+            }
+        }
+        if (!found)
+            return false;
+        p += n;
+        if (*p == ',')
+            p++;
+    }
+    *out = bits;
+    return true;
+}
+
+static unsigned exc_class(uam_exc_kind k)
+{
+    switch (k) {
+    case UAM_EXC_TRAP:             return UAM_FUZZ_EXC_TRAP;
+    case UAM_EXC_FETCH_FAULT:      return UAM_FUZZ_EXC_FETCH;
+    case UAM_EXC_LOAD_FAULT:       return UAM_FUZZ_EXC_LOAD;
+    case UAM_EXC_STORE_FAULT:      return UAM_FUZZ_EXC_STORE;
+    case UAM_EXC_LOAD_MISALIGNED:
+    case UAM_EXC_STORE_MISALIGNED: return UAM_FUZZ_EXC_ALIGN;
+    case UAM_EXC_SYSREG:
+    case UAM_EXC_HELPER:           return UAM_FUZZ_EXC_SYSREG;
+    case UAM_EXC_FETCH_XLATE:
+    case UAM_EXC_LOAD_XLATE:
+    case UAM_EXC_STORE_XLATE:      return UAM_FUZZ_EXC_XLATE;
+    }
+    return 0;
+}
+
+/* ---- hooks ------------------------------------------------------------- */
+
+static uam_hook_action begin_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)cpu; (void)pc;
+    uam_fuzz *f = ctx;
+    if (f->ph == PH_BOOT) {
+        f->at_begin = true;
+        return UAM_HOOK_STOP;
+    }
+    if (f->ph == PH_ITER && !f->n_end_pcs) {   /* begin-only: back at begin */
+        f->ended = true;
+        return UAM_HOOK_STOP;
+    }
+    if (f->ph == PH_ITER && f->cfg.nested)
+        f->depth++;
+    return UAM_HOOK_CONTINUE;
+}
+
+static uam_hook_action end_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)cpu; (void)pc;
+    uam_fuzz *f = ctx;
+    if (f->ph != PH_ITER)
+        return UAM_HOOK_CONTINUE;
+    if (f->cfg.nested && --f->depth > 0)
+        return UAM_HOOK_CONTINUE;
+    f->ended = true;
+    return UAM_HOOK_STOP;
+}
+
+static uam_hook_action crash_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)cpu;
+    uam_fuzz *f = ctx;
+    if (f->ph != PH_ITER)
+        return UAM_HOOK_CONTINUE;
+    f->oracle = true;
+    f->oracle_pc = pc;
+    return UAM_HOOK_STOP;
+}
+
+static uam_hook_action exc_hook(void *ctx, uam_cpu *cpu, const uam_exception *e)
+{
+    (void)cpu;
+    uam_fuzz *f = ctx;
+    if (f->ph != PH_ITER || !(exc_class(e->kind) & f->cfg.crash_exc))
+        return UAM_HOOK_CONTINUE;
+    f->exc_crash = true;
+    f->exc = *e;
+    return UAM_HOOK_STOP;
+}
+
+static uam_hook_action irq_hook(void *ctx, uam_cpu *cpu, const uam_interrupt *irq)
+{
+    (void)cpu;
+    uam_fuzz *f = ctx;
+    if (f->ph != PH_ITER || !(irq->lines & f->cfg.crash_irq_lines))
+        return UAM_HOOK_CONTINUE;
+    f->irq_crash = true;
+    f->irq = *irq;
+    return UAM_HOOK_STOP;
+}
+
+static void reset_hook(uam_machine *m, uam_reset_kind kind, void *ctx)
+{
+    uam_fuzz *f = ctx;
+    if (f->prev_reset)
+        f->prev_reset(m, kind, f->prev_reset_ctx);
+    if (f->ph == PH_ITER) {
+        f->reset = true;
+        uam_exec_stop(&m->exec, 0);
+    }
+}
+
+/* ---- life cycle -------------------------------------------------------- */
+
+static void set_err(char *err, size_t n, const char *msg)
+{
+    if (err && n)
+        snprintf(err, n, "%s", msg);
+}
+
+uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err, size_t errlen)
+{
+    if (err && errlen)
+        err[0] = '\0';
+    uint32_t map_size = cfg->map_size ? cfg->map_size : 1u << 16;
+    if (map_size < 2 || (map_size & (map_size - 1))) {
+        set_err(err, errlen, "the coverage map size must be a power of two");
+        return NULL;
+    }
+    for (size_t i = 0; i < cfg->n_end_pcs; i++) {
+        if (cfg->end_pcs[i] == cfg->begin_pc) {
+            set_err(err, errlen, "an end pc equals the begin pc");
+            return NULL;
+        }
+    }
+    uam_fuzz *f = calloc(1, sizeof(*f));
+    if (!f || !(f->map = calloc(1, map_size))
+        || (cfg->n_crash_pcs && !(f->crash_pcs = malloc(sizeof(uint64_t) * cfg->n_crash_pcs)))
+        || (cfg->n_end_pcs && !(f->end_pcs = malloc(sizeof(uint64_t) * cfg->n_end_pcs)))) {
+        if (f) {
+            free(f->map);
+            free(f->crash_pcs);
+        }
+        free(f);
+        set_err(err, errlen, "out of memory");
+        return NULL;
+    }
+    f->m = m;
+    f->cfg = *cfg;
+    f->cfg.map_size = map_size;
+    if (!f->cfg.iter_insns)
+        f->cfg.iter_insns = UAM_FUZZ_DEFAULT_ITER_INSNS;
+    if (cfg->n_crash_pcs)
+        memcpy(f->crash_pcs, cfg->crash_pcs, sizeof(uint64_t) * cfg->n_crash_pcs);
+    f->cfg.crash_pcs = f->crash_pcs;
+    /* One hook per distinct end pc: a duplicate would close two levels at once. */
+    for (size_t i = 0; i < cfg->n_end_pcs; i++) {
+        bool dup = false;
+        for (size_t k = 0; k < f->n_end_pcs; k++)
+            dup |= f->end_pcs[k] == cfg->end_pcs[i];
+        if (!dup)
+            f->end_pcs[f->n_end_pcs++] = cfg->end_pcs[i];
+    }
+    f->cfg.end_pcs = f->end_pcs;
+    f->cfg.n_end_pcs = f->n_end_pcs;
+    uam_cov_state_init(&f->cov, f->map, map_size, &cfg->history);
+    f->scheme = "none";
+
+    uam_exec *x = &m->exec;
+    uam_status st = uam_exec_add_pc_hook(x, cfg->begin_pc, begin_hook, f);
+    for (size_t i = 0; st == UAM_OK && i < f->n_end_pcs; i++)
+        st = uam_exec_add_pc_hook(x, f->end_pcs[i], end_hook, f);
+    for (size_t i = 0; st == UAM_OK && i < cfg->n_crash_pcs; i++)
+        st = uam_exec_add_pc_hook(x, cfg->crash_pcs[i], crash_hook, f);
+    if (st != UAM_OK) {
+        uam_fuzz_destroy(f);
+        set_err(err, errlen, "cannot install the boundary hooks");
+        return NULL;
+    }
+    uam_exec_set_exc_hook(x, exc_hook, f);
+    if (cfg->crash_irq_lines)
+        uam_exec_set_irq_hook(x, irq_hook, f);
+    f->prev_reset = m->on_reset;
+    f->prev_reset_ctx = m->on_reset_ctx;
+    m->on_reset = reset_hook;
+    m->on_reset_ctx = f;
+    return f;
+}
+
+void uam_fuzz_destroy(uam_fuzz *f)
+{
+    if (!f)
+        return;
+    uam_machine *m = f->m;
+    uam_exec *x = &m->exec;
+    uam_exec_remove_pc_hook(x, f->cfg.begin_pc, begin_hook, f);
+    for (size_t i = 0; i < f->n_end_pcs; i++)
+        uam_exec_remove_pc_hook(x, f->end_pcs[i], end_hook, f);
+    for (size_t i = 0; i < f->cfg.n_crash_pcs; i++)
+        uam_exec_remove_pc_hook(x, f->crash_pcs[i], crash_hook, f);
+    if (x->exc_hook == exc_hook)
+        uam_exec_set_exc_hook(x, NULL, NULL);
+    if (x->irq_hook == irq_hook)
+        uam_exec_set_irq_hook(x, NULL, NULL);
+    if (m->on_reset == reset_hook) {
+        m->on_reset = f->prev_reset;
+        m->on_reset_ctx = f->prev_reset_ctx;
+    }
+    if (f->has_cov)
+        uam_exec_set_coverage(x, NULL, 0, NULL, NULL, 0);
+    uam_snapshot_free(f->snap);
+    for (size_t i = 0; i < f->n_routes; i++)
+        free(f->routes[i].name);
+    free(f->routes);
+    free(f->crash_pcs);
+    free(f->end_pcs);
+    free(f->map);
+    free(f);
+}
+
+static void name_scheme(uam_fuzz *f, const char *scheme)
+{
+    snprintf(f->scheme_buf, sizeof(f->scheme_buf), "%s", scheme ? scheme : "sites");
+    f->scheme = f->scheme_buf;
+}
+
+uam_status uam_fuzz_set_sites(uam_fuzz *f, const uam_cov_site *sites, size_t n,
+                              const char *scheme, char *err, size_t errlen)
+{
+    if (f->booted)
+        return UAM_ERR_INVALID;
+    uam_status st = uam_exec_set_coverage(&f->m->exec, sites, n, &f->cov, err, errlen);
+    f->has_cov = st == UAM_OK && n;
+    name_scheme(f, f->has_cov ? scheme : "none");
+    return st;
+}
+
+uam_status uam_fuzz_set_block_coverage(uam_fuzz *f)
+{
+    if (f->booted)
+        return UAM_ERR_INVALID;
+    uam_status st = uam_exec_set_block_coverage(&f->m->exec, &f->cov);
+    f->has_cov = st == UAM_OK;
+    name_scheme(f, f->has_cov ? "blocks" : "none");
+    return st;
+}
+
+/* ---- routes ------------------------------------------------------------ */
+
+uam_status uam_fuzz_add_route(uam_fuzz *f, const char *name, uam_fuzz_deliver_fn fn, void *ctx)
+{
+    if (!name || !fn)
+        return UAM_ERR_INVALID;
+    for (size_t i = 0; i < f->n_routes; i++)
+        if (!strcmp(f->routes[i].name, name))
+            return UAM_ERR_INVALID;
+    route *nr = realloc(f->routes, sizeof(*nr) * (f->n_routes + 1));
+    if (!nr)
+        return UAM_ERR_NOMEM;
+    f->routes = nr;
+    char *nm = strdup(name);
+    if (!nm)
+        return UAM_ERR_NOMEM;
+    f->routes[f->n_routes++] = (route){ .name = nm, .fn = fn, .ctx = ctx };
+    return UAM_OK;
+}
+
+uam_status uam_fuzz_mmio_deliver(void *ctx, uam_machine *m, const uint8_t *data, size_t len)
+{
+    (void)m;
+    uam_mmio_input_set(ctx, data, len);
+    return UAM_OK;
+}
+
+/* Copy bytes to guest virtual memory, a page at a time through the ISA's translation. */
+static uam_status write_virt(uam_machine *m, uint64_t va, const uint8_t *data, size_t len)
+{
+    uam_cpu *cpu = &m->cpu;
+    while (len) {
+        size_t chunk = UAM_PAGE_SIZE - (va & (UAM_PAGE_SIZE - 1));
+        if (chunk > len)
+            chunk = len;
+        uint64_t pa = va;
+        if (cpu->isa->translate) {
+            uam_xlate xl = { 0 };
+            if (cpu->isa->translate(cpu, va, UAM_XLATE_STORE, &xl) != UAM_OK)
+                return UAM_ERR_XLATE;
+            pa = xl.paddr;
+        }
+        uam_status st = uam_bus_dma_write(&m->bus, pa, data, chunk);
+        if (st != UAM_OK)
+            return st;
+        va += chunk;
+        data += chunk;
+        len -= chunk;
+    }
+    return UAM_OK;
+}
+
+static uam_status mem_deliver(void *ctx, uam_machine *m, const uint8_t *data, size_t len)
+{
+    const mem_route *r = ctx;
+    if (len > r->max)
+        len = (size_t)r->max;
+    uam_status st = write_virt(m, r->addr, data, len);
+    if (st == UAM_OK && r->has_len) {
+        uint8_t w[4];
+        bool be = m->cpu.isa->default_endian & UAM_ACC_BE;
+        for (int i = 0; i < 4; i++)
+            w[i] = (uint8_t)((uint32_t)len >> (be ? 24 - 8 * i : 8 * i));
+        st = write_virt(m, r->len_addr, w, 4);
+    }
+    return st;
+}
+
+static bool parse_u64(const char *s, size_t n, uint64_t *out)
+{
+    char buf[32];
+    if (!n || n >= sizeof(buf))
+        return false;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    char *end;
+    *out = strtoull(buf, &end, 0);
+    return *end == '\0';
+}
+
+static bool parse_mem(mem_route *r, const char *spec)
+{
+    *r = (mem_route){ .max = 4096 };
+    size_t n = strcspn(spec, ",");
+    if (!parse_u64(spec, n, &r->addr))
+        return false;
+    for (const char *p = spec + n; *p == ',';) {
+        p++;
+        n = strcspn(p, ",");
+        if (n > 4 && !strncmp(p, "len=", 4)) {
+            if (!parse_u64(p + 4, n - 4, &r->len_addr))
+                return false;
+            r->has_len = true;
+        } else if (n > 4 && !strncmp(p, "max=", 4)) {
+            if (!parse_u64(p + 4, n - 4, &r->max))
+                return false;
+        } else {
+            return false;
+        }
+        p += n;
+    }
+    return true;
+}
+
+uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_t errlen)
+{
+    if (err && errlen)
+        err[0] = '\0';
+    if (!strncmp(spec, "mem:", 4)) {
+        if (!parse_mem(&f->mem, spec + 4)) {
+            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N]");
+            return UAM_ERR_INVALID;
+        }
+        f->deliver = mem_deliver;
+        f->deliver_ctx = &f->mem;
+        return UAM_OK;
+    }
+    for (size_t i = 0; i < f->n_routes; i++) {
+        if (!strcmp(f->routes[i].name, spec)) {
+            f->deliver = f->routes[i].fn;
+            f->deliver_ctx = f->routes[i].ctx;
+            return UAM_OK;
+        }
+    }
+    const uam_machine_input *in = uam_machine_find_input(f->m, spec);
+    if (in) {
+        f->deliver = in->fn;
+        f->deliver_ctx = in->ctx;
+        return UAM_OK;
+    }
+    if (err && errlen) {
+        int k = snprintf(err, errlen, "unknown input route '%s' (known: mem:ADDR", spec);
+        for (size_t i = 0; i < f->n_routes && k > 0 && (size_t)k < errlen; i++)
+            k += snprintf(err + k, errlen - (size_t)k, ", %s", f->routes[i].name);
+        for (uint32_t i = 0; i < f->m->n_inputs && k > 0 && (size_t)k < errlen; i++)
+            k += snprintf(err + k, errlen - (size_t)k, ", %s", f->m->inputs[i].name);
+        if (k > 0 && (size_t)k < errlen)
+            snprintf(err + k, errlen - (size_t)k, ")");
+    }
+    return UAM_ERR_INVALID;
+}
+
+/* ---- running ----------------------------------------------------------- */
+
+static void clear_flags(uam_fuzz *f)
+{
+    f->at_begin = f->ended = f->oracle = f->reset = f->exc_crash = f->irq_crash = false;
+    f->depth = 1;   /* an iteration starts inside its begin */
+}
+
+uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
+{
+    uam_machine *m = f->m;
+    memset(r, 0, sizeof(*r));
+    if (f->booted)
+        return UAM_ERR_INVALID;
+    clear_flags(f);
+    uint64_t ic0 = m->cpu.icount;
+    if (m->cpu.pc == f->cfg.begin_pc) {
+        f->at_begin = true;   /* e.g. resumed from a snapshot taken at begin */
+        r->stop = UAM_STOP_HOOK;
+    } else {
+        f->ph = PH_BOOT;
+        r->stop = uam_exec_run(&m->exec, f->cfg.boot_insns);
+        f->ph = PH_IDLE;
+    }
+    r->pc = m->cpu.pc;
+    r->insns = m->cpu.icount - ic0;
+    if (!f->at_begin || f->aborted) {
+        if (!f->aborted)
+            uam_log(UAM_LOG_ERROR, "fuzz", "boot did not reach the begin pc 0x%llx: %s at pc 0x%llx",
+                    (unsigned long long)f->cfg.begin_pc, uam_stop_reason_str(r->stop),
+                    (unsigned long long)r->pc);
+        return UAM_ERR_INVALID;
+    }
+    /* The hooks have run for this arrival at begin: iterations start past them, in the
+     * snapshot as well, so begin-only mode does not end an iteration at its first pc. */
+    m->exec.hook_fired = true;
+    m->exec.hook_fired_pc = m->cpu.pc;
+    m->exec.hook_fired_icount = m->cpu.icount;
+    uam_status st = f->boot_fn ? f->boot_fn(f->boot_ctx, f, m) : UAM_OK;
+    if (st != UAM_OK)
+        return st;
+    st = uam_snapshot_take(m, &f->snap);
+    if (st != UAM_OK) {
+        uam_log(UAM_LOG_ERROR, "fuzz", "cannot snapshot the machine at the begin pc");
+        return st;
+    }
+    f->booted = true;
+    f->last = *r;
+    return UAM_OK;
+}
+
+static void classify(uam_fuzz *f, uam_fuzz_result *r)
+{
+    const uam_machine *m = f->m;
+    r->verdict = UAM_FUZZ_OK;
+    r->detail = 0;
+    if (f->ended && r->stop == UAM_STOP_HOOK)
+        return;
+    if (f->exc_crash) {
+        r->verdict = UAM_FUZZ_CRASH_FAULT;
+        r->exc_valid = true;
+        r->exc = f->exc;
+        r->detail = f->exc.pc;
+        return;
+    }
+    if (f->oracle) {
+        r->verdict = UAM_FUZZ_CRASH_ORACLE;
+        r->detail = f->oracle_pc;
+        return;
+    }
+    if (f->irq_crash) {
+        r->verdict = UAM_FUZZ_CRASH_ORACLE;
+        r->irq_valid = true;
+        r->irq = f->irq;
+        r->detail = f->irq.lines & f->cfg.crash_irq_lines;
+        return;
+    }
+    if (f->reset) {
+        r->verdict = UAM_FUZZ_CRASH_ORACLE;
+        r->reset = true;
+        return;
+    }
+    switch (r->stop) {
+    case UAM_STOP_REQUEST:
+    case UAM_STOP_HALT:
+        /* The firmware stopped the machine (a test finisher, a halt): a clean end of
+         * the iteration with status 0, an assertion otherwise. */
+        if (m->exec.stop_status != 0) {
+            r->verdict = UAM_FUZZ_CRASH_ORACLE;
+            r->detail = (uint64_t)m->exec.stop_status;
+        }
+        return;
+    case UAM_STOP_INSN_LIMIT:
+    case UAM_STOP_TIME_LIMIT:
+        r->verdict = UAM_FUZZ_TIMEOUT;
+        return;
+    case UAM_STOP_DEADLOCK:
+    case UAM_STOP_LIVELOCK:
+        r->verdict = UAM_FUZZ_HANG;
+        r->detail = (uint64_t)r->stop;
+        return;
+    case UAM_STOP_FAULT_LOOP:
+    case UAM_STOP_ERROR:
+        r->verdict = UAM_FUZZ_CRASH_FAULT;
+        r->detail = r->pc;
+        return;
+    default:
+        /* A debug trap (a breakpoint instruction), or a hook that is not ours. */
+        r->verdict = UAM_FUZZ_CRASH_ORACLE;
+        r->detail = r->pc;
+        return;
+    }
+}
+
+uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fuzz_result *r)
+{
+    uam_machine *m = f->m;
+    memset(r, 0, sizeof(*r));
+    if (!f->booted || f->aborted)
+        return UAM_ERR_INVALID;
+    if (!f->deliver) {
+        uam_log(UAM_LOG_ERROR, "fuzz", "no input route selected");
+        return UAM_ERR_INVALID;
+    }
+    uam_status st = uam_snapshot_restore(m, f->snap);
+    if (st != UAM_OK) {
+        uam_log(UAM_LOG_ERROR, "fuzz", "restoring the begin snapshot failed");
+        return st;
+    }
+    memset(f->map, 0, f->cfg.map_size);
+    uam_cov_reset_prev(&f->cov);
+    clear_flags(f);
+    st = f->deliver(f->deliver_ctx, m, data, len);
+    if (st != UAM_OK) {
+        uam_log(UAM_LOG_ERROR, "fuzz", "delivering an input of %zu bytes failed: %s", len,
+                uam_status_str(st));
+        return st;
+    }
+    uint64_t ic0 = m->cpu.icount;
+    f->ph = PH_ITER;
+    r->stop = uam_exec_run(&m->exec, f->cfg.iter_insns);
+    f->ph = PH_IDLE;
+    r->pc = m->cpu.pc;
+    r->insns = m->cpu.icount - ic0;
+    if (f->aborted)
+        return UAM_ERR_INVALID;
+    classify(f, r);
+    f->stats.iterations++;
+    f->stats.by_verdict[r->verdict]++;
+    f->last = *r;
+    return UAM_OK;
+}
+
+void uam_fuzz_get_info(const uam_fuzz *f, uam_fuzz_info *info)
+{
+    *info = (uam_fuzz_info){ .map_size = f->cfg.map_size, .scheme = f->scheme,
+                             .arch = f->m->cpu.isa->name, .isa = f->m->cpu.isa->name };
+}
+
+uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx)
+{
+    uam_fuzz_info info;
+    uam_fuzz_get_info(f, &info);
+    uam_status st = fe->hello ? fe->hello(ctx, &info) : UAM_OK;
+    uam_fuzz_result r;
+    if (st == UAM_OK)
+        st = uam_fuzz_boot(f, &r);
+    if (st == UAM_OK && f->obs_fn)
+        f->obs_fn(f->obs_ctx, 0, UAM_FUZZ_KIND_INIT, UAM_FUZZ_OK, 0, f->map, f->cfg.map_size);
+    if (st == UAM_OK)
+        st = fe->report(ctx, 0, UAM_FUZZ_OK, 0, f->map, f->cfg.map_size, UAM_FUZZ_KIND_INIT);
+    while (st == UAM_OK && !f->aborted) {
+        uint8_t *data;
+        size_t len;
+        uint64_t id;
+        int n = fe->next_input(ctx, &data, &len, &id);
+        if (n == 0)
+            break;
+        if (n < 0) {
+            st = UAM_ERR_INVALID;
+            break;
+        }
+        st = uam_fuzz_run_one(f, data, len, &r);
+        if (st != UAM_OK)
+            break;
+        if (f->obs_fn)
+            f->obs_fn(f->obs_ctx, id, UAM_FUZZ_KIND_ITER, r.verdict, r.detail, f->map,
+                      f->cfg.map_size);
+        st = fe->report(ctx, id, r.verdict, r.detail, f->map, f->cfg.map_size, UAM_FUZZ_KIND_ITER);
+    }
+    if (fe->bye)
+        fe->bye(ctx);
+    return f->aborted ? UAM_OK : st;
+}
+
+const uint8_t *uam_fuzz_map(const uam_fuzz *f, size_t *size)
+{
+    if (size)
+        *size = f->cfg.map_size;
+    return f->map;
+}
+
+const uam_fuzz_result *uam_fuzz_last_result(const uam_fuzz *f) { return &f->last; }
+const uam_fuzz_stats  *uam_fuzz_get_stats(const uam_fuzz *f) { return &f->stats; }
+
+void uam_fuzz_abort(uam_fuzz *f)
+{
+    f->aborted = 1;
+    uam_exec_stop(&f->m->exec, 130);
+}
+
+bool uam_fuzz_aborted(const uam_fuzz *f) { return f->aborted; }

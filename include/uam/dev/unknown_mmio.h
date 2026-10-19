@@ -9,6 +9,9 @@
  * Policies:
  *   ZERO  reads return 0, writes are dropped
  *   ECHO  reads return the last value written to that address (else 0)
+ *
+ * For individual registers (a fixed value, fuzz input, a bus error, masks), map
+ * per-register rules over the holes instead: uam/dev/mmio_stub.h.
  */
 #ifndef UAM_DEV_UNKNOWN_MMIO_H
 #define UAM_DEV_UNKNOWN_MMIO_H

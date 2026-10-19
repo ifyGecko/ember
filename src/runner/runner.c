@@ -8,6 +8,8 @@
  *   keep firing, and no console or network input that could wake the hart),
  *   130 interrupted (SIGINT/SIGTERM),
  *   2 usage or setup error.
+ * With --fuzz-replay, the verdict of the last input instead (uam/fuzz.h):
+ *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout.
  */
 #include <getopt.h>
 #include <signal.h>
@@ -15,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "uam/boards.h"
+#include "uam/fuzz.h"
 #include "uam/gdbstub.h"
 #include "uam/host.h"
 #include "uam/loader.h"
@@ -23,6 +27,52 @@
 #include "uam/snapshot.h"
 
 #define MAX_LIST 64
+
+/* Whole file into a new buffer. */
+static bool read_file(const char *path, uint8_t **data, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    uint8_t *buf = NULL;
+    size_t n = 0, cap = 0;
+    for (;;) {
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 4096;
+            uint8_t *nb = realloc(buf, ncap);
+            if (!nb) {
+                free(buf);
+                fclose(f);
+                return false;
+            }
+            buf = nb;
+            cap = ncap;
+        }
+        size_t got = fread(buf + n, 1, cap - n, f);
+        n += got;
+        if (got == 0)
+            break;
+    }
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) {
+        free(buf);
+        return false;
+    }
+    *data = buf;
+    *len = n;
+    return true;
+}
+
+static void on_mmio_input_exhausted(void *ctx)
+{
+    fprintf(stderr, "uam-run: --mmio-input used up after %zu bytes; 'input' registers now read 0\n",
+            uam_mmio_input_pos(ctx));
+}
+
+/* The extensions of the current run, for usage(). */
+static const uam_runner_ext *const *g_exts;
+static size_t g_n_exts;
 
 static void usage(FILE *out)
 {
@@ -42,6 +92,10 @@ static void usage(FILE *out)
         "                          (default 4194304; 0 = never)\n"
         "      --ram SIZE          RAM size in bytes (suffix K/M/G allowed)\n"
         "      --unknown-mmio P    unmapped accesses: fault (default), zero, echo\n"
+        "      --mmio-rule RULE    answer unmodelled registers (repeatable; later rules win):\n"
+        "                          ADDR[+SIZE]=POLICY[,width=N][,set=MASK][,clear=MASK]\n"
+        "                          POLICY: zero, echo, fixed:VALUE, fault, input\n"
+        "      --mmio-input FILE   bytes read by 'input' rules, in order (0 once used up)\n"
         "      --console SPEC      console backend: stdio (default), stdio-raw, null, pty,\n"
         "                          tcp:[HOST:]PORT, unix:PATH, file:OUT[,in=FILE], string:TEXT\n"
         "      --uart-input STR    shorthand for --console string:STR\n"
@@ -70,10 +124,34 @@ static void usage(FILE *out)
         "      --no-opt            do not optimize translated blocks\n"
         "      --jit               compile blocks to native code (x86-64 host)\n"
         "      --no-chain          with --jit, return to the run loop after every block\n"
+        "      --cov-blocks        count edges between translated blocks (approximate: blocks\n"
+        "                          are not basic blocks) in a coverage map\n"
+        "      --cov-map-size N    coverage map bytes, a power of two (default 64K)\n"
+        "      --cov-out FILE      write the raw coverage map to FILE when the run stops\n"
+        "                          (fuzzing: the last input's map)\n"
+        "      --fuzz-begin PC     fuzz: boot to PC, snapshot there, run each input from it\n"
+        "      --fuzz-end PC       an iteration ends at PC (repeatable: any of them; default:\n"
+        "                          when the --fuzz-begin PC is reached again)\n"
+        "      --fuzz-input ROUTE  how inputs reach the guest: mem:ADDR[,len=ADDR][,max=N],\n"
+        "                          mmio (--mmio-rule input registers), or a board input\n"
+        "                          (stock boards: uart0)\n"
+        "      --fuzz-crash-pc PC  reaching PC is a crash (repeatable)\n"
+        "      --fuzz-crash-exc L  exceptions that are crashes: comma list of fetch, load,\n"
+        "                          store, align, xlate, trap, sysreg, all, none\n"
+        "                          (default fetch,load,store,align)\n"
+        "      --fuzz-crash-irq N  an interrupt from line N (as the board wires it to the\n"
+        "                          CPU) is a crash (repeatable)\n"
+        "      --fuzz-iter-insns N instruction budget per input (default 10000000; timeout)\n"
+        "      --fuzz-replay PATH  run each input in FILE or DIR once and print the verdict;\n"
+        "                          -n bounds the boot; exit 0 ok, 20 fault, 21 oracle,\n"
+        "                          22 hang, 23 timeout (of the last input)\n"
         "  -s, --stats             print execution statistics at exit\n"
         "  -d, --dump-state        print hart state at exit\n"
         "  -v, --verbose           more logging (repeatable)\n"
         "  -h, --help\n");
+    for (size_t i = 0; i < g_n_exts; i++)
+        if (g_exts[i]->help)
+            fputs(g_exts[i]->help, out);
 }
 
 static uint64_t parse_size(const char *s)
@@ -118,11 +196,14 @@ static bool split_kv(char *s, const char **k, const char **v)
 /* ---- signals and console quit -------------------------------------------- */
 
 static uam_machine *volatile g_machine;
+static uam_fuzz *volatile g_fuzz;
 
 static void on_signal(int sig)
 {
     (void)sig;
-    if (g_machine)
+    if (g_fuzz)
+        uam_fuzz_abort(g_fuzz);
+    else if (g_machine)
         uam_exec_stop(&g_machine->exec, 130);
 }
 
@@ -171,12 +252,109 @@ static uam_hook_action break_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
     return UAM_HOOK_STOP;
 }
 
-int uam_run_main(int argc, char **argv)
+/* --fuzz-begin: the harness with the replay frontend. Returns the exit status. */
+/* The extensions of a run and their states. */
+typedef struct ext_set {
+    const uam_runner_ext *const *ext;
+    void                **st;
+    size_t                n;
+} ext_set;
+
+static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, const char *route,
+                    uam_mmio_input *mmio_input, const char *replay, const char *cov_out,
+                    uint64_t map_size, bool stats, const uam_runner_setup *xs, const ext_set *es)
+{
+    char err[512];
+    uam_fuzz_config cfg = *fz;
+    cfg.map_size = (uint32_t)map_size;
+    uam_fuzz *f = uam_fuzz_create(m, &cfg, err, sizeof(err));
+    if (!f) {
+        fprintf(stderr, "uam-run: cannot set up fuzzing: %s\n", err);
+        return 2;
+    }
+    int rc = 2;
+    uam_fuzz_replay *r = NULL;
+    if (cov_blocks && uam_fuzz_set_block_coverage(f) != UAM_OK) {
+        fprintf(stderr, "uam-run: cannot enable coverage\n");
+        goto out;
+    }
+    if (xs->sites) {
+        if (uam_fuzz_set_sites(f, xs->sites, xs->n_sites, xs->scheme, err, sizeof(err)) != UAM_OK) {
+            fprintf(stderr, "uam-run: coverage sites: %s\n", err);
+            goto out;
+        }
+        if (xs->namer && m->exec.cov_pass)
+            uam_cov_pass_set_namer(m->exec.cov_pass, xs->namer, xs->namer_ctx);
+    }
+    for (size_t i = 0; i < es->n; i++)
+        if (es->ext[i]->attach && es->ext[i]->attach(es->st[i], m, f) != UAM_OK)
+            goto out;
+    if (mmio_input && uam_fuzz_add_route(f, "mmio", uam_fuzz_mmio_deliver, mmio_input) != UAM_OK)
+        goto out;
+    if (uam_fuzz_select_route(f, route, err, sizeof(err)) != UAM_OK) {
+        fprintf(stderr, "uam-run: --fuzz-input: %s\n", err);
+        goto out;
+    }
+    if (!xs->frontend && !(r = uam_fuzz_replay_create(replay, f, stdout)))
+        goto out;
+    g_fuzz = f;
+    uam_status st = xs->frontend ? uam_fuzz_run(f, xs->frontend, xs->frontend_ctx)
+                                 : uam_fuzz_run(f, &uam_fuzz_replay_frontend, r);
+    g_fuzz = NULL;
+    fflush(stdout);
+    const uam_fuzz_stats *fs = uam_fuzz_get_stats(f);
+    if (uam_fuzz_aborted(f)) {
+        fprintf(stderr, "uam-run: fuzz: interrupted\n");
+        rc = 130;
+    } else if (st != UAM_OK) {
+        fprintf(stderr, "uam-run: fuzz: stopped by an error after %llu inputs\n",
+                (unsigned long long)fs->iterations);
+    } else {
+        rc = r ? uam_fuzz_replay_exit_status(r) : 0;
+    }
+    fprintf(stderr, "uam-run: fuzz: %llu inputs: %llu ok, %llu crash (fault), %llu crash (oracle), "
+            "%llu hang, %llu timeout\n", (unsigned long long)fs->iterations,
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_OK],
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_FAULT],
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_ORACLE],
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_HANG],
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_TIMEOUT]);
+    if (cov_out) {
+        size_t n;
+        const uint8_t *map = r ? uam_fuzz_replay_last_map(r, &n) : uam_fuzz_map(f, &n);
+        FILE *fp = map ? fopen(cov_out, "wb") : NULL;
+        bool ok = fp && fwrite(map, 1, n, fp) == n;
+        if (fp && fclose(fp) != 0)
+            ok = false;
+        if (!ok) {
+            fprintf(stderr, "uam-run: cannot write the coverage map to %s\n", cov_out);
+            if (rc == 0)
+                rc = 2;
+        }
+    }
+    if (stats) {
+        size_t n;
+        const uint8_t *map = uam_fuzz_map(f, &n);
+        size_t hit = 0;
+        for (size_t i = 0; i < n; i++)
+            hit += map[i] != 0;
+        fprintf(stderr, "stats: coverage map=%zu bytes, buckets hit by the last input=%zu\n", n, hit);
+    }
+out:
+    uam_fuzz_replay_destroy(r);
+    uam_fuzz_destroy(f);
+    return rc;
+}
+
+static int run_main(int argc, char **argv, const ext_set *es)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
            OPT_IMAGE, OPT_CONSOLE, OPT_REALTIME, OPT_TRACE_RANGE, OPT_TRACE_AFTER, OPT_LOG_PC,
            OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL,
-           OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT };
+           OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT, OPT_MMIO_RULE, OPT_MMIO_INPUT,
+           OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
+           OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
+           OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -187,6 +365,8 @@ int uam_run_main(int argc, char **argv)
         { "max-stall", required_argument, NULL, OPT_MAX_STALL },
         { "ram", required_argument, NULL, OPT_RAM },
         { "unknown-mmio", required_argument, NULL, OPT_UNKNOWN },
+        { "mmio-rule", required_argument, NULL, OPT_MMIO_RULE },
+        { "mmio-input", required_argument, NULL, OPT_MMIO_INPUT },
         { "console", required_argument, NULL, OPT_CONSOLE },
         { "uart-input", required_argument, NULL, OPT_UART_IN },
         { "realtime", optional_argument, NULL, OPT_REALTIME },
@@ -207,6 +387,17 @@ int uam_run_main(int argc, char **argv)
         { "no-opt", no_argument, NULL, OPT_NO_OPT },
         { "jit", no_argument, NULL, OPT_JIT },
         { "no-chain", no_argument, NULL, OPT_NO_CHAIN },
+        { "cov-blocks", no_argument, NULL, OPT_COV_BLOCKS },
+        { "cov-out", required_argument, NULL, OPT_COV_OUT },
+        { "cov-map-size", required_argument, NULL, OPT_COV_MAP_SIZE },
+        { "fuzz-begin", required_argument, NULL, OPT_FUZZ_BEGIN },
+        { "fuzz-end", required_argument, NULL, OPT_FUZZ_END },
+        { "fuzz-input", required_argument, NULL, OPT_FUZZ_INPUT },
+        { "fuzz-crash-pc", required_argument, NULL, OPT_FUZZ_CRASH_PC },
+        { "fuzz-crash-exc", required_argument, NULL, OPT_FUZZ_CRASH_EXC },
+        { "fuzz-crash-irq", required_argument, NULL, OPT_FUZZ_CRASH_IRQ },
+        { "fuzz-iter-insns", required_argument, NULL, OPT_FUZZ_ITER_INSNS },
+        { "fuzz-replay", required_argument, NULL, OPT_FUZZ_REPLAY },
         { "stats", no_argument, NULL, 's' },
         { "dump-state", no_argument, NULL, 'd' },
         { "verbose", no_argument, NULL, 'v' },
@@ -215,7 +406,13 @@ int uam_run_main(int argc, char **argv)
     };
 
     const char *board_name = "rv32-ref", *console_spec = "stdio", *gdb_port = NULL;
-    const char *load_snap = NULL, *save_snap = NULL;
+    const char *load_snap = NULL, *save_snap = NULL, *mmio_input_path = NULL;
+    static uam_mmio_rule mmio_rules[UAM_MAX_MMIO_RULES];
+    size_t n_mmio_rules = 0;
+    bool mmio_input_rule = false;
+    uint8_t *mmio_input_data = NULL;
+    size_t mmio_input_len = 0;
+    uam_mmio_input *mmio_input = NULL;
     uint64_t snap_at_pc = 0;
     bool have_snap_at = false;
     char *uart_input_spec = NULL;
@@ -224,7 +421,16 @@ int uam_run_main(int argc, char **argv)
     uint64_t realtime_tps = 0, log_pcs[MAX_LIST], break_pcs[MAX_LIST], log_hits[MAX_LIST] = { 0 };
     unsigned n_log = 0, n_break = 0;
     bool have_raw_base = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
-    bool show_map = false, virtual_time = false;
+    bool show_map = false, virtual_time = false, cov_blocks = false;
+    const char *cov_out = NULL;
+    uint64_t cov_map_size = 1u << 16;
+    uint8_t *cov_map = NULL;
+    uam_cov_state cov_state = { 0 };
+    uam_fuzz_config fz = { .crash_exc = UAM_FUZZ_EXC_DEFAULT };
+    uint64_t fuzz_crash_pcs[MAX_LIST], fuzz_end_pcs[MAX_LIST];
+    size_t n_fuzz_end = 0;
+    bool have_begin = false, fuzz_opts = false;
+    const char *fuzz_input = NULL, *fuzz_replay = NULL;
     unsigned trace = 0, block_insns = 0;
     uam_board_option options[MAX_LIST];
     uam_board_image images[MAX_LIST];
@@ -233,9 +439,40 @@ int uam_run_main(int argc, char **argv)
     uam_board_config cfg = { .unknown_mmio = UAM_UNKNOWN_FAULT, .options = options, .images = images,
                              .netdevs = nics };
 
+    /* The option table: ours, then each extension's. */
+    enum { MAX_EXT_OPTS = 64 };
+    struct option all[UAM_ARRAY_LEN(opts) + MAX_EXT_OPTS];
+    size_t n_all = UAM_ARRAY_LEN(opts) - 1, n_ext_opts = 0;
+    size_t ext_of[MAX_EXT_OPTS], opt_of[MAX_EXT_OPTS];
+    memcpy(all, opts, sizeof(opts[0]) * n_all);
+    for (size_t e = 0; e < es->n; e++) {
+        for (size_t i = 0; i < es->ext[e]->n_opts; i++) {
+            if (n_ext_opts == MAX_EXT_OPTS) {
+                fprintf(stderr, "uam-run: too many extension options\n");
+                return 2;
+            }
+            const uam_runner_opt *o = &es->ext[e]->opts[i];
+            all[n_all++] = (struct option){ o->name, o->has_arg ? required_argument : no_argument,
+                                            NULL, OPT_EXT_BASE + (int)n_ext_opts };
+            ext_of[n_ext_opts] = e;
+            opt_of[n_ext_opts++] = i;
+        }
+    }
+    all[n_all] = (struct option){ 0 };
+    bool cov_map_size_given = false;
+
     optind = 1;
     int c;
-    while ((c = getopt_long(argc, argv, "b:n:t:o:sdvh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "b:n:t:o:sdvh", all, NULL)) != -1) {
+        if (c >= OPT_EXT_BASE && (size_t)(c - OPT_EXT_BASE) < n_ext_opts) {
+            size_t k = (size_t)(c - OPT_EXT_BASE), e = ext_of[k];
+            char err[256] = "";
+            if (!es->ext[e]->option(es->st[e], opt_of[k], optarg, err, sizeof(err))) {
+                fprintf(stderr, "uam-run: --%s: %s\n", es->ext[e]->opts[opt_of[k]].name, err);
+                return 2;
+            }
+            continue;
+        }
         switch (c) {
         case 'b': board_name = optarg; break;
         case 'n': max_insns = strtoull(optarg, NULL, 0); break;
@@ -324,6 +561,63 @@ int uam_run_main(int argc, char **argv)
             else if (!strcmp(optarg, "echo")) cfg.unknown_mmio = UAM_UNKNOWN_ECHO;
             else { fprintf(stderr, "uam-run: bad --unknown-mmio '%s'\n", optarg); return 2; }
             break;
+        case OPT_MMIO_RULE: {
+            char err[128];
+            if (n_mmio_rules == UAM_MAX_MMIO_RULES) {
+                fprintf(stderr, "uam-run: at most %u --mmio-rule options\n", UAM_MAX_MMIO_RULES);
+                return 2;
+            }
+            if (uam_mmio_rule_parse(optarg, &mmio_rules[n_mmio_rules], err, sizeof(err)) != UAM_OK) {
+                fprintf(stderr, "uam-run: bad --mmio-rule '%s': %s\n", optarg, err);
+                return 2;
+            }
+            mmio_input_rule |= mmio_rules[n_mmio_rules].policy == UAM_MMIO_INPUT;
+            n_mmio_rules++;
+            break;
+        }
+        case OPT_MMIO_INPUT: mmio_input_path = optarg; break;
+        case OPT_COV_BLOCKS: cov_blocks = true; break;
+        case OPT_COV_OUT: cov_out = optarg; break;
+        case OPT_COV_MAP_SIZE: cov_map_size = parse_size(optarg); cov_map_size_given = true; break;
+        case OPT_FUZZ_BEGIN: fz.begin_pc = strtoull(optarg, NULL, 0); have_begin = true; break;
+        case OPT_FUZZ_END:
+            if (n_fuzz_end == MAX_LIST) {
+                fprintf(stderr, "uam-run: at most %d --fuzz-end options\n", MAX_LIST);
+                return 2;
+            }
+            fuzz_end_pcs[n_fuzz_end++] = strtoull(optarg, NULL, 0);
+            fuzz_opts = true;
+            break;
+        case OPT_FUZZ_INPUT: fuzz_input = optarg; fuzz_opts = true; break;
+        case OPT_FUZZ_CRASH_PC:
+            if (fz.n_crash_pcs == MAX_LIST) {
+                fprintf(stderr, "uam-run: at most %d --fuzz-crash-pc options\n", MAX_LIST);
+                return 2;
+            }
+            fuzz_crash_pcs[fz.n_crash_pcs++] = strtoull(optarg, NULL, 0);
+            fuzz_opts = true;
+            break;
+        case OPT_FUZZ_CRASH_EXC:
+            if (!uam_fuzz_parse_exc_classes(optarg, &fz.crash_exc)) {
+                fprintf(stderr, "uam-run: bad --fuzz-crash-exc '%s' (classes: fetch, load, store, "
+                        "align, xlate, trap, sysreg, all, default, none)\n", optarg);
+                return 2;
+            }
+            fuzz_opts = true;
+            break;
+        case OPT_FUZZ_CRASH_IRQ: {
+            char *end;
+            unsigned long line = strtoul(optarg, &end, 0);
+            if (*end || line > 63) {
+                fprintf(stderr, "uam-run: bad --fuzz-crash-irq '%s' (an interrupt line, 0..63)\n", optarg);
+                return 2;
+            }
+            fz.crash_irq_lines |= UINT64_C(1) << line;
+            fuzz_opts = true;
+            break;
+        }
+        case OPT_FUZZ_ITER_INSNS: fz.iter_insns = strtoull(optarg, NULL, 0); fuzz_opts = true; break;
+        case OPT_FUZZ_REPLAY: fuzz_replay = optarg; fuzz_opts = true; break;
         default: usage(stderr); return 2;
         }
     }
@@ -339,6 +633,56 @@ int uam_run_main(int argc, char **argv)
     const char *image = optind < argc ? argv[optind] : NULL;
     if (have_snap_at && !save_snap) {
         fprintf(stderr, "uam-run: --snapshot-at needs --save-snapshot FILE\n");
+        return 2;
+    }
+    unsigned provides = 0;
+    for (size_t e = 0; e < es->n; e++)
+        if (es->ext[e]->provides)
+            provides |= es->ext[e]->provides(es->st[e]);
+    const bool fuzzing = have_begin || (provides & UAM_RUNNER_EXT_BEGIN);
+    if ((have_begin || n_fuzz_end) && (provides & UAM_RUNNER_EXT_BEGIN)) {
+        fprintf(stderr, "uam-run: --fuzz-begin/--fuzz-end and a boundary file both set the "
+                "iteration boundaries\n");
+        return 2;
+    }
+    if (fuzz_opts && !fuzzing) {
+        fprintf(stderr, "uam-run: the --fuzz-* options need --fuzz-begin PC (or a boundary file)\n");
+        return 2;
+    }
+    if ((provides & UAM_RUNNER_EXT_FRONTEND) && !fuzzing) {
+        fprintf(stderr, "uam-run: a fuzz frontend needs --fuzz-begin PC (or a boundary file)\n");
+        return 2;
+    }
+    if (fuzzing && !fuzz_replay && !(provides & UAM_RUNNER_EXT_FRONTEND)) {
+        fprintf(stderr, "uam-run: fuzzing needs a frontend (--fuzz-replay FILE|DIR, ...)\n");
+        return 2;
+    }
+    if (fuzz_replay && (provides & UAM_RUNNER_EXT_FRONTEND)) {
+        fprintf(stderr, "uam-run: --fuzz-replay and another frontend are both given\n");
+        return 2;
+    }
+    if (cov_blocks && (provides & UAM_RUNNER_EXT_SITES)) {
+        fprintf(stderr, "uam-run: --cov-blocks and a coverage site list are both given\n");
+        return 2;
+    }
+    if (fuzzing && !fuzz_input) {
+        fprintf(stderr, "uam-run: --fuzz-begin needs an input route (--fuzz-input ROUTE)\n");
+        return 2;
+    }
+    if (fuzzing && (gdb_port || save_snap)) {
+        fprintf(stderr, "uam-run: --fuzz-begin does not combine with --gdb or --save-snapshot\n");
+        return 2;
+    }
+    if (cov_out && !cov_blocks && !(provides & UAM_RUNNER_EXT_SITES) && !fuzzing) {
+        fprintf(stderr, "uam-run: --cov-out needs a coverage source (--cov-blocks, a site list)\n");
+        return 2;
+    }
+    fz.crash_pcs = fuzz_crash_pcs;
+    fz.end_pcs = fuzz_end_pcs;
+    fz.n_end_pcs = n_fuzz_end;
+    fz.boot_insns = max_insns;
+    if (cov_map_size < 2 || cov_map_size > (UINT64_C(1) << 30) || (cov_map_size & (cov_map_size - 1))) {
+        fprintf(stderr, "uam-run: --cov-map-size must be a power of two from 2 to 1G\n");
         return 2;
     }
     const uam_board *board = uam_board_find(board_name);
@@ -384,13 +728,40 @@ int uam_run_main(int argc, char **argv)
         if (!nics[i].nd->receive)
             fprintf(stderr, "uam-run: board '%s' has no network port '%s'; --nic %s=... is unused\n",
                     board_name, nics[i].name, nics[i].name);
+    if (mmio_input_path || mmio_input_rule) {
+        if (mmio_input_path && !read_file(mmio_input_path, &mmio_input_data, &mmio_input_len)) {
+            fprintf(stderr, "uam-run: cannot read --mmio-input %s\n", mmio_input_path);
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        if (!mmio_input_path && !fuzzing)
+            fprintf(stderr, "uam-run: 'input' rules without --mmio-input read 0\n");
+        else if (!mmio_input_rule)
+            fprintf(stderr, "uam-run: --mmio-input is unused: no --mmio-rule has policy 'input'\n");
+        mmio_input = uam_mmio_input_create();
+        if (!mmio_input) {
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        uam_mmio_input_set(mmio_input, mmio_input_data, mmio_input_len);
+        if (!fuzzing)   /* fuzz inputs run out all the time */
+            uam_mmio_input_on_exhausted(mmio_input, on_mmio_input_exhausted, mmio_input);
+    }
+    if (n_mmio_rules || mmio_input) {
+        st = uam_board_add_mmio_rules(&m, mmio_rules, n_mmio_rules, mmio_input);
+        if (st != UAM_OK) {
+            fprintf(stderr, "uam-run: --mmio-rule: %s\n", uam_status_str(st));
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+    }
     if (show_map) {
         fprintf(stderr, "bus map of '%s':\n", board_name);
         uam_bus_dump_map(&m.bus, stderr);
     }
 
+    uam_image_info info = { 0 };
     if (image) {
-        uam_image_info info;
         st = uam_load_image(&m.bus, &m.cpu, image, have_raw_base ? raw_base : m.reset_pc, &info);
         if (st != UAM_OK) {
             fprintf(stderr, "uam-run: loading %s failed: %s\n", image, uam_status_str(st));
@@ -436,6 +807,65 @@ int uam_run_main(int argc, char **argv)
         uam_exec_add_pc_hook(&m.exec, snap_at_pc, snapshot_at_hook, &snap_hook);
     for (unsigned i = 0; i < n_break; i++)
         uam_exec_add_pc_hook(&m.exec, break_pcs[i], break_hook, NULL);
+    uam_runner_setup xs = { .m = &m, .have_image = image != NULL, .image = info,
+                            .have_raw_base = have_raw_base, .raw_base = raw_base,
+                            .map_size_option = cov_map_size_given ? (uint32_t)cov_map_size : 0 };
+    for (size_t e = 0; e < es->n; e++) {
+        if (!es->ext[e]->setup)
+            continue;
+        uam_runner_setup one = xs;
+        char err[512] = "";
+        if (es->ext[e]->setup(es->st[e], &one, err, sizeof(err)) != UAM_OK) {
+            fprintf(stderr, "uam-run: %s: %s\n", es->ext[e]->name, err);
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        if (one.sites) {
+            xs.sites = one.sites; xs.n_sites = one.n_sites; xs.scheme = one.scheme;
+            xs.history = one.history;
+            xs.map_size = one.map_size; xs.namer = one.namer; xs.namer_ctx = one.namer_ctx;
+        }
+        if (one.have_begin) {
+            xs.have_begin = true; xs.begin_pc = one.begin_pc; xs.end_pcs = one.end_pcs;
+            xs.n_end_pcs = one.n_end_pcs; xs.nested = one.nested;
+        }
+        if (one.frontend) {
+            xs.frontend = one.frontend;
+            xs.frontend_ctx = one.frontend_ctx;
+        }
+    }
+    if (xs.map_size)
+        cov_map_size = xs.map_size;
+    if (xs.sites)
+        fz.history = xs.history;
+    if (xs.have_begin) {
+        fz.begin_pc = xs.begin_pc;
+        fz.end_pcs = xs.end_pcs;
+        fz.n_end_pcs = xs.n_end_pcs;
+        fz.nested = xs.nested;
+    }
+    if (xs.sites && !fuzzing) {
+        char err[256];
+        cov_map = calloc(1, cov_map_size);
+        uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size, &xs.history);
+        if (!cov_map || uam_exec_set_coverage(&m.exec, xs.sites, xs.n_sites, &cov_state, err,
+                                              sizeof(err)) != UAM_OK) {
+            fprintf(stderr, "uam-run: cannot enable coverage: %s\n", err);
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        if (xs.namer)
+            uam_cov_pass_set_namer(m.exec.cov_pass, xs.namer, xs.namer_ctx);
+    }
+    if (cov_blocks && !fuzzing) {
+        cov_map = calloc(1, cov_map_size);
+        uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size, NULL);
+        if (!cov_map || uam_exec_set_block_coverage(&m.exec, &cov_state) != UAM_OK) {
+            fprintf(stderr, "uam-run: cannot enable coverage\n");
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+    }
 
     uam_host_add_chardev(host, console);
     /* Guest network stacks time out in virtual time: with virtual pacing an idle
@@ -465,9 +895,12 @@ int uam_run_main(int argc, char **argv)
     sigaction(SIGINT, &sa, &old_int);
     sigaction(SIGTERM, &sa, &old_term);
 
-    uam_stop_reason why;
+    uam_stop_reason why = UAM_STOP_NONE;
     uam_chardev_hold(console, false);   /* the machine is set up: input may flow */
-    if (gdb_port) {
+    if (fuzzing) {
+        rc = run_fuzz(&m, &fz, cov_blocks, fuzz_input, mmio_input, fuzz_replay, cov_out,
+                      cov_map_size, stats, &xs, es);
+    } else if (gdb_port) {
         uam_gdb *g = uam_gdb_create(&m);
         if (!g || uam_gdb_listen(g, gdb_port) != UAM_OK) {
             fprintf(stderr, "uam-run: cannot start the gdb server on %s\n", gdb_port);
@@ -486,7 +919,9 @@ int uam_run_main(int argc, char **argv)
     sigaction(SIGTERM, &old_term, NULL);
     g_machine = NULL;
 
-    switch (why) {
+    switch (fuzzing ? UAM_STOP_NONE : why) {
+    case UAM_STOP_NONE:
+        break;   /* fuzzing: rc is the harness's */
     case UAM_STOP_REQUEST:
     case UAM_STOP_HALT:
         /* Pass the firmware's status through when it fits the 1..123 range. */
@@ -508,9 +943,10 @@ int uam_run_main(int argc, char **argv)
     default:                  rc = 126; break;
     }
 
-    fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
-            uam_stop_reason_str(why), (long long)m.exec.stop_status,
-            (unsigned long long)m.cpu.pc, (unsigned long long)m.cpu.icount);
+    if (!fuzzing)
+        fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
+                uam_stop_reason_str(why), (long long)m.exec.stop_status,
+                (unsigned long long)m.cpu.pc, (unsigned long long)m.cpu.icount);
     if (stats) {
         const uam_exec_stats *s = &m.exec.stats;
         fprintf(stderr,
@@ -525,6 +961,27 @@ int uam_run_main(int argc, char **argv)
                 (unsigned long long)s->blocks_native, (unsigned long long)s->blocks_chained,
                 (unsigned long long)(s->blocks_executed - s->blocks_native),
                 (unsigned long long)s->blocks_compiled, (unsigned long long)s->blocks_interp);
+        if (mmio_input)
+            fprintf(stderr, "stats: mmio input used=%zu of %zu bytes\n",
+                    uam_mmio_input_pos(mmio_input), mmio_input_len);
+        if (cov_map) {
+            uint64_t hit = 0;
+            for (uint64_t i = 0; i < cov_map_size; i++)
+                hit += cov_map[i] != 0;
+            fprintf(stderr, "stats: coverage map=%llu bytes, buckets hit=%llu\n",
+                    (unsigned long long)cov_map_size, (unsigned long long)hit);
+        }
+    }
+    if (cov_out && !fuzzing) {
+        FILE *f = fopen(cov_out, "wb");
+        bool ok = f && fwrite(cov_map, 1, cov_map_size, f) == cov_map_size;
+        if (f && fclose(f) != 0)
+            ok = false;
+        if (!ok) {
+            fprintf(stderr, "uam-run: cannot write the coverage map to %s\n", cov_out);
+            if (rc == 0)
+                rc = 2;
+        }
     }
     if (dump)
         m.cpu.isa->dump_state(&m.cpu, stderr);
@@ -543,6 +1000,10 @@ int uam_run_main(int argc, char **argv)
         fprintf(stderr, "uam-run: --snapshot-at 0x%llx was never reached; no snapshot saved\n",
                 (unsigned long long)snap_at_pc);
 
+    for (size_t e = 0; e < es->n; e++)
+        if (es->ext[e]->finish)
+            rc = es->ext[e]->finish(es->st[e], &m, fuzzing, rc);
+
     uam_host_destroy(host);  /* detach from the executor before it goes away */
     host = NULL;
     uam_machine_fini(&m);
@@ -551,6 +1012,43 @@ out_host:
     for (size_t i = 0; i < cfg.n_netdevs; i++)
         uam_netdev_destroy(nics[i].nd);   /* after the machine: devices detach first */
     uam_chardev_destroy(console);
+    uam_mmio_input_free(mmio_input);   /* after the machine: its stubs read it */
+    free(mmio_input_data);
+    free(cov_map);   /* after the machine: the hart pointed at it */
     free(uart_input_spec);
     return rc;
+}
+
+int uam_run_main_ext(int argc, char **argv, const uam_runner_ext *const *exts, size_t n_exts)
+{
+    enum { MAX_EXTS = 16 };
+    void *st[MAX_EXTS] = { 0 };
+    if (n_exts > MAX_EXTS) {
+        fprintf(stderr, "uam-run: at most %d runner extensions\n", MAX_EXTS);
+        return 2;
+    }
+    for (size_t i = 0; i < n_exts; i++) {
+        if (exts[i]->create && !(st[i] = exts[i]->create())) {
+            fprintf(stderr, "uam-run: cannot set up extension %s\n", exts[i]->name);
+            while (i--)
+                if (exts[i]->destroy)
+                    exts[i]->destroy(st[i]);
+            return 2;
+        }
+    }
+    g_exts = exts;
+    g_n_exts = n_exts;
+    ext_set es = { .ext = exts, .st = st, .n = n_exts };
+    int rc = run_main(argc, argv, &es);
+    for (size_t i = 0; i < n_exts; i++)
+        if (exts[i]->destroy)
+            exts[i]->destroy(st[i]);
+    g_exts = NULL;
+    g_n_exts = 0;
+    return rc;
+}
+
+int uam_run_main(int argc, char **argv)
+{
+    return uam_run_main_ext(argc, argv, uam_runner_stock_exts, uam_runner_n_stock_exts);
 }

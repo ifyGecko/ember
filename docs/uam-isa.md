@@ -69,6 +69,11 @@ loop:
 Ops inside a block execute in order. A block ends at its first taken exit: a guarded `EXIT`
 whose guard is true, the final unguarded terminator, or an abort (fault or exit request, §9).
 
+A backend may go straight from one block's `EXIT` into the next block, without the loop's
+steps in between (the JIT's block chaining), only when those steps would do nothing: no exit
+request pending and the deadline not reached, the same test an `IMARK` makes. The result must
+be the same as running the loop.
+
 ---
 
 ## 3. Types, operands and registers
@@ -163,7 +168,8 @@ Ops that accept a guard: `PUT, LD, ST, AMO, CAS, SYSRD, SYSWR, HELPER (effectful
 | Select | `SELECT` | 1 |
 | Control | `EXIT` | 1 |
 | System / escape | `SYSRD SYSWR TRAP WAIT HELPER` | 5 |
-| **Total** | | **47** |
+| Instrumentation | `COV` (inserted by passes only, §7.5) | 1 |
+| **Total** | | **48** |
 
 Some opcodes are left out on purpose. `NOT`, `NEG`, `MOV`, `SGT`/`UGT`, `ROTL`, `MULHSU`, and
 partial-register insert/extract are all short compositions of the ops above (§10). Leaving them
@@ -292,12 +298,45 @@ effect ∈ { PURE, READS_STATE, WRITES_STATE, MAY_FAULT }   (a bitmask)
   and optimisers may move or remove them.
 - Any helper with `WRITES_STATE` or `MAY_FAULT` is treated like a store for ordering and for the
   commit rule (§8).
-- Instrumentation (coverage, cmp-logging, taint) is inserted as helpers. Analysis needs no
-  extra opcodes.
+- Instrumentation that needs host code (cmp-logging, taint) is inserted as helpers. Edge
+  coverage is the exception: it has its own opcode (§7.5), because it runs on every
+  instrumented instruction and must stay inline in native code.
 
 Helpers are the pressure valve for complex semantics (floating point, crypto, `mret`-style mode
 switches). The rule of thumb: **if an operation can be expressed in fewer than ~10 core ops, do
 not make it a helper.**
+
+### 7.5 Coverage
+
+`COV.32 A, B` counts one edge in the hart's coverage state (`uam_cov_state`, owned by
+whoever enabled coverage). The state holds the map, its `mask`, and a history of up to
+`UAM_COV_HIST_MAX` (7) earlier `B` values `hist[]`, of which `depth` are folded (0 means 1),
+each rotated left by `rot[j]` within the map's width `bits` first (0: no rotation):
+
+```
+idx = A
+for j < depth: idx ^= rot[j] ? rotl(hist[j], rot[j]) : hist[j]
+idx &= mask
+if (map[idx] != 0xff) map[idx]++               // saturating 8-bit counter
+hist[depth-1..1] = hist[depth-2..0]; hist[0] = B
+rotl(v, r) = ((v << r) | (v >> (bits - r))) & mask      // 32-bit arithmetic
+```
+
+`A` and `B` are 32-bit immediates chosen when the block is translated. The history shape
+(`depth`, `rot`, `bits`, set with `uam_cov_state_init` and checked by
+`uam_exec_set_coverage`) and `mask` are fixed while coverage is on: the JIT compiles the
+shape in (the default shape costs exactly what the one-predecessor op always did), and
+changing it means calling `uam_exec_set_coverage` again, which flushes every translation.
+With the default shape (depth 1, no rotation; `hist[0]` is also called `prev`) the rule is
+`idx = (A ^ prev) & mask; prev = B`, which covers AFL-style edges (`A = cur`,
+`B = cur >> 1`) and block counts (`B = 0`). Deeper histories give N-gram coverage that
+folds the last N-1 sites, and rotation makes the fold order-sensitive (suzzer's schemes;
+`uam_cov_count` in `cpu.h` is the reference implementation). `COV` reads and writes nothing else: no register, no
+memory, no bus access, and it does not count as an instruction (`icount` is unchanged). With
+no coverage state attached (`cov` is NULL) it does nothing. Lifters never emit it; a pass
+inserts it directly after the `IMARK` of an instrumented instruction (§8 rule 8), so it runs
+exactly once each time that instruction starts, including when a block is interrupted and
+resumed.
 
 ---
 
@@ -321,6 +360,8 @@ The verifier (run on every lifted block in debug builds) enforces these rules:
    those are so that self-modifying code can invalidate it.
 7. **Length.** At most `MAX_BLOCK_INSNS` guest instructions per block (a tunable that bounds
    interrupt latency).
+8. **Coverage op.** `COV` has width 32, two immediate operands and no guard, and comes
+   directly after an `IMARK` that is not a continuation (`UAM_IMARK_CONT`).
 
 ---
 
@@ -345,10 +386,14 @@ ISA's sub-cause) from **bus** faults (`*_FAULT`: nothing answered at the
 physical address). Alignment is checked before translation.
 
 **Exit requests** are how the outside world interrupts a running block without polling on
-every op. Device writes that raise an interrupt line, `SYSWR` handlers that change interrupt
-enables, `FENCE.INSN`, and scheduler deadlines all set `cpu->exit_request`. The executor checks it
-at each `IMARK`. Because of the commit rule, stopping at an `IMARK` is always a clean
-architectural boundary. Interrupt acceptance (`isa->irq_accept`) runs between blocks.
+every op. Any interrupt line change, `SYSWR` handlers that change interrupt enables, software
+interrupt bits or the privilege level, translation changes, writes to translated code, stop
+and reset requests, and a timer armed earlier than the current deadline all set
+`cpu->exit_request`. The executor checks it at each `IMARK`, and before chaining into another
+block. Because of the commit rule, stopping at an `IMARK` is always a clean architectural
+boundary. Interrupt acceptance (`isa->irq_take`) runs between blocks, and is only re-evaluated
+after an exit request, so an ISA must raise one on every change that can make an interrupt
+deliverable.
 
 ---
 

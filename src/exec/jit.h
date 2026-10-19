@@ -8,7 +8,7 @@
  * interpreted, and a host without a code generator disables it transparently.
  *
  * Design (see jit_x86.c): one compiled function per block, emitting inline host code
- * for the hot opcodes (IMARK, GET, PUT, LD, plain ST, EXIT and the common integer,
+ * for the hot opcodes (IMARK, GET, PUT, LD, plain ST, EXIT, COV and the common integer,
  * compare, select and conversion ops) and calling shared C for the rest - rare pure
  * ops go through the same evaluator as the interpreter (ir_eval.h), and every memory
  * access goes through execops.h, so the two backends cannot diverge. A block using an

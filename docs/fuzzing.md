@@ -1,0 +1,227 @@
+# Coverage and fuzzing
+
+ember fuzzes firmware in-process: boot once, snapshot at the start of the code under test,
+and run every input from that snapshot, counting edge coverage on the way. It works on its own
+(no fuzzer needed to build, run, collect coverage or replay inputs). Interoperation with
+suzzer goes only through suzzer's published formats, read from a suzzer checkout the build is
+given ([`suzzer.md`](suzzer.md)): its site lists and boundary files work today, its network
+protocol and shared-memory export are planned (see the end of this page).
+
+## Coverage model
+
+Coverage is one IR opcode, `UAM_OP_COV A, B` ([`uam-isa.md`](uam-isa.md) §7.5), which the
+coverage pass inserts right after the instruction marker of each instrumented instruction:
+
+```
+idx = (A ^ prev) & mask
+if (map[idx] != 0xff) map[idx]++      // saturating 8-bit counters
+prev = B
+```
+
+`A` and `B` are fixed when a block is translated, so the scheme is just a table of
+`(guest pc, A, B)` sites (`uam_exec_set_coverage`, `uam/exec.h`):
+
+| Scheme | A | B |
+|---|---|---|
+| AFL edges | `cur` | `cur >> 1` |
+| block counts | `id` | `0` |
+| suzzer site model, N=1 | `site_id` | `0` |
+| suzzer site model, N=2 | `site_id` | `spread(site_id)` |
+| suzzer hashed-PC model, N=1 | `hash_pc(offset, module)` | `0` |
+| suzzer hashed-PC model, N=2 | `hash_pc(offset, module)` | `A >> 1` |
+
+Without a site table, block mode (`--cov-blocks`, `uam_exec_set_block_coverage`) puts a site
+at every translated block's start with `A = hash(pc)`, `B = A >> 1`. It is approximate: ember
+blocks are not basic blocks (they end at a size limit, at hooks and page ends, and an
+interrupted block resumes mid-way), so the edges depend on how code was split, though never
+on the backend.
+
+Properties:
+
+- **Coverage off costs nothing**: no block contains COV.
+- **The guest is unaffected**: COV touches only the map. `icount`, timing, registers and
+  memory are identical with coverage on.
+- **Backends agree**: the interpreter and the JIT (chained or not) produce byte-identical
+  maps. The JIT emits COV inline, about ten host instructions with no call.
+- The map is never snapshot state. Sites match the guest *virtual* pc. Instructions in delay
+  slots cannot be sites (translating one fails the run, naming the pc).
+
+Overhead, synthetic worst case (a MIPS loop of 2-7 instruction blocks): JIT +31%,
+interpreter +4%.
+
+## The harness (`uam/fuzz.h`)
+
+1. **Boot** until the first arrival at the begin pc. Coverage so far is the *INIT* map.
+2. **Snapshot** there.
+3. **Each input**: restore the snapshot, clear the map and `prev`, deliver the input, run
+   until the iteration ends, a crash check fires or the budget runs out, then classify.
+   A crash does not end the campaign; the next input starts from the snapshot.
+
+Iteration boundaries mirror LCVB1: *paired* (`--fuzz-begin` and one or more `--fuzz-end`:
+reaching any end pc ends the iteration) or *begin-only* (only `--fuzz-begin`: arriving there
+again ends the iteration). In paired mode, an input that never reaches an end runs out of
+budget (a timeout). All are PC hooks. The same input from the same snapshot gives the same map
+and verdict, on every backend.
+
+There is **one begin pc for now**: the harness snapshots at a single point. Several begins (a
+target with two request handlers, say) would need a choice of where to snapshot, and are left
+for later.
+
+**Recursion.** With nested boundaries (`uam_fuzz_config.nested`, set from depth-zero-only
+LCVB1 markers), a begin reached during an iteration opens a nested level and every end
+closes one. Only the end that closes the outermost level ends the iteration, so a recursive
+handler is one input. Without nesting, the first end reached ends it.
+
+**Between iterations.** With paired boundaries, the code between an end and the next begin
+(the target's own loop, reading the next request) never runs per input, because each input
+starts from the snapshot at the begin. It runs once during boot and is counted in the INIT
+map. That is intended: it does not depend on the input. libcov, which runs the target
+continuously, publishes it as a separate GAP map; ember has none.
+
+### Input routes (`--fuzz-input`)
+
+| Route | Delivery |
+|---|---|
+| `mem:ADDR[,len=ADDR][,max=N]` | the input written at virtual ADDR (truncated to N bytes, default 4096), and optionally its length as a 32-bit word in the CPU's byte order |
+| `mmio` | the stream that `--mmio-rule ...:input` registers read |
+| a board input | anything a board published with `uam_machine_add_input`; the stock boards publish `uart0` (the receive FIFO; what does not fit is dropped) |
+
+The harness never names a device: boards publish inputs, the harness picks one by name.
+
+### Verdicts
+
+| Verdict | Cause | detail | `--fuzz-replay` exit |
+|---|---|---|---|
+| ok | the iteration ended (or the firmware halted with status 0) | 0 | 0 |
+| crash (fault) | an exception of a crashing class (`--fuzz-crash-exc`), a fetch fault loop, an internal error | faulting pc | 20 |
+| crash (oracle) | a `--fuzz-crash-pc` reached, a `--fuzz-crash-irq` interrupt taken, a reset during the iteration, a non-zero halt, a debug trap | the pc (0 for a reset, the status for a halt, the crashing lines for an interrupt) | 21 |
+| hang | deadlock or livelock | the stop reason | 22 |
+| timeout | `--fuzz-iter-insns` (default 1e7) exhausted | 0 | 23 |
+
+Exception classes: `fetch`, `load`, `store` (bus faults), `align`, `xlate` (TLB misses and
+protection: firmware with a TLB takes these routinely), `trap` (illegal instructions, but also
+system calls and breakpoints), `sysreg`, `all`, `none`. The default is
+`fetch,load,store,align`. Exceptions outside the policy are delivered to the firmware as
+usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that end there.
+
+`--fuzz-crash-irq N` (repeatable, 0..63) makes taking an interrupt from line N a crash: a
+watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the
+`mcause` interrupt code (7 machine timer, 11 machine external), on MIPS32 the Cause.IP bit
+(0..7) that was pending and enabled. The interrupt is reported once the CPU has taken it
+(`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
+detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
+
+### Replay (`--fuzz-replay FILE|DIR`)
+
+Runs each input once (a directory in name order) and prints one line per input:
+
+```
+build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000318 --fuzz-crash-pc 0x80000222 \
+    --fuzz-input uart0 --fuzz-replay crashes/ build/firmware/fuzztarget.elf
+replay: 2-store: crash-fault pc=0x80000294 (store-fault cause 0x0 tval 0x40000000) insns=95 buckets=17
+```
+
+The exit status is the last input's verdict. `--cov-out FILE` writes the last input's map.
+In fuzz mode `-n` bounds the boot. `tests/fuzz/fuzztarget.h` is a small target with planted
+bugs used by `make fuzz-test`.
+
+### In a program
+
+```c
+uam_fuzz_config cfg = { .begin_pc = BEGIN, .crash_pcs = &panic_pc, .n_crash_pcs = 1,
+                        .crash_exc = UAM_FUZZ_EXC_DEFAULT };
+uam_fuzz *f = uam_fuzz_create(&m, &cfg, err, sizeof(err));
+uam_fuzz_set_block_coverage(f);                  /* or uam_fuzz_set_sites */
+uam_fuzz_select_route(f, "uart0", err, sizeof(err));
+uam_fuzz_boot(f, &r);
+for (each input)
+    uam_fuzz_run_one(f, data, len, &r);          /* r.verdict, r.detail, uam_fuzz_map(f) */
+```
+
+or hand the loop to a frontend (`uam_fuzz_run(f, &frontend, ctx)`: `hello`, an INIT report
+with id 0, then one report per input, `bye`).
+
+## Limitations
+
+- Sites are keyed on the virtual pc. Code reached through both kseg0 and kseg1 needs two
+  sites, and TLB-mapped code (ASIDs) is not distinguished.
+- One hart. Coverage state is per hart, so more harts need no format change.
+- Interrupts are reported only when taken, and only as a crash (`--fuzz-crash-irq`); an
+  interrupt line that is raised but masked is invisible to the harness.
+- `uam_fuzz_abort` (SIGINT in the runner) ends a campaign at the next instruction boundary.
+
+## suzzer
+
+ember reads suzzer's files through its published formats only. The options below exist when
+the build has a suzzer checkout (`make SUZZER_DIR=path`, or `make suzzer` to clone one into
+`./suzzer`); [`suzzer.md`](suzzer.md) explains the setup. `fuzz/suzzer/` is the only ember
+code that knows suzzer exists. Supported format versions: LCV3 3, LCVB1 1, LCVS 1, SZR1 1.
+
+### Site lists and boundaries
+
+```
+build/uam-run -b mips-ref --cov-sites fw.lcv3 --cov-boundary fw.lcvb --cov-strict \
+    --fuzz-input uart0 --fuzz-crash-pc 0x80102222 --fuzz-replay crashes/ fw.elf
+```
+
+| Option | |
+|---|---|
+| `--cov-sites LCV3` | coverage sites from a patch list; record *i* is site id *i* |
+| `--cov-module NAME=BASE` | a module's load base (repeatable). Otherwise the list's module base table (suzzer S2), then, for module 0, the image's link base (lowest ELF `PT_LOAD` vaddr, or `--raw-base`) |
+| `--cov-scheme site\|pc`, `--cov-ngram N`, `--cov-rotate` | libcov's model, N-gram length (1..8) and N-gram rotation; default site, N=2, no rotation, like libcov. For a map comparable with a device, match its libcov build (`LIBCOV_NGRAM_N`, `LIBCOV_NGRAM_ROTATE`); suzzer's brain recommends N=3 with rotation for fuzzing |
+| `--cov-map-size N` | overrides libcov's map-size rule (site model: from the site count and N; hashed-PC: 64 KiB) |
+| `--cov-strict` | each site's bytes in memory must equal the list's `orig[]`, checked at the first begin when fuzzing, else at the end of the run. Without it the check is only reported. A wrong base or byte order shows up here |
+| `--cov-boundary LCVB1` | iteration boundaries instead of `--fuzz-begin`/`--fuzz-end`: one BEGIN marker (more are refused for now) and any number of END markers, all with the same depth filter. Depth-zero-only markers keep nested BEGIN/END arrivals (recursion) inside one iteration. With "any depth", ember ends the iteration at the first END reached, where libcov would publish each nested segment separately |
+
+A site that is a branch delay slot cannot be instrumented. The run stops with an error naming
+the patch-list record and module. This is a policy, not a technical limit: suzzer's generator
+never places a site in a delay slot (libcov's trap-based sites cannot work there), so such a
+site usually means a wrong base or a hand-made list. Two designs remain open for later, and
+either would be fine:
+
+- **Count them.** ember runs a branch and its delay slot as one unit, so a COV right after the
+  delay slot's instruction marker would still count once per execution; the verifier's rule
+  that COV follows only non-continuation markers would be relaxed for it.
+- **Reject them, earlier.** Keep the policy, but detect delay-slot sites when the list is
+  loaded (a small ISA hook, "is this pc a delay slot?") instead of when that code is first
+  translated, which can be well into a run.
+
+The bucket formula is reimplemented in `fuzz/suzzer/scheme.c` from suzzer's specification.
+N>=2 uses the coverage state's history: depth N-1, with libcov's per-slot rotation amounts
+when `--cov-rotate` is given. `test_suzzer` replays every vector in the checkout's `test/vectors` (site and pc, N=1,
+2, 3, 4 and 8, rotation off and on, three map sizes) as guest code through `UAM_OP_COV` on
+each backend, and requires suzzer's expected bitmaps byte for byte. Suzzer has no vectors
+for N=5..7; the formula is the same for every N, but those lengths are untested. `tests/suzzer/suzzer-check.sh` runs the formats end to end with lists written by
+`tests/suzzer/mk_lists.py`.
+
+### The brain (`--fuzz-szr HOST:PORT`)
+
+ember plays `suzzer-relay`'s part: it dials `suzzer_brain.py` (retrying for a few seconds
+while the brain starts), runs each INPUT through the harness and answers it, in lockstep,
+with one COVERAGE or CRASH frame. It needs fuzzing boundaries (`--fuzz-begin` or
+`--cov-boundary`) and replaces `--fuzz-replay`. Any coverage source works: with
+`--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
+tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be` or
+`mips32le`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+
+| Verdict | SZR1 reply | `status` |
+|---|---|---|
+| ok | COVERAGE, kind ITER | |
+| crash (fault) | CRASH `GUEST_FAULT` (5) | the faulting pc, low 32 bits |
+| crash (oracle) | CRASH `ORACLE` (6) | the detail, low 32 bits: the crash pc, a halt status, the interrupt lines |
+| hang | CRASH `HANG` (7) | the stop reason |
+| timeout | CRASH `TIMEOUT` (8) | 0 |
+
+A malformed INPUT gets CRASH `MALFORMED` (4) and runs nothing; unknown frame types are
+ignored. A BYE from the brain ends the run (exit 0); the brain closing the connection without
+one is an error (exit 2). SIGINT sends BYE in place of the pending reply and exits 130.
+
+```
+python3 suzzer/tools/suzzer_brain.py --listen 127.0.0.1:7000 --seeds seeds/ --out run/
+build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000318 --fuzz-crash-pc 0x80000222 \
+    --fuzz-input uart0 --fuzz-iter-insns 200000 --fuzz-szr 127.0.0.1:7000 fw.elf
+```
+
+`tests/szr/fake_brain.py` checks the protocol frame by frame (`make suzzer-test`).
+
+Planned: LCVS shared-memory export (`--cov-shm`).

@@ -1,0 +1,3 @@
+# A suzzer clone made by `make suzzer` (tools/fetch-suzzer.sh): a separate project, used
+# in place, never part of this repository (docs/suzzer.md).
+/suzzer

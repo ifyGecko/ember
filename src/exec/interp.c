@@ -228,6 +228,15 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
             break;
         }
 
+        case UAM_OP_COV: {
+            /* Edge counter (section 7.5); no effect on guest state or icount. */
+            uam_cov_state *cs = cpu->cov;
+            if (cs)
+                uam_cov_count(cs, (uint32_t)blk->imm[uam_ref_index(in->a)],
+                              (uint32_t)blk->imm[uam_ref_index(in->b)]);
+            break;
+        }
+
         default: {
             /* Pure computation. */
             const uam_opinfo *oi = &uam_opinfo_table[in->op];

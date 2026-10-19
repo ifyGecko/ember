@@ -3,20 +3,29 @@
 #   make                 build $(BUILD)/uam-run and the libraries
 #   make lib             only the libraries (for out-of-tree projects)
 #   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE), external-board example,
-#                        snapshot round trips through the runner
+#                        snapshot round trips through the runner, coverage maps across backends,
+#                        the fuzz harness on planted-bug firmware
+#   make suzzer          clone suzzer into ./suzzer (ignored by git) for the suzzer integration
 #   make net-check       boot the network test on rv32-ref against a real tap and tun interface
 #                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
 #   make clean
 #
+# suzzer (optional; docs/suzzer.md): ember works on its own. To use it with suzzer, either point
+# the build at an existing checkout with SUZZER_DIR=path, or run `make suzzer` once to clone one
+# into ./suzzer, which is then picked up automatically. Without either, the suzzer options
+# (--cov-sites, --cov-boundary, ...) are left out and their tests are skipped.
+#
 # Out-of-tree use: `make -C path/to/uam BUILD=$PWD/build/uam lib` builds into another directory;
 # link $(BUILD)/libuam.a with -I path/to/uam/include (or use uam.pc after `make install`).
 #
 # Libraries, one per module group (each is also contained in libuam.a):
-#   libuam-core.a     IR, bus, scheduler, signals/chardev/netdev plumbing, executor, loader, machine
+#   libuam-core.a     IR, bus, scheduler, signals/chardev/netdev plumbing, executor, analysis passes,
+#                     loader, machine
 #   libuam-riscv.a    RISC-V ISA module          libuam-mips.a   MIPS32 ISA module
 #   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref)
-#   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main)
+#   libuam-fuzz.a     the fuzz harness and its frontends (fuzz/)
+#   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main; uses libuam-fuzz)
 
 CC      ?= cc
 AR      ?= ar
@@ -30,42 +39,67 @@ UAM_COMPILE := -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Wshadow -Wstric
 
 BUILD ?= build
 
+# ---- suzzer ------------------------------------------------------------------------------
+# SUZZER_DIR: an existing suzzer checkout to use in place. Else ./suzzer if `make suzzer`
+# cloned one there. Ember needs the format header suzzer publishes (src/lcv_formats.h).
+SUZZER_URL ?= git@github.com:ifyGecko/suzzer.git
+SUZZER_REV ?=
+ifeq ($(origin SUZZER_DIR),undefined)
+SUZZER_DIR := $(if $(wildcard suzzer/src/lcv_formats.h),suzzer,)
+else ifneq ($(SUZZER_DIR),)
+ifeq ($(wildcard $(SUZZER_DIR)/src/lcv_formats.h),)
+$(error SUZZER_DIR=$(SUZZER_DIR) has no src/lcv_formats.h: not a suzzer checkout, or one older than its published format header)
+endif
+endif
+HAVE_SUZZER := $(if $(SUZZER_DIR),1,)
+
 # One list per module, mirroring the dependency rules in docs/architecture.md.
-IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c
+IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c src/ir/pass.c
 CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
                src/core/state.c
-EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit_x86.c
+EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit_x86.c \
+               src/exec/coverage.c
+ANALYSIS_SRC := analysis/cov.c
 LOADER_SRC  := src/loader/loader.c
 MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/sifive_test.c \
-               devices/unknown_mmio.c devices/unimp.c devices/virtio_net.c
-BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/stock.c
+               devices/unknown_mmio.c devices/unimp.c devices/virtio_net.c devices/mmio_stub.c
+BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/stock.c boards/mmio_rules.c
+SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
+               fuzz/suzzer/frontend_szr1.c
+FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
+               $(if $(HAVE_SUZZER),$(SUZZER_SRC))
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c
 
-CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(LOADER_SRC) $(MACHINE_SRC)
-LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(DEV_SRC) $(BOARD_SRC) $(HOST_SRC)
+CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
+LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
 obj = $(1:%.c=$(BUILD)/obj/%.o)
 LIB_OBJ  := $(call obj,$(LIB_SRC))
 
 LIB        := $(BUILD)/libuam.a
 MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mips.a \
-               $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-host.a
+               $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
+               $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
 TEST_IR   := $(BUILD)/test_ir
 TEST_CORE := $(BUILD)/test_core
 TEST_HOST := $(BUILD)/test_host
 TEST_SNAP := $(BUILD)/test_snapshot
 TEST_JIT  := $(BUILD)/test_jit
+TEST_MMIO := $(BUILD)/test_mmio
+TEST_COV  := $(BUILD)/test_cov
+TEST_FUZZ := $(BUILD)/test_fuzz
+TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
 FW_MIPS_BE := $(BUILD)/firmware-mips/selftest-be.elf
 FW_MIPS_EL := $(BUILD)/firmware-mips/selftest-el.elf
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test unit-test firmware-test firmware firmware-mips mips-test example-test \
-        snapshot-test net-check install clean
+        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check install clean FORCE
 
 all: $(RUN) lib
 
@@ -74,6 +108,22 @@ lib: $(LIB) $(MODULE_LIBS) $(BUILD)/uam.pc
 $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(UAM_COMPILE) -MMD -MP -c $< -o $@
+
+# fuzz/suzzer/ alone sees suzzer, and only its format header (src/lcv_formats.h).
+$(BUILD)/obj/fuzz/suzzer/%.o: fuzz/suzzer/%.c $(BUILD)/suzzer.cfg
+	@mkdir -p $(dir $@)
+	$(CC) $(UAM_COMPILE) -I$(SUZZER_DIR)/src -MMD -MP -c $< -o $@
+
+# The stock runner extensions include the suzzer one only when suzzer is configured.
+$(BUILD)/obj/fuzz/stock_exts.o: fuzz/stock_exts.c $(BUILD)/suzzer.cfg
+	@mkdir -p $(dir $@)
+	$(CC) $(UAM_COMPILE) $(if $(HAVE_SUZZER),-DUAM_HAVE_SUZZER) -MMD -MP -c $< -o $@
+
+# Which suzzer the objects were built against; rewritten only when that changes, so
+# switching SUZZER_DIR (or cloning one) rebuilds what depends on it.
+$(BUILD)/suzzer.cfg: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(abspath $(SUZZER_DIR))' | cmp -s - $@ || echo '$(abspath $(SUZZER_DIR))' > $@
 
 $(LIB): $(LIB_OBJ)
 	@rm -f $@
@@ -84,6 +134,7 @@ $(BUILD)/libuam-riscv.a:   $(call obj,$(RISCV_SRC))
 $(BUILD)/libuam-mips.a:    $(call obj,$(MIPS_SRC))
 $(BUILD)/libuam-devices.a: $(call obj,$(DEV_SRC))
 $(BUILD)/libuam-boards.a:  $(call obj,$(BOARD_SRC))
+$(BUILD)/libuam-fuzz.a:    $(call obj,$(FUZZ_SRC))
 $(BUILD)/libuam-host.a:    $(call obj,$(HOST_SRC))
 $(MODULE_LIBS):
 	@rm -f $@
@@ -116,6 +167,40 @@ $(TEST_SNAP): $(BUILD)/obj/tests/unit/test_snapshot.o $(LIB)
 $(TEST_JIT): $(BUILD)/obj/tests/unit/test_jit.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^
 
+$(TEST_MMIO): $(BUILD)/obj/tests/unit/test_mmio.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(TEST_COV): $(BUILD)/obj/tests/unit/test_cov.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(TEST_FUZZ): $(BUILD)/obj/tests/unit/test_fuzz.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
+$(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
+	@mkdir -p $(dir $@)
+	$(CC) $(UAM_COMPILE) -Ifuzz/suzzer -I$(SUZZER_DIR)/src -MMD -MP -c $< -o $@
+
+$(TEST_SUZZER): $(BUILD)/obj/tests/unit/test_suzzer.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# suzzer's format header must build on its own with ember's strict flags.
+$(BUILD)/suzzer-header-check.stamp: $(SUZZER_DIR)/src/lcv_formats.h $(BUILD)/suzzer.cfg
+	@mkdir -p $(BUILD)
+	printf '#include "lcv_formats.h"\n' | $(CC) $(UAM_COMPILE) -I$(SUZZER_DIR)/src -x c -c - -o /dev/null
+	@touch $@
+
+# Clone suzzer into ./suzzer (SUZZER_URL, SUZZER_REV); a no-op if one is already there.
+suzzer:
+	SUZZER_URL='$(SUZZER_URL)' SUZZER_REV='$(SUZZER_REV)' sh tools/fetch-suzzer.sh suzzer
+
+# The suzzer tests, or a note that they were skipped.
+ifeq ($(HAVE_SUZZER),1)
+SUZZER_UNIT := $(TEST_SUZZER) $(BUILD)/suzzer-header-check.stamp
+else
+SUZZER_UNIT :=
+endif
+
 firmware:
 	$(MAKE) -C tests/firmware OUT=$(abspath $(BUILD))/firmware
 
@@ -124,12 +209,21 @@ firmware-mips:
 
 $(FIRMWARE): firmware
 
-unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT)
+unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
+           $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
 	$(TEST_HOST)
 	$(TEST_SNAP)
 	$(TEST_JIT)
+	$(TEST_MMIO)
+	$(TEST_COV)
+	$(TEST_FUZZ)
+ifeq ($(HAVE_SUZZER),1)
+	$(TEST_SUZZER) $(SUZZER_DIR)/test/vectors
+else
+	@echo "test_suzzer: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
+endif
 
 firmware-test: $(RUN) firmware
 	$(RUN) --stats $(FIRMWARE) < /dev/null
@@ -152,7 +246,36 @@ snapshot-test: $(RUN) firmware firmware-mips example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL) 5000
 	sh tests/snapshot/snapshot-check.sh $(EXAMPLE) ext-mips $(FW_MIPS_BE) 4000
 
-test: unit-test firmware-test mips-test example-test snapshot-test
+# Block coverage: identical maps from the interpreter and the JIT (chained or not), and
+# runs that end exactly as without coverage, on every ISA.
+cov-test: $(RUN) firmware firmware-mips
+	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
+	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
+	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
+
+# The fuzz harness end to end: planted bugs found, the same on every backend, crash
+# files reproduce on their own.
+fuzz-test: $(RUN) firmware firmware-mips
+	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/fuzz/fuzz-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+
+# suzzer's formats and the SZR1 executor through the runner (lists written by
+# tests/suzzer/mk_lists.py; the brain is tests/szr/fake_brain.py).
+ifeq ($(HAVE_SUZZER),1)
+suzzer-test: $(RUN) firmware firmware-mips
+	sh tests/suzzer/suzzer-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/suzzer/suzzer-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/suzzer/suzzer-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+	sh tests/szr/szr-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/szr/szr-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/szr/szr-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+else
+suzzer-test:
+	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
+endif
+
+test: unit-test firmware-test mips-test example-test snapshot-test cov-test fuzz-test suzzer-test
 
 net-check: $(RUN) firmware
 	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both
@@ -167,7 +290,11 @@ install: all
 clean:
 	rm -rf $(BUILD)
 
+FORCE:
+
 -include $(LIB_OBJ:.o=.d) $(BUILD)/obj/tools/uam-run.d $(BUILD)/obj/tests/unit/test_ir.d \
          $(BUILD)/obj/tests/unit/test_core.d $(BUILD)/obj/tests/unit/test_host.d \
          $(BUILD)/obj/tests/unit/test_snapshot.d \
-         $(BUILD)/obj/tests/unit/test_jit.d
+         $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_mmio.d \
+         $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
+         $(BUILD)/obj/tests/unit/test_suzzer.d

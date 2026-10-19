@@ -87,6 +87,20 @@ typedef struct uam_state_part {
     void                *ctx;
 } uam_state_part;
 
+/*
+ * A named way to hand the guest a block of bytes (uam_machine_add_input): a UART's
+ * receive FIFO, a DMA buffer, a mailbox. Boards publish the inputs their devices
+ * offer; tools (a fuzz harness, a replay tool) pick one by name, so they never need to
+ * know a concrete device. Called between runs; returns non-OK if the bytes cannot be
+ * delivered (e.g. too long).
+ */
+typedef uam_status (*uam_input_fn)(void *ctx, uam_machine *m, const uint8_t *data, size_t len);
+typedef struct uam_machine_input {
+    char        *name;
+    uam_input_fn fn;
+    void        *ctx;
+} uam_machine_input;
+
 struct uam_machine {
     const char *board_name;
     uam_bus     bus;
@@ -104,6 +118,9 @@ struct uam_machine {
     uam_state_part *state_parts;         /* registered with uam_machine_add_state */
     uint32_t        n_state_parts, cap_state_parts;
     uint64_t        snap_base;           /* snapshot the bus's dirty pages are relative to */
+    /* Named inputs (uam_machine_add_input). */
+    uam_machine_input *inputs;
+    uint32_t           n_inputs, cap_inputs;
 };
 
 /*
@@ -113,9 +130,14 @@ struct uam_machine {
  * the entry points a board calls first (uam_board_register, uam_machine_init,
  * uam_machine_add_device) are macros that pass the layout the caller was
  * compiled with. On a mismatch the library logs each differing item and
- * aborts: a mixed build is never usable, and an error status could be ignored.
+ * exits with UAM_ABI_EXIT_STATUS (the runner's status for setup errors): a
+ * mixed build is never usable, and an error status could be ignored. The check
+ * runs before the library touches any of the caller's structs, so nothing is
+ * corrupted and no core dump is needed. Programs that want to handle a mismatch
+ * themselves can call uam_abi_check(UAM_ABI_LAYOUT, ...) first.
  * A board built against headers older than this handshake fails to link.
  */
+#define UAM_ABI_EXIT_STATUS 2
 typedef struct uam_abi_layout {
     uint32_t version;   /* UAM_ABI_VERSION; always the first member */
     uint32_t self;      /* sizeof(uam_abi_layout) */
@@ -149,6 +171,10 @@ void       uam_machine_reset(uam_machine *m, uint64_t entry);
  */
 uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_save_fn save,
                                  uam_state_restore_fn restore, void *ctx);
+/* Publish a named input (see uam_input_fn); `name` must be unique. */
+uam_status uam_machine_add_input(uam_machine *m, const char *name, uam_input_fn fn, void *ctx);
+/* The input called `name`, or NULL. */
+const uam_machine_input *uam_machine_find_input(const uam_machine *m, const char *name);
 /* Stop callback usable by devices: ctx is the machine. */
 void       uam_machine_stop_cb(void *ctx, int64_t status);
 /*

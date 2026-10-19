@@ -33,6 +33,85 @@ typedef struct uam_reservation {
 #define UAM_DTLB_SIZE (1u << UAM_DTLB_BITS)
 #define UAM_DTLB_NONE UINT64_MAX   /* a tag no guest page number can equal */
 
+/* The most earlier B values UAM_OP_COV folds into an index (an N-gram of N = 8). */
+#define UAM_COV_HIST_MAX 7u
+
+/*
+ * The shape of the coverage history: how many earlier B values fold into each index,
+ * and how each is rotated first. All zero is the classic one-predecessor edge
+ * (AFL-style). rot[j] rotates hist[j] left within the map's width (0: no rotation);
+ * it must be below log2(map size).
+ */
+typedef struct uam_cov_history {
+    uint32_t depth;                   /* 1..UAM_COV_HIST_MAX; 0 means 1 */
+    uint8_t  rot[UAM_COV_HIST_MAX];
+} uam_cov_history;
+
+/*
+ * Edge-coverage state read and written by UAM_OP_COV (docs/uam-isa.md section 7.5;
+ * uam_cov_count below is the reference):
+ *     idx = A;  for j < depth: idx ^= rot[j] ? rotl(hist[j], rot[j]) : hist[j]
+ *     idx &= mask;  if (map[idx] != 0xff) map[idx]++
+ *     hist[depth-1..1] = hist[depth-2..0];  hist[0] = B
+ * with rotl(v, r) = ((v << r) | (v >> (bits - r))) & mask in 32-bit arithmetic.
+ * `map` has mask + 1 bytes (a power of two). depth 0 means 1, so { .map, .mask } alone
+ * is the classic edge (`prev` is hist[0]). Set the history with uam_cov_state_init;
+ * uam_exec_set_coverage checks it. mask, depth, bits and rot are fixed while coverage
+ * is on (the JIT compiles the shape in): to change them, call uam_exec_set_coverage
+ * again. The state belongs to whoever enabled coverage (exec.h); it is never part of a
+ * snapshot.
+ */
+typedef struct uam_cov_state {
+    uint8_t  *map;
+    uint32_t  mask;
+    uint32_t  depth;                  /* 0..UAM_COV_HIST_MAX; 0 means 1 */
+    uint32_t  bits;                   /* log2(mask + 1); used by rotation */
+    uint8_t   rot[UAM_COV_HIST_MAX];
+    union {
+        uint32_t prev;                /* hist[0], the newest */
+        uint32_t hist[UAM_COV_HIST_MAX];
+    };
+} uam_cov_state;
+
+/* A state for a map of `map_size` bytes (a power of two) and the history shape `h`
+ * (NULL: the classic one-predecessor edge). */
+static inline void uam_cov_state_init(uam_cov_state *s, uint8_t *map, uint32_t map_size,
+                                      const uam_cov_history *h)
+{
+    *s = (uam_cov_state){ .map = map, .mask = map_size - 1 };
+    while (s->bits < 32 && (UINT64_C(1) << s->bits) < map_size)
+        s->bits++;
+    if (h) {
+        s->depth = h->depth;
+        for (unsigned j = 0; j < UAM_COV_HIST_MAX; j++)
+            s->rot[j] = h->rot[j];
+    }
+}
+
+/* Forget the history, e.g. at the start of a fuzz iteration. */
+static inline void uam_cov_reset_prev(uam_cov_state *s)
+{
+    for (unsigned j = 0; j < UAM_COV_HIST_MAX; j++)
+        s->hist[j] = 0;
+}
+
+/* One UAM_OP_COV A, B: the reference the interpreter runs and the JIT matches. */
+static inline void uam_cov_count(uam_cov_state *s, uint32_t a, uint32_t b)
+{
+    const uint32_t d = s->depth ? s->depth : 1;
+    uint32_t idx = a;
+    for (uint32_t j = 0; j < d; j++) {
+        uint32_t v = s->hist[j], r = s->rot[j];
+        idx ^= r ? ((v << r) | (v >> (s->bits - r))) & s->mask : v;
+    }
+    idx &= s->mask;
+    if (s->map[idx] != 0xff)
+        s->map[idx]++;
+    for (uint32_t j = d - 1; j > 0; j--)
+        s->hist[j] = s->hist[j - 1];
+    s->hist[0] = b;
+}
+
 typedef struct uam_cpu {
     uint64_t              pc;
     uint8_t              *regfile;
@@ -50,6 +129,7 @@ typedef struct uam_cpu {
     struct uam_sched     *sched;    /* virtual time; used by CPU-internal timers (e.g. MIPS CP0) */
     const struct uam_isa *isa;
     void                 *isa_state;
+    uam_cov_state        *cov;      /* UAM_OP_COV target; NULL while coverage is off */
     /* JIT data-TLB (see above). tag = guest vpage, base = host_page - vpage*4096. */
     uint64_t              dtlb_rt[UAM_DTLB_SIZE], dtlb_rb[UAM_DTLB_SIZE];
     uint64_t              dtlb_wt[UAM_DTLB_SIZE], dtlb_wb[UAM_DTLB_SIZE];
@@ -61,10 +141,11 @@ static inline void uam_cpu_dtlb_flush(uam_cpu *cpu)
         cpu->dtlb_rt[i] = cpu->dtlb_wt[i] = UAM_DTLB_NONE;
 }
 
-/* Ask the hart to leave its current block at the next instruction boundary.
- * The deadline is cleared too, so executors can test a single condition
- * (icount >= icount_deadline) at instruction boundaries; the run loop
- * recomputes the deadline before every block. */
+/* Ask the hart to leave its current block at the next instruction boundary
+ * (and stop the JIT from chaining into another block). The run loop clears it
+ * before every block it dispatches. Call it on anything the run loop must act
+ * on between blocks: in particular every change that can make isa->irq_take()
+ * newly succeed (isa.h). */
 static inline void uam_cpu_request_exit(uam_cpu *cpu) { cpu->exit_request = true; }
 
 /* The ISA's virtual-to-physical mapping changed (e.g. a TLB write or an

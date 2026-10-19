@@ -47,6 +47,8 @@ enum uam_op_prop {
 /*
  * X(name, mnemonic, n_src, result_kind, props)
  *   n_src: number of value operands (a, b, c) the op consumes.
+ *
+ * New opcodes go at the end, so existing values keep their numbers.
  */
 #define UAM_OPCODES(X)                                                          \
     /* instruction marker */                                                    \
@@ -108,7 +110,9 @@ enum uam_op_prop {
     X(SYSWR,   "syswr",   1, UAM_RK_NONE, UAM_P_GUARD | UAM_P_FAULT | UAM_P_EFFECT) \
     X(TRAP,    "trap",    2, UAM_RK_NONE, UAM_P_GUARD | UAM_P_FAULT | UAM_P_EFFECT | UAM_P_TERM) \
     X(WAIT,    "wait",    1, UAM_RK_NONE, UAM_P_EFFECT | UAM_P_TERM)            \
-    X(HELPER,  "helper",  3, UAM_RK_SPECIAL, UAM_P_GUARD | UAM_P_EFFECT)
+    X(HELPER,  "helper",  3, UAM_RK_SPECIAL, UAM_P_GUARD | UAM_P_EFFECT)      \
+    /* instrumentation (inserted by passes, never by lifters) */                \
+    X(COV,     "cov",     2, UAM_RK_NONE, UAM_P_EFFECT)
 
 typedef enum uam_opcode {
 #define UAM_X_ENUM(name, mn, nsrc, rk, props) UAM_OP_##name,

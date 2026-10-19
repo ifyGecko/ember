@@ -110,12 +110,12 @@ static uam_status load_elf_buf(uam_bus *bus, uam_cpu *cpu, const uint8_t *d, siz
             return UAM_ERR_INVALID;
         const uint8_t *ph = d + o;
         uint32_t type = (uint32_t)rd(ph, 4, be);
-        uint64_t off, paddr, filesz, memsz;
+        uint64_t off, vaddr, paddr, filesz, memsz;
         if (is64) {
-            off = rd(ph + 8, 8, be);  paddr = rd(ph + 24, 8, be);
+            off = rd(ph + 8, 8, be);  vaddr = rd(ph + 16, 8, be);  paddr = rd(ph + 24, 8, be);
             filesz = rd(ph + 32, 8, be); memsz = rd(ph + 40, 8, be);
         } else {
-            off = rd(ph + 4, 4, be);  paddr = rd(ph + 12, 4, be);
+            off = rd(ph + 4, 4, be);  vaddr = rd(ph + 8, 4, be);  paddr = rd(ph + 12, 4, be);
             filesz = rd(ph + 16, 4, be); memsz = rd(ph + 20, 4, be);
         }
         if (type != PT_LOAD || memsz == 0)
@@ -136,6 +136,8 @@ static uam_status load_elf_buf(uam_bus *bus, uam_cpu *cpu, const uint8_t *d, siz
             return st;
         uam_log(UAM_LOG_INFO, "loader", "segment %u: 0x%llx (%llu bytes)", i,
                 (unsigned long long)paddr, (unsigned long long)memsz);
+        if (!info->n_segments || vaddr < info->link_base)
+            info->link_base = vaddr;
         info->n_segments++;
     }
     return info->n_segments ? UAM_OK : UAM_ERR_INVALID;
@@ -164,6 +166,7 @@ uam_status uam_load_raw(uam_bus *bus, uam_cpu *cpu, const char *path, uint64_t b
     free(d);
     memset(info, 0, sizeof(*info));
     info->entry = base;
+    info->link_base = base;
     info->n_segments = 1;
     return st;
 }

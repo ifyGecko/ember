@@ -17,6 +17,7 @@
  *
  * This is the only file that knows both the ISA and the concrete devices.
  */
+#include "uam/boards.h"
 #include "uam/dev/clint.h"
 #include "uam/dev/plic.h"
 #include "uam/dev/sifive_test.h"
@@ -113,7 +114,8 @@ static uam_status rv32_ref_build(uam_machine *m, const uam_board_config *cfg)
     uam_signal_connect(uam_plic_context_line(plic, 0), uam_cpu_irq_sink, &m->cpu, UAM_RV_IRQ_MEI);
     uam_signal_connect(uam_uart16550_irq_line(uart), uam_plic_input, plic, RV32REF_UART0_IRQ);
 
-    if ((st = build_virtio(m, cfg, plic)) != UAM_OK)
+    if ((st = build_virtio(m, cfg, plic)) != UAM_OK
+        || (st = uam_board_add_uart_input(m, "uart0", uart)) != UAM_OK)
         return st;
 
     if (cfg->unknown_mmio != UAM_UNKNOWN_FAULT) {

@@ -66,8 +66,9 @@ bool uam_abi_check(const uam_abi_layout *caller, const char *entry)
 
 static void abi_require(const uam_abi_layout *caller, const char *entry)
 {
+    /* Nothing has touched the caller's structs yet: a plain error exit is safe. */
     if (!uam_abi_check(caller, entry))
-        abort();
+        exit(UAM_ABI_EXIT_STATUS);
 }
 
 uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_abi_layout *abi)
@@ -114,11 +115,43 @@ void uam_machine_fini(uam_machine *m)
     free(m->state_parts);
     m->state_parts = NULL;
     m->n_state_parts = m->cap_state_parts = 0;
+    for (uint32_t i = 0; i < m->n_inputs; i++)
+        free(m->inputs[i].name);
+    free(m->inputs);
+    m->inputs = NULL;
+    m->n_inputs = m->cap_inputs = 0;
     if (m->cpu.isa && m->cpu.isa_state)
         m->cpu.isa->fini(&m->cpu);
     free(m->cpu.regfile);
     m->cpu.regfile = NULL;
     uam_bus_fini(&m->bus);
+}
+
+uam_status uam_machine_add_input(uam_machine *m, const char *name, uam_input_fn fn, void *ctx)
+{
+    if (!name || !fn || uam_machine_find_input(m, name))
+        return UAM_ERR_INVALID;
+    if (m->n_inputs == m->cap_inputs) {
+        uint32_t ncap = m->cap_inputs ? m->cap_inputs * 2 : 4;
+        uam_machine_input *ni = realloc(m->inputs, sizeof(*ni) * ncap);
+        if (!ni)
+            return UAM_ERR_NOMEM;
+        m->inputs = ni;
+        m->cap_inputs = ncap;
+    }
+    char *nm = strdup(name);
+    if (!nm)
+        return UAM_ERR_NOMEM;
+    m->inputs[m->n_inputs++] = (uam_machine_input){ .name = nm, .fn = fn, .ctx = ctx };
+    return UAM_OK;
+}
+
+const uam_machine_input *uam_machine_find_input(const uam_machine *m, const char *name)
+{
+    for (uint32_t i = 0; i < m->n_inputs; i++)
+        if (!strcmp(m->inputs[i].name, name))
+            return &m->inputs[i];
+    return NULL;
 }
 
 void uam_machine_add_device_abi(uam_machine *m, uam_device *dev, const uam_abi_layout *abi)

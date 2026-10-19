@@ -24,7 +24,15 @@ struct uam_host {
     bool         started;
     uint64_t     t0_ns;        /* host time at the pacing origin */
     uint64_t     v0;           /* virtual time at the pacing origin */
+    uint32_t     idle_skips;   /* virtual pacing: idle skips since the last host poll */
 };
+
+/* Virtual pacing: an idle hart skips to its next timer in a few nanoseconds, while
+ * looking for host input costs a poll() system call (~1 us). Look once every this
+ * many skips, so that a hart idling through a stream of timer events (and, when
+ * those cannot wake it, the max_stall livelock count) runs at the skip's speed.
+ * Input still arrives within microseconds of host time. */
+#define IDLE_POLL_EVERY 64u
 
 static uint64_t host_ns(void)
 {
@@ -174,7 +182,10 @@ static bool bridge_idle(void *ctx, uint64_t ticks, uint64_t *skip)
     uam_host *h = ctx;
     if (h->pacing != UAM_PACE_REALTIME) {
         if (ticks != UINT64_MAX) {
-            uam_host_poll(h, 0);
+            if (++h->idle_skips >= IDLE_POLL_EVERY) {
+                h->idle_skips = 0;
+                uam_host_poll(h, 0);
+            }
             *skip = ticks;           /* deterministic: idle time costs nothing */
             return true;
         }

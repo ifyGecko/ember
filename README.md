@@ -11,15 +11,16 @@ with one module per concern.
 Status: two guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board, and
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards - run by a reference interpreter or, with `--jit`, a native x86-64 JIT
-(a block optimizer feeds both). A gdb stub, host console and network backends (tap, tun,
-UDP, pcap; virtio-net on `rv32-ref`), and a library build for out-of-tree boards. C11,
-no dependencies beyond libc.
+with block chaining (a block optimizer feeds both). Machine snapshots (boot once, resume in
+milliseconds), a gdb stub, host console and network backends (tap, tun, UDP, pcap; virtio-net
+on `rv32-ref`), and a library build for out-of-tree boards. C11, no dependencies beyond libc.
 
 ## Build and test
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V and MIPS firmware self-tests, external-board example
+make test            # unit tests, RISC-V and MIPS firmware self-tests, external-board example,
+                     # snapshot split runs (interpreter and JIT)
 make net-check       # ARP/ping between an rv32-ref guest and the host kernel over a real tap and tun
 make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
 make install PREFIX=DIR
@@ -39,6 +40,8 @@ build/uam-run --raw-base 0x80000000 path/to/image.bin
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
+build/uam-run --cov-blocks --cov-out cov.map fw.elf  # block-edge coverage map (64 KiB by default)
+build/uam-run --cov-blocks --fuzz-begin 0x80000318 --fuzz-input uart0 --fuzz-replay crashes/ fw.elf
 build/uam-run --help
 ```
 
@@ -48,17 +51,39 @@ blocks: a VxWorks boot on a MIPS board ran 7.5x faster (19.8 s to 2.6 s for 3e9 
 Results are bit-identical with and without it, and to the interpreter. `--stats` reports how
 many blocks were entered by chaining.
 
+`--cov-blocks` counts AFL-style edges between translated blocks into a coverage map
+(`--cov-map-size`, a power of two), and `--cov-out FILE` writes the raw map when the run
+stops. Blocks are not basic blocks, so the edges are approximate; site-accurate coverage
+comes from a site table (`uam_exec_set_coverage`, `uam/exec.h`). The interpreter and the JIT
+produce byte-identical maps, and the guest runs exactly as without coverage. Overhead on a
+synthetic worst case (a MIPS loop of 2-7 instruction blocks, 3e8 instructions): JIT 0.145 s
+to 0.190 s (+31%), interpreter 2.93 s to 3.05 s (+4%). Real firmware has longer blocks.
+
+`--fuzz-begin PC` turns the runner into a persistent-mode fuzz harness: it boots to PC,
+snapshots there and runs every input from the snapshot, delivered through `--fuzz-input`
+(`mem:ADDR`, `mmio`, or a board input such as `uart0`), and classifies each run as ok, crash
+(an exception, a `--fuzz-crash-pc`, a reset), hang or timeout. `--fuzz-replay FILE|DIR` runs
+saved inputs once each and exits with the last verdict (0 ok, 20/21 crash, 22 hang, 23
+timeout). See [`docs/fuzzing.md`](docs/fuzzing.md).
+
+With a [suzzer](docs/suzzer.md) checkout (`make SUZZER_DIR=path`, or `make suzzer` to clone one
+into `./suzzer`), suzzer's site lists and boundary files plug in directly: `--cov-sites fw.lcv3` gives bitmaps
+with the same meaning as libcov's (site-id or hashed-PC model, N=1 or 2), `--cov-boundary
+fw.lcvb` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-strict` checks every site's bytes
+in memory against the list.
+
 A run always ends. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual
 time, which also advances while the hart idles in WFI/WAIT (both exit 124). When a hart
 waits for an interrupt that the device timers can never deliver (an interrupt line left
 unwired, say), `--max-stall N` timer events with no instruction retired (default 4194304)
 end the time skipping: with a console or network input attached, the run sleeps until
 input arrives (typing still wakes the guest, SIGINT/SIGTERM still stop it); with none,
-nothing can ever wake the hart and the run stops as a livelock (exit 128). Virtual time never passes 2^62 ticks.
+nothing can ever wake the hart and the run stops as a livelock (exit 128). Idle time costs next to
+nothing (the default 4194304 events take about 0.1 s). Virtual time never passes 2^62 ticks.
 All of these are counted in virtual time, so runs stay deterministic.
-The other exit statuses: the firmware's own status when it ends the run, 125 deadlock (waiting with
-nothing that could wake it), 126 internal error or fetch-fault loop, 127 breakpoint or debug trap,
-130 SIGINT/SIGTERM.
+The other exit statuses: the firmware's own status when it ends the run, 2 usage or setup error
+(including a library/header ABI mismatch), 125 deadlock (waiting with nothing that could wake it),
+126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 130 SIGINT/SIGTERM.
 
 ```bash
 build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructions and idle time
@@ -66,6 +91,22 @@ build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructi
 
 `--unknown-mmio zero|echo` keeps firmware running past unmodelled peripherals and
 logs the first access to each address. That log is the bring-up to-do list.
+
+`--mmio-rule` answers individual unmodelled registers, for when firmware needs more than
+zero, for example a status register that must read "ready". The syntax is
+`ADDR[+SIZE]=POLICY[,width=N][,set=MASK][,clear=MASK]`, and the policies are `zero`, `echo`,
+`fixed:VALUE`, `fault` (bus error), and `input`, which reads the next bytes of
+`--mmio-input FILE` (for fuzzing). Rules sit over a board's catch-all windows and unmapped
+holes and under its real devices; later rules win where they overlap. Values are what the
+CPU reads, on either byte order. Registers are 4 bytes unless `width=` says otherwise. `-v`
+logs each rule's first access to each register and an access summary. A snapshot taken with
+rules is restored with the same rules.
+
+```bash
+build/uam-run --mmio-rule 0x18040000=fixed:0x1 fw.elf                 # a status register reads 1
+build/uam-run --mmio-rule 0x18020000+0x100=echo,set=0x60 fw.elf       # read back writes, bits 5-6 set
+build/uam-run --mmio-rule 0x18060010=input,width=1 --mmio-input case.bin fw.elf
+```
 `--trace ir` prints every translated block in the IR's text form; `--trace blocks`
 can be narrowed with `--trace-range LO:HI` and `--trace-after N`.
 
@@ -171,33 +212,38 @@ Build with `make -C path/to/uam BUILD=$PWD/build/uam lib` and link
 `build/uam/libuam.a` (or `pkg-config --cflags --libs uam` after `make install`).
 Compile against the headers of the same tree the library was built from. A board
 built from different headers is stopped at `uam_board_register` / `uam_machine_init`
-with an `abi:` error that names each struct whose size differs, instead of corrupting
-memory. Rebuild the library and the board together after updating UAM.
+with an `abi:` error that names each struct whose size differs and exit status 2, instead
+of corrupting memory. Rebuild the library and the board together after updating UAM.
 Only the modules you reference are linked: a MIPS-only board pulls in neither
 the RISC-V lifter nor the stock boards.
 
 ## Layout
 
 ```
-include/uam/       public interfaces: ir.h isa.h bus.h device.h signal.h sched.h cpu.h exec.h loader.h
-                   machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
+include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.h signal.h sched.h
+                   cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h host.h
+                   gdbstub.h runner.h boards.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module
 src/ir/            IR builder, verifier, printer
-src/core/          bus, scheduler, logging, chardev/netdev plumbing
-src/exec/          interpreter, translation cache, run loop
+src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
+src/exec/          interpreter, translation cache, run loop, x86-64 JIT (jit_x86.c)
 src/loader/        ELF / raw loaders
-src/machine/       machine lifecycle, resets, board registry
+src/machine/       machine lifecycle, resets, board registry, snapshots
 src/host/          chardev/netdev backends, host loop, real-time pacing
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c)
-devices/           clint, plic, uart16550, sifive_test, unknown_mmio, unimp, virtio_net
-boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS): the only files that pair an ISA with devices
+devices/           clint, plic, uart16550, sifive_test, unknown_mmio, unimp, mmio_stub, virtio_net
+boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS): the only files that pair an ISA with
+                   devices; mmio_rules.c: per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 examples/          external-board: an out-of-tree board using the library
-tests/unit/        IR semantics/verifier, core (bus, resets, hooks), host side
+tests/unit/        IR semantics/verifier, core (bus, resets, hooks, ABI), host side, snapshots,
+                   JIT chaining, MMIO rules
 tests/firmware/    bare-metal RV32 self-test and network-test images
+tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
+tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

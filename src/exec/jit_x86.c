@@ -237,6 +237,7 @@ struct uam_jit {
 #define CPU(f)  ((int32_t)offsetof(uam_cpu, f))
 #define REXC(f) ((int32_t)(offsetof(uam_jit_ctx, res) + offsetof(uam_block_result, exc) + offsetof(uam_exception, f)))
 #define SLOT(f) ((int32_t)offsetof(jit_slot, f))
+#define COV(f)  ((int32_t)offsetof(uam_cov_state, f))
 
 static void g8(uam_jit *j, uint8_t b)
 {
@@ -431,6 +432,52 @@ static void patch(uam_jit *j, size_t pos)
         memcpy(&j->cb[pos], &rel, 4);
 }
 
+/*
+ * UAM_OP_COV A, B (docs/uam-isa.md section 7.5; uam_cov_count in cpu.h is the
+ * reference), inline: no bridge, so chained blocks count too. cpu->cov is read at run
+ * time (NULL: nothing), but its history shape (depth, rot, bits) is compiled in: it is
+ * fixed while coverage is on, and uam_exec_set_coverage, the only way to change it,
+ * flushes every translation. The default shape (depth <= 1, no rotation) is the
+ * classic edge, about ten host instructions; deeper histories unroll with immediate
+ * shifts. Clobbers rax, rcx, rdx, rsi (scratch between ops).
+ */
+static void emit_cov(uam_jit *j, uint32_t a, uint32_t b)
+{
+    const uam_cov_state *cs = j->x->cpu->cov;
+    const uint32_t d = cs && cs->depth > 1 ? cs->depth : 1;
+    ld_mem(j, RCX, R14, CPU(cov));                         /* rcx = cpu->cov */
+    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RCX, RCX); /* test rcx, rcx */
+    size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    if (d == 1 && !(cs && cs->rot[0])) {
+        g8(j, 0x8B); modrm_mem(j, RAX, RCX, COV(prev));    /* eax = prev */
+        g8(j, 0x35); g32(j, a);                            /* xor eax, A */
+    } else {
+        g8(j, 0xB8); g32(j, a);                            /* eax = A */
+        for (uint32_t k = 0; k < d; k++) {
+            unsigned r = cs->rot[k];
+            g8(j, 0x8B); modrm_mem(j, RDX, RCX, COV(hist) + 4 * (int32_t)k); /* edx = hist[k] */
+            if (r) {                                       /* rotl within bits, & mask */
+                g8(j, 0x89); modrm_reg(j, RDX, RSI);       /* esi = edx */
+                g8(j, 0xC1); modrm_reg(j, 4, RDX); g8(j, (uint8_t)r);            /* shl edx, r */
+                g8(j, 0xC1); modrm_reg(j, 5, RSI); g8(j, (uint8_t)(cs->bits - r)); /* shr esi, bits-r */
+                g8(j, 0x09); modrm_reg(j, RSI, RDX);       /* edx |= esi */
+                g8(j, 0x23); modrm_mem(j, RDX, RCX, COV(mask)); /* edx &= mask */
+            }
+            g8(j, 0x31); modrm_reg(j, RDX, RAX);           /* eax ^= edx */
+        }
+    }
+    g8(j, 0x23); modrm_mem(j, RAX, RCX, COV(mask));        /* and eax, mask (zero-extends) */
+    ld_mem(j, RDX, RCX, COV(map));                         /* rdx = map */
+    g8(j, 0x80); modrm_sib(j, 0, RDX, RAX, 0, 0); g8(j, 1);  /* add byte [rdx+rax], 1 */
+    g8(j, 0x80); modrm_sib(j, 3, RDX, RAX, 0, 0); g8(j, 0);  /* sbb byte [rdx+rax], 0: saturate */
+    for (uint32_t k = d - 1; k > 0; k--) {                 /* hist[k] = hist[k-1] */
+        g8(j, 0x8B); modrm_mem(j, RDX, RCX, COV(hist) + 4 * (int32_t)(k - 1));
+        g8(j, 0x89); modrm_mem(j, RDX, RCX, COV(hist) + 4 * (int32_t)k);
+    }
+    g8(j, 0xC7); modrm_mem(j, 0, RCX, COV(prev)); g32(j, b); /* hist[0] = B */
+    patch(j, off);
+}
+
 /* Store a block result into jc and jump to the epilogue. */
 static void set_res_pc(uam_jit *j, uint32_t kind, const uam_block *blk, uam_ref target, unsigned aw)
 {
@@ -511,7 +558,7 @@ static bool op_supported(uam_opcode op)
 {
     switch (op) {
     case UAM_OP_IMARK: case UAM_OP_GET: case UAM_OP_PUT: case UAM_OP_LD: case UAM_OP_ST:
-    case UAM_OP_EXIT:
+    case UAM_OP_EXIT: case UAM_OP_COV:
         return true;
     case UAM_OP_SYSRD: case UAM_OP_SYSWR: case UAM_OP_TRAP: case UAM_OP_WAIT:
         return true;
@@ -882,6 +929,10 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         case UAM_OP_WAIT:
             set_res_pc(j, UAM_BR_WAIT, blk, in->a, aw);
             epi[n_epi++] = jmp_fwd(j);
+            break;
+        case UAM_OP_COV:
+            emit_cov(j, (uint32_t)blk->imm[uam_ref_index(in->a)],
+                     (uint32_t)blk->imm[uam_ref_index(in->b)]);
             break;
         default:
             emit_pure(j, blk, in);

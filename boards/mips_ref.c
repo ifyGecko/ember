@@ -10,6 +10,7 @@
  * The UART interrupt is wired to hardware interrupt 0 (Cause.IP2). The CP0
  * Count/Compare timer is internal to the CPU and needs no wiring.
  */
+#include "uam/boards.h"
 #include "uam/dev/sifive_test.h"
 #include "uam/dev/uart16550.h"
 #include "uam/dev/unknown_mmio.h"
@@ -48,6 +49,8 @@ static uam_status mips_ref_build_isa(uam_machine *m, const uam_board_config *cfg
         return st;
 
     uam_signal_connect(uam_uart16550_irq_line(uart), uam_cpu_irq_sink, &m->cpu, MIPS_UART_IRQ);
+    if ((st = uam_board_add_uart_input(m, "uart0", uart)) != UAM_OK)
+        return st;
 
     if (cfg->unknown_mmio != UAM_UNKNOWN_FAULT) {
         uam_device *um = uam_unknown_mmio_create(

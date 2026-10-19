@@ -14,7 +14,12 @@
  * src/exec/jit.h. Interrupts are taken only between dispatched blocks, so ISA
  * modules must request an exit when an interrupt may newly be taken (isa.h).
  *
- * Dependencies: ir.h, isa.h, cpu.h, bus.h, sched.h.
+ * Optional instrumentation: IR passes (pass.h) run on every new block, edge coverage
+ * (uam_exec_set_coverage) is one such pass, and an exception observer sees each
+ * synchronous exception before the ISA takes it (uam_exec_set_exc_hook), and an
+ * interrupt observer each interrupt the ISA takes (uam_exec_set_irq_hook).
+ *
+ * Dependencies: ir.h, isa.h, cpu.h, bus.h, sched.h, pass.h, cov.h.
  */
 #ifndef UAM_EXEC_H
 #define UAM_EXEC_H
@@ -22,9 +27,11 @@
 #include <stdio.h>
 
 #include "uam/bus.h"
+#include "uam/cov.h"
 #include "uam/cpu.h"
 #include "uam/ir.h"
 #include "uam/isa.h"
+#include "uam/pass.h"
 #include "uam/sched.h"
 
 /* ------------------------------------------------------------------------ */
@@ -99,6 +106,8 @@ typedef enum uam_stop_reason {
     UAM_STOP_RESET,       /* reset requested and no reset handler installed */
     UAM_STOP_TIME_LIMIT,  /* virtual time reached max_time or UAM_SCHED_TIME_MAX */
     UAM_STOP_LIVELOCK,    /* timers keep firing, no instruction retires, nothing else can wake the hart */
+    UAM_STOP_EXC_HOOK,    /* the exception observer returned UAM_HOOK_STOP */
+    UAM_STOP_IRQ_HOOK,    /* the interrupt observer returned UAM_HOOK_STOP */
 } uam_stop_reason;
 
 const char *uam_stop_reason_str(uam_stop_reason r);
@@ -154,6 +163,35 @@ typedef struct uam_pc_hook {
     uam_pc_hook_fn fn;
     void          *ctx;
 } uam_pc_hook;
+
+/* --- exception observer --------------------------------------------------- */
+
+/*
+ * Called for every synchronous exception (a fault, a TRAP EXCEPTION, a fetch fault)
+ * just before the ISA takes it, with precise state: earlier instructions retired,
+ * cpu->pc at the faulting instruction (at its parent_pc if it continues another, as
+ * in a delay slot). Returning UAM_HOOK_STOP makes uam_exec_run return
+ * UAM_STOP_EXC_HOOK without delivering the exception; resuming re-executes the
+ * instruction. Interrupts and resets are not reported.
+ */
+typedef uam_hook_action (*uam_exc_hook_fn)(void *ctx, uam_cpu *cpu, const uam_exception *e);
+
+/* --- interrupt observer --------------------------------------------------- */
+
+typedef struct uam_interrupt {
+    uint64_t from_pc;     /* where the hart was interrupted (it resumes there) */
+    uint64_t handler_pc;  /* where the ISA entered the handler */
+    uint64_t lines;       /* the lines that caused it (isa->irq_lines; 0 if unknown) */
+} uam_interrupt;
+
+/*
+ * Called each time the ISA takes an interrupt, after it entered the handler (the
+ * state is the handler's first instruction; interrupts are only taken between
+ * blocks, so all earlier instructions have retired). Returning UAM_HOOK_STOP makes
+ * uam_exec_run return UAM_STOP_IRQ_HOOK there; the interrupt has been taken.
+ * Synchronous exceptions go to the exception observer instead.
+ */
+typedef uam_hook_action (*uam_irq_hook_fn)(void *ctx, uam_cpu *cpu, const uam_interrupt *irq);
 
 /* --- host integration ----------------------------------------------------- */
 
@@ -214,6 +252,17 @@ typedef struct uam_exec {
     uam_exec_host    host;
     uint32_t         blocks_since_poll;
 
+    /* IR passes (pass.h), in registration order */
+    const uam_pass **passes;
+    uint32_t         n_passes, cap_passes;
+    /* edge coverage (uam_exec_set_coverage): the pass the executor owns */
+    uam_cov_pass    *cov_pass;
+    /* exception and interrupt observers: one slot each */
+    uam_exc_hook_fn  exc_hook;
+    void            *exc_hook_ctx;
+    uam_irq_hook_fn  irq_hook;
+    void            *irq_hook_ctx;
+
     /* Bounds on virtual time, which (unlike icount) advances while the hart
      * waits. Both are deterministic: no host time is involved.
      *   max_time:  stop with UAM_STOP_TIME_LIMIT once uam_sched_now() reaches
@@ -258,6 +307,28 @@ bool            uam_exec_remove_pc_hook(uam_exec *x, uint64_t pc, uam_pc_hook_fn
 bool            uam_exec_has_pc_hook(const uam_exec *x, uint64_t pc);
 
 void            uam_exec_set_host(uam_exec *x, const uam_exec_host *host);
+
+/*
+ * Edge coverage. Instrument the given sites (copied; see cov.h) and count into
+ * `state`, which must stay valid while coverage is on; cpu->cov points at it.
+ * sites = NULL / n = 0 or state = NULL turns coverage off. Every call replaces the
+ * previous configuration and discards translated code. With coverage off no block
+ * contains COV, so runs are exactly as without this feature. The map is not part of
+ * any snapshot. On UAM_ERR_INVALID (two sites at one pc) err says why and coverage
+ * is off.
+ */
+uam_status      uam_exec_set_coverage(uam_exec *x, const uam_cov_site *sites, size_t n,
+                                      uam_cov_state *state, char *err, size_t errlen);
+/* Block mode (uam_cov_pass_create_blocks): a site at every block start. NULL turns
+ * coverage off. */
+uam_status      uam_exec_set_block_coverage(uam_exec *x, uam_cov_state *state);
+
+/* Install the exception observer (NULL removes it). There is one slot; the fuzz
+ * harness owns it while it runs, so it cannot be shared with the gdb stub. */
+void            uam_exec_set_exc_hook(uam_exec *x, uam_exc_hook_fn fn, void *ctx);
+/* Install the interrupt observer (NULL removes it). One slot, owned by the fuzz
+ * harness while it runs. */
+void            uam_exec_set_irq_hook(uam_exec *x, uam_irq_hook_fn fn, void *ctx);
 
 /* Enable the native JIT backend. Returns false (and stays on the interpreter) if code
  * generation is unavailable on this host. Call after uam_exec_init, before running. */
