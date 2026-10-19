@@ -235,8 +235,9 @@ while the brain starts), runs each INPUT through the harness and answers it, in 
 with one COVERAGE or CRASH frame. It needs fuzzing boundaries (`--fuzz-begin` or
 `--cov-boundary`) and replaces `--fuzz-replay`. ember connects first, boots to the begin
 pc, and only then sends HELLO and the INIT map, so a long firmware boot is not spent between
-HELLO and the first reply (the brain's `--io-timeout`, 60 s by default; give it more for a
-boot that takes longer, or use suzzer's `--hello-timeout` where it has one). Any coverage source works: with
+HELLO and the first reply. The brain waits for HELLO up to its `--hello-timeout` (600 s in
+suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default, so raise
+that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be` or
 `mips32le`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
