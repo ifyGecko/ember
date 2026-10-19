@@ -90,7 +90,7 @@ With suzzer configured, `uam-run` (and every board built on `uam_run_main`) gain
 | `--cov-scheme site\|pc`, `--cov-ngram N`, `--cov-rotate` | match the device's libcov build |
 | `--cov-mode leapfrog\|every` | which executions count: libcov's default (`leapfrog`, the default here too) or every one |
 | `--cov-strict` | every site's bytes in memory must match the list |
-| `--cov-boundary LCVB1` | iteration boundaries from `gen_boundary.py`: one BEGIN marker for now, any number of END markers |
+| `--cov-boundary LCVB1` | iteration boundaries from `gen_boundary.py`: any number of BEGIN and END markers |
 | `--fuzz-szr HOST:PORT` | fuzz with inputs from `suzzer_brain.py` over SZR1, ember standing in for `suzzer-relay` |
 | `--fuzz-szr-timeout SEC` | give up when the brain sends nothing for SEC seconds (default: wait; TCP keepalive still notices a vanished host) |
 | `--cov-shm PATH`, `--cov-shm-ring N` | publish INIT and every ok iteration's map in an LCVS region for suzzer's readers |
@@ -137,8 +137,9 @@ readers, e.g. `python3 suzzer/test/shm_bitmap.py stats /tmp/fw.lcvs`.
 
 What ember does differently from libcov on a device, by design or for now:
 
-- **One BEGIN marker.** ember snapshots at a single begin; a boundary file with several is
-  refused. Any number of END markers work.
+- **One snapshot.** With several BEGIN markers, every input starts from the snapshot at the
+  first BEGIN the boot reached; on a device each BEGIN starts an iteration where it is.
+  During an iteration every BEGIN closes it (begin-only) or opens a level (nested) in both.
 - **"Any depth" paired markers.** ember ends the iteration at the first END; libcov
   publishes and resets at every nested BEGIN and END. Depth-zero-only markers (recursion
   kept in one input) behave the same in both.

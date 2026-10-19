@@ -88,9 +88,13 @@ begin's hit goes to the map it closes (INIT at boot; in begin-only mode, the ite
 that ends back at begin), an end's to the iteration it ends. An iteration's first count is
 the site after the begin, with an empty history.
 
-There is **one begin pc for now**: the harness snapshots at a single point. Several begins (a
-target with two request handlers, say) would need a choice of where to snapshot, and are left
-for later.
+**Several begins.** `--fuzz-begin` is repeatable (`uam_fuzz_config.more_begin_pcs`), and a
+boundary file may hold several BEGIN markers: a target with two request handlers, say. The
+snapshot is taken at whichever begin the boot reaches first (after `--fuzz-begin-skip`
+arrivals at any of them), and every input starts there, so it reaches whichever handler the
+firmware runs for it. During an iteration any begin acts as the begin does: it ends the
+iteration in begin-only mode (as each BEGIN closes the current iteration in libcov) and
+opens a level when the boundaries are nested.
 
 **Recursion.** With nested boundaries (`uam_fuzz_config.nested`, set from depth-zero-only
 LCVB1 markers), a begin reached during an iteration opens a nested level and every end
@@ -207,7 +211,7 @@ build/uam-run -b mips-ref --cov-sites fw.lcv3 --cov-boundary fw.lcvb --cov-stric
 | `--cov-mode leapfrog\|every` | which executions count. `leapfrog` (the default, libcov's default `LIBCOV_MODE`): a site counts again only after another site did, so loops count visits and no self-edge appears, exactly as on the device. `every`: each execution counts (finer counts, but maps no longer equal libcov's). libcov's `oneshot` sanity-check mode is not offered |
 | `--cov-map-size N` | overrides libcov's map-size rule (site model: from the site count and N; hashed-PC: 64 KiB) |
 | `--cov-strict` | each site's bytes in memory must equal the list's `orig[]`, checked at the first begin when fuzzing, else at the end of the run. Without it the check is only reported. A wrong base or byte order shows up here |
-| `--cov-boundary LCVB1` | iteration boundaries instead of `--fuzz-begin`/`--fuzz-end`: one BEGIN marker (more are refused for now) and any number of END markers, all with the same depth filter. Depth-zero-only markers keep nested BEGIN/END arrivals (recursion) inside one iteration. With "any depth", ember ends the iteration at the first END reached, where libcov would publish each nested segment separately |
+| `--cov-boundary LCVB1` | iteration boundaries instead of `--fuzz-begin`/`--fuzz-end`: any number of BEGIN markers (the snapshot is at the first one the boot reaches) and of END markers, all with the same depth filter. Depth-zero-only markers keep nested BEGIN/END arrivals (recursion) inside one iteration. With "any depth", ember ends the iteration at the first END reached, where libcov would publish each nested segment separately |
 
 **Where the BEGIN marker sits.** ember snapshots at the BEGIN marker and delivers each input
 there, so the marker must come before the firmware reads its input. suzzer's generators

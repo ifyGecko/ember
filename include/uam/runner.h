@@ -55,6 +55,8 @@ typedef struct uam_runner_setup {
     /* out: iteration boundaries (turn on the fuzz harness) */
     bool                  have_begin;
     uint64_t              begin_pc;
+    const uint64_t       *more_begin_pcs;  /* other begins (owned by the extension) */
+    size_t                n_more_begin_pcs;
     const uint64_t       *end_pcs;         /* none: begin-only (owned by the extension) */
     size_t                n_end_pcs;
     bool                  nested;

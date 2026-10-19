@@ -11,8 +11,8 @@
  *      classify the outcome. A crash never ends the campaign: the next input starts
  *      from the snapshot again, since nothing outside the machine died.
  *
- * Iteration boundaries come in two modes: *paired* (a begin pc and an end pc) and
- * *begin-only* (an iteration ends when the begin pc is reached again). Both are PC
+ * Iteration boundaries come in two modes: *paired* (begin pcs and end pcs) and
+ * *begin-only* (an iteration ends when a begin pc is reached again). Both are PC
  * hooks. A coverage site at a boundary pc is counted by its hook, before the map is
  * published: the begin's hit belongs to the map it closes (INIT, or the previous
  * iteration in begin-only mode), an end's to the iteration it ends, and an
@@ -73,7 +73,12 @@ enum uam_fuzz_exc_class {
 bool uam_fuzz_parse_exc_classes(const char *s, unsigned *out);
 
 typedef struct uam_fuzz_config {
-    uint64_t        begin_pc;      /* one begin for now (the snapshot is taken there) */
+    uint64_t        begin_pc;      /* where an iteration begins (the snapshot is taken there) */
+    const uint64_t *more_begin_pcs; /* other begins, each like begin_pc (copied): the snapshot
+                                    * is taken at whichever begin the boot reaches first, and
+                                    * during an iteration any begin ends it (begin-only) or
+                                    * opens a nested level (paired + nested) */
+    size_t          n_more_begin_pcs;
     const uint64_t *end_pcs;       /* paired mode: reaching any of these ends an iteration
                                     * (copied; none: begin-only mode) */
     size_t          n_end_pcs;

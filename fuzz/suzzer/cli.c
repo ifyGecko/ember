@@ -270,6 +270,8 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
         }
         s->have_begin = true;
         s->begin_pc = c->bounds.begin_pc;
+        s->more_begin_pcs = c->bounds.more_begin_pcs;
+        s->n_more_begin_pcs = c->bounds.n_more_begin_pcs;
         s->end_pcs = c->bounds.end_pcs;
         s->n_end_pcs = c->bounds.n_end_pcs;
         s->nested = c->bounds.nested;
@@ -340,7 +342,8 @@ const uam_runner_ext uam_suzzer_runner_ext = {
         "      --cov-mode M        leapfrog (default, like libcov: a site counts again only\n"
         "                          after another one) or every (each execution counts)\n"
         "      --cov-strict        fail if a site's bytes in memory differ from the list\n"
-        "      --cov-boundary LCVB1  iteration begin/end from a suzzer boundary file\n"
+        "      --cov-boundary LCVB1  iteration begin/end from a suzzer boundary file (any\n"
+        "                          number of BEGIN and END markers)\n"
         "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP;\n"
         "                          TCP keepalive notices a vanished brain host)\n"
         "      --fuzz-szr-timeout S  give up when the brain sends nothing for S seconds\n"

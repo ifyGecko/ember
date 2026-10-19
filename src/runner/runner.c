@@ -135,8 +135,10 @@ static void usage(FILE *out)
         "      --cov-out FILE      write the raw coverage map to FILE when the run stops\n"
         "                          (fuzzing: the last input's map)\n"
         "      --fuzz-begin PC     fuzz: boot to PC, snapshot there, run each input from it\n"
+        "                          (repeatable: the snapshot is at the first one reached, and\n"
+        "                          any of them begins an iteration)\n"
         "      --fuzz-end PC       an iteration ends at PC (repeatable: any of them; default:\n"
-        "                          when the --fuzz-begin PC is reached again)\n"
+        "                          when a --fuzz-begin PC is reached again)\n"
         "      --fuzz-begin-skip N boot passes the begin PC N times and snapshots at the next\n"
         "                          arrival (firmware that runs its handler at start-up)\n"
         "      --fuzz-input ROUTE  how inputs reach the guest: mem:ADDR[,len=ADDR][,max=N]\n"
@@ -441,8 +443,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint8_t *cov_map = NULL;
     uam_cov_state cov_state = { 0 };
     uam_fuzz_config fz = { .crash_exc = UAM_FUZZ_EXC_DEFAULT };
-    uint64_t fuzz_crash_pcs[MAX_LIST], fuzz_end_pcs[MAX_LIST];
-    size_t n_fuzz_end = 0;
+    uint64_t fuzz_crash_pcs[MAX_LIST], fuzz_end_pcs[MAX_LIST], fuzz_more_begins[MAX_LIST];
+    size_t n_fuzz_end = 0, n_more_begins = 0;
     bool have_begin = false, fuzz_opts = false;
     const char *fuzz_input = NULL, *fuzz_replay = NULL;
     unsigned trace = 0, block_insns = 0;
@@ -594,7 +596,18 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_COV_BLOCKS: cov_blocks = true; break;
         case OPT_COV_OUT: cov_out = optarg; break;
         case OPT_COV_MAP_SIZE: cov_map_size = parse_size(optarg); cov_map_size_given = true; break;
-        case OPT_FUZZ_BEGIN: fz.begin_pc = strtoull(optarg, NULL, 0); have_begin = true; break;
+        case OPT_FUZZ_BEGIN:
+            /* Repeatable: the first is begin_pc, the others more begins. */
+            if (!have_begin) {
+                fz.begin_pc = strtoull(optarg, NULL, 0);
+                have_begin = true;
+            } else if (n_more_begins == MAX_LIST) {
+                fprintf(stderr, "uam-run: at most %d --fuzz-begin options\n", MAX_LIST + 1);
+                return 2;
+            } else {
+                fuzz_more_begins[n_more_begins++] = strtoull(optarg, NULL, 0);
+            }
+            break;
         case OPT_FUZZ_END:
             if (n_fuzz_end == MAX_LIST) {
                 fprintf(stderr, "uam-run: at most %d --fuzz-end options\n", MAX_LIST);
@@ -710,6 +723,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     fz.crash_pcs = fuzz_crash_pcs;
     fz.end_pcs = fuzz_end_pcs;
     fz.n_end_pcs = n_fuzz_end;
+    fz.more_begin_pcs = fuzz_more_begins;
+    fz.n_more_begin_pcs = n_more_begins;
     fz.boot_insns = max_insns;
     if (cov_map_size < 2 || cov_map_size > (UINT64_C(1) << 30) || (cov_map_size & (cov_map_size - 1))) {
         fprintf(stderr, "uam-run: --cov-map-size must be a power of two from 2 to 1G\n");
@@ -860,6 +875,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         if (one.have_begin) {
             xs.have_begin = true; xs.begin_pc = one.begin_pc; xs.end_pcs = one.end_pcs;
             xs.n_end_pcs = one.n_end_pcs; xs.nested = one.nested;
+            xs.more_begin_pcs = one.more_begin_pcs; xs.n_more_begin_pcs = one.n_more_begin_pcs;
         }
         if (one.frontend) {
             xs.frontend = one.frontend;
@@ -878,6 +894,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     if (xs.have_begin) {
         fz.begin_pc = xs.begin_pc;
+        fz.more_begin_pcs = xs.more_begin_pcs;
+        fz.n_more_begin_pcs = xs.n_more_begin_pcs;
         fz.end_pcs = xs.end_pcs;
         fz.n_end_pcs = xs.n_end_pcs;
         fz.nested = xs.nested;

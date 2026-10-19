@@ -492,10 +492,21 @@ static void test_lcvb(void)
     sz_bounds_free(&bo);
     sz_boundaries_free(&bd);
 
+    /* Several BEGIN markers: the first is begin_pc, the others more begins. */
     b = lcvb(2, bb, 0);
     sz_lcvb_parse(b.d, b.n, &bd, err, sizeof(err));
-    CHECK(!sz_boundaries_apply(&bd, 0, 32, &bo, err, sizeof(err)) && strstr(err, "several BEGIN"),
-          "two BEGINs refused: %s", err);
+    CHECK(sz_boundaries_apply(&bd, 0x1000, 32, &bo, err, sizeof(err)) && bo.begin_pc == 0x1100
+          && bo.n_more_begin_pcs == 1 && bo.more_begin_pcs[0] == 0x1110 && bo.n_end_pcs == 0
+          && !bo.nested, "two BEGINs: %s", err);
+    sz_bounds_free(&bo);
+    sz_boundaries_free(&bd);
+    const uint8_t bbe[3] = { 0, 1, 0 };
+    b = lcvb(3, bbe, 1);
+    sz_lcvb_parse(b.d, b.n, &bd, err, sizeof(err));
+    CHECK(sz_boundaries_apply(&bd, 0x1000, 32, &bo, err, sizeof(err)) && bo.begin_pc == 0x1100
+          && bo.n_more_begin_pcs == 1 && bo.more_begin_pcs[0] == 0x1120 && bo.n_end_pcs == 1
+          && bo.end_pcs[0] == 0x1110 && bo.nested, "two BEGINs and an END, nested: %s", err);
+    sz_bounds_free(&bo);
     sz_boundaries_free(&bd);
 
     b = lcvb(1, b1, 0);

@@ -131,12 +131,15 @@ bool sz_namer_init(sz_namer *n, const sz_patchlist *p, const uam_cov_site *sites
 void sz_namer_fini(sz_namer *n);
 void sz_namer_describe(void *ctx, uint64_t pc, char *buf, size_t len);
 
-/* An LCVB1 file as harness boundaries (uam_fuzz_config): one BEGIN (the harness
- * snapshots at a single begin, so several are refused for now) and any number of END
- * markers (none: begin-only mode). All markers must share one depth filter;
- * depth-zero-only markers make the boundaries nested. */
+/* An LCVB1 file as harness boundaries (uam_fuzz_config): one or more BEGIN markers (the
+ * first in the file is begin_pc, the others more_begin_pcs; the harness snapshots at
+ * whichever the boot reaches first) and any number of END markers (none: begin-only
+ * mode). All markers must share one depth filter; depth-zero-only markers make the
+ * boundaries nested. */
 typedef struct sz_bounds {
     uint64_t  begin_pc;
+    uint64_t *more_begin_pcs;  /* owned; sz_bounds_free */
+    size_t    n_more_begin_pcs;
     uint64_t *end_pcs;     /* owned; sz_bounds_free */
     size_t    n_end_pcs;
     bool      nested;

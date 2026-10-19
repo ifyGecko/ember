@@ -32,6 +32,8 @@ struct uam_fuzz {
     uint64_t      *crash_pcs;
     uint64_t      *end_pcs;        /* distinct, copied from cfg */
     size_t         n_end_pcs;
+    uint64_t      *begin_pcs;      /* cfg.begin_pc, then the distinct more_begin_pcs */
+    size_t         n_begin_pcs;
     uint8_t       *map;
     uam_cov_state  cov;
     uam_cov_site  *marker;         /* sites at the begin and end pcs, counted by the hooks */
@@ -280,18 +282,23 @@ uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err,
         return NULL;
     }
     for (size_t i = 0; i < cfg->n_end_pcs; i++) {
-        if (cfg->end_pcs[i] == cfg->begin_pc) {
-            set_err(err, errlen, "an end pc equals the begin pc");
+        bool clash = cfg->end_pcs[i] == cfg->begin_pc;
+        for (size_t k = 0; k < cfg->n_more_begin_pcs; k++)
+            clash |= cfg->end_pcs[i] == cfg->more_begin_pcs[k];
+        if (clash) {
+            set_err(err, errlen, "an end pc equals a begin pc");
             return NULL;
         }
     }
     uam_fuzz *f = calloc(1, sizeof(*f));
     if (!f || !(f->map = calloc(1, map_size))
         || (cfg->n_crash_pcs && !(f->crash_pcs = malloc(sizeof(uint64_t) * cfg->n_crash_pcs)))
-        || (cfg->n_end_pcs && !(f->end_pcs = malloc(sizeof(uint64_t) * cfg->n_end_pcs)))) {
+        || (cfg->n_end_pcs && !(f->end_pcs = malloc(sizeof(uint64_t) * cfg->n_end_pcs)))
+        || !(f->begin_pcs = malloc(sizeof(uint64_t) * (1 + cfg->n_more_begin_pcs)))) {
         if (f) {
             free(f->map);
             free(f->crash_pcs);
+            free(f->end_pcs);
         }
         free(f);
         set_err(err, errlen, "out of memory");
@@ -315,13 +322,26 @@ uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err,
     }
     f->cfg.end_pcs = f->end_pcs;
     f->cfg.n_end_pcs = f->n_end_pcs;
+    /* Likewise one hook per distinct begin pc, cfg.begin_pc first. */
+    f->begin_pcs[f->n_begin_pcs++] = cfg->begin_pc;
+    for (size_t i = 0; i < cfg->n_more_begin_pcs; i++) {
+        bool dup = false;
+        for (size_t k = 0; k < f->n_begin_pcs; k++)
+            dup |= f->begin_pcs[k] == cfg->more_begin_pcs[i];
+        if (!dup)
+            f->begin_pcs[f->n_begin_pcs++] = cfg->more_begin_pcs[i];
+    }
+    f->cfg.more_begin_pcs = f->begin_pcs + 1;
+    f->cfg.n_more_begin_pcs = f->n_begin_pcs - 1;
     uam_cov_state_init(&f->cov, f->map, map_size, &cfg->history);
     f->cov.skip_repeat = cfg->skip_repeats;
     f->snap_last_pc = UAM_COV_NO_PC;
     f->scheme = "none";
 
     uam_exec *x = &m->exec;
-    uam_status st = uam_exec_add_pc_hook(x, cfg->begin_pc, begin_hook, f);
+    uam_status st = UAM_OK;
+    for (size_t i = 0; st == UAM_OK && i < f->n_begin_pcs; i++)
+        st = uam_exec_add_pc_hook(x, f->begin_pcs[i], begin_hook, f);
     for (size_t i = 0; st == UAM_OK && i < f->n_end_pcs; i++)
         st = uam_exec_add_pc_hook(x, f->end_pcs[i], end_hook, f);
     for (size_t i = 0; st == UAM_OK && i < cfg->n_crash_pcs; i++)
@@ -347,7 +367,8 @@ void uam_fuzz_destroy(uam_fuzz *f)
         return;
     uam_machine *m = f->m;
     uam_exec *x = &m->exec;
-    uam_exec_remove_pc_hook(x, f->cfg.begin_pc, begin_hook, f);
+    for (size_t i = 0; i < f->n_begin_pcs; i++)
+        uam_exec_remove_pc_hook(x, f->begin_pcs[i], begin_hook, f);
     for (size_t i = 0; i < f->n_end_pcs; i++)
         uam_exec_remove_pc_hook(x, f->end_pcs[i], end_hook, f);
     for (size_t i = 0; i < f->cfg.n_crash_pcs; i++)
@@ -368,6 +389,7 @@ void uam_fuzz_destroy(uam_fuzz *f)
     free(f->routes);
     free(f->crash_pcs);
     free(f->end_pcs);
+    free(f->begin_pcs);
     free(f->marker);
     free(f->map);
     free(f);
@@ -379,9 +401,17 @@ static void name_scheme(uam_fuzz *f, const char *scheme)
     f->scheme = f->scheme_buf;
 }
 
+static bool is_begin(const uam_fuzz *f, uint64_t pc)
+{
+    for (size_t i = 0; i < f->n_begin_pcs; i++)
+        if (f->begin_pcs[i] == pc)
+            return true;
+    return false;
+}
+
 static bool is_boundary(const uam_fuzz *f, uint64_t pc)
 {
-    if (pc == f->cfg.begin_pc)
+    if (is_begin(f, pc))
         return true;
     for (size_t i = 0; i < f->n_end_pcs; i++)
         if (f->end_pcs[i] == pc)
@@ -596,7 +626,7 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     clear_flags(f);
     f->boot_arrivals = 0;
     uint64_t ic0 = m->cpu.icount;
-    if (m->cpu.pc == f->cfg.begin_pc) {
+    if (is_begin(f, m->cpu.pc)) {
         /* Already there (e.g. resumed from a snapshot taken at begin): an arrival whose
          * hook must not run again when the hart starts. */
         count_marker(f, m->cpu.pc);
@@ -618,8 +648,9 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     r->insns = m->cpu.icount - ic0;
     if (!f->at_begin || f->aborted) {
         if (!f->aborted)
-            uam_log(UAM_LOG_ERROR, "fuzz", "boot did not reach the begin pc 0x%llx%s: %s at pc 0x%llx "
-                    "(%u arrivals)", (unsigned long long)f->cfg.begin_pc,
+            uam_log(UAM_LOG_ERROR, "fuzz", "boot did not reach the begin pc 0x%llx%s%s: %s at pc "
+                    "0x%llx (%u arrivals)", (unsigned long long)f->cfg.begin_pc,
+                    f->n_begin_pcs > 1 ? " (or another begin)" : "",
                     f->cfg.begin_skip ? " often enough" : "", uam_stop_reason_str(r->stop),
                     (unsigned long long)r->pc, f->boot_arrivals);
         return UAM_ERR_INVALID;

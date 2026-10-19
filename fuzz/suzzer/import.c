@@ -349,16 +349,15 @@ bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_w
     const uint64_t amask = uam_mask(addr_width);
     memset(out, 0, sizeof(*out));
     int begin = -1;
-    size_t n_end = 0;
+    size_t n_end = 0, n_begin = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         if (b->rec[i].kind == LIBCOV_BOUNDARY_KIND_END) {
             n_end++;
             continue;
         }
-        if (begin >= 0)
-            return fail(err, errlen, "the boundary file has several BEGIN markers (records %d and %u); "
-                        "ember supports one BEGIN for now (any number of END markers)", begin, i);
-        begin = (int)i;
+        if (begin < 0)
+            begin = (int)i;
+        n_begin++;
     }
     if (begin < 0)
         return fail(err, errlen, "the boundary file has no BEGIN marker");
@@ -372,17 +371,25 @@ bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_w
                         begin, i);
     out->begin_pc = (base0 + b->rec[begin].offset) & amask;
     out->nested = n_end && depth == LIBCOV_BOUNDARY_DEPTH_ZERO;
-    if (n_end && !(out->end_pcs = malloc(sizeof(uint64_t) * n_end)))
+    if ((n_end && !(out->end_pcs = malloc(sizeof(uint64_t) * n_end)))
+        || (n_begin > 1 && !(out->more_begin_pcs = malloc(sizeof(uint64_t) * (n_begin - 1))))) {
+        sz_bounds_free(out);
         return fail(err, errlen, "out of memory");
-    for (uint32_t i = 0; i < b->count; i++)
+    }
+    for (uint32_t i = 0; i < b->count; i++) {
+        uint64_t pc = (base0 + b->rec[i].offset) & amask;
         if (b->rec[i].kind == LIBCOV_BOUNDARY_KIND_END)
-            out->end_pcs[out->n_end_pcs++] = (base0 + b->rec[i].offset) & amask;
+            out->end_pcs[out->n_end_pcs++] = pc;
+        else if ((int)i != begin)
+            out->more_begin_pcs[out->n_more_begin_pcs++] = pc;
+    }
     return true;
 }
 
 void sz_bounds_free(sz_bounds *bd)
 {
     free(bd->end_pcs);
+    free(bd->more_begin_pcs);
     memset(bd, 0, sizeof(*bd));
 }
 

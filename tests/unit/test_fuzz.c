@@ -461,6 +461,88 @@ static uam_fuzz *skip_harness(uam_machine *m, const target *t, uint32_t skip, ui
     return f;
 }
 
+/* ---- several begins ------------------------------------------------------ */
+
+static uam_fuzz *begins_harness(uam_machine *m, const target *t, const uint64_t *more, size_t n_more,
+                                const uint64_t *ends, size_t n_ends, bool nested, uint32_t skip)
+{
+    uam_fuzz_config cfg = { .begin_pc = t->begin, .more_begin_pcs = more, .n_more_begin_pcs = n_more,
+                            .end_pcs = ends, .n_end_pcs = n_ends, .nested = nested,
+                            .iter_insns = 20000, .boot_insns = 100000, .begin_skip = skip,
+                            .crash_pcs = &t->oracle, .n_crash_pcs = 1, .map_size = MAP_SIZE,
+                            .crash_exc = UAM_FUZZ_EXC_DEFAULT };
+    char err[256];
+    uam_fuzz *f = uam_fuzz_create(m, &cfg, err, sizeof(err));
+    CHECK(f != NULL, "create: %s", err);
+    if (f) {
+        CHECK(uam_fuzz_set_block_coverage(f) == UAM_OK, "coverage");
+        CHECK(uam_fuzz_select_route(f, t->route, err, sizeof(err)) == UAM_OK, "route: %s", err);
+    }
+    return f;
+}
+
+/* "count" is the instruction right before END (s0++): a second begin there ends a
+ * begin-only iteration before the count; the boot loop is a begin the boot reaches
+ * before BEGIN. */
+static void test_begins(const target *t)
+{
+    const uint64_t count = t->end - 4, boot_loop = t->begin - (t->isa == &uam_isa_rv32 ? 8 : 12);
+    for (int bk = BK_INTERP; bk <= BK_JIT; bk++) {
+        uam_machine m;
+        uam_fuzz_result r;
+        /* The boot stops at the first begin it reaches, wherever that is. */
+        machine_for(&m, t, (backend)bk);
+        uam_fuzz *f = begins_harness(&m, t, &boot_loop, 1, NULL, 0, false, 0);
+        CHECK(uam_fuzz_boot(f, &r) == UAM_OK && m.cpu.pc == boot_loop, "%s: snapshot at the first "
+              "begin reached (pc 0x%llx)", t->name, (unsigned long long)m.cpu.pc);
+        uam_fuzz_destroy(f);
+        uam_machine_fini(&m);
+
+        /* Begin-only: reaching another begin ends the iteration (before the count). */
+        machine_for(&m, t, (backend)bk);
+        f = begins_harness(&m, t, &count, 1, NULL, 0, false, 0);
+        CHECK(uam_fuzz_boot(f, &r) == UAM_OK && m.cpu.pc == t->begin, "%s: snapshot at BEGIN", t->name);
+        CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) == UAM_OK && r.verdict == UAM_FUZZ_OK
+              && r.pc == count, "%s: the second begin ends the iteration (pc 0x%llx)", t->name,
+              (unsigned long long)r.pc);
+        EQ64(reg32(&m, t->s0), 0, "stopped before the count");
+        uam_fuzz_destroy(f);
+        uam_machine_fini(&m);
+
+        /* begin_skip counts arrivals at every begin: the boot loop's 5 passes, then BEGIN. */
+        machine_for(&m, t, (backend)bk);
+        f = begins_harness(&m, t, &boot_loop, 1, NULL, 0, false, 5);
+        CHECK(uam_fuzz_boot(f, &r) == UAM_OK && m.cpu.pc == t->begin,
+              "%s: five arrivals in the boot loop, the sixth at BEGIN (pc 0x%llx)", t->name,
+              (unsigned long long)m.cpu.pc);
+        uam_fuzz_destroy(f);
+        uam_machine_fini(&m);
+
+        /* Paired and nested: another begin opens a level, so END no longer closes the
+         * iteration and it runs out of budget; not nested, END ends it. */
+        for (int nested = 0; nested <= 1; nested++) {
+            machine_for(&m, t, (backend)bk);
+            f = begins_harness(&m, t, &count, 1, &t->end, 1, nested, 0);
+            uam_fuzz_boot(f, &r);
+            CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) == UAM_OK, "run");
+            EQ64(r.verdict, nested ? UAM_FUZZ_TIMEOUT : UAM_FUZZ_OK,
+                 nested ? "nested: a begin inside the iteration opens a level"
+                        : "not nested: END ends the iteration");
+            uam_fuzz_destroy(f);
+            uam_machine_fini(&m);
+        }
+    }
+    /* An end may not be any begin. */
+    uam_machine m;
+    machine_for(&m, t, BK_INTERP);
+    uam_fuzz_config cfg = { .begin_pc = t->begin, .more_begin_pcs = &count, .n_more_begin_pcs = 1,
+                            .end_pcs = &count, .n_end_pcs = 1 };
+    char err[128] = "";
+    CHECK(uam_fuzz_create(&m, &cfg, err, sizeof(err)) == NULL && strstr(err, "begin"),
+          "an end equal to another begin is refused (%s)", err);
+    uam_machine_fini(&m);
+}
+
 /* The target's boot finds an empty input (count, END, back to BEGIN), so each skipped
  * arrival is one pass through the handler, counted in s0. */
 static void test_begin_skip(const target *t)
@@ -982,8 +1064,10 @@ int main(void)
     }
     test_internal_error(&ts[1]);
     test_replay_sidecars();
-    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++)
+    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {
         test_begin_skip(&ts[i]);
+        test_begins(&ts[i]);
+    }
     printf("test_fuzz: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }
