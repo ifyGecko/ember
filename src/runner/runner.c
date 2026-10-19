@@ -83,6 +83,8 @@ static void usage(FILE *out)
         "usage: uam-run [options] [IMAGE]\n"
         "  -b, --board NAME        board to build (default: rv32-ref); --board list shows all\n"
         "      --raw-base ADDR     load address for raw (non-ELF) images (default: board reset pc)\n"
+        "      --entry PC          start the hart at PC (default: the ELF entry, or the raw\n"
+        "                          image's load address)\n"
         "      --image NAME=PATH   named image for the board to place (repeatable)\n"
         "  -o, --option KEY=VALUE  board-specific option (repeatable)\n"
         "  -n, --max-insns N       stop after N guest instructions (0 = unlimited)\n"
@@ -358,10 +360,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT, OPT_MMIO_RULE, OPT_MMIO_INPUT,
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
-           OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_EXT_BASE = 1000 };
+           OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
+        { "entry", required_argument, NULL, OPT_ENTRY },
         { "image", required_argument, NULL, OPT_IMAGE },
         { "option", required_argument, NULL, 'o' },
         { "max-insns", required_argument, NULL, 'n' },
@@ -420,11 +423,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint64_t snap_at_pc = 0;
     bool have_snap_at = false;
     char *uart_input_spec = NULL;
-    uint64_t raw_base = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
+    uint64_t raw_base = 0, entry = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
     uint64_t max_ticks = 0, max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
     uint64_t realtime_tps = 0, log_pcs[MAX_LIST], break_pcs[MAX_LIST], log_hits[MAX_LIST] = { 0 };
     unsigned n_log = 0, n_break = 0;
-    bool have_raw_base = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
+    bool have_raw_base = false, have_entry = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
     bool show_map = false, virtual_time = false, cov_blocks = false;
     const char *cov_out = NULL;
     uint64_t cov_map_size = 1u << 16;
@@ -521,6 +524,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_MAX_TICKS: max_ticks = strtoull(optarg, NULL, 0); break;
         case OPT_MAX_STALL: max_stall = strtoull(optarg, NULL, 0); break;
         case OPT_RAW_BASE: raw_base = strtoull(optarg, NULL, 0); have_raw_base = true; break;
+        case OPT_ENTRY: entry = strtoull(optarg, NULL, 0); have_entry = true; break;
         case OPT_RAM: cfg.ram_size = parse_size(optarg); break;
         case OPT_CONSOLE: console_spec = optarg; break;
         case OPT_UART_IN:
@@ -776,7 +780,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
             uam_machine_fini(&m);
             goto out_host;
         }
-        uam_machine_reset(&m, info.entry);
+        uam_machine_reset(&m, have_entry ? entry : info.entry);
+    } else if (have_entry) {
+        uam_machine_reset(&m, entry);
     }
     if (load_snap) {
         uam_snapshot *snap;

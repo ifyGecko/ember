@@ -1,5 +1,5 @@
 #!/bin/sh
-# fuzz-check.sh RUN BOARD FIRMWARE - the fuzz harness through the runner (--fuzz-replay).
+# fuzz-check.sh RUN BOARD FIRMWARE [RAW] - the fuzz harness through the runner (--fuzz-replay).
 #
 # FIRMWARE is a build of tests/fuzz/fuzztarget.h. Its inputs arrive through the
 # board's "uart0" route; iterations begin at fuzz_iteration (begin-only) and
@@ -9,7 +9,9 @@
 #     without chaining,
 #   - a crash file replayed on its own reproducing the same line and exit status,
 #   - the exception-class policy: with --fuzz-crash-exc none, the bad store reaches
-#     the firmware's trap handler, which calls fuzz_panic (an oracle crash).
+#     the firmware's trap handler, which calls fuzz_panic (an oracle crash);
+#   - with RAW (FIRMWARE as a flat binary), the raw image loaded at the ELF's first
+#     segment and started at _start with --entry giving the same verdicts.
 set -eu
 
 run=$1
@@ -101,6 +103,21 @@ if [ $rc -ne 21 ] || ! grep -q "crash-oracle pc=$panic" "$tmp/none.out"; then
     echo "fuzz-check: $board: --fuzz-crash-exc none: exit $rc (expected 21):" >&2
     cat "$tmp/none.out" >&2
     fail=1
+fi
+
+if [ -n "${4:-}" ]; then
+    lo=$(readelf -lW "$fw" | awk '$1 == "LOAD" { print $3; exit }')
+    rc=0
+    "$run" -b "$board" --raw-base "$lo" --entry "$(sym _start)" --cov-blocks --fuzz-begin "$begin" \
+        --fuzz-crash-pc "$panic" --fuzz-input uart0 --fuzz-iter-insns 200000 -n 10000000 \
+        --fuzz-replay "$tmp/in" "$4" < /dev/null > "$tmp/raw.raw" 2> "$tmp/raw.err" || rc=$?
+    grep '^replay: ' "$tmp/raw.raw" | sed "s|$tmp/in/||" > "$tmp/raw.out" || true
+    if [ $rc -ne 20 ] || ! cmp -s "$tmp/raw.out" "$out"; then
+        echo "fuzz-check: $board: the raw image with --entry (exit $rc):" >&2
+        diff "$out" "$tmp/raw.out" >&2 || true
+        cat "$tmp/raw.err" >&2
+        fail=1
+    fi
 fi
 
 [ $fail -eq 0 ] && echo "fuzz-check: $board: $(basename "$fw"): verdicts, backends and replay agree"

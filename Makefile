@@ -257,7 +257,8 @@ cov-test: $(RUN) firmware firmware-mips
 # files reproduce on their own.
 fuzz-test: $(RUN) firmware firmware-mips
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
-	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
+	    $(BUILD)/firmware-mips/fuzztarget-be.bin
 	sh tests/fuzz/fuzz-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
 
 # suzzer's formats and the SZR1 executor through the runner (lists written by

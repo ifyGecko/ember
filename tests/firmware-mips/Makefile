@@ -9,7 +9,8 @@ FW_CFLAGS  = -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin -fno-pi
           -fno-stack-protector -nostdlib -nostartfiles -G0
 FW_LDFLAGS = -static -no-pie -Wl,-T,link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest-be.elf $(OUT)/selftest-el.elf $(OUT)/fuzztarget-be.elf $(OUT)/fuzztarget-el.elf
+all: $(OUT)/selftest-be.elf $(OUT)/selftest-el.elf $(OUT)/fuzztarget-be.elf $(OUT)/fuzztarget-el.elf \
+     $(OUT)/fuzztarget-be.bin
 
 $(OUT)/selftest-be.elf: start.S selftest.c link.ld
 	@mkdir -p $(OUT)
@@ -24,6 +25,10 @@ $(OUT)/selftest-el.elf: start.S selftest.c link.ld
 $(OUT)/fuzztarget-be.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
 	@mkdir -p $(OUT)
 	$(CROSS_BE)gcc -march=mips32r2 -mabi=32 -EB $(FW_CFLAGS) $(FW_LDFLAGS) start.S fuzztarget.c -o $@
+
+# The same image without its ELF wrapper, for the raw-image path (--raw-base, --entry).
+$(OUT)/fuzztarget-be.bin: $(OUT)/fuzztarget-be.elf
+	$(CROSS_BE)objcopy -O binary $< $@
 
 $(OUT)/fuzztarget-el.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
 	@mkdir -p $(OUT)
