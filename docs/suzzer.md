@@ -85,7 +85,8 @@ With suzzer configured, `uam-run` (and every board built on `uam_run_main`) gain
 | `--cov-shm PATH`, `--cov-shm-ring N` | publish INIT and every ok iteration's map in an LCVS region for suzzer's readers |
 
 and `make test` adds `test_suzzer` (the format readers and the conformance vectors) and
-`suzzer-test`: the options end to end on RV32 and MIPS32 BE/LE, the LCVS region read back by
+`suzzer-test`: the options end to end on RV32 and MIPS32 BE/LE (with lists from suzzer's own
+generators too, when rizin and rzpipe are installed), the LCVS region read back by
 suzzer's `test/shm_bitmap.py` and an independent reader, the SZR1 executor against a
 scripted brain (`tests/szr/fake_brain.py`), and a session with suzzer's own
 `tools/suzzer_brain.py` (`tests/szr/brain-check.sh`). See
