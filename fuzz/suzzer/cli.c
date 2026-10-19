@@ -177,9 +177,15 @@ static uam_status connect_brain(cli *c, uam_runner_setup *s, char *err, size_t e
     return UAM_OK;
 }
 
+/* suzzer's brain saves each crash or hang X with its notes in X.info (FORMATS.md 4.5):
+ * replaying its crashes/ or hangs/ directory runs the inputs, not the notes. */
+static const char *const brain_sidecars[] = { ".info" };
+
 static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t errlen)
 {
     cli *c = st;
+    s->replay_sidecars = brain_sidecars;
+    s->n_replay_sidecars = UAM_ARRAY_LEN(brain_sidecars);
     if (!c->sites_path && !c->boundary_path) {
         if (c->n_mod || c->strict) {
             snprintf(err, errlen, "--cov-module and --cov-strict need --cov-sites");

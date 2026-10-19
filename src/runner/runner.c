@@ -301,7 +301,8 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
         fprintf(stderr, "uam-run: --fuzz-input: %s\n", err);
         goto out;
     }
-    if (!xs->frontend && !(r = uam_fuzz_replay_create(replay, f, stdout)))
+    if (!xs->frontend && !(r = uam_fuzz_replay_create_ex(replay, f, stdout, xs->replay_sidecars,
+                                                         xs->n_replay_sidecars)))
         goto out;
     g_fuzz = f;
     uam_status st = xs->frontend ? uam_fuzz_run(f, xs->frontend, xs->frontend_ctx)
@@ -846,6 +847,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
         if (one.frontend) {
             xs.frontend = one.frontend;
             xs.frontend_ctx = one.frontend_ctx;
+        }
+        if (one.n_replay_sidecars) {
+            xs.replay_sidecars = one.replay_sidecars;
+            xs.n_replay_sidecars = one.n_replay_sidecars;
         }
     }
     if (xs.map_size)

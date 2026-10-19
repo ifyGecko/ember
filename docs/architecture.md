@@ -132,7 +132,8 @@ boards/           rv32_ref.c mips_ref.c stock.c mmio_rules.c (uam_board_add_mmio
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
 fuzz/suzzer/      scheme.c (the bucket formula) import.c (LCV3/LCVB1 readers, site check)
-                  cli.c (the --cov-sites/--cov-boundary runner extension) suzzer.h
+                  frontend_szr1.c (the SZR1 executor, --fuzz-szr) lcvs.c (the LCVS export,
+                  --cov-shm) cli.c (the runner extension for all of them) suzzer.h
 tools/            uam-run.c fetch-suzzer.sh (`make suzzer`: clone suzzer into ./suzzer, ignored
                   by git)
 examples/         external-board/ (an out-of-tree board built against `make lib`)
@@ -140,7 +141,10 @@ tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c t
                   test_fuzz.c test_suzzer.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
-tests/suzzer/     suzzer-check.sh mk_lists.py  (suzzer's formats through the runner)
+tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
+                  runner) gen-check.sh  (lists from suzzer's own generators, with rizin)
+tests/szr/        szr-check.sh fake_brain.py  (the SZR1 executor against a scripted brain)
+                  brain-check.sh  (a session with suzzer's own brain)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
 tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
@@ -314,9 +318,12 @@ Implemented (`make test`):
 - suzzer formats: `test_suzzer` reproduces every conformance vector of the configured suzzer (N=1..4 and 8,
   rotation off and on) byte for byte through `UAM_OP_COV` on every backend, checks the map-size rule against suzzer's table, and
   covers the LCV3/LCVB1 readers (every rejection of suzzer's reader checklist), base
-  resolution, boundaries, site naming and the site-byte check. `tests/suzzer/suzzer-check.sh`
-  runs `--cov-sites`/`--cov-boundary` end to end on all three ISAs, including N=3 and N=8
-  with rotation.
+  resolution, boundaries, site naming, the site-byte check and the LCVS region's ownership
+  rules. `tests/suzzer/suzzer-check.sh` runs `--cov-sites`/`--cov-boundary` end to end on all
+  three ISAs, including N=3 and N=8 with rotation, and the LCVS export read back by suzzer's
+  reader; `gen-check.sh` does it with suzzer's own generators; `tests/szr/` checks the SZR1
+  executor frame by frame and in a session with suzzer's brain, whose saved crash directory
+  replays without its `.info` notes.
 - With a suzzer checkout configured: its format header compiles on its own with ember's
   strict flags, and `test_suzzer` reads the checkout's own conformance vectors. Without one,
   the suzzer tests are skipped.

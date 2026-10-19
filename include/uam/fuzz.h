@@ -215,6 +215,11 @@ typedef struct uam_fuzz_replay uam_fuzz_replay;
 extern const uam_fuzz_frontend uam_fuzz_replay_frontend;
 /* NULL if path cannot be read (logged). `f` gives the result details printed. */
 uam_fuzz_replay *uam_fuzz_replay_create(const char *path, uam_fuzz *f, FILE *out);
+/* The same, but in a directory a file named X<suffix> is skipped when X is there too, for
+ * each of the n suffixes: notes a fuzzer saves beside each input (suzzer's brain writes
+ * X.info next to crash X), which would otherwise run as inputs. A FILE path always runs. */
+uam_fuzz_replay *uam_fuzz_replay_create_ex(const char *path, uam_fuzz *f, FILE *out,
+                                           const char *const *sidecars, size_t n_sidecars);
 void             uam_fuzz_replay_destroy(uam_fuzz_replay *r);
 int              uam_fuzz_replay_exit_status(const uam_fuzz_replay *r);
 /* The map of the last input (or the INIT map if there were none). */

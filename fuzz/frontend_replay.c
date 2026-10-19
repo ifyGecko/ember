@@ -42,7 +42,55 @@ static bool add_path(uam_fuzz_replay *r, const char *p)
     return true;
 }
 
+/* X<suffix> for one of the suffixes, with X among the (sorted) paths too. */
+static bool is_sidecar(const uam_fuzz_replay *r, const char *p, const char *const *sidecars,
+                       size_t n_sidecars)
+{
+    size_t len = strlen(p);
+    for (size_t i = 0; i < n_sidecars; i++) {
+        size_t sl = strlen(sidecars[i]);
+        if (!sl || len <= sl || strcmp(p + len - sl, sidecars[i]))
+            continue;
+        char *base = strndup(p, len - sl);
+        bool found = base && bsearch(&base, r->paths, r->n_paths, sizeof(*r->paths), path_cmp);
+        free(base);
+        if (found)
+            return true;
+    }
+    return false;
+}
+
+/* Drops the sidecars from r->paths (sorted), keeping the order. */
+static void drop_sidecars(uam_fuzz_replay *r, const char *dir, const char *const *sidecars,
+                          size_t n_sidecars)
+{
+    bool *drop = n_sidecars && r->n_paths ? calloc(r->n_paths, sizeof(*drop)) : NULL;
+    if (!drop)
+        return;
+    size_t n = 0;
+    for (size_t i = 0; i < r->n_paths; i++)
+        n += drop[i] = is_sidecar(r, r->paths[i], sidecars, n_sidecars);
+    size_t k = 0;
+    for (size_t i = 0; i < r->n_paths; i++) {
+        if (drop[i])
+            free(r->paths[i]);
+        else
+            r->paths[k++] = r->paths[i];
+    }
+    r->n_paths = k;
+    free(drop);
+    if (n)
+        uam_log(UAM_LOG_INFO, "replay", "%s: skipped %zu sidecar file%s (notes beside an input)",
+                dir, n, n == 1 ? "" : "s");
+}
+
 uam_fuzz_replay *uam_fuzz_replay_create(const char *path, uam_fuzz *f, FILE *out)
+{
+    return uam_fuzz_replay_create_ex(path, f, out, NULL, 0);
+}
+
+uam_fuzz_replay *uam_fuzz_replay_create_ex(const char *path, uam_fuzz *f, FILE *out,
+                                           const char *const *sidecars, size_t n_sidecars)
 {
     uam_fuzz_replay *r = calloc(1, sizeof(*r));
     if (!r)
@@ -79,6 +127,7 @@ uam_fuzz_replay *uam_fuzz_replay_create(const char *path, uam_fuzz *f, FILE *out
         }
         closedir(d);
         qsort(r->paths, r->n_paths, sizeof(*r->paths), path_cmp);
+        drop_sidecars(r, path, sidecars, n_sidecars);
     } else if (!add_path(r, path)) {
         uam_fuzz_replay_destroy(r);
         return NULL;

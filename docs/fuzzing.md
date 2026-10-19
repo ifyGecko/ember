@@ -144,8 +144,11 @@ replay: crashes//2-store: crash-fault pc=0x800002b2 (store-fault cause 0x0 tval 
 (The pcs are `fuzz_iteration` and `fuzz_panic` from `readelf -s`; they move with the
 toolchain.) The exit status is the most severe verdict of any input: a crash (the first
 one's kind), else a hang, else a timeout, else 0. So a directory of crashes fails however
-it is ordered and whatever other files (a fuzzer's metadata sidecars) it holds; those are
-run as inputs too. `--cov-out FILE` writes the last input's map. `tests/fuzz/fuzztarget.h`
+it is ordered and whatever other files it holds. Every regular file runs as an input, except
+a fuzzer's notes saved beside an input: a runner extension can name their suffixes, and a
+file X plus that suffix is then skipped when X is in the directory too. With suzzer
+configured that is `.info`, so a brain's `crashes/` or `hangs/` directory replays its inputs
+and not their `.info` sidecars (`uam_fuzz_replay_create_ex` in a program). `--cov-out FILE` writes the last input's map. `tests/fuzz/fuzztarget.h`
 is a small target with planted bugs used by `make fuzz-test`.
 
 ### In a program
@@ -280,7 +283,9 @@ channel next to any frontend (`--fuzz-replay` or `--fuzz-szr`) and needs fuzzing
   clear and `shm_bitmap.py stats` shows the campaign's coverage so far.
 - The header carries the scheme flags (with `--cov-sites`; none for `--cov-blocks`),
   `ACTIVE`, and ember's pid and start time as the owner. A region another live process owns
-  is refused. PATH follows `LIBCOV_SHM_PATH`: with a `/` after its first character it is a
+  is refused, decided as libcov decides it: under an exclusive `flock`, so ember and libcov
+  starting at once cannot both take it, with an owner alive only if its pid still has the
+  recorded start time (a reused pid is not the owner). PATH follows `LIBCOV_SHM_PATH`: with a `/` after its first character it is a
   file, otherwise a shared-memory name under `/dev/shm`. The region stays after ember exits.
 
 ```

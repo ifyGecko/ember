@@ -12,12 +12,18 @@
  * PATH follows LIBCOV_SHM_PATH's rule: with a '/' after the first character it is a
  * file, otherwise a POSIX shared-memory name (/dev/shm). The region is left in place
  * at exit for readers that come late.
+ *
+ * Ownership follows libcov's: the decision to take a region is made under an exclusive
+ * flock, so two writers starting at once (ember or libcov) cannot both claim it, and an
+ * owner counts as alive only if its pid exists with the recorded start time (a reused
+ * pid has another one), or, without /proc, if the pid exists at all.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -44,11 +50,16 @@ static bool looks_like_file(const char *path)
     return false;
 }
 
-/* This process's start time in clock ticks since boot (field 22 of /proc/self/stat),
- * low 32 bits; 0 where that is not available. */
-static uint32_t own_start_time(void)
+/* A process's start time in clock ticks since boot (field 22 of /proc/PID/stat), low
+ * 32 bits; 0 where that is not available (no such process, no /proc). pid 0: this one. */
+static uint32_t start_time(pid_t pid)
 {
-    FILE *fp = fopen("/proc/self/stat", "r");
+    char path[64];
+    if (pid)
+        snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    else
+        snprintf(path, sizeof(path), "/proc/self/stat");
+    FILE *fp = fopen(path, "r");
     if (!fp)
         return 0;
     char buf[1024];
@@ -64,13 +75,35 @@ static uint32_t own_start_time(void)
     return p ? (uint32_t)strtoull(p + 1, NULL, 10) : 0;
 }
 
+/* libcov's owner_alive: the recorded start time decides when /proc has one for the pid;
+ * otherwise the pid's existence does (EPERM: it exists, as another user's). */
+static bool owner_alive(uint32_t pid, uint32_t start)
+{
+    if (!pid)
+        return false;
+    uint32_t cur = start_time((pid_t)pid);
+    if (cur)
+        return cur == start;
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+}
+
 /* An existing region whose owner is still alive and is not us belongs to someone else. */
 static bool owned_by_other(int fd)
 {
     struct libcov_shm_header h;
     if (pread(fd, &h, sizeof(h), 0) != (ssize_t)sizeof(h) || memcmp(h.magic, LIBCOV_SHM_MAGIC, 4))
         return false;
-    return h.owner_pid && (pid_t)h.owner_pid != getpid() && kill((pid_t)h.owner_pid, 0) == 0;
+    if (h.owner_pid == (uint32_t)getpid() && h.owner_start == start_time(0))
+        return false;
+    return owner_alive(h.owner_pid, h.owner_start);
+}
+
+/* Releases the decision lock before close: a flock belongs to the open file
+ * description, which the region's mapping keeps alive after close(fd). */
+static void unlock_close(int fd)
+{
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size, uint32_t scheme_flags,
@@ -92,9 +125,12 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
         snprintf(err, errlen, "%s: %s", path, strerror(errno));
         return NULL;
     }
+    /* Check, truncate and initialise under the lock libcov takes for the same choice. */
+    if (flock(fd, LOCK_EX) != 0)
+        uam_log(UAM_LOG_WARN, "lcvs", "%s: flock: %s (continuing unlocked)", path, strerror(errno));
     if (owned_by_other(fd)) {
         snprintf(err, errlen, "%s: in use by another live process", path);
-        close(fd);
+        unlock_close(fd);
         return NULL;
     }
     const size_t slot_stride = sizeof(struct libcov_ring_slot_hdr) + map_size;
@@ -102,16 +138,16 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
     /* Truncating to 0 first gives a zeroed region: readers wait for the magic. */
     if (ftruncate(fd, 0) != 0 || ftruncate(fd, (off_t)size) != 0) {
         snprintf(err, errlen, "%s: %s", path, strerror(errno));
-        close(fd);
+        unlock_close(fd);
         return NULL;
     }
     void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
     sz_lcvs *l = base == MAP_FAILED ? NULL : calloc(1, sizeof(*l));
     if (!l) {
         snprintf(err, errlen, "%s: %s", path, base == MAP_FAILED ? strerror(errno) : "out of memory");
         if (base != MAP_FAILED)
             munmap(base, size);
+        unlock_close(fd);
         return NULL;
     }
     l->base = base;
@@ -130,9 +166,10 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
     h->bitmap_offset = sizeof(struct libcov_shm_header);
     h->ring_offset = sizeof(struct libcov_shm_header) + map_size;
     h->owner_pid = (uint32_t)getpid();
-    h->owner_start = own_start_time();
+    h->owner_start = start_time(0);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy(h->magic, LIBCOV_SHM_MAGIC, 4);   /* last: the region is ready */
+    unlock_close(fd);
     return l;
 }
 

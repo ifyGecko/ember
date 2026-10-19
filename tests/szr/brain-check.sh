@@ -7,7 +7,8 @@
 # business, not ember's): a fixed-seed session must report it, the brain must save it
 # with its executor-neutral reason in the .info sidecar and minimize it, and the
 # session must end with the brain's BYE, both sides exiting 0. The saved crash
-# replays as a crash.
+# replays as a crash, and so does the whole crashes/ directory, running only the inputs
+# (not their .info notes).
 set -eu
 run=$1
 board=$2
@@ -58,6 +59,20 @@ else
     if [ $rc -ne 20 ] && [ $rc -ne 21 ]; then
         echo "brain-check: $board: the saved crash does not replay as a crash (exit $rc)" >&2
         cat "$tmp/replay.log" >&2
+        fail=1
+    fi
+    # The whole directory replays its inputs, not the brain's .info notes beside them.
+    rc=0
+    "$run" -b "$board" --cov-sites "$tmp/sites.lcv3" --cov-boundary "$tmp/begin.lcvb" \
+        --fuzz-crash-pc "$panic" --fuzz-input uart0 --fuzz-iter-insns 200000 \
+        --fuzz-replay "$tmp/out/crashes" "$fw" < /dev/null > "$tmp/replay-dir.log" 2>&1 || rc=$?
+    inputs=$(ls "$tmp/out/crashes" | grep -c -v '\.info$')
+    ran=$(grep -c '^replay: ' "$tmp/replay-dir.log" || true)
+    if grep -q '\.info: ' "$tmp/replay-dir.log" || [ "$ran" -ne "$inputs" ] \
+       || { [ $rc -ne 20 ] && [ $rc -ne 21 ]; }; then
+        echo "brain-check: $board: replaying the crash directory ran $ran files for $inputs" \
+             "inputs (exit $rc):" >&2
+        cat "$tmp/replay-dir.log" >&2
         fail=1
     fi
 fi

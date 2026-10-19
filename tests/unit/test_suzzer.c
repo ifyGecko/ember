@@ -12,9 +12,16 @@
  *     site-byte check.
  */
 #include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "lcv_formats.h"
 #include "suzzer.h"
@@ -502,6 +509,109 @@ static void test_lcvb(void)
     CHECK(!sz_lcvb_parse(b.d, b.n, &bd, err, sizeof(err)), "truncated");
 }
 
+/* ---- LCVS region ownership (as libcov decides it) ---------------------- */
+
+/* Field 22 of /proc/PID/stat, low 32 bits; 0 if unreadable. */
+static uint32_t proc_start(pid_t pid)
+{
+    char path[64], line[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+    size_t n = fread(line, 1, sizeof(line) - 1, fp);
+    fclose(fp);
+    line[n] = '\0';
+    char *p = strrchr(line, ')');   /* the command name may hold spaces */
+    if (p)
+        p++;                         /* the space before field 3 */
+    for (int field = 3; field < 22 && p; field++)
+        p = strchr(p + 1, ' ');
+    return p ? (uint32_t)strtoull(p + 1, NULL, 10) : 0;
+}
+
+static void set_owner(const char *path, uint32_t pid, uint32_t start)
+{
+    FILE *fp = fopen(path, "r+b");
+    CHECK(fp != NULL, "open %s", path);
+    if (!fp)
+        return;
+    fseek(fp, (long)offsetof(struct libcov_shm_header, owner_pid), SEEK_SET);
+    fwrite(&pid, 4, 1, fp);
+    fseek(fp, (long)offsetof(struct libcov_shm_header, owner_start), SEEK_SET);
+    fwrite(&start, 4, 1, fp);
+    fclose(fp);
+}
+
+static double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void test_lcvs_owner(void)
+{
+    char path[] = "/tmp/uam-lcvs-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "mkstemp");
+    if (fd < 0)
+        return;
+    close(fd);
+    char err[256] = "";
+    sz_lcvs *l = sz_lcvs_create(path, 4096, 2, 0, err, sizeof(err));
+    CHECK(l != NULL, "create: %s", err);
+    sz_lcvs_close(l);
+    CHECK((l = sz_lcvs_create(path, 4096, 2, 0, err, sizeof(err))) != NULL,
+          "our own earlier region is ours: %s", err);
+    sz_lcvs_close(l);
+
+    /* A live owner: a child process, recorded with its start time. */
+    pid_t kid = fork();
+    if (kid == 0) {
+        pause();
+        _exit(0);
+    }
+    uint32_t start = 0;
+    for (int i = 0; i < 1000 && !(start = proc_start(kid)); i++)
+        usleep(1000);
+    set_owner(path, (uint32_t)kid, start);
+    err[0] = '\0';
+    l = sz_lcvs_create(path, 4096, 2, 0, err, sizeof(err));
+    CHECK(!l && strstr(err, "in use"), "a live owner's region is refused (%s)", err);
+    sz_lcvs_close(l);
+    /* The same pid with another start time is a reused pid: the owner is gone. */
+    set_owner(path, (uint32_t)kid, start + 1);
+    l = sz_lcvs_create(path, 4096, 2, 0, err, sizeof(err));
+    CHECK(l != NULL, "a reused pid does not own the region: %s", err);
+    sz_lcvs_close(l);
+    kill(kid, SIGKILL);
+    waitpid(kid, NULL, 0);
+
+    /* The decision is made under the exclusive flock libcov takes for it. */
+    int pfd[2];
+    CHECK(pipe(pfd) == 0, "pipe");
+    kid = fork();
+    if (kid == 0) {
+        int lfd = open(path, O_RDWR);
+        if (lfd >= 0 && flock(lfd, LOCK_EX) == 0 && write(pfd[1], "L", 1) == 1)
+            usleep(300000);
+        _exit(0);   /* releases the lock */
+    }
+    char c = 0;
+    CHECK(read(pfd[0], &c, 1) == 1 && c == 'L', "the child holds the lock");
+    double t0 = now_s();
+    l = sz_lcvs_create(path, 4096, 2, 0, err, sizeof(err));
+    double waited = now_s() - t0;
+    CHECK(l != NULL, "create after the lock is released: %s", err);
+    CHECK(waited >= 0.2, "create waited for the lock (%.3f s)", waited);
+    sz_lcvs_close(l);
+    waitpid(kid, NULL, 0);
+    close(pfd[0]);
+    close(pfd[1]);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -513,6 +623,7 @@ int main(int argc, char **argv)
     test_lcv3();
     test_lcvb();
     test_vectors();
+    test_lcvs_owner();
     printf("test_suzzer: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

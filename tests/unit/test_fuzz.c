@@ -559,6 +559,38 @@ static void test_replay(const target *t)
     rmdir(dir);
 }
 
+/* A fuzzer's notes beside its inputs (X.info next to crash X) are skipped when their
+ * suffix is named, and only when X is there too. */
+static void test_replay_sidecars(void)
+{
+    char dir[] = "/tmp/uam-replay-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "mkdtemp");
+    const char *names[] = { "crash_1", "crash_1.info", "lone.info", "x.notes", "x" };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(names); i++)
+        write_file(dir, names[i], "A");
+    uam_fuzz_replay *r = uam_fuzz_replay_create(dir, NULL, stdout);
+    CHECK(r && uam_fuzz_replay_count(r) == 5, "no suffixes: every file runs");
+    uam_fuzz_replay_destroy(r);
+    static const char *const one[] = { ".info" };
+    r = uam_fuzz_replay_create_ex(dir, NULL, stdout, one, 1);
+    CHECK(r && uam_fuzz_replay_count(r) == 4, "crash_1.info skipped, lone.info (no lone) kept");
+    uam_fuzz_replay_destroy(r);
+    static const char *const two[] = { ".info", ".notes" };
+    r = uam_fuzz_replay_create_ex(dir, NULL, stdout, two, 2);
+    CHECK(r && uam_fuzz_replay_count(r) == 3, "both kinds of sidecar skipped");
+    uam_fuzz_replay_destroy(r);
+    char p[512];
+    snprintf(p, sizeof(p), "%s/crash_1.info", dir);
+    r = uam_fuzz_replay_create_ex(p, NULL, stdout, one, 1);
+    CHECK(r && uam_fuzz_replay_count(r) == 1, "a FILE path always runs");
+    uam_fuzz_replay_destroy(r);
+    for (size_t i = 0; i < UAM_ARRAY_LEN(names); i++) {
+        snprintf(p, sizeof(p), "%s/%s", dir, names[i]);
+        unlink(p);
+    }
+    rmdir(dir);
+}
+
 static void test_misc(void)
 {
     unsigned c;
@@ -848,6 +880,7 @@ int main(void)
         test_markers(&ts[i]);
     }
     test_internal_error(&ts[1]);
+    test_replay_sidecars();
     printf("test_fuzz: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

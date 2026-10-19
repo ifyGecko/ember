@@ -61,6 +61,10 @@ typedef struct uam_runner_setup {
     /* out: a fuzz frontend in place of --fuzz-replay */
     const uam_fuzz_frontend *frontend;
     void                 *frontend_ctx;
+    /* out: --fuzz-replay DIR skips X<suffix> when X is there too (a fuzzer's notes beside
+     * its inputs; uam_fuzz_replay_create_ex). Static strings. */
+    const char *const    *replay_sidecars;
+    size_t                n_replay_sidecars;
 } uam_runner_setup;
 
 /* What an extension will contribute, known right after option parsing. */
