@@ -47,6 +47,8 @@ typedef enum uam_fuzz_verdict {
                              * interrupt) */
     UAM_FUZZ_HANG,          /* detail: the uam_stop_reason (deadlock, livelock) */
     UAM_FUZZ_TIMEOUT,       /* detail: 0 */
+    UAM_FUZZ_REJECTED,      /* the route could not deliver the input (it returned
+                             * UAM_ERR_REJECTED): nothing ran. detail: 0 */
 } uam_fuzz_verdict;
 
 const char *uam_fuzz_verdict_str(uam_fuzz_verdict v);
@@ -81,6 +83,10 @@ typedef struct uam_fuzz_config {
                                     * (recursion stays in one input) */
     uint64_t        iter_insns;    /* per-iteration budget (0: UAM_FUZZ_DEFAULT_ITER_INSNS) */
     uint64_t        boot_insns;    /* budget to reach the first begin (0: unlimited) */
+    uint32_t        begin_skip;    /* boot passes the begin pc this many times and takes the
+                                    * snapshot at the next arrival: firmware that runs its
+                                    * handler during start-up (libcov's
+                                    * LIBCOV_BOUNDARY_INIT_GRACE); all of it is INIT */
     unsigned        crash_exc;     /* enum uam_fuzz_exc_class */
     const uint64_t *crash_pcs;     /* copied */
     size_t          n_crash_pcs;
@@ -134,7 +140,10 @@ typedef struct uam_fuzz_frontend {
 
 typedef struct uam_fuzz uam_fuzz;
 
-/* Delivers an input to the guest; the same type as a machine input (machine.h). */
+/* Delivers an input to the guest; the same type as a machine input (machine.h).
+ * UAM_ERR_REJECTED: this input cannot be delivered (too long for the buffer, not in the
+ * shape the route needs): the iteration's verdict is UAM_FUZZ_REJECTED and the campaign
+ * goes on. Any other error is the harness's and stops it. */
 typedef uam_input_fn uam_fuzz_deliver_fn;
 
 /* NULL on a bad configuration (err says why). */
@@ -149,9 +158,11 @@ uam_status uam_fuzz_set_block_coverage(uam_fuzz *f);
 
 /*
  * Input routes. Built in, by spec string:
- *   "mem:ADDR[,len=ADDR][,max=N]"  write the input to guest memory at virtual ADDR,
+ *   "mem:ADDR[,len=ADDR][,max=N][,reject]"
+ *                                  write the input to guest memory at virtual ADDR,
  *                                  optionally its length as a 32-bit word in the CPU's
- *                                  byte order, truncated to N bytes (default 4096)
+ *                                  byte order, truncated to N bytes (default 4096), or with
+ *                                  "reject" refused when longer (verdict REJECTED)
  * Registered: uam_fuzz_add_route, then the machine's inputs (uam_machine_add_input,
  * e.g. a board's "uart0"). uam_fuzz_mmio_deliver feeds a uam_mmio_input (ctx) for
  * --mmio-rule input registers; the runner registers it as "mmio".
@@ -193,7 +204,7 @@ bool       uam_fuzz_aborted(const uam_fuzz *f);
 /* Counts per verdict over the harness's life. */
 typedef struct uam_fuzz_stats {
     uint64_t iterations;
-    uint64_t by_verdict[UAM_FUZZ_TIMEOUT + 1];
+    uint64_t by_verdict[UAM_FUZZ_REJECTED + 1];
 } uam_fuzz_stats;
 const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 
@@ -202,13 +213,15 @@ const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 /*
  * Runs each input file once - FILE, or every regular file in DIR in name order - and
  * prints one line per input to `out`. Its exit status is the most severe verdict of
- * any input: a crash (the kind of the first one), else a hang, else a timeout, else ok.
+ * any input: a crash (the kind of the first one), else a hang, else a timeout, else a
+ * rejected input, else ok.
  */
 #define UAM_FUZZ_EXIT_OK           0
 #define UAM_FUZZ_EXIT_CRASH_FAULT  20
 #define UAM_FUZZ_EXIT_CRASH_ORACLE 21
 #define UAM_FUZZ_EXIT_HANG         22
 #define UAM_FUZZ_EXIT_TIMEOUT      23
+#define UAM_FUZZ_EXIT_REJECTED     24
 int uam_fuzz_exit_status(uam_fuzz_verdict v);
 
 typedef struct uam_fuzz_replay uam_fuzz_replay;

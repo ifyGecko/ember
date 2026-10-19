@@ -19,6 +19,7 @@ struct uam_fuzz_replay {
     char    **paths;
     size_t    n_paths, next;
     uint8_t  *data;
+    size_t    last_len;      /* of the input last handed out */
     int       exit_status;
     int       rank;          /* of the verdict behind exit_status (verdict_rank) */
     uint8_t  *last_map;
@@ -175,15 +176,17 @@ static const char *exc_name(uam_exc_kind k)
 }
 
 /* The exit status is the most severe verdict of any input: a crash (the first one
- * seen), else a hang, else a timeout, else ok. So replaying a directory fails when any
- * input in it does, whatever else (or whatever order) the directory holds. */
+ * seen), else a hang, else a timeout, else a rejected input, else ok. So replaying a
+ * directory fails when any input in it does, whatever else (or whatever order) the
+ * directory holds. */
 static int verdict_rank(uam_fuzz_verdict v)
 {
     switch (v) {
     case UAM_FUZZ_CRASH_FAULT:
-    case UAM_FUZZ_CRASH_ORACLE: return 3;
-    case UAM_FUZZ_HANG:         return 2;
-    case UAM_FUZZ_TIMEOUT:      return 1;
+    case UAM_FUZZ_CRASH_ORACLE: return 4;
+    case UAM_FUZZ_HANG:         return 3;
+    case UAM_FUZZ_TIMEOUT:      return 2;
+    case UAM_FUZZ_REJECTED:     return 1;
     case UAM_FUZZ_OK:           return 0;
     }
     return 0;
@@ -227,6 +230,7 @@ static int replay_next(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     }
     *data = r->data;
     *len = n;
+    r->last_len = n;
     *id = ++r->next;   /* 1-based: id 0 is the INIT report */
     return 1;
 }
@@ -274,6 +278,9 @@ static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint
         break;
     case UAM_FUZZ_HANG:
         fprintf(r->out, " (%s)", uam_stop_reason_str((uam_stop_reason)detail));
+        break;
+    case UAM_FUZZ_REJECTED:
+        fprintf(r->out, " (the route refused %zu bytes; nothing ran)", r->last_len);
         break;
     case UAM_FUZZ_OK:
     case UAM_FUZZ_TIMEOUT:

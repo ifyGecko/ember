@@ -105,6 +105,26 @@ if [ $rc -ne 21 ] || ! grep -q "crash-oracle pc=$panic" "$tmp/none.out"; then
     fail=1
 fi
 
+# --fuzz-begin-skip: the snapshot at a later arrival at the begin pc (an empty UART at
+# boot runs the handler and comes back) gives the same verdicts; an arrival the boot
+# never reaches fails it.
+rc=0
+fuzz "" "--fuzz-begin-skip 3 --fuzz-replay $tmp/in" > "$tmp/skip.out" || rc=$?
+cut -d' ' -f2-3 "$out" > "$tmp/want.v"
+cut -d' ' -f2-3 "$tmp/skip.out" > "$tmp/skip.v"
+if [ $rc -ne 20 ] || ! cmp -s "$tmp/want.v" "$tmp/skip.v"; then
+    echo "fuzz-check: $board: --fuzz-begin-skip 3: exit $rc, verdicts:" >&2
+    diff "$tmp/want.v" "$tmp/skip.v" >&2 || true
+    fail=1
+fi
+rc=0
+fuzz "" "-n 300000 --fuzz-begin-skip 100000000 --fuzz-replay $tmp/in/1-ok" > /dev/null || rc=$?
+if [ $rc -ne 2 ] || ! grep -q 'often enough' "$tmp/err"; then
+    echo "fuzz-check: $board: --fuzz-begin-skip past the last arrival: exit $rc (expected 2):" >&2
+    cat "$tmp/err" >&2
+    fail=1
+fi
+
 if [ -n "${4:-}" ]; then
     lo=$(readelf -lW "$fw" | awk '$1 == "LOAD" { print $3; exit }')
     rc=0

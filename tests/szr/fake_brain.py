@@ -11,7 +11,10 @@ uam-run with --fuzz-szr, and checks, frame by frame (suzzer's docs/FORMATS.md se
     the planted bugs;
   - CRASH MALFORMED for a short payload (id 0) and for a len overrun (its id);
   - an unknown frame type being ignored;
-  - BYE ending the run with exit 0, and EOF before BYE being an error.
+  - BYE ending the run with exit 0, and EOF before BYE being an error;
+  - CRASH DELIVERY (status 0) for an input the route refuses (mem:...,reject), the
+    session going on after it;
+  - --fuzz-szr-timeout giving up on a brain that goes silent.
 Exit status 0 when everything holds.
 """
 import os
@@ -19,9 +22,11 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 
 HELLO, INPUT, COVERAGE, CRASH, BYE = 1, 2, 3, 4, 5
-GUEST_FAULT, ORACLE, MALFORMED, TIMEOUT = 5, 6, 4, 8
+GUEST_FAULT, ORACLE, MALFORMED, TIMEOUT, DELIVERY = 5, 6, 4, 8, 3
+SCRATCH = 0x81f00000   # RAM on every stock board, unused by the fuzz target
 FLAG_SCHEME, FLAG_MT, FLAG_LIVE_EMPTY = 0x4, 0x1, 0x2
 
 failures = []
@@ -192,6 +197,53 @@ def main():
         rc, err = session(run, board, fw, extra, script)
         if not check(rc not in (0, None) and "without BYE" in err, f"{tag}: EOF before BYE: exit {rc}"):
             sys.stderr.write(err)
+
+    blocks = ["--cov-blocks", "--fuzz-begin", hex(sym(fw, "fuzz_iteration"))]
+
+    def handshake(c, tag):
+        check(recv_exact(c, 4) == b"SZR1", f"{tag}: magic")
+        t, _ = recv_frame(c)
+        check(t == HELLO, f"{tag}: HELLO")
+        t, p = recv_frame(c)
+        check(t == COVERAGE and coverage(p)[0] == 0, f"{tag}: INIT")
+
+    # An input the route refuses: CRASH DELIVERY, nothing ran, and the session goes on.
+    def rejecting(c):
+        tag = f"{board} reject"
+        handshake(c, tag)
+        send_input(c, 1, b"0123456789")
+        t, p = recv_frame(c)
+        check(t == CRASH and p == struct.pack(">QBi", 1, DELIVERY, 0),
+              f"{tag}: over max: CRASH DELIVERY status 0 (type {t}, {p.hex()})")
+        send_input(c, 2, b"ok")
+        t, p = recv_frame(c)
+        rid = struct.unpack(">Q", p[:8])[0] if len(p) >= 8 else None
+        check(rid == 2 and not (t == CRASH and p[8] == DELIVERY), f"{tag}: within max: it runs")
+        send_frame(c, BYE)
+
+    rc, err = session(run, board, fw, [*blocks, "--fuzz-input", f"mem:{SCRATCH:#x},max=4,reject"],
+                      rejecting)
+    if not check(rc == 0, f"{board} reject: exit {rc}"):
+        sys.stderr.write(err)
+
+    # A brain that goes silent: --fuzz-szr-timeout gives up instead of waiting forever.
+    waited = {}
+
+    def silent(c):
+        handshake(c, f"{board} silent")
+        t0 = time.monotonic()
+        c.settimeout(15)
+        try:
+            while c.recv(4096):
+                pass
+        except OSError:
+            pass
+        waited["s"] = time.monotonic() - t0
+
+    rc, err = session(run, board, fw, [*blocks, "--fuzz-szr-timeout", "1"], silent)
+    if not check(rc not in (0, None) and "--fuzz-szr-timeout" in err and waited.get("s", 99) < 10,
+                 f"{board} silent: exit {rc} after {waited.get('s')} s"):
+        sys.stderr.write(err)
 
     # A frontend needs fuzzing boundaries.
     r = subprocess.run([run, "-b", board, "--fuzz-szr", "127.0.0.1:1", fw], stdin=subprocess.DEVNULL,

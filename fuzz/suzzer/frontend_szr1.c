@@ -11,11 +11,16 @@
  *                                             pc, a halt status or interrupt lines
  *   UAM_FUZZ_HANG          CRASH HANG,        status = the uam_stop_reason
  *   UAM_FUZZ_TIMEOUT       CRASH TIMEOUT,     status 0
+ *   UAM_FUZZ_REJECTED      CRASH DELIVERY,    status 0: the route refused the input
  *
  * The boot map goes out once, unsolicited, as COVERAGE id 0 kind INIT. A malformed
  * INPUT is answered with CRASH MALFORMED and nothing runs. A BYE from the brain ends
  * the run; ember sends BYE when it stops first (an error, an interrupt). EOF before a
  * BYE is an error. Unknown frame types are ignored.
+ *
+ * A dead peer is noticed by TCP keepalive (a brain host that vanished without closing the
+ * connection would otherwise leave ember waiting forever); a live brain that stops
+ * answering, by the optional per-frame timeout (--fuzz-szr-timeout).
  */
 #include <errno.h>
 #include <netdb.h>
@@ -24,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -33,12 +39,16 @@
 #define SZR_FRAME_MAX     (64u << 20)   /* suzzer-relay's limit: stay below it */
 #define CONNECT_TRIES     50            /* the brain may still be starting: ~5 s */
 #define CONNECT_DELAY_NS  100000000L
+#define KEEPALIVE_IDLE_S  60            /* probe after a minute of silence ... */
+#define KEEPALIVE_INTVL_S 10            /* ... every 10 s ... */
+#define KEEPALIVE_CNT     6             /* ... and give up after 6 unanswered: ~2 min */
 
 struct sz_szr {
     int       fd;
     bool      broken;      /* a frame was cut short: the stream is out of sync */
     bool      peer_bye;    /* the brain said BYE */
     uint16_t  flags;       /* HELLO scheme flags */
+    unsigned  timeout_s;   /* per-frame wait for the brain; 0: none */
     uint64_t  gen;         /* COVERAGE generation counter */
     uint8_t  *in;          /* the last frame's payload */
     size_t    in_cap;
@@ -69,7 +79,11 @@ static bool write_all(sz_szr *z, const uint8_t *buf, size_t len)
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0) {
-            uam_log(UAM_LOG_ERROR, "szr", "%s: send: %s", z->peer, strerror(errno));
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                uam_log(UAM_LOG_ERROR, "szr", "%s: the brain took nothing for %u s "
+                        "(--fuzz-szr-timeout)", z->peer, z->timeout_s);
+            else
+                uam_log(UAM_LOG_ERROR, "szr", "%s: send: %s", z->peer, strerror(errno));
             z->broken = true;
             return false;
         }
@@ -100,7 +114,10 @@ static int read_all(sz_szr *z, uint8_t *buf, size_t len, bool frame_start)
         z->broken = true;
         if (n == 0 && !got && frame_start)
             return RD_EOF;
-        if (n == 0)
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            uam_log(UAM_LOG_ERROR, "szr", "%s: nothing from the brain for %u s (--fuzz-szr-timeout)",
+                    z->peer, z->timeout_s);
+        else if (n == 0)
             uam_log(UAM_LOG_ERROR, "szr", "%s: connection closed in the middle of a frame", z->peer);
         else
             uam_log(UAM_LOG_ERROR, "szr", "%s: recv: %s", z->peer, strerror(errno));
@@ -174,12 +191,17 @@ static int dial(const char *host, const char *port, char *err, size_t errlen)
                  strerror(last));
         return -1;
     }
-    int one = 1;
+    int one = 1, idle = KEEPALIVE_IDLE_S, intvl = KEEPALIVE_INTVL_S, cnt = KEEPALIVE_CNT;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
     return fd;
 }
 
-sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, char *err, size_t errlen)
+sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, unsigned timeout_s, char *err,
+                       size_t errlen)
 {
     /* HOST:PORT, or [V6ADDR]:PORT */
     const char *colon = strrchr(hostport, ':');
@@ -208,6 +230,12 @@ sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, char *err, size_t e
         return NULL;
     }
     z->flags = flags;
+    z->timeout_s = timeout_s;
+    if (timeout_s) {
+        struct timeval tv = { .tv_sec = (time_t)timeout_s };
+        setsockopt(z->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(z->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
     snprintf(z->peer, sizeof(z->peer), "%s", hostport);
     uam_log(UAM_LOG_INFO, "szr", "connected to the brain at %s", hostport);
     return z;
@@ -324,6 +352,7 @@ static uam_status szr_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
         case UAM_FUZZ_CRASH_FAULT:  reason = SZR_CRASH_GUEST_FAULT; break;
         case UAM_FUZZ_CRASH_ORACLE: reason = SZR_CRASH_ORACLE; break;
         case UAM_FUZZ_HANG:         reason = SZR_CRASH_HANG; break;
+        case UAM_FUZZ_REJECTED:     reason = SZR_CRASH_DELIVERY; status = 0; break;
         default:                    reason = SZR_CRASH_TIMEOUT; status = 0; break;
         }
         ok = send_crash(z, id, reason, status);

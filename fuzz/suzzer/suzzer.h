@@ -154,10 +154,13 @@ size_t sz_check_sites(uam_machine *m, const sz_patchlist *p, const uam_cov_site 
 /* ---- SZR1 executor (FORMATS.md section 4; frontend_szr1.c) ---------- */
 
 /* A connection to a brain at HOST:PORT ([V6ADDR]:PORT), retried for a few seconds while
- * the brain starts. `flags` are HELLO's flags (sz_hello_scheme_flags, or 0 when the
- * maps follow no suzzer scheme). Use it with sz_szr_frontend as the frontend context. */
+ * the brain starts, with TCP keepalive on. `flags` are HELLO's flags
+ * (sz_hello_scheme_flags, or 0 when the maps follow no suzzer scheme). timeout_s > 0:
+ * waiting longer than that for the brain's next frame (or for it to take ours) is an
+ * error. Use it with sz_szr_frontend as the frontend context. */
 typedef struct sz_szr sz_szr;
-sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, char *err, size_t errlen);
+sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, unsigned timeout_s, char *err,
+                       size_t errlen);
 void    sz_szr_close(sz_szr *z);
 extern const uam_fuzz_frontend sz_szr_frontend;
 

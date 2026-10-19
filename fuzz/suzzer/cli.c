@@ -10,6 +10,7 @@
  *   --cov-strict            a site whose bytes differ from the patch list is fatal
  *   --cov-boundary LCVB1    iteration boundaries from a suzzer boundary file (fuzzing)
  *   --fuzz-szr HOST:PORT    take inputs from a suzzer brain over SZR1 (fuzzing)
+ *   --fuzz-szr-timeout SEC  give up when the brain sends nothing for SEC seconds
  *   --cov-shm PATH          publish the maps in an LCVS region (fuzzing)
  *   --cov-shm-ring N        its ring size (default 8)
  *
@@ -26,6 +27,7 @@
 typedef struct cli {
     const char     *sites_path, *boundary_path, *szr_addr, *shm_path;
     unsigned        shm_ring;
+    unsigned        szr_timeout;
     sz_module_base  mod[MAX_MODULE_OPTS];
     char           *mod_names[MAX_MODULE_OPTS];
     size_t          n_mod;
@@ -46,10 +48,10 @@ static const uam_runner_opt opts[] = {
     { "cov-sites", true }, { "cov-module", true }, { "cov-scheme", true },
     { "cov-ngram", true }, { "cov-strict", false }, { "cov-boundary", true },
     { "cov-rotate", false }, { "fuzz-szr", true }, { "cov-mode", true },
-    { "cov-shm", true }, { "cov-shm-ring", true },
+    { "cov-shm", true }, { "cov-shm-ring", true }, { "fuzz-szr-timeout", true },
 };
 enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_SZR, O_MODE,
-       O_SHM, O_SHM_RING };
+       O_SHM, O_SHM_RING, O_SZR_TIMEOUT };
 
 static void *cli_create(void)
 {
@@ -93,6 +95,16 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
             return false;
         }
         c->shm_ring = (unsigned)n;
+        return true;
+    }
+    case O_SZR_TIMEOUT: {
+        char *end;
+        unsigned long n = strtoul(arg, &end, 10);
+        if (*end || !*arg || n > 86400) {
+            snprintf(err, errlen, "expected seconds from 0 (no limit) to 86400");
+            return false;
+        }
+        c->szr_timeout = (unsigned)n;
         return true;
     }
     case O_STRICT:   c->strict = true; return true;
@@ -167,7 +179,7 @@ static uam_status connect_brain(cli *c, uam_runner_setup *s, char *err, size_t e
         return UAM_OK;
     char e[256];
     c->szr = sz_szr_connect(c->szr_addr, c->loaded ? sz_hello_scheme_flags(&c->scheme) : 0,
-                            e, sizeof(e));
+                            c->szr_timeout, e, sizeof(e));
     if (!c->szr) {
         snprintf(err, errlen, "--fuzz-szr: %s", e);
         return UAM_ERR_INVALID;
@@ -186,6 +198,10 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
     cli *c = st;
     s->replay_sidecars = brain_sidecars;
     s->n_replay_sidecars = UAM_ARRAY_LEN(brain_sidecars);
+    if (c->szr_timeout && !c->szr_addr) {
+        snprintf(err, errlen, "--fuzz-szr-timeout needs --fuzz-szr");
+        return UAM_ERR_INVALID;
+    }
     if (!c->sites_path && !c->boundary_path) {
         if (c->n_mod || c->strict) {
             snprintf(err, errlen, "--cov-module and --cov-strict need --cov-sites");
@@ -325,7 +341,10 @@ const uam_runner_ext uam_suzzer_runner_ext = {
         "                          after another one) or every (each execution counts)\n"
         "      --cov-strict        fail if a site's bytes in memory differ from the list\n"
         "      --cov-boundary LCVB1  iteration begin/end from a suzzer boundary file\n"
-        "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP)\n"
+        "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP;\n"
+        "                          TCP keepalive notices a vanished brain host)\n"
+        "      --fuzz-szr-timeout S  give up when the brain sends nothing for S seconds\n"
+        "                          (default 0: wait as long as it takes)\n"
         "      --cov-shm PATH      publish INIT and each ok iteration's map in an LCVS region\n"
         "                          (a file if PATH has a '/' after its start, else /dev/shm)\n"
         "      --cov-shm-ring N    ring slots in that region (default 8)\n",

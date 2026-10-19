@@ -63,13 +63,18 @@ interpreter +4%.
 
 1. **Boot** until the first arrival at the begin pc. Coverage so far is the *INIT* map.
    `-n` (`uam_fuzz_config.boot_insns`) bounds the boot; without it a firmware that never
-   reaches the begin pc runs until interrupted.
+   reaches the begin pc runs until interrupted. `--fuzz-begin-skip N`
+   (`uam_fuzz_config.begin_skip`) lets the boot pass the begin pc N times first, for
+   firmware that runs its handler during start-up (a self-test, a first request of its
+   own): the snapshot is taken at arrival N+1, and everything before it, the skipped
+   passes included, is INIT. It is ember's `LIBCOV_BOUNDARY_INIT_GRACE`.
 2. **Snapshot** there.
 3. **Each input**: restore the snapshot, clear the map and `prev`, deliver the input, run
    until the iteration ends, a crash check fires or the budget runs out, then classify.
-   A crash does not end the campaign; the next input starts from the snapshot. An
-   internal error of ember itself (a site it cannot instrument, bad IR) does: it would
-   recur on every input, and it is not the input's doing.
+   A crash does not end the campaign; the next input starts from the snapshot. Neither
+   does an input the route refuses (verdict *rejected*, below). An internal error of ember
+   itself (a site it cannot instrument, bad IR) does: it would recur on every input, and
+   it is not the input's doing.
 
 Iteration boundaries mirror LCVB1: *paired* (`--fuzz-begin` and one or more `--fuzz-end`:
 reaching any end pc ends the iteration) or *begin-only* (only `--fuzz-begin`: arriving there
@@ -102,11 +107,14 @@ continuously, publishes it as a separate GAP map; ember has none.
 
 | Route | Delivery |
 |---|---|
-| `mem:ADDR[,len=ADDR][,max=N]` | the input written at virtual ADDR (truncated to N bytes, default 4096), and optionally its length as a 32-bit word in the CPU's byte order |
+| `mem:ADDR[,len=ADDR][,max=N][,reject]` | the input written at virtual ADDR (truncated to N bytes, default 4096; with `reject`, a longer input is refused instead: verdict rejected), and optionally its length as a 32-bit word in the CPU's byte order |
 | `mmio` | the stream that `--mmio-rule ...:input` registers read |
 | a board input | anything a board published with `uam_machine_add_input`; the stock boards publish `uart0` (the receive FIFO; what does not fit is dropped) |
 
 The harness never names a device: boards publish inputs, the harness picks one by name.
+A route that cannot deliver a particular input (too long for its buffer, not in the shape
+it needs) returns `UAM_ERR_REJECTED`: that input's verdict is *rejected*, nothing runs, and
+the campaign goes on. Any other error from a route is a harness error and stops the run.
 
 ### Verdicts
 
@@ -117,6 +125,7 @@ The harness never names a device: boards publish inputs, the harness picks one b
 | crash (oracle) | a `--fuzz-crash-pc` reached, a `--fuzz-crash-irq` interrupt taken, a reset during the iteration, a non-zero halt, a debug trap | the pc (0 for a reset, the status for a halt, the crashing lines for an interrupt) | 21 |
 | hang | deadlock or livelock | the stop reason (`uam_stop_reason`: `UAM_STOP_DEADLOCK` or `UAM_STOP_LIVELOCK`, numbered as in `uam/exec.h` of this ember) | 22 |
 | timeout | `--fuzz-iter-insns` (default 1e7) exhausted | 0 | 23 |
+| rejected | the input route refused the input (`UAM_ERR_REJECTED`); nothing ran | 0 | 24 |
 
 Exception classes: `fetch`, `load`, `store` (bus faults), `align`, `xlate` (TLB misses and
 protection: firmware with a TLB takes these routinely), `trap` (illegal instructions, but also
@@ -143,7 +152,7 @@ replay: crashes//2-store: crash-fault pc=0x800002b2 (store-fault cause 0x0 tval 
 
 (The pcs are `fuzz_iteration` and `fuzz_panic` from `readelf -s`; they move with the
 toolchain.) The exit status is the most severe verdict of any input: a crash (the first
-one's kind), else a hang, else a timeout, else 0. So a directory of crashes fails however
+one's kind), else a hang, else a timeout, else a rejected input (24), else 0. So a directory of crashes fails however
 it is ordered and whatever other files it holds. Every regular file runs as an input, except
 a fuzzer's notes saved beside an input: a runner extension can name their suffixes, and a
 file X plus that suffix is then skipped when X is in the directory too. With suzzer
@@ -252,12 +261,16 @@ tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, 
 | crash (oracle) | CRASH `ORACLE` (6) | the detail, low 32 bits: the crash pc, a halt status, the interrupt lines |
 | hang | CRASH `HANG` (7) | the stop reason (ember's `uam_stop_reason` number) |
 | timeout | CRASH `TIMEOUT` (8) | 0 |
+| rejected | CRASH `DELIVERY` (3) | 0 |
 
 A malformed INPUT gets CRASH `MALFORMED` (4) and runs nothing; unknown frame types are
 ignored. A BYE from the brain ends the run (exit 0); the brain closing the connection without
 one is an error (exit 2), and so is an internal error of ember's, which sends BYE first. SIGINT
-sends BYE in place of the pending reply and exits 130. ember waits for the brain's next frame
-without a time limit: a brain that stalls without closing the connection stalls ember too.
+sends BYE in place of the pending reply and exits 130. TCP keepalive (probes after a minute
+of silence, giving up after about two more) notices a brain host that vanished without
+closing the connection. A brain that is still there but stops answering is waited for
+unless `--fuzz-szr-timeout SEC` is given: then SEC seconds without a frame from the brain
+(or without it taking one of ember's) ends the run with an error.
 
 ```
 python3 suzzer/tools/suzzer_brain.py --listen 127.0.0.1:7000 --seeds seeds/ --out run/

@@ -23,7 +23,7 @@ typedef struct route {
 
 typedef struct mem_route {
     uint64_t addr, len_addr, max;
-    bool     has_len;
+    bool     has_len, reject;   /* reject: refuse inputs over max instead of truncating */
 } mem_route;
 
 struct uam_fuzz {
@@ -56,6 +56,7 @@ struct uam_fuzz {
     bool           at_begin, ended, oracle, reset, exc_crash, irq_crash;
     uam_interrupt  irq;
     unsigned       depth;          /* nested levels open (paired + nested) */
+    uint32_t       boot_arrivals;  /* at the begin pc during boot (cfg.begin_skip) */
     uint64_t       oracle_pc;
     uam_exception  exc;
 
@@ -91,6 +92,7 @@ const char *uam_fuzz_verdict_str(uam_fuzz_verdict v)
     case UAM_FUZZ_CRASH_ORACLE: return "crash-oracle";
     case UAM_FUZZ_HANG:         return "hang";
     case UAM_FUZZ_TIMEOUT:      return "timeout";
+    case UAM_FUZZ_REJECTED:     return "rejected";
     }
     return "?";
 }
@@ -103,6 +105,7 @@ int uam_fuzz_exit_status(uam_fuzz_verdict v)
     case UAM_FUZZ_CRASH_ORACLE: return UAM_FUZZ_EXIT_CRASH_ORACLE;
     case UAM_FUZZ_HANG:         return UAM_FUZZ_EXIT_HANG;
     case UAM_FUZZ_TIMEOUT:      return UAM_FUZZ_EXIT_TIMEOUT;
+    case UAM_FUZZ_REJECTED:     return UAM_FUZZ_EXIT_REJECTED;
     }
     return 1;
 }
@@ -186,6 +189,8 @@ static uam_hook_action begin_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
         return UAM_HOOK_CONTINUE;
     count_marker(f, pc);
     if (f->ph == PH_BOOT) {
+        if (f->boot_arrivals++ < f->cfg.begin_skip)
+            return UAM_HOOK_CONTINUE;   /* a start-up pass (begin_skip): part of INIT */
         f->at_begin = true;
         return UAM_HOOK_STOP;
     }
@@ -483,6 +488,8 @@ static uam_status write_virt(uam_machine *m, uint64_t va, const uint8_t *data, s
 static uam_status mem_deliver(void *ctx, uam_machine *m, const uint8_t *data, size_t len)
 {
     const mem_route *r = ctx;
+    if (len > r->max && r->reject)
+        return UAM_ERR_REJECTED;
     if (len > r->max)
         len = (size_t)r->max;
     uam_status st = write_virt(m, r->addr, data, len);
@@ -524,6 +531,8 @@ static bool parse_mem(mem_route *r, const char *spec)
         } else if (n > 4 && !strncmp(p, "max=", 4)) {
             if (!parse_u64(p + 4, n - 4, &r->max))
                 return false;
+        } else if (n == 6 && !strncmp(p, "reject", 6)) {
+            r->reject = true;
         } else {
             return false;
         }
@@ -538,7 +547,7 @@ uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_
         err[0] = '\0';
     if (!strncmp(spec, "mem:", 4)) {
         if (!parse_mem(&f->mem, spec + 4)) {
-            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N]");
+            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N][,reject]");
             return UAM_ERR_INVALID;
         }
         f->deliver = mem_deliver;
@@ -585,12 +594,22 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     if (f->booted)
         return UAM_ERR_INVALID;
     clear_flags(f);
+    f->boot_arrivals = 0;
     uint64_t ic0 = m->cpu.icount;
     if (m->cpu.pc == f->cfg.begin_pc) {
-        f->at_begin = true;   /* e.g. resumed from a snapshot taken at begin */
-        r->stop = UAM_STOP_HOOK;
+        /* Already there (e.g. resumed from a snapshot taken at begin): an arrival whose
+         * hook must not run again when the hart starts. */
         count_marker(f, m->cpu.pc);
-    } else {
+        if (f->boot_arrivals++ >= f->cfg.begin_skip) {
+            f->at_begin = true;
+            r->stop = UAM_STOP_HOOK;
+        } else {
+            m->exec.hook_fired = true;
+            m->exec.hook_fired_pc = m->cpu.pc;
+            m->exec.hook_fired_icount = m->cpu.icount;
+        }
+    }
+    if (!f->at_begin) {
         f->ph = PH_BOOT;
         r->stop = uam_exec_run(&m->exec, f->cfg.boot_insns);
         f->ph = PH_IDLE;
@@ -599,9 +618,10 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     r->insns = m->cpu.icount - ic0;
     if (!f->at_begin || f->aborted) {
         if (!f->aborted)
-            uam_log(UAM_LOG_ERROR, "fuzz", "boot did not reach the begin pc 0x%llx: %s at pc 0x%llx",
-                    (unsigned long long)f->cfg.begin_pc, uam_stop_reason_str(r->stop),
-                    (unsigned long long)r->pc);
+            uam_log(UAM_LOG_ERROR, "fuzz", "boot did not reach the begin pc 0x%llx%s: %s at pc 0x%llx "
+                    "(%u arrivals)", (unsigned long long)f->cfg.begin_pc,
+                    f->cfg.begin_skip ? " often enough" : "", uam_stop_reason_str(r->stop),
+                    (unsigned long long)r->pc, f->boot_arrivals);
         return UAM_ERR_INVALID;
     }
     /* The hooks have run for this arrival at begin: iterations start past them, in the
@@ -705,6 +725,15 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     f->cov.last_pc = f->snap_last_pc;
     clear_flags(f);
     st = f->deliver(f->deliver_ctx, m, data, len);
+    if (st == UAM_ERR_REJECTED) {
+        /* The input's fault, not the harness's: nothing ran, the next input goes on. */
+        r->verdict = UAM_FUZZ_REJECTED;
+        r->pc = m->cpu.pc;
+        f->stats.iterations++;
+        f->stats.by_verdict[r->verdict]++;
+        f->last = *r;
+        return UAM_OK;
+    }
     if (st != UAM_OK) {
         uam_log(UAM_LOG_ERROR, "fuzz", "delivering an input of %zu bytes failed: %s", len,
                 uam_status_str(st));

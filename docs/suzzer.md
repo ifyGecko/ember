@@ -92,6 +92,7 @@ With suzzer configured, `uam-run` (and every board built on `uam_run_main`) gain
 | `--cov-strict` | every site's bytes in memory must match the list |
 | `--cov-boundary LCVB1` | iteration boundaries from `gen_boundary.py`: one BEGIN marker for now, any number of END markers |
 | `--fuzz-szr HOST:PORT` | fuzz with inputs from `suzzer_brain.py` over SZR1, ember standing in for `suzzer-relay` |
+| `--fuzz-szr-timeout SEC` | give up when the brain sends nothing for SEC seconds (default: wait; TCP keepalive still notices a vanished host) |
 | `--cov-shm PATH`, `--cov-shm-ring N` | publish INIT and every ok iteration's map in an LCVS region for suzzer's readers |
 
 and `make test` adds `test_suzzer` (the format readers and the conformance vectors) and
@@ -149,6 +150,7 @@ What ember does differently from libcov on a device, by design or for now:
 - **Crashed iterations.** Their maps go to the frontend (the brain gets CRASH frames, replay
   prints them) but not to the LCVS ring, matching a device whose process died.
 - **libcov settings without an ember equivalent:** `LIBCOV_MODE=oneshot`,
-  `LIBCOV_BOUNDARY_INIT_GRACE`, `LIBCOV_BOUNDARY_REARM` and marker emulation. `--cov-map-size`
-  stands in for libcov's map-size knobs.
+  `LIBCOV_BOUNDARY_REARM` and marker emulation. `--cov-map-size` stands in for libcov's
+  map-size knobs, and `--fuzz-begin-skip N` for `LIBCOV_BOUNDARY_INIT_GRACE` (it counts
+  arrivals at the BEGIN marker, where libcov counts every boundary that fires).
 - **Single hart.** libcov's MT variant has no counterpart; ember never sets `MT`.

@@ -18,6 +18,7 @@ const char *uam_status_str(uam_status st)
     case UAM_ERR_ILLEGAL:    return "illegal";
     case UAM_ERR_NOMEM:      return "out of memory";
     case UAM_ERR_INVALID:    return "invalid";
+    case UAM_ERR_REJECTED:   return "input rejected";
     }
     return "?";
 }

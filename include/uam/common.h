@@ -22,6 +22,8 @@ typedef enum uam_status {
     UAM_ERR_ILLEGAL,    /* system register / operation not permitted */
     UAM_ERR_NOMEM,      /* host allocation failure */
     UAM_ERR_INVALID,    /* malformed input (bad IR, bad image, bad config) */
+    UAM_ERR_REJECTED,   /* a fuzz input route cannot deliver this input (too long, wrong
+                         * shape): the input's doing, not a harness error (uam/fuzz.h) */
 } uam_status;
 
 const char *uam_status_str(uam_status st);
@@ -49,7 +51,7 @@ static inline int64_t uam_sext(uint64_t v, unsigned width)
  * changes. Entry points check it together with the struct sizes the caller
  * was compiled with (uam_abi_layout in uam/machine.h).
  */
-#define UAM_ABI_VERSION 6u
+#define UAM_ABI_VERSION 7u
 
 /* The UAM_ABI_VERSION the library itself was built with. */
 unsigned uam_abi_version(void);

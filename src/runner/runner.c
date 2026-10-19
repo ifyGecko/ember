@@ -9,8 +9,8 @@
  *   130 interrupted (SIGINT/SIGTERM),
  *   2 usage or setup error.
  * With --fuzz-replay, the most severe verdict of any input instead (uam/fuzz.h):
- *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout; of several
- *   crashes, the first one's.
+ *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout, 24 rejected (the
+ *   input route refused it); of several crashes, the first one's.
  * A fuzz run that stops on an error (an internal error of the executor, a lost
  * frontend) exits 2.
  */
@@ -137,7 +137,10 @@ static void usage(FILE *out)
         "      --fuzz-begin PC     fuzz: boot to PC, snapshot there, run each input from it\n"
         "      --fuzz-end PC       an iteration ends at PC (repeatable: any of them; default:\n"
         "                          when the --fuzz-begin PC is reached again)\n"
-        "      --fuzz-input ROUTE  how inputs reach the guest: mem:ADDR[,len=ADDR][,max=N],\n"
+        "      --fuzz-begin-skip N boot passes the begin PC N times and snapshots at the next\n"
+        "                          arrival (firmware that runs its handler at start-up)\n"
+        "      --fuzz-input ROUTE  how inputs reach the guest: mem:ADDR[,len=ADDR][,max=N]\n"
+        "                          [,reject] (reject: refuse longer inputs, verdict rejected),\n"
         "                          mmio (--mmio-rule input registers), or a board input\n"
         "                          (stock boards: uart0)\n"
         "      --fuzz-crash-pc PC  reaching PC is a crash (repeatable)\n"
@@ -149,8 +152,8 @@ static void usage(FILE *out)
         "      --fuzz-iter-insns N instruction budget per input (default 10000000; timeout)\n"
         "      --fuzz-replay PATH  run each input in FILE or DIR once and print the verdict;\n"
         "                          -n bounds the boot; exit 0 ok, 20 fault, 21 oracle,\n"
-        "                          22 hang, 23 timeout (the most severe of any input:\n"
-        "                          a crash, then a hang, then a timeout)\n"
+        "                          22 hang, 23 timeout, 24 rejected (the most severe of\n"
+        "                          any input: a crash, a hang, a timeout, a rejection)\n"
         "  -s, --stats             print execution statistics at exit\n"
         "  -d, --dump-state        print hart state at exit\n"
         "  -v, --verbose           more logging (repeatable)\n"
@@ -320,12 +323,13 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
         rc = r ? uam_fuzz_replay_exit_status(r) : 0;
     }
     fprintf(stderr, "uam-run: fuzz: %llu inputs: %llu ok, %llu crash (fault), %llu crash (oracle), "
-            "%llu hang, %llu timeout\n", (unsigned long long)fs->iterations,
+            "%llu hang, %llu timeout, %llu rejected\n", (unsigned long long)fs->iterations,
             (unsigned long long)fs->by_verdict[UAM_FUZZ_OK],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_FAULT],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_ORACLE],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_HANG],
-            (unsigned long long)fs->by_verdict[UAM_FUZZ_TIMEOUT]);
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_TIMEOUT],
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_REJECTED]);
     if (cov_out) {
         size_t n;
         const uint8_t *map = r ? uam_fuzz_replay_last_map(r, &n) : uam_fuzz_map(f, &n);
@@ -361,7 +365,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT, OPT_MMIO_RULE, OPT_MMIO_INPUT,
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
-           OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_EXT_BASE = 1000 };
+           OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
+           OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -406,6 +411,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "fuzz-crash-irq", required_argument, NULL, OPT_FUZZ_CRASH_IRQ },
         { "fuzz-iter-insns", required_argument, NULL, OPT_FUZZ_ITER_INSNS },
         { "fuzz-replay", required_argument, NULL, OPT_FUZZ_REPLAY },
+        { "fuzz-begin-skip", required_argument, NULL, OPT_FUZZ_BEGIN_SKIP },
         { "stats", no_argument, NULL, 's' },
         { "dump-state", no_argument, NULL, 'd' },
         { "verbose", no_argument, NULL, 'v' },
@@ -627,6 +633,17 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         case OPT_FUZZ_ITER_INSNS: fz.iter_insns = strtoull(optarg, NULL, 0); fuzz_opts = true; break;
         case OPT_FUZZ_REPLAY: fuzz_replay = optarg; fuzz_opts = true; break;
+        case OPT_FUZZ_BEGIN_SKIP: {
+            char *end;
+            unsigned long n = strtoul(optarg, &end, 0);
+            if (*end || !*optarg || n > UINT32_MAX) {
+                fprintf(stderr, "uam-run: bad --fuzz-begin-skip '%s' (a count)\n", optarg);
+                return 2;
+            }
+            fz.begin_skip = (uint32_t)n;
+            fuzz_opts = true;
+            break;
+        }
         default: usage(stderr); return 2;
         }
     }

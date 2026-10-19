@@ -347,6 +347,7 @@ typedef struct route_log {
     unsigned calls;
     size_t   len;
     bool     reset, abort;
+    uam_status status;   /* returned after logging the call */
     uam_fuzz *f;
 } route_log;
 
@@ -360,7 +361,7 @@ static uam_status log_route(void *ctx, uam_machine *m, const uint8_t *data, size
     if (l->abort)
         uam_fuzz_abort(l->f);
     (void)data;
-    return UAM_OK;
+    return l->status;
 }
 
 static void test_routes(const target *t)
@@ -406,6 +407,106 @@ static void test_routes(const target *t)
     /* physical 0x7ffc on both targets, in the guest byte order */
     uam_bus_read(&m.bus, 0x7ffc, 4, (t->be ? UAM_ACC_BE : UAM_ACC_LE) | UAM_ACC_DEBUG, &len);
     EQ64(len, 64, "the length word is the truncated length");
+
+    /* mem:...,reject refuses an input over max: nothing runs, the campaign goes on. */
+    char spec[128];
+    snprintf(spec, sizeof(spec), "%s,reject", t->route);
+    CHECK(uam_fuzz_select_route(f, spec, err, sizeof(err)) == UAM_OK, "select mem reject: %s", err);
+    const uam_fuzz_stats *st = uam_fuzz_get_stats(f);
+    uint64_t rejected = st->by_verdict[UAM_FUZZ_REJECTED];
+    CHECK(uam_fuzz_run_one(f, big, sizeof(big), &r) == UAM_OK, "a rejection is no harness error");
+    CHECK(r.verdict == UAM_FUZZ_REJECTED && r.insns == 0, "over max: rejected, nothing ran (%s, %llu)",
+          uam_fuzz_verdict_str(r.verdict), (unsigned long long)r.insns);
+    EQ64(st->by_verdict[UAM_FUZZ_REJECTED], rejected + 1, "counted");
+    CHECK(uam_fuzz_run_one(f, big, 64, &r) == UAM_OK && r.verdict == UAM_FUZZ_OK, "at max: runs");
+    EQ64(uam_fuzz_exit_status(UAM_FUZZ_REJECTED), UAM_FUZZ_EXIT_REJECTED, "exit code");
+
+    /* A route of its own says the same with UAM_ERR_REJECTED; other errors stay errors. */
+    mine.status = UAM_ERR_REJECTED;
+    CHECK(uam_fuzz_select_route(f, "mine", err, sizeof(err)) == UAM_OK, "select mine");
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"x", 1, &r) == UAM_OK && r.verdict == UAM_FUZZ_REJECTED,
+          "a route's rejection");
+    mine.status = UAM_ERR_INVALID;
+    fprintf(stderr, "(expected delivery error follows)\n");
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"x", 1, &r) == UAM_ERR_INVALID,
+          "any other delivery error stops the run");
+    mine.status = UAM_OK;
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"x", 1, &r) == UAM_OK && r.verdict == UAM_FUZZ_OK,
+          "and an accepted input runs");
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+}
+
+/* ---- begin_skip: snapshot at a later arrival ----------------------------- */
+
+static uint32_t reg32(const uam_machine *m, uint32_t off)
+{
+    uint32_t v;
+    memcpy(&v, m->cpu.regfile + off, 4);
+    return v;
+}
+
+static uam_fuzz *skip_harness(uam_machine *m, const target *t, uint32_t skip, uint64_t boot_insns)
+{
+    uam_fuzz_config cfg = { .begin_pc = t->begin, .iter_insns = 20000, .boot_insns = boot_insns,
+                            .begin_skip = skip, .crash_pcs = &t->oracle, .n_crash_pcs = 1,
+                            .map_size = MAP_SIZE, .crash_exc = UAM_FUZZ_EXC_DEFAULT };
+    char err[256];
+    uam_fuzz *f = uam_fuzz_create(m, &cfg, err, sizeof(err));
+    CHECK(f != NULL, "create: %s", err);
+    if (f) {
+        CHECK(uam_fuzz_set_block_coverage(f) == UAM_OK, "coverage");
+        CHECK(uam_fuzz_select_route(f, t->route, err, sizeof(err)) == UAM_OK, "route: %s", err);
+    }
+    return f;
+}
+
+/* The target's boot finds an empty input (count, END, back to BEGIN), so each skipped
+ * arrival is one pass through the handler, counted in s0. */
+static void test_begin_skip(const target *t)
+{
+    uint8_t init0[MAP_SIZE];
+    for (uint32_t skip = 0; skip <= 3; skip++) {
+        for (int bk = BK_INTERP; bk <= BK_JIT; bk++) {
+            uam_machine m;
+            machine_for(&m, t, (backend)bk);
+            uam_fuzz *f = skip_harness(&m, t, skip, 100000);
+            uam_fuzz_result r;
+            CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "%s: boot with begin_skip %u", t->name, skip);
+            EQ64(reg32(&m, t->s0), skip, "the handler ran once per skipped arrival");
+            EQ64(m.cpu.pc, t->begin, "snapshot at begin");
+            size_t n;
+            const uint8_t *map = uam_fuzz_map(f, &n);
+            if (skip == 0)
+                memcpy(init0, map, MAP_SIZE);
+            else
+                CHECK(nonzero(map) > nonzero(init0), "the skipped passes are in INIT");
+            CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) == UAM_OK && r.verdict == UAM_FUZZ_OK,
+                  "inputs run from the later snapshot");
+            EQ64(reg32(&m, t->s0), skip + 1, "from the state at that arrival");
+            uam_fuzz_destroy(f);
+            uam_machine_fini(&m);
+        }
+    }
+    /* Not reached often enough within the boot budget: the boot fails. */
+    uam_machine m;
+    machine_for(&m, t, BK_INTERP);
+    uam_fuzz *f = skip_harness(&m, t, 1000000, 5000);
+    uam_fuzz_result r;
+    fprintf(stderr, "(expected boot error follows)\n");
+    CHECK(uam_fuzz_boot(f, &r) != UAM_OK, "too few arrivals fail the boot");
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+
+    /* Starting at the begin pc is one arrival, counted once (its hook does not fire again
+     * when the hart starts). */
+    machine_for(&m, t, BK_INTERP);
+    f = skip_harness(&m, t, 0, 100000);
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "first boot");
+    uam_fuzz_destroy(f);
+    f = skip_harness(&m, t, 1, 100000);
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "boot from begin with begin_skip 1");
+    EQ64(reg32(&m, t->s0), 1, "one more pass, not none");
     uam_fuzz_destroy(f);
     uam_machine_fini(&m);
 }
@@ -881,6 +982,8 @@ int main(void)
     }
     test_internal_error(&ts[1]);
     test_replay_sidecars();
+    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++)
+        test_begin_skip(&ts[i]);
     printf("test_fuzz: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }
