@@ -147,8 +147,8 @@ tests/net/            net-check.sh  (nettest.elf against real tap and tun interf
 tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
 ```
 
-Planned: more passes in `analysis/` (cmp-log, taint), the suzzer importers and frontends
-(`fuzz/suzzer/`), an Intel HEX loader, more boards and devices.
+Planned: more passes in `analysis/` (cmp-log, taint), an Intel HEX loader, more boards and
+devices.
 
 ## 5. Firmware specifics
 
@@ -226,7 +226,8 @@ Planned: more passes in `analysis/` (cmp-log, taint), the suzzer importers and f
   it provably touches nothing but the map: guest state, `icount` and timing are the same with
   coverage on, and the interpreter and the JIT produce byte-identical maps. With coverage off
   no block contains COV. The map is never part of a snapshot. Sites in delay slots cannot be
-  instrumented (translation fails, naming the pc).
+  instrumented (translation fails, naming the pc). Optionally a site counts only when another
+  counted since (`skip_repeat`), the emit stream of a trap-and-rearm coverage runtime.
 - **Exception observer** (`uam_exec_set_exc_hook`): sees each synchronous exception before
   the ISA takes it, with precise state, and may stop the run (`UAM_STOP_EXC_HOOK`) instead of
   delivering it. One slot (the fuzz harness owns it). Interrupts and resets are not reported.
@@ -234,13 +235,19 @@ Planned: more passes in `analysis/` (cmp-log, taint), the suzzer importers and f
   and run each input from the snapshot through a named route (guest memory, MMIO `input`
   rules, or an input a board published such as a UART FIFO), with paired or begin-only
   iteration boundaries. Verdicts come from crash pcs, the exception observer filtered by
-  exception class, resets, and the executor's stop reasons (hangs, the per-input budget).
-  Frontends sit behind `uam_fuzz_frontend`; the replay frontend runs saved inputs.
+  exception class, resets, and the executor's stop reasons (hangs, the per-input budget);
+  an internal error stops the campaign instead. Coverage sites at the boundaries are
+  counted by the boundary hooks, in the map they close. Frontends sit behind
+  `uam_fuzz_frontend`; the replay frontend runs saved inputs. Observers
+  (`uam_fuzz_set_observer`) see every published map, for side channels.
+- **suzzer interoperation** (`fuzz/suzzer/`, built only with a suzzer checkout,
+  [`suzzer.md`](suzzer.md)): LCV3 site lists and LCVB1 boundary files in, the SZR1 executor
+  (`--fuzz-szr`) and LCVS export (`--cov-shm`, an observer) out. It reaches the runner
+  through the generic runner-extension interface (`runner.h`), so nothing outside
+  `fuzz/suzzer/` names suzzer.
 - **Planned** (phase 3, on top of snapshots):
   - More passes: cmp-logging, memory hooks, taint (these need `HELPER` support in the JIT).
   - More crash checks: execution outside code regions, an icount watchdog per function.
-  - suzzer interoperation (*LCV3/LCVB1 done*, see [`fuzzing.md`](fuzzing.md)): the SZR1
-    frontend, LCVS export.
 
   PC hooks, watchpoints and `uam_exec_stop` are already available to build oracles by hand.
 - **GDB stub** against the abstract state (`--gdb PORT`): breakpoints are PC hooks, watchpoints

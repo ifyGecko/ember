@@ -9,7 +9,10 @@ repositories. Neither contains the other's files:
   site and boundary generators, `suzzer_brain.py`).
 - **Together**, ember runs firmware under emulation with suzzer's coverage sites and iteration
   boundaries, producing bitmaps that mean the same as libcov's on a real device, so corpora
-  and coverage carry over between the two.
+  and coverage carry over between the two. ember reproduces libcov's bucket formula and its
+  emit stream (FORMATS.md 5.7: leapfrog's collapsed repeats, boundary markers counted in
+  the snapshot they close), and suzzer's brain drives ember as it drives `suzzer-relay`.
+  The differences that remain are listed under [Differences from libcov](#differences-from-libcov).
 
 They meet only through the formats suzzer publishes: the LCV3 site list, the LCVB1 boundary
 file, the LCVS shared-memory region and the SZR1 protocol, specified in suzzer's
@@ -75,27 +78,37 @@ With suzzer configured, `uam-run` (and every board built on `uam_run_main`) gain
 | `--cov-sites LCV3` | coverage sites from a patch list (`gen_patchlist.py`) |
 | `--cov-module NAME=BASE` | a module's load base; otherwise the list's base table, then the image's link base |
 | `--cov-scheme site\|pc`, `--cov-ngram N`, `--cov-rotate` | match the device's libcov build |
+| `--cov-mode leapfrog\|every` | which executions count: libcov's default (`leapfrog`, the default here too) or every one |
 | `--cov-strict` | every site's bytes in memory must match the list |
 | `--cov-boundary LCVB1` | iteration boundaries from `gen_boundary.py`: one BEGIN marker for now, any number of END markers |
 | `--fuzz-szr HOST:PORT` | fuzz with inputs from `suzzer_brain.py` over SZR1, ember standing in for `suzzer-relay` |
+| `--cov-shm PATH`, `--cov-shm-ring N` | publish INIT and every ok iteration's map in an LCVS region for suzzer's readers |
 
 and `make test` adds `test_suzzer` (the format readers and the conformance vectors) and
-`suzzer-test` (the options end to end on RV32 and MIPS32 BE/LE, and the SZR1 executor
-against a scripted brain, `tests/szr/fake_brain.py`). See
+`suzzer-test`: the options end to end on RV32 and MIPS32 BE/LE, the LCVS region read back by
+suzzer's `test/shm_bitmap.py` and an independent reader, the SZR1 executor against a
+scripted brain (`tests/szr/fake_brain.py`), and a session with suzzer's own
+`tools/suzzer_brain.py` (`tests/szr/brain-check.sh`). See
 [`fuzzing.md`](fuzzing.md#suzzer) for how the options behave.
 
 A typical session:
 
 ```bash
 # on the suzzer side: sites and boundaries for the firmware
-python3 suzzer/tools/gen_patchlist.py fw.elf fw.lcv3
-python3 suzzer/tools/gen_boundary.py --patchlist fw.lcv3 fw.elf fw.lcvb handle_request:begin
+python3 suzzer/tools/gen_patchlist.py --strategy entry fw.elf fw.lcv3
+python3 suzzer/tools/gen_boundary.py --strategy entry --patchlist fw.lcv3 fw.elf fw.lcvb \
+    handle_request:begin
 # on the ember side
 build/uam-run -b mips-ref --cov-sites fw.lcv3 --cov-boundary fw.lcvb --cov-strict \
-    --fuzz-input uart0 --fuzz-replay corpus/ fw.elf
+    --fuzz-input uart0 --fuzz-crash-pc 0x80102000 --fuzz-replay corpus/ fw.elf
 ```
 
-(The generators and their options belong to suzzer; see its `HOWTO.md`. They need rizin.)
+(The generators and their options belong to suzzer; see its `HOWTO.md`. They need rizin.
+`--strategy entry` puts the BEGIN marker at the handler's first instruction, before it reads
+any input, which is where ember snapshots; on RV32 the generators' default would place it
+after the read. `--fuzz-crash-pc` names the firmware's fatal-error routine, e.g. from
+`nm fw.elf`. For a raw image, generate with suzzer's `--raw --base ... --symbols ...` and run
+it with `--raw-base` and, if its reset code is not at its first byte, `--entry`.)
 
 To let suzzer's brain drive ember directly, start the brain and point ember at it:
 
@@ -105,4 +118,26 @@ build/uam-run -b mips-ref --cov-sites fw.lcv3 --cov-boundary fw.lcvb --cov-stric
     --fuzz-input uart0 --fuzz-szr 127.0.0.1:7000 fw.elf
 ```
 
-Planned on top of this: LCVS shared-memory export for suzzer's reader tools.
+Add `--cov-shm /tmp/fw.lcvs` to either command to watch the run with suzzer's region
+readers, e.g. `python3 suzzer/test/shm_bitmap.py stats /tmp/fw.lcvs`.
+
+## Differences from libcov
+
+What ember does differently from libcov on a device, by design or for now:
+
+- **One BEGIN marker.** ember snapshots at a single begin; a boundary file with several is
+  refused. Any number of END markers work.
+- **"Any depth" paired markers.** ember ends the iteration at the first END; libcov
+  publishes and resets at every nested BEGIN and END. Depth-zero-only markers (recursion
+  kept in one input) behave the same in both.
+- **No GAP snapshots.** Each input starts from the snapshot at BEGIN, so the code between an
+  END and the next BEGIN runs once, at boot, and is counted in INIT.
+- **Markers need not be sites.** ember stops at a boundary pc whether or not the patch list
+  has a site there; libcov only fires markers that are sites. Use lists from one generator
+  run.
+- **Crashed iterations.** Their maps go to the frontend (the brain gets CRASH frames, replay
+  prints them) but not to the LCVS ring, matching a device whose process died.
+- **libcov settings without an ember equivalent:** `LIBCOV_MODE=oneshot`,
+  `LIBCOV_BOUNDARY_INIT_GRACE`, `LIBCOV_BOUNDARY_REARM` and marker emulation. `--cov-map-size`
+  stands in for libcov's map-size knobs.
+- **Single hart.** libcov's MT variant has no counterpart; ember never sets `MT`.

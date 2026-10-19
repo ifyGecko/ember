@@ -314,6 +314,7 @@ whoever enabled coverage). The state holds the map, its `mask`, and a history of
 each rotated left by `rot[j]` within the map's width `bits` first (0: no rotation):
 
 ```
+if skip_repeat: { if last_pc == pc: done; last_pc = pc }   // pc: the instruction's IMARK
 idx = A
 for j < depth: idx ^= rot[j] ? rotl(hist[j], rot[j]) : hist[j]
 idx &= mask
@@ -331,7 +332,12 @@ With the default shape (depth 1, no rotation; `hist[0]` is also called `prev`) t
 `idx = (A ^ prev) & mask; prev = B`, which covers AFL-style edges (`A = cur`,
 `B = cur >> 1`) and block counts (`B = 0`). Deeper histories give N-gram coverage that
 folds the last N-1 sites, and rotation makes the fold order-sensitive (suzzer's schemes;
-`uam_cov_count` in `cpu.h` is the reference implementation). `COV` reads and writes nothing else: no register, no
+`uam_cov_count` in `cpu.h` is the reference implementation). `skip_repeat`, also part of
+the shape, makes a site count only when it is not the site that counted last (`last_pc`,
+which `uam_cov_reset_prev` keeps): back-to-back executions of one site count once and no
+site-to-itself edge is ever made, the emit stream of a coverage runtime that disarms a
+site when it fires and re-arms the one before it (suzzer's libcov in its default leapfrog
+mode). `COV` reads and writes nothing else: no register, no
 memory, no bus access, and it does not count as an instruction (`icount` is unchanged). With
 no coverage state attached (`cov` is NULL) it does nothing. Lifters never emit it; a pass
 inserts it directly after the `IMARK` of an instrumented instruction (§8 rule 8), so it runs

@@ -37,6 +37,7 @@ The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
 build/uam-run build/firmware/selftest.elf
 build/uam-run --stats --trace exc --unknown-mmio zero path/to/firmware.elf
 build/uam-run --raw-base 0x80000000 path/to/image.bin
+build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
@@ -63,14 +64,16 @@ to 0.190 s (+31%), interpreter 2.93 s to 3.05 s (+4%). Real firmware has longer 
 snapshots there and runs every input from the snapshot, delivered through `--fuzz-input`
 (`mem:ADDR`, `mmio`, or a board input such as `uart0`), and classifies each run as ok, crash
 (an exception, a `--fuzz-crash-pc`, a reset), hang or timeout. `--fuzz-replay FILE|DIR` runs
-saved inputs once each and exits with the last verdict (0 ok, 20/21 crash, 22 hang, 23
-timeout). See [`docs/fuzzing.md`](docs/fuzzing.md).
+saved inputs once each and exits with the most severe verdict of any input (20/21 crash,
+else 22 hang, else 23 timeout, else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
 
 With a [suzzer](docs/suzzer.md) checkout (`make SUZZER_DIR=path`, or `make suzzer` to clone one
 into `./suzzer`), suzzer's site lists and boundary files plug in directly: `--cov-sites fw.lcv3` gives bitmaps
-with the same meaning as libcov's (site-id or hashed-PC model, N=1 or 2), `--cov-boundary
-fw.lcvb` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-strict` checks every site's bytes
-in memory against the list.
+with the same meaning as libcov's (site-id or hashed-PC model, N=1..8, rotation, leapfrog's
+emit stream), `--cov-boundary fw.lcvb` replaces `--fuzz-begin`/`--fuzz-end`, and
+`--cov-strict` checks every site's bytes in memory against the list. `--fuzz-szr HOST:PORT`
+lets suzzer's brain drive ember in place of `suzzer-relay`, and `--cov-shm PATH` publishes
+the maps in an LCVS region for suzzer's readers.
 
 A run always ends. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual
 time, which also advances while the hart idles in WFI/WAIT (both exit 124). When a hart
