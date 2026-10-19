@@ -161,4 +161,19 @@ sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, char *err, size_t e
 void    sz_szr_close(sz_szr *z);
 extern const uam_fuzz_frontend sz_szr_frontend;
 
+/* ---- LCVS export (FORMATS.md section 3; lcvs.c) -------------------------- */
+
+/* A region at PATH (LIBCOV_SHM_PATH's rule: a '/' after the first character means a
+ * file, else a shared-memory name) for maps of map_size bytes and ring_size (2..65535)
+ * slots; scheme_flags are sz_lcvs_scheme_flags, or 0. Refuses a region another live
+ * process owns. sz_lcvs_observe is a uam_fuzz_observer_fn with the region as ctx: it
+ * publishes INIT and each ok iteration, and keeps the live bitmap as their union. */
+typedef struct sz_lcvs sz_lcvs;
+sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size, uint32_t scheme_flags,
+                        char *err, size_t errlen);
+void     sz_lcvs_close(sz_lcvs *l);
+uint64_t sz_lcvs_published(const sz_lcvs *l);
+void     sz_lcvs_observe(void *ctx, uint64_t id, int kind, uam_fuzz_verdict v, uint64_t detail,
+                         const uint8_t *map, size_t map_size);
+
 #endif /* UAM_FUZZ_SUZZER_H */

@@ -68,7 +68,7 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/sifive
                devices/unknown_mmio.c devices/unimp.c devices/virtio_net.c devices/mmio_stub.c
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
-               fuzz/suzzer/frontend_szr1.c
+               fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
                $(if $(HAVE_SUZZER),$(SUZZER_SRC))
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/hostloop.c \
@@ -261,12 +261,16 @@ fuzz-test: $(RUN) firmware firmware-mips
 	sh tests/fuzz/fuzz-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
 
 # suzzer's formats and the SZR1 executor through the runner (lists written by
-# tests/suzzer/mk_lists.py; the brain is tests/szr/fake_brain.py).
+# tests/suzzer/mk_lists.py): the LCVS export read back by suzzer's test/shm_bitmap.py,
+# a session with suzzer's own brain (tools/suzzer_brain.py), and the protocol frame by
+# frame against a scripted brain (tests/szr/fake_brain.py).
 ifeq ($(HAVE_SUZZER),1)
 suzzer-test: $(RUN) firmware firmware-mips
-	sh tests/suzzer/suzzer-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
-	sh tests/suzzer/suzzer-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
-	sh tests/suzzer/suzzer-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+	sh tests/suzzer/suzzer-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
+	sh tests/suzzer/suzzer-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
+	sh tests/suzzer/suzzer-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf $(SUZZER_DIR)
+	sh tests/szr/brain-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
+	sh tests/szr/brain-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
 	sh tests/szr/szr-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/szr/szr-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
 	sh tests/szr/szr-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf

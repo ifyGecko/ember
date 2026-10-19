@@ -1,5 +1,5 @@
 #!/bin/sh
-# suzzer-check.sh RUN BOARD FIRMWARE - suzzer's file formats through uam-run.
+# suzzer-check.sh RUN BOARD FIRMWARE SUZZER_DIR - suzzer's formats through uam-run.
 #
 # FIRMWARE is a build of tests/fuzz/fuzztarget.h. mk_lists.py writes an LCV3 patch list
 # (a site at every function) and an LCVB1 begin marker for it, with no suzzer checkout.
@@ -11,6 +11,9 @@
 #     maps on every backend, of libcov's size for that N;
 #   - several END markers each ending an iteration, and --fuzz-end refused next to a
 #     boundary file;
+#   - --cov-shm to publish INIT and the ok iterations (not the crashes) in an LCVS
+#     region that an independent reader (lcvs_check.py) and suzzer's own
+#     test/shm_bitmap.py both read back;
 #   - the hashed-PC scheme and the image link base (no base table) to work;
 #   - --cov-strict to fail on a corrupted site, and N outside 1..8 and unknown
 #     --cov-module names to be refused.
@@ -19,6 +22,7 @@ set -eu
 run=$1
 board=$2
 fw=$3
+suzzer=$4
 here=$(dirname "$0")
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -162,6 +166,38 @@ rc=0
     --fuzz-replay "$tmp/in" "$fw" < /dev/null > /dev/null 2> "$tmp/conflict.err" || rc=$?
 if [ $rc -ne 2 ]; then
     echo "suzzer-check: $board: --fuzz-end with --cov-boundary was not refused (exit $rc)" >&2
+    fail=1
+fi
+
+# 2d. LCVS export: INIT, then the two ok inputs; the crash in between is not published.
+mkdir "$tmp/shm-in"
+cp "$tmp/in/1-ok" "$tmp/shm-in/1-ok"
+cp "$tmp/in/2-store" "$tmp/shm-in/2-store"
+printf 'okay' > "$tmp/shm-in/3-ok"
+for i in 1-ok 3-ok; do
+    "$run" -b "$board" --cov-sites "$tmp/sites.lcv3" --cov-boundary "$tmp/begin.lcvb" \
+        --fuzz-input uart0 --cov-out "$tmp/shm-$i.map" --fuzz-replay "$tmp/shm-in/$i" "$fw" \
+        < /dev/null > /dev/null 2>&1 || true
+done
+rc=0
+"$run" -b "$board" --cov-sites "$tmp/sites.lcv3" --cov-boundary "$tmp/begin.lcvb" \
+    --fuzz-input uart0 --cov-shm "$tmp/region" --cov-shm-ring 4 --fuzz-replay "$tmp/shm-in" "$fw" \
+    < /dev/null > /dev/null 2> "$tmp/shm.err" || rc=$?
+# flags: ACTIVE | SCHEME | N=2 (site model, no rotation)
+if [ $rc -ne 20 ] \
+   || ! python3 "$here/lcvs_check.py" "$tmp/region" 0x209 "$tmp/shm-1-ok.map" "$tmp/shm-3-ok.map" \
+        > "$tmp/shm.out" 2>&1 \
+   || [ "$(python3 "$suzzer/test/shm_bitmap.py" gen "$tmp/region")" != 3 ] \
+   || [ "$(python3 "$suzzer/test/shm_bitmap.py" scheme "$tmp/region")" != "n=2 model=site rotate=0" ]; then
+    echo "suzzer-check: $board: --cov-shm (exit $rc):" >&2
+    cat "$tmp/shm.err" "$tmp/shm.out" >&2
+    fail=1
+fi
+rc=0
+"$run" -b "$board" --cov-sites "$tmp/sites.lcv3" --cov-shm "$tmp/region2" -n 1000 "$fw" \
+    < /dev/null > /dev/null 2>&1 || rc=$?
+if [ $rc -ne 2 ]; then
+    echo "suzzer-check: $board: --cov-shm without fuzzing was not refused (exit $rc)" >&2
     fail=1
 fi
 

@@ -657,6 +657,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: a fuzz frontend needs --fuzz-begin PC (or a boundary file)\n");
         return 2;
     }
+    if ((provides & UAM_RUNNER_EXT_OBSERVER) && !fuzzing) {
+        fprintf(stderr, "uam-run: a fuzz side channel needs --fuzz-begin PC (or a boundary file)\n");
+        return 2;
+    }
     if (fuzzing && !fuzz_replay && !(provides & UAM_RUNNER_EXT_FRONTEND)) {
         fprintf(stderr, "uam-run: fuzzing needs a frontend (--fuzz-replay FILE|DIR, ...)\n");
         return 2;

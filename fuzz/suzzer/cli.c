@@ -10,6 +10,8 @@
  *   --cov-strict            a site whose bytes differ from the patch list is fatal
  *   --cov-boundary LCVB1    iteration boundaries from a suzzer boundary file (fuzzing)
  *   --fuzz-szr HOST:PORT    take inputs from a suzzer brain over SZR1 (fuzzing)
+ *   --cov-shm PATH          publish the maps in an LCVS region (fuzzing)
+ *   --cov-shm-ring N        its ring size (default 8)
  *
  * Site bytes are checked at the first begin when fuzzing, else when the run ends.
  */
@@ -22,7 +24,8 @@
 #define MAX_MODULE_OPTS 32
 
 typedef struct cli {
-    const char     *sites_path, *boundary_path, *szr_addr;
+    const char     *sites_path, *boundary_path, *szr_addr, *shm_path;
+    unsigned        shm_ring;
     sz_module_base  mod[MAX_MODULE_OPTS];
     char           *mod_names[MAX_MODULE_OPTS];
     size_t          n_mod;
@@ -36,20 +39,25 @@ typedef struct cli {
     bool            loaded;
     sz_bounds       bounds;
     sz_szr         *szr;
+    sz_lcvs        *shm;
 } cli;
 
 static const uam_runner_opt opts[] = {
     { "cov-sites", true }, { "cov-module", true }, { "cov-scheme", true },
     { "cov-ngram", true }, { "cov-strict", false }, { "cov-boundary", true },
     { "cov-rotate", false }, { "fuzz-szr", true }, { "cov-mode", true },
+    { "cov-shm", true }, { "cov-shm-ring", true },
 };
-enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_SZR, O_MODE };
+enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_SZR, O_MODE,
+       O_SHM, O_SHM_RING };
 
 static void *cli_create(void)
 {
     cli *c = calloc(1, sizeof(*c));
-    if (c)
+    if (c) {
         c->scheme = (sz_scheme){ .model = SZ_MODEL_SITE, .ngram = 2 };
+        c->shm_ring = 8;
+    }
     return c;
 }
 
@@ -59,6 +67,7 @@ static void cli_destroy(void *st)
     if (!c)
         return;
     sz_szr_close(c->szr);
+    sz_lcvs_close(c->shm);
     sz_namer_fini(&c->namer);
     sz_bounds_free(&c->bounds);
     free(c->sites);
@@ -75,6 +84,17 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
     case O_SITES:    c->sites_path = arg; return true;
     case O_BOUNDARY: c->boundary_path = arg; return true;
     case O_SZR:      c->szr_addr = arg; return true;
+    case O_SHM:      c->shm_path = arg; return true;
+    case O_SHM_RING: {
+        char *end;
+        unsigned long n = strtoul(arg, &end, 10);
+        if (*end || n < 2 || n > 0xffff) {
+            snprintf(err, errlen, "expected a ring size from 2 to 65535");
+            return false;
+        }
+        c->shm_ring = (unsigned)n;
+        return true;
+    }
     case O_STRICT:   c->strict = true; return true;
     case O_ROTATE:   c->scheme.rotate = true; return true;
     case O_MODE:
@@ -137,7 +157,7 @@ static unsigned cli_provides(void *st)
 {
     const cli *c = st;
     return (c->sites_path ? UAM_RUNNER_EXT_SITES : 0) | (c->boundary_path ? UAM_RUNNER_EXT_BEGIN : 0)
-         | (c->szr_addr ? UAM_RUNNER_EXT_FRONTEND : 0);
+         | (c->szr_addr ? UAM_RUNNER_EXT_FRONTEND : 0) | (c->shm_path ? UAM_RUNNER_EXT_OBSERVER : 0);
 }
 
 /* Last in setup: the brain hears HELLO with the scheme the sites were built for. */
@@ -258,6 +278,20 @@ static uam_status cli_attach(void *st, uam_machine *m, uam_fuzz *f)
     cli *c = st;
     if (c->loaded)
         uam_fuzz_set_boot_hook(f, boot_check, c);
+    if (c->shm_path) {
+        size_t map_size;
+        uam_fuzz_map(f, &map_size);
+        char e[300];
+        c->shm = sz_lcvs_create(c->shm_path, (uint32_t)map_size, c->shm_ring,
+                                c->loaded ? sz_lcvs_scheme_flags(&c->scheme) : 0, e, sizeof(e));
+        if (!c->shm) {
+            uam_log(UAM_LOG_ERROR, "lcvs", "--cov-shm: %s", e);
+            return UAM_ERR_INVALID;
+        }
+        uam_fuzz_set_observer(f, sz_lcvs_observe, c->shm);
+        uam_log(UAM_LOG_INFO, "lcvs", "%s: %zu-byte maps, %u ring slots", c->shm_path, map_size,
+                c->shm_ring);
+    }
     return UAM_OK;
 }
 
@@ -285,7 +319,10 @@ const uam_runner_ext uam_suzzer_runner_ext = {
         "                          after another one) or every (each execution counts)\n"
         "      --cov-strict        fail if a site's bytes in memory differ from the list\n"
         "      --cov-boundary LCVB1  iteration begin/end from a suzzer boundary file\n"
-        "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP)\n",
+        "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP)\n"
+        "      --cov-shm PATH      publish INIT and each ok iteration's map in an LCVS region\n"
+        "                          (a file if PATH has a '/' after its start, else /dev/shm)\n"
+        "      --cov-shm-ring N    ring slots in that region (default 8)\n",
     .create = cli_create,
     .destroy = cli_destroy,
     .option = cli_option,

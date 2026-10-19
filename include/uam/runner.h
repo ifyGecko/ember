@@ -68,6 +68,7 @@ enum uam_runner_ext_provides {
     UAM_RUNNER_EXT_SITES    = 1u << 0,
     UAM_RUNNER_EXT_BEGIN    = 1u << 1,
     UAM_RUNNER_EXT_FRONTEND = 1u << 2,
+    UAM_RUNNER_EXT_OBSERVER = 1u << 3,   /* watches the harness (attach): needs fuzzing */
 };
 
 typedef struct uam_runner_ext {
