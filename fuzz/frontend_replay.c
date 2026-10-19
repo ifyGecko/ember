@@ -20,6 +20,7 @@ struct uam_fuzz_replay {
     size_t    n_paths, next;
     uint8_t  *data;
     int       exit_status;
+    int       rank;          /* of the verdict behind exit_status (verdict_rank) */
     uint8_t  *last_map;
     size_t    map_size;
 };
@@ -124,6 +125,21 @@ static const char *exc_name(uam_exc_kind k)
     return "?";
 }
 
+/* The exit status is the most severe verdict of any input: a crash (the first one
+ * seen), else a hang, else a timeout, else ok. So replaying a directory fails when any
+ * input in it does, whatever else (or whatever order) the directory holds. */
+static int verdict_rank(uam_fuzz_verdict v)
+{
+    switch (v) {
+    case UAM_FUZZ_CRASH_FAULT:
+    case UAM_FUZZ_CRASH_ORACLE: return 3;
+    case UAM_FUZZ_HANG:         return 2;
+    case UAM_FUZZ_TIMEOUT:      return 1;
+    case UAM_FUZZ_OK:           return 0;
+    }
+    return 0;
+}
+
 static int replay_next(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
 {
     uam_fuzz_replay *r = ctx;
@@ -215,7 +231,10 @@ static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint
         break;
     }
     fprintf(r->out, " insns=%llu buckets=%zu\n", (unsigned long long)res->insns, hit);
-    r->exit_status = uam_fuzz_exit_status(v);
+    if (verdict_rank(v) > r->rank) {
+        r->rank = verdict_rank(v);
+        r->exit_status = uam_fuzz_exit_status(v);
+    }
     return UAM_OK;
 }
 

@@ -54,8 +54,8 @@ for mode in interp jit jit-nochain; do
     esac
     rc=0
     fuzz "$flags" "--cov-out $tmp/$mode.map --fuzz-replay $tmp/in" > "$tmp/$mode.out" || rc=$?
-    if [ $rc -ne 0 ]; then
-        echo "fuzz-check: $board $mode: exit $rc, expected 0 (the last input is fine)" >&2
+    if [ $rc -ne 20 ]; then
+        echo "fuzz-check: $board $mode: exit $rc, expected 20 (the first crash, 2-store)" >&2
         cat "$tmp/err" >&2
         fail=1
     fi

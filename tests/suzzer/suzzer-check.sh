@@ -54,7 +54,7 @@ for mode in interp jit jit-nochain; do
         --cov-strict --fuzz-crash-pc "$panic" --fuzz-input uart0 --cov-out "$tmp/$mode.map" \
         --fuzz-replay "$tmp/in" "$fw" < /dev/null > "$tmp/$mode.raw" 2> "$tmp/$mode.err" || rc=$?
     grep '^replay: ' "$tmp/$mode.raw" | sed "s|$tmp/in/||" > "$tmp/$mode.out" || true
-    if [ $rc -ne 21 ] || ! grep -q '^replay: 1-ok: ok' "$tmp/$mode.out" \
+    if [ $rc -ne 20 ] || ! grep -q '^replay: 1-ok: ok' "$tmp/$mode.out" \
        || ! grep -q '^replay: 2-store: crash-fault' "$tmp/$mode.out" \
        || ! grep -q "^replay: 3-panic: crash-oracle pc=$panic" "$tmp/$mode.out"; then
         echo "suzzer-check: $board $mode: fuzzing with suzzer lists (exit $rc):" >&2
@@ -99,7 +99,7 @@ for scheme in "3 --cov-rotate" "8 --cov-rotate"; do
             --cov-out "$tmp/$tag-$mode.map" --fuzz-replay "$tmp/in" "$fw" \
             < /dev/null > "$tmp/$tag-$mode.raw" 2> "$tmp/$tag-$mode.err" || rc=$?
         grep '^replay: ' "$tmp/$tag-$mode.raw" | sed "s|$tmp/in/||" > "$tmp/$tag-$mode.out" || true
-        if [ $rc -ne 21 ] || ! grep -q '^replay: 1-ok: ok .*buckets=[1-9]' "$tmp/$tag-$mode.out" \
+        if [ $rc -ne 20 ] || ! grep -q '^replay: 1-ok: ok .*buckets=[1-9]' "$tmp/$tag-$mode.out" \
            || ! grep -q '^replay: 2-store: crash-fault' "$tmp/$tag-$mode.out" \
            || ! grep -q "^replay: 3-panic: crash-oracle pc=$panic" "$tmp/$tag-$mode.out"; then
             echo "suzzer-check: $board $mode: --cov-ngram $scheme (exit $rc):" >&2
@@ -126,10 +126,20 @@ print(max(s, 4096, t))")
     fi
 done
 
-# The history shape reaches the harness: rotation changes the map (the rotation
-# amounts also depend on the depth, so N=3 and N=8 differ too). Without rotation the
-# fuzz target's short paths give the same map at N=2 and N=3, which is correct.
-if cmp -s "$tmp/interp.map" "$tmp/n3-interp.map" || cmp -s "$tmp/n3-interp.map" "$tmp/n8-interp.map"; then
+# The history shape reaches the harness: rotation changes the map. Compared on the ok
+# input, whose path has two sites after the begin: an iteration's first count has an
+# empty history and is the same bucket under every scheme (FORMATS.md 5.7), and the
+# crashing inputs count only that one. Two sites use only hist[0], which N=3 and N=8
+# both rotate by 1, so those two agree here; the conformance vectors (test_suzzer)
+# cover the deeper histories.
+for scheme in 2 "3 --cov-rotate"; do
+    # shellcheck disable=SC2086
+    "$run" -b "$board" --cov-sites "$tmp/sites.lcv3" --cov-boundary "$tmp/begin.lcvb" \
+        --cov-ngram $scheme --cov-map-size 4096 --fuzz-input uart0 \
+        --cov-out "$tmp/ok-n${scheme%% *}.map" --fuzz-replay "$tmp/in/1-ok" "$fw" \
+        < /dev/null > /dev/null 2>&1 || true
+done
+if cmp -s "$tmp/ok-n2.map" "$tmp/ok-n3.map"; then
     echo "suzzer-check: $board: --cov-ngram / --cov-rotate did not change the map" >&2
     fail=1
 fi
@@ -141,7 +151,7 @@ rc=0
     --fuzz-crash-exc none --fuzz-input uart0 --fuzz-iter-insns 100000 --fuzz-replay "$tmp/in" "$fw" \
     < /dev/null > "$tmp/ends.raw" 2> "$tmp/ends.err" || rc=$?
 grep '^replay: ' "$tmp/ends.raw" | sed "s|$tmp/in/||" > "$tmp/ends.out" || true
-if [ $rc -ne 0 ] || ! grep -q '^replay: 1-ok: timeout' "$tmp/ends.out" \
+if [ $rc -ne 23 ] || ! grep -q '^replay: 1-ok: timeout' "$tmp/ends.out" \
    || ! grep -q '^replay: 2-store: ok' "$tmp/ends.out" || ! grep -q '^replay: 3-panic: ok' "$tmp/ends.out"; then
     echo "suzzer-check: $board: two END markers (exit $rc):" >&2
     cat "$tmp/ends.out" "$tmp/ends.err" >&2

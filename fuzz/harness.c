@@ -34,6 +34,9 @@ struct uam_fuzz {
     size_t         n_end_pcs;
     uint8_t       *map;
     uam_cov_state  cov;
+    uam_cov_site  *marker;         /* sites at the begin and end pcs, counted by the hooks */
+    size_t         n_marker;
+    uint64_t       snap_last_pc;   /* cov.last_pc when the snapshot was taken */
     const char    *scheme;
     char           scheme_buf[32];
     bool           has_cov;
@@ -154,27 +157,54 @@ static unsigned exc_class(uam_exc_kind k)
 
 /* ---- hooks ------------------------------------------------------------- */
 
+/*
+ * A coverage site at a boundary pc is counted here, by its hook, rather than by a COV
+ * in the translated code: the hook runs before the instruction, and its hit has to be
+ * counted before the map is published and the history reset. So the begin's hit goes
+ * to the map it closes (INIT at boot, the previous iteration in begin-only mode), an
+ * end's to the iteration it ends, and an iteration's first count is the site after
+ * the begin, with an empty history. The snapshot is taken at the begin pc with its
+ * hook already run, so the begin instruction there is never counted twice.
+ */
+static void count_marker(uam_fuzz *f, uint64_t pc)
+{
+    if (!f->has_cov)
+        return;
+    for (size_t i = 0; i < f->n_marker; i++) {
+        if (f->marker[i].pc == pc) {
+            uam_cov_count(&f->cov, pc, f->marker[i].a, f->marker[i].b);
+            return;
+        }
+    }
+}
+
 static uam_hook_action begin_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    (void)cpu; (void)pc;
+    (void)cpu;
     uam_fuzz *f = ctx;
+    if (f->ph == PH_IDLE)
+        return UAM_HOOK_CONTINUE;
+    count_marker(f, pc);
     if (f->ph == PH_BOOT) {
         f->at_begin = true;
         return UAM_HOOK_STOP;
     }
-    if (f->ph == PH_ITER && !f->n_end_pcs) {   /* begin-only: back at begin */
+    if (!f->n_end_pcs) {   /* begin-only: back at begin */
         f->ended = true;
         return UAM_HOOK_STOP;
     }
-    if (f->ph == PH_ITER && f->cfg.nested)
+    if (f->cfg.nested)
         f->depth++;
     return UAM_HOOK_CONTINUE;
 }
 
 static uam_hook_action end_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    (void)cpu; (void)pc;
+    (void)cpu;
     uam_fuzz *f = ctx;
+    if (f->ph == PH_IDLE)
+        return UAM_HOOK_CONTINUE;
+    count_marker(f, pc);
     if (f->ph != PH_ITER)
         return UAM_HOOK_CONTINUE;
     if (f->cfg.nested && --f->depth > 0)
@@ -281,6 +311,8 @@ uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err,
     f->cfg.end_pcs = f->end_pcs;
     f->cfg.n_end_pcs = f->n_end_pcs;
     uam_cov_state_init(&f->cov, f->map, map_size, &cfg->history);
+    f->cov.skip_repeat = cfg->skip_repeats;
+    f->snap_last_pc = UAM_COV_NO_PC;
     f->scheme = "none";
 
     uam_exec *x = &m->exec;
@@ -331,6 +363,7 @@ void uam_fuzz_destroy(uam_fuzz *f)
     free(f->routes);
     free(f->crash_pcs);
     free(f->end_pcs);
+    free(f->marker);
     free(f->map);
     free(f);
 }
@@ -341,13 +374,46 @@ static void name_scheme(uam_fuzz *f, const char *scheme)
     f->scheme = f->scheme_buf;
 }
 
+static bool is_boundary(const uam_fuzz *f, uint64_t pc)
+{
+    if (pc == f->cfg.begin_pc)
+        return true;
+    for (size_t i = 0; i < f->n_end_pcs; i++)
+        if (f->end_pcs[i] == pc)
+            return true;
+    return false;
+}
+
 uam_status uam_fuzz_set_sites(uam_fuzz *f, const uam_cov_site *sites, size_t n,
                               const char *scheme, char *err, size_t errlen)
 {
     if (f->booted)
         return UAM_ERR_INVALID;
-    uam_status st = uam_exec_set_coverage(&f->m->exec, sites, n, &f->cov, err, errlen);
+    /* Boundary sites go to the hooks (count_marker), the rest to the coverage pass. */
+    uam_cov_site *body = n ? malloc(sizeof(*body) * n) : NULL;
+    uam_cov_site *marker = n ? malloc(sizeof(*marker) * n) : NULL;
+    if (n && (!body || !marker)) {
+        free(body);
+        free(marker);
+        set_err(err, errlen, "out of memory");
+        return UAM_ERR_NOMEM;
+    }
+    size_t n_body = 0, n_marker = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (is_boundary(f, sites[i].pc))
+            marker[n_marker++] = sites[i];
+        else
+            body[n_body++] = sites[i];
+    }
+    free(f->marker);
+    f->marker = marker;
+    f->n_marker = n_marker;
+    /* With only boundary sites there is no pass at all (n_body 0 turns it off). */
+    uam_status st = uam_exec_set_coverage(&f->m->exec, body, n_body, &f->cov, err, errlen);
+    free(body);
     f->has_cov = st == UAM_OK && n;
+    if (!f->has_cov)
+        f->n_marker = 0;
     name_scheme(f, f->has_cov ? scheme : "none");
     return st;
 }
@@ -523,6 +589,7 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     if (m->cpu.pc == f->cfg.begin_pc) {
         f->at_begin = true;   /* e.g. resumed from a snapshot taken at begin */
         r->stop = UAM_STOP_HOOK;
+        count_marker(f, m->cpu.pc);
     } else {
         f->ph = PH_BOOT;
         r->stop = uam_exec_run(&m->exec, f->cfg.boot_insns);
@@ -550,6 +617,7 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
         uam_log(UAM_LOG_ERROR, "fuzz", "cannot snapshot the machine at the begin pc");
         return st;
     }
+    f->snap_last_pc = f->cov.last_pc;
     f->booted = true;
     f->last = *r;
     return UAM_OK;
@@ -606,7 +674,6 @@ static void classify(uam_fuzz *f, uam_fuzz_result *r)
         r->detail = (uint64_t)r->stop;
         return;
     case UAM_STOP_FAULT_LOOP:
-    case UAM_STOP_ERROR:
         r->verdict = UAM_FUZZ_CRASH_FAULT;
         r->detail = r->pc;
         return;
@@ -635,6 +702,7 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     }
     memset(f->map, 0, f->cfg.map_size);
     uam_cov_reset_prev(&f->cov);
+    f->cov.last_pc = f->snap_last_pc;
     clear_flags(f);
     st = f->deliver(f->deliver_ctx, m, data, len);
     if (st != UAM_OK) {
@@ -650,6 +718,13 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     r->insns = m->cpu.icount - ic0;
     if (f->aborted)
         return UAM_ERR_INVALID;
+    if (r->stop == UAM_STOP_ERROR) {
+        /* ember itself failed (bad IR, a site it cannot instrument): not the input's
+         * doing, and every later input would fail the same way. */
+        uam_log(UAM_LOG_ERROR, "fuzz", "internal error at pc 0x%llx: stopping",
+                (unsigned long long)r->pc);
+        return UAM_ERR_INVALID;
+    }
     classify(f, r);
     f->stats.iterations++;
     f->stats.by_verdict[r->verdict]++;
@@ -665,12 +740,15 @@ void uam_fuzz_get_info(const uam_fuzz *f, uam_fuzz_info *info)
 
 uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx)
 {
+    /* Boot first: it may take long (a whole firmware start-up), and a frontend's peer
+     * should not wait on it between hello and the first input. */
+    uam_fuzz_result r;
+    uam_status st = uam_fuzz_boot(f, &r);
     uam_fuzz_info info;
     uam_fuzz_get_info(f, &info);
-    uam_status st = fe->hello ? fe->hello(ctx, &info) : UAM_OK;
-    uam_fuzz_result r;
+    uam_status hs = fe->hello ? fe->hello(ctx, &info) : UAM_OK;
     if (st == UAM_OK)
-        st = uam_fuzz_boot(f, &r);
+        st = hs;
     if (st == UAM_OK && f->obs_fn)
         f->obs_fn(f->obs_ctx, 0, UAM_FUZZ_KIND_INIT, UAM_FUZZ_OK, 0, f->map, f->cfg.map_size);
     if (st == UAM_OK)

@@ -6,6 +6,7 @@
  *   --cov-scheme site|pc    coverage model (default site, like libcov)
  *   --cov-ngram N           N-gram length 1..8 (default 2, like libcov)
  *   --cov-rotate            N-gram rotation (libcov's LIBCOV_NGRAM_ROTATE=1)
+ *   --cov-mode leapfrog|every  which executions count (default leapfrog, like libcov)
  *   --cov-strict            a site whose bytes differ from the patch list is fatal
  *   --cov-boundary LCVB1    iteration boundaries from a suzzer boundary file (fuzzing)
  *   --fuzz-szr HOST:PORT    take inputs from a suzzer brain over SZR1 (fuzzing)
@@ -26,6 +27,7 @@ typedef struct cli {
     char           *mod_names[MAX_MODULE_OPTS];
     size_t          n_mod;
     sz_scheme       scheme;
+    bool            every;      /* --cov-mode every: count every execution */
     bool            strict;
     /* after setup */
     sz_patchlist    pl;
@@ -39,9 +41,9 @@ typedef struct cli {
 static const uam_runner_opt opts[] = {
     { "cov-sites", true }, { "cov-module", true }, { "cov-scheme", true },
     { "cov-ngram", true }, { "cov-strict", false }, { "cov-boundary", true },
-    { "cov-rotate", false }, { "fuzz-szr", true },
+    { "cov-rotate", false }, { "fuzz-szr", true }, { "cov-mode", true },
 };
-enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_SZR };
+enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_SZR, O_MODE };
 
 static void *cli_create(void)
 {
@@ -75,6 +77,19 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
     case O_SZR:      c->szr_addr = arg; return true;
     case O_STRICT:   c->strict = true; return true;
     case O_ROTATE:   c->scheme.rotate = true; return true;
+    case O_MODE:
+        /* libcov's LIBCOV_MODE: leapfrog re-arms the previous site when one fires, so
+         * a site counts again only after another one did (FORMATS.md 5.7). oneshot is
+         * not offered: it is a sanity-check mode, not a fuzzing one. */
+        if (!strcmp(arg, "leapfrog"))
+            c->every = false;
+        else if (!strcmp(arg, "every"))
+            c->every = true;
+        else {
+            snprintf(err, errlen, "expected leapfrog or every");
+            return false;
+        }
+        return true;
     case O_SCHEME:
         if (!strcmp(arg, "site"))
             c->scheme.model = SZ_MODEL_SITE;
@@ -188,6 +203,7 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
         s->scheme = sz_scheme_name(&c->scheme);
         s->map_size = c->scheme.map_size;
         sz_cov_history(&c->scheme, &s->history);
+        s->skip_repeats = !c->every;
         s->namer = sz_namer_describe;
         s->namer_ctx = &c->namer;
         uam_log(UAM_LOG_INFO, "cov", "%s: %u sites in %u modules, scheme %s, map %u bytes",
@@ -265,6 +281,8 @@ const uam_runner_ext uam_suzzer_runner_ext = {
         "      --cov-scheme M      site (default) or pc: libcov's coverage model\n"
         "      --cov-ngram N       N-gram length 1..8 (default 2, like libcov)\n"
         "      --cov-rotate        N-gram rotation, as libcov's LIBCOV_NGRAM_ROTATE=1\n"
+        "      --cov-mode M        leapfrog (default, like libcov: a site counts again only\n"
+        "                          after another one) or every (each execution counts)\n"
         "      --cov-strict        fail if a site's bytes in memory differ from the list\n"
         "      --cov-boundary LCVB1  iteration begin/end from a suzzer boundary file\n"
         "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP)\n",

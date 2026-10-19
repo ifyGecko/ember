@@ -49,6 +49,7 @@ typedef struct uam_runner_setup {
     const char           *scheme;          /* names the scheme for frontends */
     uint32_t              map_size;        /* 0: the runner's --cov-map-size */
     uam_cov_history       history;         /* COV history shape (zero: classic edges) */
+    bool                  skip_repeats;    /* uam_cov_state.skip_repeat */
     uam_cov_namer_fn      namer;           /* optional, see uam_cov_pass_set_namer */
     void                 *namer_ctx;
     /* out: iteration boundaries (turn on the fuzz harness) */

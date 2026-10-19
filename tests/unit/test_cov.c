@@ -303,6 +303,7 @@ typedef struct run_cfg {
     uam_exc_hook_fn     exc_hook;
     void               *exc_ctx;
     bool                illegal_at_s3;  /* replace site 3's instruction by an illegal one */
+    bool                skip_repeat;    /* uam_cov_state.skip_repeat */
 } run_cfg;
 
 typedef struct run_out {
@@ -343,7 +344,8 @@ static void run_prog(const prog *p, backend bk, const run_cfg *cfg, run_out *out
     m.exec.chain = bk == BK_JIT;
     CHECK(uam_exec_add_pc_hook(&m.exec, p->done, stop_hook, NULL) == UAM_OK, "hook");
 
-    uam_cov_state cs = { .map = out->map, .mask = MAP_SIZE - 1 };
+    uam_cov_state cs = { .map = out->map, .mask = MAP_SIZE - 1, .skip_repeat = cfg->skip_repeat,
+                         .last_pc = UAM_COV_NO_PC };
     char err[128];
     switch (cfg->mode) {
     case COV_NONE:
@@ -487,6 +489,60 @@ static void test_coverage_on(const prog *p3, const prog *p300)
     }
 }
 
+/*
+ * skip_repeat: with only site 1 in the loop (site 2 left out), the loop runs site 1
+ * back to back. Every execution counts without skip_repeat; with it the repeats
+ * collapse into one count and the edge from site 1 to itself never appears. The
+ * interpreter and the JIT (chained or not) agree.
+ */
+static void test_skip_repeat(const prog *p3)
+{
+    const uam_cov_site counts[3] = { { p3->site[0], 100, 0 }, { p3->site[1], 101, 0 },
+                                     { p3->site[3], 103, 0 } };
+    uam_cov_site edges[3];
+    for (unsigned i = 0; i < 3; i++)
+        edges[i] = (uam_cov_site){ .pc = counts[i].pc, .a = i + 1, .b = spread(i + 1) };
+    run_out out[3];
+    for (int bk = 0; bk < 3; bk++) {
+        run_cfg every = { .mode = COV_SITES, .sites = counts, .n_sites = 3 };
+        run_prog(p3, (backend)bk, &every, &out[bk]);
+        EQ64(out[bk].map[101], 3, "without skip_repeat the self-loop counts every time");
+        run_cfg skip = every;
+        skip.skip_repeat = true;
+        run_prog(p3, (backend)bk, &skip, &out[bk]);
+        EQ64(out[bk].map[100], 1, "skip_repeat: site 0 once");
+        EQ64(out[bk].map[101], 1, "skip_repeat: back-to-back runs of site 1 count once");
+        EQ64(out[bk].map[103], 1, "skip_repeat: site 3 once");
+        if (bk)
+            CHECK(!memcmp(out[bk].map, out[0].map, MAP_SIZE), "%s/%s: skip_repeat map identical",
+                  p3->name, bk_name[bk]);
+    }
+    /* Edges: the stream is 0, 1, 3 - no 1 -> 1 edge. */
+    uint8_t want[MAP_SIZE] = { 0 };
+    uint32_t prev = 0;
+    for (unsigned i = 0; i < 3; i++)
+        model_cov(want, MAP_SIZE - 1, &prev, edges[i].a, edges[i].b);
+    for (int bk = 0; bk < 3; bk++) {
+        run_cfg c = { .mode = COV_SITES, .sites = edges, .n_sites = 3, .skip_repeat = true };
+        run_prog(p3, (backend)bk, &c, &out[bk]);
+        CHECK(!memcmp(out[bk].map, want, MAP_SIZE), "%s/%s: skip_repeat edges match the model",
+              p3->name, bk_name[bk]);
+    }
+    /* The reference itself. */
+    uint8_t m[16] = { 0 };
+    uam_cov_state r;
+    uam_cov_state_init(&r, m, 16, NULL);
+    r.skip_repeat = true;
+    uam_cov_count(&r, 0x10, 1, 0);
+    uam_cov_count(&r, 0x10, 1, 0);
+    uam_cov_count(&r, 0x20, 2, 0);
+    uam_cov_count(&r, 0x10, 1, 0);
+    EQ64(m[1], 2, "reference: a repeat is skipped, a return after another site is not");
+    EQ64(r.last_pc, 0x10, "reference: last_pc is the last site counted");
+    uam_cov_reset_prev(&r);
+    EQ64(r.last_pc, 0x10, "uam_cov_reset_prev keeps last_pc");
+}
+
 static void test_site_errors(const prog *p)
 {
     uam_machine m;
@@ -538,9 +594,9 @@ static void test_site_errors(const prog *p)
     uam_cov_history d2 = { .depth = 2 };
     uam_cov_state r;
     uam_cov_state_init(&r, m2, 16, &d2);
-    uam_cov_count(&r, 1, 3);       /* idx 1 ^ 0 ^ 0           */
-    uam_cov_count(&r, 2, 5);       /* idx 2 ^ 3 ^ 0 = 1       */
-    uam_cov_count(&r, 4, 9);       /* idx 4 ^ 5 ^ 3 = 2       */
+    uam_cov_count(&r, 0, 1, 3);       /* idx 1 ^ 0 ^ 0           */
+    uam_cov_count(&r, 0, 2, 5);       /* idx 2 ^ 3 ^ 0 = 1       */
+    uam_cov_count(&r, 0, 4, 9);       /* idx 4 ^ 5 ^ 3 = 2       */
     CHECK(m2[1] == 2 && m2[2] == 1 && r.hist[0] == 9 && r.hist[1] == 5,
           "depth-2 history folds the last two B values");
     uam_exec_set_coverage(&m.exec, NULL, 0, NULL, NULL, 0);
@@ -684,6 +740,7 @@ int main(void)
     for (int i = 0; i < 3; i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);
+        test_skip_repeat(&progs3[i]);
         test_passes(&progs3[i]);
         test_exc_hook(&progs3[i]);
     }

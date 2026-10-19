@@ -521,7 +521,8 @@ static void test_replay(const target *t)
         CHECK(r && uam_fuzz_replay_count(r) == 3, "three files");
         CHECK(uam_fuzz_run(f, &uam_fuzz_replay_frontend, r) == UAM_OK, "replay");
         fclose(out);
-        EQ64(uam_fuzz_replay_exit_status(r), UAM_FUZZ_EXIT_CRASH_FAULT, "exit status of the last input");
+        EQ64(uam_fuzz_replay_exit_status(r), UAM_FUZZ_EXIT_CRASH_ORACLE,
+             "exit status: the first crash (an ok input after it does not clear it)");
         char want[64];
         snprintf(want, sizeof(want), "3-crash: crash-fault pc=0x%llx", (unsigned long long)t->fault_pc);
         CHECK(strstr(buf, "1-ok: ok") && strstr(buf, "2-oracle: crash-oracle") && strstr(buf, want),
@@ -751,6 +752,87 @@ static void test_nested(void)
     CHECK(r.verdict == UAM_FUZZ_OK && r.pc == 0x100c && s1 == 0, "not nested: the first END ends it");
 }
 
+/*
+ * Coverage sites at the boundaries are counted by the hooks, in the map they close
+ * (suzzer's FORMATS.md 5.7): the begin's hit goes to INIT (and, in begin-only mode,
+ * to the iteration that ends back at begin), an end's to the iteration it ends, and an
+ * iteration's first count is the site after the begin with an empty history. B values
+ * are non-zero so that a begin counted inside the iteration would move the next bucket.
+ */
+static void test_markers(const target *t)
+{
+    const uam_cov_site sites[4] = {
+        { t->base, 4, 0x40 },        /* boot */
+        { t->begin, 1, 0x50 },       /* BEGIN */
+        { t->begin + 4, 2, 0x60 },   /* the first site of an iteration */
+        { t->end, 3, 0x70 },         /* END (paired), or an ordinary site (begin-only) */
+    };
+    for (int bk = 0; bk < 3; bk++) {
+        for (int paired = 0; paired < 2; paired++) {
+            for (int skip = 0; skip < 2; skip++) {
+                uam_machine m;
+                machine_for(&m, t, (backend)bk);
+                uam_fuzz_config cfg = { .begin_pc = t->begin, .end_pcs = &t->end,
+                                        .n_end_pcs = paired ? 1 : 0, .iter_insns = 20000,
+                                        .boot_insns = 100000, .map_size = MAP_SIZE,
+                                        .skip_repeats = skip };
+                char err[256];
+                uam_fuzz *f = uam_fuzz_create(&m, &cfg, err, sizeof(err));
+                CHECK(f != NULL, "create: %s", err);
+                CHECK(uam_fuzz_set_sites(f, sites, 4, "test", err, sizeof(err)) == UAM_OK,
+                      "sites: %s", err);
+                CHECK(uam_fuzz_select_route(f, t->route, err, sizeof(err)) == UAM_OK, "route");
+                uam_fuzz_result r;
+                CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "boot");
+                const uint8_t *map = uam_fuzz_map(f, NULL);
+                const char *what = paired ? "paired" : "begin-only";
+                EQ64(map[4], 1, "INIT: the boot site");
+                EQ64(map[1 ^ 0x40], 1, "INIT: the begin's hit, after the boot site");
+                EQ64(nonzero(map), 2, "INIT: nothing else");
+                for (int it = 0; it < 2; it++) {
+                    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) == UAM_OK, "run");
+                    EQ64(r.verdict, UAM_FUZZ_OK, "ok");
+                    CHECK(map[2] == 1, "%s/%s/%s: the iteration's first count has an empty "
+                          "history (map[2] = %u)", t->name, bk_name[bk], what, map[2]);
+                    EQ64(map[3 ^ 0x60], 1, "the end site follows it");
+                    if (paired) {
+                        EQ64(nonzero(map), 2, "paired: the begin is not counted in the iteration");
+                    } else {
+                        EQ64(map[1 ^ 0x70], 1, "begin-only: the begin's hit closes the iteration");
+                        EQ64(nonzero(map), 3, "begin-only: nothing else");
+                    }
+                }
+                uam_fuzz_destroy(f);
+                uam_machine_fini(&m);
+            }
+        }
+    }
+}
+
+/* An internal error (here a site the pass cannot instrument, a MIPS delay slot) is the
+ * harness's error, not a verdict: it would recur on every input. */
+static void test_internal_error(const target *t)
+{
+    const uam_cov_site site = { t->begin + 24, 1, 0 };   /* b+6: the first beq's delay slot */
+    uam_machine m;
+    machine_for(&m, t, BK_INTERP);
+    uam_fuzz_config cfg = { .begin_pc = t->begin, .end_pcs = &t->end, .n_end_pcs = 1,
+                            .iter_insns = 20000, .boot_insns = 100000, .map_size = MAP_SIZE };
+    char err[256];
+    uam_fuzz *f = uam_fuzz_create(&m, &cfg, err, sizeof(err));
+    CHECK(f && uam_fuzz_set_sites(f, &site, 1, "test", err, sizeof(err)) == UAM_OK, "sites: %s", err);
+    CHECK(uam_fuzz_select_route(f, t->route, err, sizeof(err)) == UAM_OK, "route");
+    uam_fuzz_result r;
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "boot");
+    fprintf(stderr, "(expected coverage errors follow)\n");
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) != UAM_OK,
+          "%s: an internal error fails the iteration instead of being a crash", t->name);
+    EQ64(r.stop, UAM_STOP_ERROR, "the stop reason says so");
+    EQ64(uam_fuzz_get_stats(f)->iterations, 0, "and it is not counted as a result");
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+}
+
 int main(void)
 {
     test_misc();
@@ -763,7 +845,9 @@ int main(void)
         test_frontend(&ts[i]);
         test_replay(&ts[i]);
         test_irq(&ts[i]);
+        test_markers(&ts[i]);
     }
+    test_internal_error(&ts[1]);
     printf("test_fuzz: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

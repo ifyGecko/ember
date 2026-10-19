@@ -8,8 +8,11 @@
  *   keep firing, and no console or network input that could wake the hart),
  *   130 interrupted (SIGINT/SIGTERM),
  *   2 usage or setup error.
- * With --fuzz-replay, the verdict of the last input instead (uam/fuzz.h):
- *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout.
+ * With --fuzz-replay, the most severe verdict of any input instead (uam/fuzz.h):
+ *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout; of several
+ *   crashes, the first one's.
+ * A fuzz run that stops on an error (an internal error of the executor, a lost
+ * frontend) exits 2.
  */
 #include <getopt.h>
 #include <signal.h>
@@ -144,7 +147,8 @@ static void usage(FILE *out)
         "      --fuzz-iter-insns N instruction budget per input (default 10000000; timeout)\n"
         "      --fuzz-replay PATH  run each input in FILE or DIR once and print the verdict;\n"
         "                          -n bounds the boot; exit 0 ok, 20 fault, 21 oracle,\n"
-        "                          22 hang, 23 timeout (of the last input)\n"
+        "                          22 hang, 23 timeout (the most severe of any input:\n"
+        "                          a crash, then a hang, then a timeout)\n"
         "  -s, --stats             print execution statistics at exit\n"
         "  -d, --dump-state        print hart state at exit\n"
         "  -v, --verbose           more logging (repeatable)\n"
@@ -822,7 +826,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         if (one.sites) {
             xs.sites = one.sites; xs.n_sites = one.n_sites; xs.scheme = one.scheme;
-            xs.history = one.history;
+            xs.history = one.history; xs.skip_repeats = one.skip_repeats;
             xs.map_size = one.map_size; xs.namer = one.namer; xs.namer_ctx = one.namer_ctx;
         }
         if (one.have_begin) {
@@ -836,8 +840,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     if (xs.map_size)
         cov_map_size = xs.map_size;
-    if (xs.sites)
+    if (xs.sites) {
         fz.history = xs.history;
+        fz.skip_repeats = xs.skip_repeats;
+    }
     if (xs.have_begin) {
         fz.begin_pc = xs.begin_pc;
         fz.end_pcs = xs.end_pcs;
@@ -848,6 +854,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         char err[256];
         cov_map = calloc(1, cov_map_size);
         uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size, &xs.history);
+        cov_state.skip_repeat = xs.skip_repeats;
         if (!cov_map || uam_exec_set_coverage(&m.exec, xs.sites, xs.n_sites, &cov_state, err,
                                               sizeof(err)) != UAM_OK) {
             fprintf(stderr, "uam-run: cannot enable coverage: %s\n", err);

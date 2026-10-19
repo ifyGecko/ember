@@ -439,15 +439,23 @@ static void patch(uam_jit *j, size_t pos)
  * fixed while coverage is on, and uam_exec_set_coverage, the only way to change it,
  * flushes every translation. The default shape (depth <= 1, no rotation) is the
  * classic edge, about ten host instructions; deeper histories unroll with immediate
- * shifts. Clobbers rax, rcx, rdx, rsi (scratch between ops).
+ * shifts. skip_repeat adds a compare of last_pc with the instruction's pc. Clobbers
+ * rax, rcx, rdx, rsi (scratch between ops).
  */
-static void emit_cov(uam_jit *j, uint32_t a, uint32_t b)
+static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
 {
     const uam_cov_state *cs = j->x->cpu->cov;
     const uint32_t d = cs && cs->depth > 1 ? cs->depth : 1;
     ld_mem(j, RCX, R14, CPU(cov));                         /* rcx = cpu->cov */
     rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RCX, RCX); /* test rcx, rcx */
     size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    size_t rep = 0;
+    if (cs && cs->skip_repeat) {
+        movabs(j, RAX, pc);                                /* rax = pc */
+        rex(j, 1, 0, 0, 0); g8(j, 0x39); modrm_mem(j, RAX, RCX, COV(last_pc)); /* cmp last_pc, rax */
+        rep = jcc_fwd(j, 0x84);                            /* je skip: the same site again */
+        st_mem(j, RAX, RCX, COV(last_pc));                 /* last_pc = pc */
+    }
     if (d == 1 && !(cs && cs->rot[0])) {
         g8(j, 0x8B); modrm_mem(j, RAX, RCX, COV(prev));    /* eax = prev */
         g8(j, 0x35); g32(j, a);                            /* xor eax, A */
@@ -476,6 +484,8 @@ static void emit_cov(uam_jit *j, uint32_t a, uint32_t b)
     }
     g8(j, 0xC7); modrm_mem(j, 0, RCX, COV(prev)); g32(j, b); /* hist[0] = B */
     patch(j, off);
+    if (rep)
+        patch(j, rep);
 }
 
 /* Store a block result into jc and jump to the epilogue. */
@@ -728,6 +738,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         return false;
     unsigned n_epi = 0;
     bool first = true;
+    uint64_t imark_pc = blk->guest_pc;   /* the pc of the instruction being emitted */
 
     for (uint32_t i = 0; i < blk->n_insn && !j->overflow; i++) {
         const uam_insn *in = &blk->insn[i];
@@ -756,6 +767,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         case UAM_OP_IMARK: {
             uint64_t pc = blk->imm[uam_ref_index(in->a)];
             bool cont = in->flags & UAM_IMARK_CONT;
+            imark_pc = pc;
             if (!first && !cont) {
                 if (in->flags & UAM_IMARK_BREAK) {
                     set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
@@ -931,7 +943,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             epi[n_epi++] = jmp_fwd(j);
             break;
         case UAM_OP_COV:
-            emit_cov(j, (uint32_t)blk->imm[uam_ref_index(in->a)],
+            emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                      (uint32_t)blk->imm[uam_ref_index(in->b)]);
             break;
         default:

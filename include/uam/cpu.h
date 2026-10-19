@@ -60,7 +60,16 @@ typedef struct uam_cov_history {
  * is on (the JIT compiles the shape in): to change them, call uam_exec_set_coverage
  * again. The state belongs to whoever enabled coverage (exec.h); it is never part of a
  * snapshot.
+ *
+ * skip_repeat (also part of the shape) counts a site only when it is not the site
+ * that counted last: back-to-back executions of one site, such as a loop with no
+ * other site in it, count once, and no edge from a site to itself is ever made. This
+ * is the emit stream of a trap-and-rearm coverage runtime (one that disarms a site
+ * when it fires and re-arms the one before it). last_pc is that site's pc
+ * (UAM_COV_NO_PC: none yet); it is not history and uam_cov_reset_prev keeps it.
  */
+#define UAM_COV_NO_PC UINT64_MAX
+
 typedef struct uam_cov_state {
     uint8_t  *map;
     uint32_t  mask;
@@ -71,6 +80,8 @@ typedef struct uam_cov_state {
         uint32_t prev;                /* hist[0], the newest */
         uint32_t hist[UAM_COV_HIST_MAX];
     };
+    bool      skip_repeat;
+    uint64_t  last_pc;                /* with skip_repeat: the site that counted last */
 } uam_cov_state;
 
 /* A state for a map of `map_size` bytes (a power of two) and the history shape `h`
@@ -78,7 +89,7 @@ typedef struct uam_cov_state {
 static inline void uam_cov_state_init(uam_cov_state *s, uint8_t *map, uint32_t map_size,
                                       const uam_cov_history *h)
 {
-    *s = (uam_cov_state){ .map = map, .mask = map_size - 1 };
+    *s = (uam_cov_state){ .map = map, .mask = map_size - 1, .last_pc = UAM_COV_NO_PC };
     while (s->bits < 32 && (UINT64_C(1) << s->bits) < map_size)
         s->bits++;
     if (h) {
@@ -95,9 +106,15 @@ static inline void uam_cov_reset_prev(uam_cov_state *s)
         s->hist[j] = 0;
 }
 
-/* One UAM_OP_COV A, B: the reference the interpreter runs and the JIT matches. */
-static inline void uam_cov_count(uam_cov_state *s, uint32_t a, uint32_t b)
+/* One UAM_OP_COV A, B at guest pc `pc`: the reference the interpreter runs and the JIT
+ * matches. */
+static inline void uam_cov_count(uam_cov_state *s, uint64_t pc, uint32_t a, uint32_t b)
 {
+    if (s->skip_repeat) {
+        if (s->last_pc == pc)
+            return;
+        s->last_pc = pc;
+    }
     const uint32_t d = s->depth ? s->depth : 1;
     uint32_t idx = a;
     for (uint32_t j = 0; j < d; j++) {

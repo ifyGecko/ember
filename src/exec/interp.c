@@ -232,7 +232,7 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
             /* Edge counter (section 7.5); no effect on guest state or icount. */
             uam_cov_state *cs = cpu->cov;
             if (cs)
-                uam_cov_count(cs, (uint32_t)blk->imm[uam_ref_index(in->a)],
+                uam_cov_count(cs, pos.pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                               (uint32_t)blk->imm[uam_ref_index(in->b)]);
             break;
         }

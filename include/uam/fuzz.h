@@ -13,7 +13,10 @@
  *
  * Iteration boundaries come in two modes: *paired* (a begin pc and an end pc) and
  * *begin-only* (an iteration ends when the begin pc is reached again). Both are PC
- * hooks. Crash checks: crash pcs (an RTOS's fatal-error or exception handler), the
+ * hooks. A coverage site at a boundary pc is counted by its hook, before the map is
+ * published: the begin's hit belongs to the map it closes (INIT, or the previous
+ * iteration in begin-only mode), an end's to the iteration it ends, and an
+ * iteration's first count is the site after the begin, with an empty history. Crash checks: crash pcs (an RTOS's fatal-error or exception handler), the
  * exception observer filtered by exception class, interrupts from chosen lines (a
  * watchdog's warning interrupt), a reset during an iteration, and the
  * executor's stop reasons (fault loop, internal error; deadlock and livelock are hangs;
@@ -86,6 +89,8 @@ typedef struct uam_fuzz_config {
     uint32_t        map_size;      /* coverage map bytes, a power of two (0: 64 KiB) */
     uam_cov_history history;       /* COV history shape for site coverage (zero: classic
                                     * one-predecessor edges; block coverage always is) */
+    bool            skip_repeats;  /* a site counts only when another site counted since
+                                    * its last count (uam_cov_state.skip_repeat) */
 } uam_fuzz_config;
 
 #define UAM_FUZZ_DEFAULT_ITER_INSNS UINT64_C(10000000)
@@ -167,12 +172,14 @@ typedef void (*uam_fuzz_observer_fn)(void *ctx, uint64_t id, int kind, uam_fuzz_
 void       uam_fuzz_set_observer(uam_fuzz *f, uam_fuzz_observer_fn fn, void *ctx);
 
 /* Boot to the first begin and take the snapshot. Fails (with r filled in) if the run
- * stops anywhere else. */
+ * stops anywhere else (cfg.boot_insns bounds it). */
 uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r);
 /* One iteration (after uam_fuzz_boot). The machine is left where the iteration
- * stopped, for inspection. Non-OK only for harness errors (route, snapshot). */
+ * stopped, for inspection. Non-OK only for harness errors (route, snapshot, or an
+ * internal error of the executor, UAM_STOP_ERROR, which is never the input's fault). */
 uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fuzz_result *r);
-/* The whole loop with a frontend: boot, INIT report, one report per input. */
+/* The whole loop with a frontend: boot, hello (after the boot, whether or not it
+ * succeeded), INIT report, one report per input, bye. */
 uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx);
 
 const uint8_t         *uam_fuzz_map(const uam_fuzz *f, size_t *size);
@@ -194,7 +201,8 @@ const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 
 /*
  * Runs each input file once - FILE, or every regular file in DIR in name order - and
- * prints one line per input to `out`. Its exit status is that of the last input.
+ * prints one line per input to `out`. Its exit status is the most severe verdict of
+ * any input: a crash (the kind of the first one), else a hang, else a timeout, else ok.
  */
 #define UAM_FUZZ_EXIT_OK           0
 #define UAM_FUZZ_EXIT_CRASH_FAULT  20
