@@ -35,7 +35,7 @@ make SUZZER_DIR=~/src/suzzer test
 **A clone inside ember's tree**, for a self-contained setup:
 
 ```bash
-make suzzer        # clones into ./suzzer (SUZZER_URL, SUZZER_REV to override)
+make suzzer        # clones into ./suzzer: SSH, then HTTPS (SUZZER_URL, SUZZER_REV to override)
 make               # ./suzzer is picked up automatically
 ```
 
@@ -48,11 +48,21 @@ How the build decides:
 1. `SUZZER_DIR=path` if given. It must be a suzzer checkout with `src/lcv_formats.h`, or the
    build stops and says so. `SUZZER_DIR=` (empty) turns the integration off even when
    `./suzzer` exists.
-2. Otherwise `./suzzer`, if it holds `src/lcv_formats.h`.
-3. Otherwise none. ember builds without the suzzer options (`--cov-sites`, `--cov-boundary`,
+2. Otherwise the choice this build directory made last (`build/suzzer.cfg` records it): the
+   same checkout, or off. So `make SUZZER_DIR=~/src/suzzer` once and plain `make` (or
+   `make test`) after it keeps the suzzer options. If that checkout is gone, the build says
+   so and goes on to 3.
+3. Otherwise `./suzzer`, if it holds `src/lcv_formats.h`.
+4. Otherwise none. ember builds without the suzzer options (`--cov-sites`, `--cov-boundary`,
    ...), and `make test` reports the suzzer tests as skipped.
 
-Switching between these rebuilds what depends on the choice (`build/suzzer.cfg` records it).
+Switching between these rebuilds what depends on the choice. `make clean` forgets it. After
+`make SUZZER_DIR=` a clone made by `make suzzer` is used only once a path is given again
+(`make SUZZER_DIR=suzzer`).
+
+`make suzzer` clones over SSH first and, if that fails (no keys on this machine), over
+HTTPS, which needs a GitHub credential helper or token while the repository is private.
+`SUZZER_URL` picks the URL instead.
 
 ## Compatibility
 

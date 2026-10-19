@@ -6,12 +6,15 @@
 # one passed as SUZZER_DIR=path, or a clone made by this script into DIR (default
 # ./suzzer, which git ignores and the build picks up by itself). See docs/suzzer.md.
 #
-#   SUZZER_URL  repository to clone (default git@github.com:ifyGecko/suzzer.git)
+#   SUZZER_URL  repository to clone (default: git@github.com:ifyGecko/suzzer.git over SSH,
+#               then https://github.com/ifyGecko/suzzer.git if SSH fails, e.g. no keys)
 #   SUZZER_REV  commit, tag or branch to check out (default: the default branch)
 set -eu
 
 dir=${1:-suzzer}
-url=${SUZZER_URL:-git@github.com:ifyGecko/suzzer.git}
+ssh_url=git@github.com:ifyGecko/suzzer.git
+https_url=https://github.com/ifyGecko/suzzer.git
+url=${SUZZER_URL:-}
 rev=${SUZZER_REV:-}
 
 if [ -e "$dir/.git" ]; then
@@ -22,7 +25,16 @@ else
         echo "fetch-suzzer: $dir exists and is not a git checkout; not touching it" >&2
         exit 1
     fi
-    git clone "$url" "$dir"
+    if [ -n "$url" ]; then
+        git clone "$url" "$dir"
+    elif GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" git clone "$ssh_url" "$dir"; then
+        url=$ssh_url
+    else
+        echo "fetch-suzzer: cloning over SSH failed; trying $https_url" >&2
+        rm -rf "$dir"
+        url=$https_url
+        git clone "$url" "$dir"
+    fi
     [ -z "$rev" ] || git -C "$dir" checkout --quiet "$rev"
     echo "fetch-suzzer: cloned $url into $dir ($(git -C "$dir" rev-parse --short HEAD))"
 fi

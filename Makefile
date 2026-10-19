@@ -14,7 +14,9 @@
 # suzzer (optional; docs/suzzer.md): ember works on its own. To use it with suzzer, either point
 # the build at an existing checkout with SUZZER_DIR=path, or run `make suzzer` once to clone one
 # into ./suzzer, which is then picked up automatically. Without either, the suzzer options
-# (--cov-sites, --cov-boundary, ...) are left out and their tests are skipped.
+# (--cov-sites, --cov-boundary, ...) are left out and their tests are skipped. The choice is
+# remembered in $(BUILD)/suzzer.cfg: a later plain `make` keeps it; `make SUZZER_DIR=` turns the
+# integration off until a path is given again.
 #
 # Out-of-tree use: `make -C path/to/uam BUILD=$PWD/build/uam lib` builds into another directory;
 # link $(BUILD)/libuam.a with -I path/to/uam/include (or use uam.pc after `make install`).
@@ -40,16 +42,32 @@ UAM_COMPILE := -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Wshadow -Wstric
 BUILD ?= build
 
 # ---- suzzer ------------------------------------------------------------------------------
-# SUZZER_DIR: an existing suzzer checkout to use in place. Else ./suzzer if `make suzzer`
-# cloned one there. Ember needs the format header suzzer publishes (src/lcv_formats.h).
-SUZZER_URL ?= git@github.com:ifyGecko/suzzer.git
+# SUZZER_DIR: an existing suzzer checkout to use in place; empty turns the integration off.
+# Not given: the choice remembered in $(BUILD)/suzzer.cfg (a checkout's path, or "off"), else
+# ./suzzer if `make suzzer` cloned one there. Ember needs the format header suzzer publishes
+# (src/lcv_formats.h). SUZZER_URL unset: `make suzzer` tries SSH, then HTTPS.
+SUZZER_URL ?=
 SUZZER_REV ?=
+SUZZER_SAVED := $(strip $(shell cat $(BUILD)/suzzer.cfg 2>/dev/null))
 ifeq ($(origin SUZZER_DIR),undefined)
+ifeq ($(SUZZER_SAVED),off)
+SUZZER_DIR :=
+else ifneq ($(and $(SUZZER_SAVED),$(wildcard $(SUZZER_SAVED)/src/lcv_formats.h)),)
+SUZZER_DIR := $(SUZZER_SAVED)
+else
+ifneq ($(SUZZER_SAVED),)
+$(warning the suzzer checkout this build used ($(SUZZER_SAVED)) is gone; looking for ./suzzer)
+endif
 SUZZER_DIR := $(if $(wildcard suzzer/src/lcv_formats.h),suzzer,)
+endif
+SUZZER_RECORD := $(if $(SUZZER_DIR),$(abspath $(SUZZER_DIR)),$(if $(filter off,$(SUZZER_SAVED)),off,))
 else ifneq ($(SUZZER_DIR),)
 ifeq ($(wildcard $(SUZZER_DIR)/src/lcv_formats.h),)
 $(error SUZZER_DIR=$(SUZZER_DIR) has no src/lcv_formats.h: not a suzzer checkout, or one older than its published format header)
 endif
+SUZZER_RECORD := $(abspath $(SUZZER_DIR))
+else
+SUZZER_RECORD := off
 endif
 HAVE_SUZZER := $(if $(SUZZER_DIR),1,)
 
@@ -119,11 +137,12 @@ $(BUILD)/obj/fuzz/stock_exts.o: fuzz/stock_exts.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
 	$(CC) $(UAM_COMPILE) $(if $(HAVE_SUZZER),-DUAM_HAVE_SUZZER) -MMD -MP -c $< -o $@
 
-# Which suzzer the objects were built against; rewritten only when that changes, so
-# switching SUZZER_DIR (or cloning one) rebuilds what depends on it.
+# Which suzzer the objects were built against (a path, "off" when turned off with
+# SUZZER_DIR=, empty when none was found): the choice a later plain `make` keeps. Rewritten
+# only when that changes, so switching SUZZER_DIR (or cloning one) rebuilds what depends on it.
 $(BUILD)/suzzer.cfg: FORCE
 	@mkdir -p $(BUILD)
-	@echo '$(abspath $(SUZZER_DIR))' | cmp -s - $@ || echo '$(abspath $(SUZZER_DIR))' > $@
+	@echo '$(SUZZER_RECORD)' | cmp -s - $@ || echo '$(SUZZER_RECORD)' > $@
 
 $(LIB): $(LIB_OBJ)
 	@rm -f $@
