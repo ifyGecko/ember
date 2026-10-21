@@ -61,6 +61,7 @@ typedef enum uam_region_kind {
 typedef struct uam_map_attrs {
     int      prio;    /* overlapping regions: the highest priority wins (default 0) */
     unsigned endian;  /* MMIO/ROMD: override the device's byte order (0 = device's own) */
+    bool     disabled;/* start disabled (uam_bus_region_enable) */
 } uam_map_attrs;
 
 typedef struct uam_region {
@@ -79,6 +80,7 @@ typedef struct uam_region {
     bool               rom_mode;     /* ROMD: reads and fetches use the backing store */
     struct uam_region *target;       /* ALIAS: the aliased region (never an alias) */
     uint64_t           target_off;   /* ALIAS: offset of `base` within the target */
+    bool               disabled;     /* not decoded (uam_bus_region_enable) */
 } uam_region;
 
 /* Called when a page that holds translated code changes. */
@@ -113,6 +115,7 @@ typedef struct uam_bus {
     uint32_t           n_watches, cap_watches;
     int                next_watch_id;
     uint32_t           direct_gen;         /* bumped when uam_bus_page_host answers may change */
+    uint32_t           gen_seq;            /* source of page generations (unique bus-wide) */
     bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
 } uam_bus;
 
@@ -120,6 +123,8 @@ void       uam_bus_init(uam_bus *bus);
 void       uam_bus_fini(uam_bus *bus);
 
 uam_status uam_bus_map_ram(uam_bus *bus, const char *name, uint64_t base, uint64_t size);
+uam_status uam_bus_map_ram_ex(uam_bus *bus, const char *name, uint64_t base, uint64_t size,
+                              const uam_map_attrs *attrs, uam_region **out);
 uam_status uam_bus_map_rom(uam_bus *bus, const char *name, uint64_t base, uint64_t size,
                            const void *data, size_t len);
 uam_status uam_bus_map_mmio(uam_bus *bus, const char *name, uint64_t base, uint64_t size,
@@ -140,6 +145,18 @@ void       uam_bus_set_code_write_hook(uam_bus *bus, uam_code_write_fn fn, void 
 
 /* Region handle by name (the name given when mapping), or NULL. */
 uam_region *uam_bus_region(uam_bus *bus, const char *name);
+
+/*
+ * Run-time decode changes, for chipset and bus-bridge models (PCI BARs, shadow
+ * RAM, SMRAM windows): a disabled region is skipped as if unmapped, and a moved
+ * region decodes at its new base. Overlap at equal priority is only checked
+ * when mapping; where enabled regions overlap at one priority, the one mapped
+ * first wins. Translated code is revalidated against the new map (page
+ * generations are unique across regions), and direct host-page answers are
+ * withdrawn.
+ */
+void       uam_bus_region_enable(uam_bus *bus, uam_region *r, bool on);
+void       uam_bus_region_move(uam_bus *bus, uam_region *r, uint64_t base);
 
 /* ROMD control, for the owning device. Leaving ROM mode discards code
  * translated from the region. After changing the backing store, call

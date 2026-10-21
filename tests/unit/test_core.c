@@ -538,6 +538,46 @@ static void test_romd_exec(void)
     uam_machine_fini(&m);
 }
 
+/* Run-time decode changes: code translated from a region that stops decoding
+ * (disabled, or moved away) must not run, and must run again when it returns. */
+static void test_region_remap(void)
+{
+    uam_machine m;
+    mips_machine(&m);
+    put32(&m, 0x1000, 0x24020001u);              /* RAM:     addiu v0, zero, 1 */
+    put32(&m, 0x1004, 0x1000FFFFu);              /*          b . */
+    put32(&m, 0x1008, 0x00000000u);
+    uam_region *ov = NULL;
+    CHECK(uam_bus_map_ram_ex(&m.bus, "overlay", 0x1000, 0x1000, &(uam_map_attrs){ .prio = 1 }, &ov)
+          == UAM_OK, "map overlay");
+    uint32_t prog[] = { 0x24020002u, 0x1000FFFFu, 0 };   /* addiu v0, zero, 2; b . */
+    for (unsigned i = 0; i < 3; i++)
+        uam_bus_write(&m.bus, 0x1000 + i * 4, 4, UAM_ACC_BE, prog[i]);
+
+    uam_machine_reset(&m, 0x80001000u);
+    uam_exec_run(&m.exec, 10);
+    EQ64(gpr(&m, 2), 2, "overlay decodes over RAM");
+
+    uam_bus_region_enable(&m.bus, ov, false);
+    uam_machine_reset(&m, 0x80001000u);
+    uam_exec_run(&m.exec, 10);
+    EQ64(gpr(&m, 2), 1, "disabled overlay: RAM code, not the cached overlay block");
+
+    uam_bus_region_enable(&m.bus, ov, true);
+    uam_machine_reset(&m, 0x80001000u);
+    uam_exec_run(&m.exec, 10);
+    EQ64(gpr(&m, 2), 2, "re-enabled overlay");
+
+    uam_bus_region_move(&m.bus, ov, 0x3000);
+    uam_machine_reset(&m, 0x80001000u);
+    uam_exec_run(&m.exec, 10);
+    EQ64(gpr(&m, 2), 1, "moved overlay leaves RAM visible");
+    uam_machine_reset(&m, 0x80003000u);
+    uam_exec_run(&m.exec, 10);
+    EQ64(gpr(&m, 2), 2, "moved overlay decodes at its new base");
+    uam_machine_fini(&m);
+}
+
 /* ------------------------------------------------------------------------ */
 /* #8 WAIT whose wakeup never comes while a timer keeps re-arming itself     */
 /* ------------------------------------------------------------------------ */
@@ -705,6 +745,7 @@ int main(void)
     test_timer_reset();
     test_device_reset();
     test_romd_exec();
+    test_region_remap();
     test_wait_livelock();
     test_abi();
     printf("test_core: %d/%d checks passed\n", n_checks - n_failed, n_checks);

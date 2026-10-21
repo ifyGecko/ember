@@ -56,7 +56,8 @@ static uam_status add_region(uam_bus *bus, const uam_region *proto, uam_region *
     uint32_t pos = bus->n_regions;
     for (uint32_t i = 0; i < bus->n_regions; i++) {
         const uam_region *o = bus->regions[i];
-        if (o->prio == proto->prio && overlaps(proto->base, proto->size, o->base, o->size)) {
+        if (o->prio == proto->prio && !o->disabled && !proto->disabled
+            && overlaps(proto->base, proto->size, o->base, o->size)) {
             uam_log(UAM_LOG_ERROR, "bus", "region %s overlaps %s at the same priority (%d)",
                     proto->name, o->name, o->prio);
             return UAM_ERR_INVALID;
@@ -109,6 +110,11 @@ static uam_status map_backed(uam_bus *bus, const uam_region *proto, const void *
     }
     if (data && len)
         memcpy(r.host, data, len < r.size ? len : r.size);
+    /* A generation of its own: a page that comes to resolve to another region
+     * (a remap) never matches code translated from this one. */
+    uint32_t g = ++bus->gen_seq;
+    for (uint64_t i = 0; i < npages; i++)
+        r.page_gen[i] = g;
 
     uam_status st = add_region(bus, &r, out);
     if (st != UAM_OK) {
@@ -118,6 +124,14 @@ static uam_status map_backed(uam_bus *bus, const uam_region *proto, const void *
         free(r.dirty);
     }
     return st;
+}
+
+uam_status uam_bus_map_ram_ex(uam_bus *bus, const char *name, uint64_t base, uint64_t size,
+                              const uam_map_attrs *attrs, uam_region **out)
+{
+    uam_region r = { .name = name, .base = base, .size = size, .kind = UAM_REGION_RAM,
+                     .prio = attrs ? attrs->prio : 0, .disabled = attrs && attrs->disabled };
+    return map_backed(bus, &r, NULL, 0, out);
 }
 
 uam_status uam_bus_map_ram(uam_bus *bus, const char *name, uint64_t base, uint64_t size)
@@ -139,7 +153,8 @@ uam_status uam_bus_map_mmio_ex(uam_bus *bus, const char *name, uint64_t base, ui
     if (!dev)
         return UAM_ERR_INVALID;
     uam_region r = { .name = name, .base = base, .size = size, .kind = UAM_REGION_MMIO, .dev = dev,
-                     .prio = attrs ? attrs->prio : 0, .endian = attrs ? attrs->endian : 0 };
+                     .prio = attrs ? attrs->prio : 0, .endian = attrs ? attrs->endian : 0,
+                     .disabled = attrs && attrs->disabled };
     return add_region(bus, &r, NULL);
 }
 
@@ -157,6 +172,7 @@ uam_status uam_bus_map_romd(uam_bus *bus, const char *name, uint64_t base, uint6
         return UAM_ERR_INVALID;
     uam_region r = { .name = name, .base = base, .size = size, .kind = UAM_REGION_ROMD, .dev = dev,
                      .rom_mode = true, .prio = attrs ? attrs->prio : 0,
+                     .disabled = attrs && attrs->disabled,
                      .endian = attrs ? attrs->endian : 0 };
     return map_backed(bus, &r, data, len, out);
 }
@@ -174,7 +190,7 @@ uam_status uam_bus_map_alias(uam_bus *bus, const char *name, uint64_t base, uint
         return UAM_ERR_INVALID;
     uam_region r = { .name = name, .base = base, .size = size, .kind = UAM_REGION_ALIAS,
                      .target = (uam_region *)target, .target_off = offset,
-                     .prio = attrs ? attrs->prio : 0 };
+                     .prio = attrs ? attrs->prio : 0, .disabled = attrs && attrs->disabled };
     return add_region(bus, &r, NULL);
 }
 
@@ -266,7 +282,7 @@ static uam_region *winner(const uam_bus *bus, uint64_t addr, uint32_t *idx)
 {
     for (uint32_t i = 0; i < bus->n_regions; i++) {
         uam_region *r = bus->regions[i];
-        if (addr - r->base < r->size) {
+        if (!r->disabled && addr - r->base < r->size) {
             if (idx)
                 *idx = i;
             return r;
@@ -279,7 +295,7 @@ static uam_region *winner(const uam_bus *bus, uint64_t addr, uint32_t *idx)
 static bool shadowed(const uam_bus *bus, uint32_t upto, uint64_t base, uint64_t size)
 {
     for (uint32_t i = 0; i < upto; i++)
-        if (overlaps(base, size, bus->regions[i]->base, bus->regions[i]->size))
+        if (!bus->regions[i]->disabled && overlaps(base, size, bus->regions[i]->base, bus->regions[i]->size))
             return true;
     return false;
 }
@@ -306,7 +322,8 @@ static res_kind resolve(uam_bus *bus, uint64_t addr, unsigned size, hit *h)
     uam_region *w = winner(bus, addr, &idx);
     if (!w) {
         for (uint32_t i = 0; i < bus->n_regions; i++)
-            if (overlaps(addr, size, bus->regions[i]->base, bus->regions[i]->size))
+            if (!bus->regions[i]->disabled
+                && overlaps(addr, size, bus->regions[i]->base, bus->regions[i]->size))
                 return RES_SPLIT;
         h->watched = bus->n_watches && watched(bus, addr, size);
         return RES_NONE;
@@ -460,7 +477,7 @@ static uam_status dev_write(const uam_region *r, uam_device *d, uint64_t off, un
 static void note_code_change(uam_bus *bus, uam_region *r, uint64_t off)
 {
     uint64_t pidx = off >> UAM_PAGE_SHIFT;
-    r->page_gen[pidx]++;
+    r->page_gen[pidx] = ++bus->gen_seq;
     if (!r->code_page[pidx])
         return;
     r->code_page[pidx] = 0;
@@ -692,6 +709,32 @@ uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_
     return UAM_OK;
 }
 
+/* ---- run-time decode changes ------------------------------------------ */
+
+static void map_changed(uam_bus *bus, uint64_t page)
+{
+    tlb_flush(bus);
+    /* Chained translations bypass the lookup that would revalidate them. */
+    if (bus->on_code_write)
+        bus->on_code_write(bus->code_write_ctx, page);
+}
+
+void uam_bus_region_enable(uam_bus *bus, uam_region *r, bool on)
+{
+    if (r->disabled == !on)
+        return;
+    r->disabled = !on;
+    map_changed(bus, r->base & UAM_PAGE_MASK);
+}
+
+void uam_bus_region_move(uam_bus *bus, uam_region *r, uint64_t base)
+{
+    if (r->base == base || base + r->size - 1 < base)
+        return;
+    r->base = base;
+    map_changed(bus, base & UAM_PAGE_MASK);
+}
+
 /* ---- ROMD -------------------------------------------------------------- */
 
 static void drop_code_pages(uam_bus *bus, uam_region *r, uint64_t off, uint64_t len)
@@ -846,6 +889,8 @@ void uam_bus_dump_map(const uam_bus *bus, FILE *out)
                     (unsigned long long)r->target_off);
         if (r->kind == UAM_REGION_ROMD)
             fprintf(out, " (%s mode)", r->rom_mode ? "rom" : "device");
+        if (r->disabled)
+            fputs(" (disabled)", out);
         fputc('\n', out);
     }
 }
