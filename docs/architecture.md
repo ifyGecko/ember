@@ -1,9 +1,10 @@
 # UAM Firmware Emulator — Architecture
 
-Status: phases 1 and 2 implemented, plus a second ISA (MIPS32 with a TLB), the snapshot part of
-phase 3 and the JIT from phase 4. IR, interpreter and optimizer, an x86-64 JIT with block chaining,
-bus (priorities, device byte order, ROM devices, aliases, watchpoints, dirty-page tracking),
-RV32IMAC (`rv32-ref` board) and MIPS32 big/little-endian (`mips-ref` / `mipsel-ref` boards), host
+Status: phases 1 and 2 implemented, plus two more ISAs (MIPS32 with a TLB, ARMv7-A with an
+MMU), the snapshot part of phase 3 and the JIT from phase 4. IR, interpreter and optimizer, an
+x86-64 JIT with block chaining, bus (priorities, device byte order, ROM devices, aliases,
+watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
+(`mips-ref` / `mipsel-ref` boards) and ARMv7-A, ARM and Thumb-2 (`arm-ref` board), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -42,7 +43,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian`, optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state. An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed | `isa/riscv`, `isa/mips32` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian`, optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state. An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -112,9 +113,9 @@ Implemented:
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
                   loader.h machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
                   state.h snapshot.h pass.h cov.h
-include/uam/dev/  clint.h plic.h uart16550.h sifive_test.h unknown_mmio.h unimp.h mmio_stub.h
-                  virtio_net.h
-include/uam/isa/  riscv.h mips32.h
+include/uam/dev/  clint.h plic.h gic.h uart16550.h sifive_test.h unknown_mmio.h unimp.h
+                  mmio_stub.h virtio_net.h
+include/uam/isa/  riscv.h mips32.h arm.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit_x86.c coverage.c jit.h execops.h
@@ -126,9 +127,12 @@ src/debug/        gdbstub.c
 src/runner/       runner.c
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips.h (private)
-devices/          clint.c plic.c uart16550.c sifive_test.c unknown_mmio.c unimp.c mmio_stub.c
-                  virtio_net.c
-boards/           rv32_ref.c mips_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules, any board)
+isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32) arm_system.c
+                  arm.h (private)
+devices/          clint.c plic.c gic.c uart16550.c sifive_test.c unknown_mmio.c unimp.c
+                  mmio_stub.c virtio_net.c
+boards/           rv32_ref.c mips_ref.c arm_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+                  any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
 fuzz/suzzer/      scheme.c (the bucket formula) import.c (LCV3/LCVB1 readers, site check)
@@ -149,6 +153,7 @@ tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --loa
 tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
 tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
+tests/firmware-arm/   start.S selftest.c fuzztarget.c link.ld  (ARMv7: ARM and Thumb-2 builds)
 ```
 
 Planned: more passes in `analysis/` (cmp-log, taint), an Intel HEX loader, more boards and
@@ -185,8 +190,18 @@ devices.
   placed by address; lookup by symbol name is planned.
 - **Stock boards**: `rv32-ref`, an RV32IMAC M-mode reference board (CLINT, PLIC, NS16550A UART,
   sifive,test finisher, virtio-net ports, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
-  (MIPS32 with a NS16550A UART and a test finisher). Real devices are built out of tree on the
-  library (`examples/external-board/`).
+  (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` (ARMv7-A with a
+  GICv2-style interrupt controller fed by the generic timer and the NS16550A UART, a test
+  finisher, RAM at 0 under the vectors). Real devices are built out of tree on the library
+  (`examples/external-board/`).
+- **ARM state** (`isa/arm`, `uam/isa/arm.h`): Thumb state is bit 0 of the pc, the ARM
+  convention for code addresses, so the translation cache, interrupted blocks and ELF entry
+  points need nothing ARM-specific, and interworking branches stay plain IR (`BX` compiles and
+  chains like any computed exit). PC hooks, coverage sites and fuzz boundaries in Thumb code
+  name the pc with bit 0 set; the gdb stub and the suzzer importer (suzzer marks Thumb sites
+  by their 2-byte length) translate. IT blocks are continuations (`UAM_IMARK_CONT`) so no
+  interrupt splits one; only an exception return into the middle of one leaves IT state for
+  the next block, which `cpu->priv` then carries (`uam-isa.md` section 10b).
 
 ## 6. Analysis and fuzzing
 
@@ -278,8 +293,9 @@ devices.
    policy), a persistent-mode fuzz harness (*done*, with a replay frontend).
 4. Board description format, more peripherals, Cortex-M, JIT (*done*: x86-64, with block chaining).
 
-Done outside the plan: MIPS32 (CP0, TLB, both byte orders), host networking, a gdb stub, the
-library build with an ABI handshake.
+Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
+short-descriptor MMU, generic timer, a GIC), host networking, a gdb stub, the library build with
+an ABI handshake. Cortex-M (ARMv7-M: the NVIC exception model) is still planned.
 
 ## 8. Verification
 
@@ -290,9 +306,9 @@ Implemented (`make test`):
   holding (`test_host`); state streams and snapshots under both backends (`test_snapshot`).
 - The IR verifier runs on every translated block (on by default; `--no-verify` skips it), before
   and after the optimizer.
-- Firmware self-tests: bare-metal RV32 and MIPS32 (both byte orders) programs that check
-  themselves and report through the test finisher, run on the interpreter (the snapshot
-  check below runs them on the JIT as well).
+- Firmware self-tests: bare-metal RV32, MIPS32 (both byte orders) and ARMv7 (built as ARM and
+  as Thumb-2 code) programs that check themselves and report through the test finisher, run
+  on the interpreter (the snapshot check below runs them on the JIT as well).
 - Snapshot determinism: `tests/snapshot/snapshot-check.sh` splits a run with `--save-snapshot`
   / `--load-snapshot` at several points and requires the same console output, pc and icount as
   the uninterrupted run, with the interpreter and the JIT on either side.
@@ -301,26 +317,29 @@ Implemented (`make test`):
   guest reading a rule through the interpreter and the JIT.
 - Chaining: `test_jit` runs one guest (calls, returns, branches, self-modifying code, DI/EI
   with a timer, MMIO) through the interpreter and the JIT with and without chaining, with host
-  code patches, PC hooks and snapshot restores in between, and requires identical state.
+  code patches, PC hooks and snapshot restores in between, and requires identical state; and
+  code rewritten on a page that has just become a code page again must run as rewritten.
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
-  the run), expected hit counts and edge buckets for a known loop on RV32 and MIPS32 BE/LE
+  the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and
+  ARMv7 (ARM and Thumb-2)
   under the interpreter and the JIT with and without chaining, block mode, rejected sites,
   coverage off, and the exception observer on an illegal instruction on each ISA.
   `tests/cov/cov-check.sh` runs the self-tests with block coverage on every backend and
   requires identical maps and an outcome identical to the run without coverage.
-- Fuzzing: `test_fuzz` runs a hand-assembled planted-bug target on RV32 and MIPS32 BE/LE
+- Fuzzing: `test_fuzz` runs a hand-assembled planted-bug target on RV32, MIPS32 BE/LE and ARMv7
   under every backend: each verdict and its detail, identical maps and results across
   backends and across restores, paired and begin-only modes, the exception-class policy,
   routes, resets, the frontend protocol, abort, and the replay frontend.
   `tests/fuzz/fuzz-check.sh` does the same through `uam-run --fuzz-replay` on C firmware
-  (`fuzztarget.h`) on all three ISAs, including replaying a crash file on its own.
+  (`fuzztarget.h`) on every stock board (Thumb-2 code on `arm-ref`), including replaying a
+  crash file on its own.
 - suzzer formats: `test_suzzer` reproduces every conformance vector of the configured suzzer (N=1..4 and 8,
   rotation off and on) byte for byte through `UAM_OP_COV` on every backend, checks the map-size rule against suzzer's table, and
   covers the LCV3/LCVB1 readers (every rejection of suzzer's reader checklist), base
   resolution, boundaries, site naming, the site-byte check and the LCVS region's ownership
-  rules. `tests/suzzer/suzzer-check.sh` runs `--cov-sites`/`--cov-boundary` end to end on all
-  three ISAs, including N=3 and N=8 with rotation, and the LCVS export read back by suzzer's
+  rules. `tests/suzzer/suzzer-check.sh` runs `--cov-sites`/`--cov-boundary` end to end on
+  every stock board, including N=3 and N=8 with rotation, and the LCVS export read back by suzzer's
   reader; `gen-check.sh` does it with suzzer's own generators; `tests/szr/` checks the SZR1
   executor frame by frame and in a session with suzzer's brain, whose saved crash directory
   replays without its `.info` notes.

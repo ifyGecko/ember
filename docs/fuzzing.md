@@ -140,7 +140,8 @@ usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that 
 `--fuzz-crash-irq N` (repeatable, 0..63) makes taking an interrupt from line N a crash: a
 watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the
 `mcause` interrupt code (7 machine timer, 11 machine external), on MIPS32 the Cause.IP bit
-(0..7) that was pending and enabled. The interrupt is reported once the CPU has taken it
+(0..7) that was pending and enabled, on ARMv7 0 for IRQ and 1 for FIQ (on `arm-ref` every
+device interrupt arrives as IRQ, through the GIC). The interrupt is reported once the CPU has taken it
 (`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
 detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
 
@@ -223,6 +224,14 @@ and `gen_boundary.py --strategy entry --patchlist fw.lcv3 fw.elf fw.lcvb handler
 ember accepts a marker that is not a patch-list site (it simply has no coverage of its own);
 libcov would never fire such a marker, so keep the two lists from one generator run.
 
+**ARM and Thumb.** ember names Thumb code by its address with bit 0 set (the ARM convention,
+`uam/isa/arm.h`): `--fuzz-begin`, `--fuzz-end`, `--fuzz-crash-pc` and `--cov-blocks` maps use
+pcs such as `0x10024d` for Thumb code at `0x10024c`, as a Thumb function symbol already gives
+them. suzzer's lists instead give every site its even address and mark Thumb sites by their
+2-byte length, so on `arm-ref` the importer sets bit 0 of each 2-byte site, and of each
+boundary marker whose closest site at or below it is a Thumb site (a marker inside a Thumb
+function). A Thumb marker needs `--cov-sites` next to `--cov-boundary` for that.
+
 A site that is a branch delay slot cannot be instrumented. The run stops with an error naming
 the patch-list record and module. This is a policy, not a technical limit: suzzer's generator
 never places a site in a delay slot (libcov's trap-based sites cannot work there), so such a
@@ -255,8 +264,8 @@ HELLO and the first reply. The brain waits for HELLO up to its `--hello-timeout`
 suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default, so raise
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
-tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be` or
-`mips32le`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
+`mips32le` or `armv7`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|

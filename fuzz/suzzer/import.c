@@ -343,6 +343,39 @@ void sz_namer_describe(void *ctx, uint64_t pc, char *buf, size_t len)
     }
 }
 
+void sz_arm_thumb_sites(const sz_patchlist *p, uam_cov_site *sites)
+{
+    for (uint32_t i = 0; i < p->count; i++)
+        if (p->rec[i].len == 2)
+            sites[i].pc |= 1;
+}
+
+static uint64_t thumb_pc(const sz_patchlist *p, const uam_cov_site *sites, uint64_t pc)
+{
+    uint64_t best = 0;
+    bool found = false, thumb = false;
+    for (uint32_t i = 0; i < p->count; i++) {
+        uint64_t at = sites[i].pc & ~UINT64_C(1);
+        if (at <= pc && (!found || at >= best)) {
+            best = at;
+            found = true;
+            thumb = sites[i].pc & 1;
+        }
+    }
+    return thumb ? pc | 1 : pc;
+}
+
+void sz_arm_thumb_bounds(const sz_patchlist *p, const uam_cov_site *sites, sz_bounds *bd)
+{
+    if (!p || !sites)
+        return;
+    bd->begin_pc = thumb_pc(p, sites, bd->begin_pc);
+    for (size_t i = 0; i < bd->n_more_begin_pcs; i++)
+        bd->more_begin_pcs[i] = thumb_pc(p, sites, bd->more_begin_pcs[i]);
+    for (size_t i = 0; i < bd->n_end_pcs; i++)
+        bd->end_pcs[i] = thumb_pc(p, sites, bd->end_pcs[i]);
+}
+
 bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_width,
                          sz_bounds *out, char *err, size_t errlen)
 {
@@ -402,8 +435,10 @@ size_t sz_check_sites(uam_machine *m, const sz_patchlist *p, const uam_cov_site 
         const sz_record *r = &p->rec[i];
         uint8_t got[LIBCOV_PATCH_ORIG_MAX] = { 0 };
         bool ok = true;
+        /* a Thumb site's pc carries bit 0 (sz_arm_thumb_sites); its bytes start below */
+        const uint64_t at = r->len == 2 ? sites[i].pc & ~UINT64_C(1) : sites[i].pc;
         for (unsigned k = 0; k < r->len && ok; k++) {
-            uint64_t va = sites[i].pc + k, pa = va, v = 0;
+            uint64_t va = at + k, pa = va, v = 0;
             if (cpu->isa->translate) {
                 uam_xlate xl = { 0 };
                 ok = cpu->isa->translate(cpu, va, UAM_XLATE_DEBUG, &xl) == UAM_OK;

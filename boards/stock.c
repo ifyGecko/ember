@@ -9,6 +9,7 @@ void uam_boards_register_stock(void)
     uam_board_register(&uam_board_rv32_ref);
     uam_board_register(&uam_board_mips_ref);
     uam_board_register(&uam_board_mipsel_ref);
+    uam_board_register(&uam_board_arm_ref);
 }
 
 static uam_status uart_input(void *ctx, uam_machine *m, const uint8_t *data, size_t len)

@@ -23,7 +23,7 @@ trap 'rm -rf "$tmp"' EXIT
 sym() {
     v=$(readelf -sW "$fw" | awk -v n="$1" '$8 == n { print $2; exit }')
     [ -n "$v" ] || { echo "fuzz-check: no symbol $1 in $fw" >&2; exit 1; }
-    echo "0x$v"
+    printf '0x%x\n' "0x$v"   # readelf pads with zeros; the runner prints pcs without
 }
 begin=$(sym fuzz_iteration)
 panic=$(sym fuzz_panic)

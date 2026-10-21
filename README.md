@@ -8,9 +8,11 @@ with one module per concern.
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: two guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board, and
+Status: three guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
-`mipsel-ref` boards - run by a reference interpreter or, with `--jit`, a native x86-64 JIT
+`mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
+the short-descriptor MMU, generic timer) on the `arm-ref` board with a GIC - run by a
+reference interpreter or, with `--jit`, a native x86-64 JIT
 with block chaining (a block optimizer feeds both). Machine snapshots (boot once, resume in
 milliseconds), a gdb stub, host console and network backends (tap, tun, UDP, pcap; virtio-net
 on `rv32-ref`), and a library build for out-of-tree boards. C11, no dependencies beyond libc.
@@ -19,7 +21,7 @@ on `rv32-ref`), and a library build for out-of-tree boards. C11, no dependencies
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V and MIPS firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS and ARM firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT)
 make net-check       # ARP/ping between an rv32-ref guest and the host kernel over a real tap and tun
 make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
@@ -27,6 +29,8 @@ make install PREFIX=DIR
 ```
 
 The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc`.
+
+The ARM self-test (built once as ARM and once as Thumb-2 code) needs `arm-linux-gnueabi-gcc`.
 
 The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
 `riscv64-unknown-elf-gcc` both work).
@@ -37,6 +41,7 @@ The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
 build/uam-run build/firmware/selftest.elf
 build/uam-run --stats --trace exc --unknown-mmio zero path/to/firmware.elf
 build/uam-run --raw-base 0x80000000 path/to/image.bin
+build/uam-run -b arm-ref build/firmware-arm/selftest-thumb.elf   # ARMv7, Thumb-2 code
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
@@ -239,15 +244,19 @@ src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c)
-devices/           clint, plic, uart16550, sifive_test, unknown_mmio, unimp, mmio_stub, virtio_net
-boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS): the only files that pair an ISA with
-                   devices; mmio_rules.c: per-register rules for any board
+isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
+                   and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
+devices/           clint, plic, gic, uart16550, sifive_test, unknown_mmio, unimp, mmio_stub,
+                   virtio_net
+boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM): the only files that
+                   pair an ISA with devices; mmio_rules.c: per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 examples/          external-board: an out-of-tree board using the library
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, ABI), host side, snapshots,
                    JIT chaining, MMIO rules
 tests/firmware/    bare-metal RV32 self-test and network-test images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
+tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2 builds) and fuzz target
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

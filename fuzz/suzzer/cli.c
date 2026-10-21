@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "suzzer.h"
+#include "uam/isa/arm.h"
 #include "uam/runner.h"
 
 #define MAX_MODULE_OPTS 32
@@ -235,8 +236,10 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
         if (c->scheme.model == SZ_MODEL_SITE && c->pl.count > c->scheme.map_size)
             uam_log(UAM_LOG_WARN, "cov", "%u sites in a %u-byte map: site ids collide, and the map "
                     "differs from libcov's", c->pl.count, c->scheme.map_size);
-        bool ok = sz_build_sites(&c->pl, bases, &c->scheme, aw, &c->sites, err, errlen)
-               && sz_namer_init(&c->namer, &c->pl, c->sites);
+        bool ok = sz_build_sites(&c->pl, bases, &c->scheme, aw, &c->sites, err, errlen);
+        if (ok && s->m->cpu.isa == &uam_isa_arm)
+            sz_arm_thumb_sites(&c->pl, c->sites);
+        ok = ok && sz_namer_init(&c->namer, &c->pl, c->sites);
         free(bases);
         if (!ok)
             return UAM_ERR_INVALID;
@@ -268,6 +271,8 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
             snprintf(err, errlen, "%s: %s", c->boundary_path, e);
             return UAM_ERR_INVALID;
         }
+        if (s->m->cpu.isa == &uam_isa_arm)
+            sz_arm_thumb_bounds(c->sites_path ? &c->pl : NULL, c->sites, &c->bounds);
         s->have_begin = true;
         s->begin_pc = c->bounds.begin_pc;
         s->more_begin_pcs = c->bounds.more_begin_pcs;
