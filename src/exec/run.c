@@ -341,7 +341,8 @@ static uam_status lift_fetch(uam_lift_ctx *lc, uint64_t addr, unsigned size, uin
     if (!uam_builder_add_page(lc->b, pa0 & UAM_PAGE_MASK)
         || !uam_builder_add_page(lc->b, pa1 & UAM_PAGE_MASK))
         return UAM_ERR_INVALID;
-    st = uam_bus_read(x->cpu->bus, pa0, size, isa->default_endian | UAM_ACC_FETCH, val);
+    const unsigned order = isa->fetch_endian ? isa->fetch_endian : isa->default_endian;
+    st = uam_bus_read(x->cpu->bus, pa0, size, order | UAM_ACC_FETCH, val);
     if (st != UAM_OK && core->fault_st == UAM_OK) {
         core->fault_st = UAM_ERR_FAULT;
         core->fault_addr = addr;

@@ -108,7 +108,13 @@ typedef struct uam_lift_ctx {
 typedef struct uam_isa {
     const char             *name;
     unsigned                addr_width;    /* 32 or 64 */
-    unsigned                default_endian;/* UAM_ACC_LE or UAM_ACC_BE: byte order of instruction fetch */
+    /* UAM_ACC_LE or UAM_ACC_BE: the CPU's byte order - instruction fetch (unless
+     * fetch_endian says otherwise), the data order a board, the debugger's register
+     * view, MMIO stubs and fuzz routes assume. */
+    unsigned                default_endian;
+    /* Optional: the byte order of instruction fetch when it differs from
+     * default_endian (ARM BE8: little-endian code, big-endian data). 0: the same. */
+    unsigned                fetch_endian;
     size_t                  regfile_size;  /* bytes */
     const uam_regdesc      *regs;
     size_t                  n_regs;

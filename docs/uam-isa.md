@@ -456,8 +456,10 @@ all are ISA-neutral and unused by ISAs that do not need them.
   before that instruction; PC hooks and debugger breakpoints use it to run at a
   precise instruction boundary without per-instruction checks.
 
-The ISA also declares `default_endian`, the byte order of instruction fetch,
-so the executor reads instructions in the guest's order (MIPS is bi-endian).
+The ISA also declares `default_endian`, the CPU's byte order, so the executor
+reads instructions in the guest's order (MIPS is bi-endian), and optionally
+`fetch_endian` when code and data differ (ARM BE8: little-endian instructions,
+big-endian data; the lifter puts the data order on each memory op).
 
 ## 10b. Two instruction sets and IT blocks (ARMv7)
 
