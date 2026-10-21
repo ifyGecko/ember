@@ -271,19 +271,46 @@ static void watch_cb(void *ctx, uint64_t addr, unsigned size, bool is_write, uin
     }
 }
 
+/* The ISA's pc state bits (uam_gdb_arch.pc_state_bits), or 0. */
+static uint64_t state_bits(const uam_gdb *g)
+{
+    const uam_gdb_arch *a = g->m->cpu.isa->gdb;
+    return a ? a->pc_state_bits : 0;
+}
+
+/* A breakpoint at addr in whichever instruction-set state the code there runs in. */
+static bool bp_hooks(uam_gdb *g, uint64_t addr, bool insert)
+{
+    const uint64_t sb = state_bits(g);
+    if (insert) {
+        if (uam_exec_add_pc_hook(&g->m->exec, addr, bp_hook, g) != UAM_OK)
+            return false;
+        if (sb && uam_exec_add_pc_hook(&g->m->exec, addr | sb, bp_hook, g) != UAM_OK) {
+            uam_exec_remove_pc_hook(&g->m->exec, addr, bp_hook, g);
+            return false;
+        }
+        return true;
+    }
+    uam_exec_remove_pc_hook(&g->m->exec, addr, bp_hook, g);
+    if (sb)
+        uam_exec_remove_pc_hook(&g->m->exec, addr | sb, bp_hook, g);
+    return true;
+}
+
 static bool set_point(uam_gdb *g, int type, uint64_t addr, uint64_t len, bool insert)
 {
     if (type == 0 || type == 1) {
+        addr &= ~state_bits(g);
         for (unsigned i = 0; i < MAX_BP; i++) {
             gdb_bp *b = &g->bp[i];
             if (insert && !b->used) {
-                if (uam_exec_add_pc_hook(&g->m->exec, addr, bp_hook, g) != UAM_OK)
+                if (!bp_hooks(g, addr, true))
                     return false;
                 *b = (gdb_bp){ .addr = addr, .used = true };
                 return true;
             }
             if (!insert && b->used && b->addr == addr) {
-                uam_exec_remove_pc_hook(&g->m->exec, addr, bp_hook, g);
+                bp_hooks(g, addr, false);
                 b->used = false;
                 return true;
             }
@@ -509,8 +536,8 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
         }
         case 'c':
         case 's': {
-            if (p[1])
-                cpu->pc = strtoull(p + 1, NULL, 16);
+            if (p[1])   /* an address, in the current instruction-set state */
+                cpu->pc = (strtoull(p + 1, NULL, 16) & ~state_bits(g)) | (cpu->pc & state_bits(g));
             bool done;
             last = resume(g, p[0] == 's');
             report(g, last, &done);

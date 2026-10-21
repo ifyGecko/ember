@@ -31,6 +31,11 @@ typedef struct uam_gdb_arch {
     /* Side-effect-free access by gdb register number; false if unknown. */
     bool (*read_reg)(uam_cpu *cpu, unsigned regno, uint64_t *val);
     bool (*write_reg)(uam_cpu *cpu, unsigned regno, uint64_t val);
+    /* Bits of a code address that select an instruction-set state instead of
+     * addressing (ARM: bit 0, Thumb). gdb's addresses never carry them: the stub
+     * puts a breakpoint at every state of an address, and a pc gdb sets keeps the
+     * current state. 0 for most ISAs. */
+    uint64_t pc_state_bits;
 } uam_gdb_arch;
 
 /* What went wrong, delivered to take_exception (docs/uam-isa.md section 9). */
