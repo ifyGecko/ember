@@ -7,7 +7,7 @@
  *   - passes: a no-op pass changes nothing, a counting pass sees every IMARK, a
  *     failing or invalid pass stops the run with an error;
  *   - coverage on a small program with a known loop, on RV32, MIPS32 BE and LE and
- *     ARMv7 (ARM and Thumb-2), under the interpreter, the JIT and the JIT without
+ *     ARMv7 (ARM and Thumb-2, Thumb-2 BE8 too), under the interpreter, the JIT and the JIT without
  *     chaining: the expected
  *     hit counts and edge buckets, byte-identical maps across backends, saturation,
  *     block mode, delay-slot and duplicate-site rejection, and runs with coverage
@@ -296,11 +296,13 @@ static prog mips_prog(int n, bool be)
  * words; its pcs carry bit 0, as Thumb code addresses do in ember). */
 #define T32(hw1, hw2) ((uint32_t)(hw1) | (uint32_t)(hw2) << 16)   /* first halfword lowest */
 
-static prog arm_prog(int n, bool thumb)
+static prog arm_prog(int n, bool thumb, bool be8)
 {
     enum { R4 = 4 };
     const uint32_t t = thumb ? 1 : 0;
-    prog p = { .name = thumb ? "thumb2" : "armv7", .isa = &uam_isa_arm, .base = 0x1000 | t,
+    /* BE8 code is little-endian like the rest (.be is the order the words are stored in) */
+    prog p = { .name = be8 ? (thumb ? "thumb2-be8" : "armv7-be8") : (thumb ? "thumb2" : "armv7"),
+               .isa = be8 ? &uam_isa_armeb : &uam_isa_arm, .base = 0x1000 | t,
                .phys = 0x1000, .be = false, .xreg = R4 * 4 };
     if (thumb) {
         p.illegal = T32(0xF7F0, 0xA000);                                   /* udf.w #0 */
@@ -776,9 +778,11 @@ int main(void)
     test_ir_semantics();
 
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
-                            arm_prog(3, false), arm_prog(3, true) };
+                            arm_prog(3, false, false), arm_prog(3, true, false),
+                            arm_prog(3, true, true) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
-                              arm_prog(300, false), arm_prog(300, true) };
+                              arm_prog(300, false, false), arm_prog(300, true, false),
+                              arm_prog(300, true, true) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

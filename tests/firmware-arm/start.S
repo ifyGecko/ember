@@ -92,7 +92,9 @@ enter_user:
     str     lr, [r2, #4]
     mov     lr, r0
     mov     r0, r1
-    mov     r3, #0x10               /* User mode, interrupts enabled */
+    mrs     r3, cpsr
+    and     r3, r3, #0x200          /* keep the byte order (E) */
+    orr     r3, r3, #0x10           /* User mode, interrupts enabled */
     tst     lr, #1
     orrne   r3, r3, #0x20           /* T */
     msr     spsr_cxsf, r3

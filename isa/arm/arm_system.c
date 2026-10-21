@@ -17,10 +17,15 @@
  *   entries can never be observed, and TLB maintenance only drops translated code.
  *
  * Unknown CP15 registers read as zero and ignore writes in privileged modes, which
- * keeps firmware running past implementation-defined registers. Not modelled:
- * the security, virtualization and LPAE extensions, VFP/NEON, alignment checking
- * of ordinary loads and stores (SCTLR.A), big-endian data (CPSR.E), and
- * unprivileged permission checks for LDRT/STRT (they use the current mode).
+ * keeps firmware running past implementation-defined registers.
+ *
+ * Byte order is BE8: CPSR.E selects the data byte order (SETEND, MSR, exception
+ * entry from SCTLR.EE, exception return from SPSR), SCTLR.EE that of translation
+ * table walks, and instructions are always little-endian. uam_isa_armeb resets
+ * big-endian. Not modelled: the security, virtualization and LPAE extensions,
+ * VFP/NEON, BE32 (the pre-ARMv7 word-invariant big-endian mode), alignment checking
+ * of ordinary loads and stores (SCTLR.A), and unprivileged permission checks for
+ * LDRT/STRT (they use the current mode).
  */
 #include <stdlib.h>
 #include <string.h>
@@ -62,7 +67,7 @@ const uam_arm_config uam_arm_cortex_a7 = {
 
 uam_status uam_arm_configure(uam_cpu *cpu, const uam_arm_config *cfg)
 {
-    if (!cpu || !cfg || cpu->isa != &uam_isa_arm || !cpu->isa_state)
+    if (!cpu || !cfg || !uam_arm_is(cpu->isa) || !cpu->isa_state)
         return UAM_ERR_INVALID;
     arm_st(cpu)->cfg = *cfg;
     return UAM_OK;
@@ -70,7 +75,7 @@ uam_status uam_arm_configure(uam_cpu *cpu, const uam_arm_config *cfg)
 
 uam_status uam_arm_set_timer_sink(uam_cpu *cpu, uam_arm_timer_sink fn, void *ctx)
 {
-    if (!cpu || cpu->isa != &uam_isa_arm || !cpu->isa_state)
+    if (!cpu || !uam_arm_is(cpu->isa) || !cpu->isa_state)
         return UAM_ERR_INVALID;
     arm_st(cpu)->sink = fn;
     arm_st(cpu)->sink_ctx = ctx;
@@ -100,15 +105,19 @@ static int cur_bank(const arm_state *a) { return bank_of(cur_mode(a)); }
 static uint32_t reg_r(uam_cpu *cpu, unsigned r) { return (uint32_t)uam_cpu_reg_read(cpu, ARM_REG_OFF(r), 32); }
 static void reg_w(uam_cpu *cpu, unsigned r, uint32_t v) { uam_cpu_reg_write(cpu, ARM_REG_OFF(r), 32, v); }
 
-/* Keep cpu->priv's User bit current (it tags translated code and decides
- * translation permissions). The JIT data-TLB caches permissions of the old mode. */
+/* Keep cpu->priv's User bit (it tags translated code and decides translation
+ * permissions; the JIT data-TLB caches permissions of the old mode) and its BE bit
+ * (CPSR.E, the data byte order lifted code uses) current. */
 static void priv_update(uam_cpu *cpu)
 {
-    unsigned user = cur_mode(arm_st(cpu)) == ARM_MODE_USR ? ARM_PRIV_USER : 0;
+    const arm_state *a = arm_st(cpu);
+    unsigned user = cur_mode(a) == ARM_MODE_USR ? ARM_PRIV_USER : 0;
     if ((cpu->priv & ARM_PRIV_USER) != user) {
         cpu->priv = (cpu->priv & ~ARM_PRIV_USER) | user;
         uam_cpu_dtlb_flush(cpu);
     }
+    unsigned be = (a->s.cpsr & CPSR_E) ? ARM_PRIV_BE : 0;
+    cpu->priv = (cpu->priv & ~ARM_PRIV_BE) | be;
     uam_cpu_request_exit(cpu);
 }
 
@@ -179,7 +188,8 @@ static void write_cpsr_full(uam_cpu *cpu, uint32_t psr)
 {
     arm_state *a = arm_st(cpu);
     write_flags(cpu, psr);
-    a->s.cpsr = (a->s.cpsr & ~(CPSR_A | CPSR_I | CPSR_F)) | (psr & (CPSR_A | CPSR_I | CPSR_F));
+    const uint32_t bits = CPSR_A | CPSR_I | CPSR_F | CPSR_E;
+    a->s.cpsr = (a->s.cpsr & ~bits) | (psr & bits);
     if (bank_of(psr & CPSR_M_MASK) >= 0)
         switch_mode(cpu, psr & CPSR_M_MASK);
     set_it(cpu, psr_it(psr));
@@ -259,6 +269,16 @@ static bool ap_allows(unsigned ap, bool user, bool write)
     }
 }
 
+/* A translation table entry: big-endian when SCTLR.EE is set. */
+static bool walk_read(uam_cpu *cpu, uint32_t pa, uint32_t *desc)
+{
+    uint64_t v = 0;
+    if (uam_cpu_peek(cpu, pa, 4, &v) != UAM_OK)
+        return false;
+    *desc = (arm_st(cpu)->s.sctlr & SCTLR_EE) ? __builtin_bswap32((uint32_t)v) : (uint32_t)v;
+    return true;
+}
+
 static uam_status arm_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_xlate *out)
 {
     const arm_state *a = arm_st(cpu);
@@ -284,10 +304,9 @@ static uam_status arm_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kin
         uint32_t mask = 0xFFFFFFFFu << (14 - n);   /* TTBR0 table: 16 KiB >> N */
         l1 = (a->s.ttbr0 & mask) | (((va >> 20) & (0xFFFu >> n)) << 2);
     }
-    uint64_t d1 = 0;
-    if (uam_cpu_peek(cpu, l1, 4, &d1) != UAM_OK)
+    uint32_t desc;
+    if (!walk_read(cpu, l1, &desc))
         return xfault(out, ARM_FS_WALK_L1, 0);
-    uint32_t desc = (uint32_t)d1;
 
     unsigned dom, ap, fs_dom, fs_perm;
     bool xn;
@@ -298,10 +317,9 @@ static uam_status arm_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kin
     case 1: {
         dom = (desc >> 5) & 0xF;
         uint32_t l2 = (desc & 0xFFFFFC00u) | (((va >> 12) & 0xFF) << 2);
-        uint64_t d2 = 0;
-        if (uam_cpu_peek(cpu, l2, 4, &d2) != UAM_OK)
+        uint32_t pd;
+        if (!walk_read(cpu, l2, &pd))
             return xfault(out, ARM_FS_WALK_L2, dom);
-        uint32_t pd = (uint32_t)d2;
         fs_dom = ARM_FS_DOM_PAGE;
         fs_perm = ARM_FS_PERM_PAGE;
         if ((pd & 3) == 0)
@@ -412,6 +430,7 @@ static void enter(uam_cpu *cpu, unsigned mode, unsigned vec, uint32_t lr, bool t
         a->s.cpsr |= CPSR_F;
     if (mode != ARM_MODE_UND && mode != ARM_MODE_SVC)
         a->s.cpsr |= CPSR_A;
+    a->s.cpsr = (a->s.cpsr & ~CPSR_E) | ((a->s.sctlr & SCTLR_EE) ? CPSR_E : 0);
     set_it(cpu, 0);
     uint32_t base = (a->s.sctlr & SCTLR_V) ? 0xFFFF0000u : (a->s.vbar & ~0x1Fu);
     cpu->pc = (base + vec) | ((a->s.sctlr & SCTLR_TE) ? 1u : 0u);
@@ -682,8 +701,7 @@ static uam_status cp15_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     case CP15(0, 1, 0, 0): {
         uint32_t old = s->sctlr;
         s->sctlr = (v & ~0x00C00000u) | 0x00C50000u;    /* RES1 bits kept */
-        s->sctlr &= ~(1u << 25);                        /* EE: no big-endian exceptions */
-        if ((old ^ s->sctlr) & (SCTLR_M | SCTLR_AFE))
+        if ((old ^ s->sctlr) & (SCTLR_M | SCTLR_AFE | SCTLR_EE))
             uam_cpu_xlate_changed(cpu);
         uam_cpu_request_exit(cpu);
         break;
@@ -828,7 +846,7 @@ static uam_status arm_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
         if (user)
             return UAM_OK;                      /* only the flags (written by the IR) */
         if (id & 2)
-            a->s.cpsr = (a->s.cpsr & ~CPSR_A) | (v & CPSR_A);
+            a->s.cpsr = (a->s.cpsr & ~(CPSR_A | CPSR_E)) | (v & (CPSR_A | CPSR_E));
         if (id & 1) {
             a->s.cpsr = (a->s.cpsr & ~(CPSR_I | CPSR_F)) | (v & (CPSR_I | CPSR_F));
             if (bank_of(v & CPSR_M_MASK) >= 0)
@@ -861,6 +879,10 @@ static uam_status arm_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     }
     case ARM_SR_USRREG:
         usrreg_write(cpu, id & 0xF, v);
+        return UAM_OK;
+    case ARM_SR_SETEND:                         /* any mode */
+        a->s.cpsr = (a->s.cpsr & ~CPSR_E) | (v ? CPSR_E : 0);
+        priv_update(cpu);
         return UAM_OK;
     case ARM_SR_BANKSP: {
         int b = bank_of(id & 0x1F);
@@ -917,6 +939,10 @@ static void arm_reset(uam_cpu *cpu, uint64_t entry)
         cpu->regfile[i] = 0;
     a->s.cpsr = ARM_MODE_SVC | CPSR_A | CPSR_I | CPSR_F;
     a->s.sctlr = 0x00C50078u;
+    if (cpu->isa->default_endian & UAM_ACC_BE) {    /* CFGEND: big-endian (BE8) reset */
+        a->s.sctlr |= SCTLR_EE;
+        a->s.cpsr |= CPSR_E;
+    }
     a->s.cntfrq = a->cfg.cntfrq;
     cpu->priv = 0;
     priv_update(cpu);
@@ -944,9 +970,10 @@ static void arm_dump_state(uam_cpu *cpu, FILE *out)
 {
     arm_state *a = arm_st(cpu);
     uint32_t cpsr = cpsr_full(cpu, cpu->pc & 1, (uint8_t)ARM_PRIV_IT(cpu->priv));
-    fprintf(out, "pc=%08llx icount=%llu state=%s mode=%s cpsr=%08x\n",
+    fprintf(out, "pc=%08llx icount=%llu state=%s mode=%s data=%s cpsr=%08x\n",
             (unsigned long long)(cpu->pc & ~UINT64_C(1)), (unsigned long long)cpu->icount,
-            (cpu->pc & 1) ? "thumb" : "arm", mode_name(cur_mode(a)), cpsr);
+            (cpu->pc & 1) ? "thumb" : "arm", mode_name(cur_mode(a)),
+            (cpsr & CPSR_E) ? "big" : "little", cpsr);
     for (unsigned i = 0; i < 15; i++)
         fprintf(out, "%-3s=%08x%s", arm_regs[i].name, reg_r(cpu, i), (i % 4 == 3) ? "\n" : "  ");
     fprintf(out, "\n");
@@ -1081,28 +1108,34 @@ static const uam_gdb_arch arm_gdb = {
 /* Descriptor                                                                */
 /* ------------------------------------------------------------------------ */
 
+#define ARM_COMMON                                    \
+    .addr_width     = 32,                             \
+    .regfile_size   = ARM_REGFILE_SIZE,               \
+    .regs           = arm_regs,                       \
+    .n_regs         = UAM_ARRAY_LEN(arm_regs),        \
+    .helpers        = { arm_helpers, ARM_HELPER__COUNT }, \
+    .init           = arm_init,                       \
+    .fini           = arm_fini,                       \
+    .reset          = arm_reset,                      \
+    .lift           = arm_lift_block,                 \
+    .take_exception = arm_take_exception,             \
+    .irq_take       = arm_irq_take,                   \
+    .irq_wakeup     = arm_irq_wakeup,                 \
+    .irq_input      = arm_irq_input,                  \
+    .sysreg_read    = arm_sysreg_read,                \
+    .sysreg_write   = arm_sysreg_write,               \
+    .translate      = arm_translate,                  \
+    .gdb            = &arm_gdb,                       \
+    .dump_state     = arm_dump_state,                 \
+    .save           = arm_save,                       \
+    .restore        = arm_restore,                    \
+    .irq_lines      = arm_irq_lines
+
 const uam_isa uam_isa_arm = {
-    .name           = "armv7",
-    .addr_width     = 32,
-    .default_endian = UAM_ACC_LE,
-    .regfile_size   = ARM_REGFILE_SIZE,
-    .regs           = arm_regs,
-    .n_regs         = UAM_ARRAY_LEN(arm_regs),
-    .helpers        = { arm_helpers, ARM_HELPER__COUNT },
-    .init           = arm_init,
-    .fini           = arm_fini,
-    .reset          = arm_reset,
-    .lift           = arm_lift_block,
-    .take_exception = arm_take_exception,
-    .irq_take       = arm_irq_take,
-    .irq_wakeup     = arm_irq_wakeup,
-    .irq_input      = arm_irq_input,
-    .sysreg_read    = arm_sysreg_read,
-    .sysreg_write   = arm_sysreg_write,
-    .translate      = arm_translate,
-    .gdb            = &arm_gdb,
-    .dump_state     = arm_dump_state,
-    .save           = arm_save,
-    .restore        = arm_restore,
-    .irq_lines      = arm_irq_lines,
+    .name = "armv7", .default_endian = UAM_ACC_LE, ARM_COMMON,
+};
+
+/* BE8: big-endian data, little-endian instructions. */
+const uam_isa uam_isa_armeb = {
+    .name = "armv7be", .default_endian = UAM_ACC_BE, .fetch_endian = UAM_ACC_LE, ARM_COMMON,
 };

@@ -57,11 +57,13 @@ enum { ARM_BANK_USR, ARM_BANK_FIQ, ARM_BANK_IRQ, ARM_BANK_SVC, ARM_BANK_ABT, ARM
 /*
  * cpu->priv tags translated code with everything the lifted code depends on
  * besides the pc (whose bit 0 is the instruction set): bit 0 is set in User mode
- * (translation permissions), bits 15:8 hold the IT state at the start of the block.
+ * (translation permissions), bit 1 is CPSR.E (the data byte order lifted code
+ * uses), bits 15:8 hold the IT state at the start of the block.
  * The IT state is non-zero only when a block resumes inside an IT block, after an
  * exception return into one.
  */
 #define ARM_PRIV_USER      1u
+#define ARM_PRIV_BE        2u   /* CPSR.E: big-endian data */
 #define ARM_PRIV_IT_SHIFT  8
 #define ARM_PRIV_IT(p)     (((p) >> ARM_PRIV_IT_SHIFT) & 0xFFu)
 
@@ -81,6 +83,7 @@ enum {
                                    * mode << 8) */
     ARM_SR_USRREG  = 0x00230000u, /* | n: User-mode r8-r14 (LDM/STM with ^) */
     ARM_SR_BANKSP  = 0x00240000u, /* | mode: the banked SP of a mode (SRS) */
+    ARM_SR_SETEND  = 0x00250000u, /* write 1: big-endian data, 0: little-endian */
 };
 
 /* Exception vectors (offsets) and the cause carried by TRAP / uam_exception.cause. */
@@ -122,6 +125,7 @@ enum {
 #define SCTLR_I   (1u << 12)
 #define SCTLR_V   (1u << 13)
 #define SCTLR_AFE (1u << 29)
+#define SCTLR_EE  (1u << 25)
 #define SCTLR_TE  (1u << 30)
 
 /* CP15 and banked state cleared by a reset. */
@@ -169,6 +173,7 @@ typedef struct arm_lift {
     uint32_t      raw;     /* the instruction (T32: first halfword in bits 31:16) */
     uam_ref       guard;   /* condition of the current instruction, NONE if always */
     bool          user;    /* lifted for User mode */
+    unsigned      endian;  /* data accesses: UAM_ACC_LE or UAM_ACC_BE (CPSR.E) */
     uint8_t       it;      /* IT state of the instruction being lifted (Thumb) */
     uint8_t       it_next; /* IT state after it */
     bool          end;     /* end the block after this instruction */
@@ -262,6 +267,7 @@ arm_lift_result arm_coproc(arm_lift *L, bool load, unsigned cp, unsigned opc1, u
 arm_lift_result arm_coproc64(arm_lift *L, bool load, unsigned cp, unsigned opc1, unsigned crm,
                              unsigned rt, unsigned rt2);              /* MRRC / MCRR */
 arm_lift_result arm_hint(arm_lift *L, unsigned op);   /* NOP YIELD WFE WFI SEV */
+arm_lift_result arm_setend(arm_lift *L, bool be);
 arm_lift_result arm_barrier(arm_lift *L, unsigned op); /* 4 DSB 5 DMB 6 ISB; 1 CLREX */
 arm_lift_result arm_srs(arm_lift *L, unsigned mode, bool inc, bool before, bool wb);
 arm_lift_result arm_rfe(arm_lift *L, unsigned rn, bool inc, bool before, bool wb);

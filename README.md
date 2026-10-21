@@ -11,7 +11,8 @@ with one module per concern.
 Status: three guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
-the short-descriptor MMU, generic timer) on the `arm-ref` board with a GIC - run by a
+the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
+boards with a GIC - run by a
 reference interpreter or, with `--jit`, a native x86-64 JIT
 with block chaining (a block optimizer feeds both). Machine snapshots (boot once, resume in
 milliseconds), a gdb stub, host console and network backends (tap, tun, UDP, pcap; virtio-net
@@ -30,7 +31,8 @@ make install PREFIX=DIR
 
 The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc`.
 
-The ARM self-test (built once as ARM and once as Thumb-2 code) needs `arm-linux-gnueabi-gcc`.
+The ARM self-test (built as ARM and as Thumb-2 code, little-endian and BE8) needs
+`arm-linux-gnueabi-gcc`.
 
 The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
 `riscv64-unknown-elf-gcc` both work).
@@ -42,6 +44,7 @@ build/uam-run build/firmware/selftest.elf
 build/uam-run --stats --trace exc --unknown-mmio zero path/to/firmware.elf
 build/uam-run --raw-base 0x80000000 path/to/image.bin
 build/uam-run -b arm-ref build/firmware-arm/selftest-thumb.elf   # ARMv7, Thumb-2 code
+build/uam-run -b armeb-ref build/firmware-arm/selftest-arm-be.elf # big-endian (BE8)
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
@@ -256,7 +259,7 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, ABI), host s
                    JIT chaining, MMIO rules
 tests/firmware/    bare-metal RV32 self-test and network-test images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
-tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2 builds) and fuzz target
+tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

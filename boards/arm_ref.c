@@ -1,5 +1,6 @@
 /*
- * arm_ref.c - "arm-ref": the ARMv7-A reference board. RAM, a GIC, a 16550
+ * arm_ref.c - "arm-ref" / "armeb-ref": the ARMv7-A reference boards, little- and
+ * big-endian (BE8: big-endian data, little-endian code). RAM, a GIC, a 16550
  * console and a simulation finisher.
  *
  *   0x00000000  RAM (64 MiB; the exception vectors at 0 are in RAM)
@@ -9,7 +10,9 @@
  *   0x1c020000  GIC CPU interface
  *
  * The generic timer is inside the CPU; its physical timer drives PPI 30 and its
- * virtual timer PPI 27. The GIC's output is the CPU's IRQ input.
+ * virtual timer PPI 27. The GIC's output is the CPU's IRQ input. The devices'
+ * registers are little-endian on both boards: a big-endian guest byte-swaps its
+ * 32-bit GIC accesses, as on BE8 hardware.
  */
 #include "uam/boards.h"
 #include "uam/dev/gic.h"
@@ -35,12 +38,12 @@ static void timer_to_gic(void *gic, unsigned timer, int level)
     uam_gic_input(gic, timer == UAM_ARM_TIMER_VIRT ? ARM_PPI_VTIMER : ARM_PPI_PTIMER, level);
 }
 
-static uam_status arm_ref_build(uam_machine *m, const uam_board_config *cfg)
+static uam_status arm_ref_build_isa(uam_machine *m, const uam_board_config *cfg, const uam_isa *isa)
 {
-    uam_status st = uam_machine_init(m, &uam_isa_arm);
+    uam_status st = uam_machine_init(m, isa);
     if (st != UAM_OK)
         return st;
-    m->board_name = "arm-ref";
+    m->board_name = isa == &uam_isa_armeb ? "armeb-ref" : "arm-ref";
     m->reset_pc = 0;   /* the reset vector; overridden by the loaded image's entry */
 
     st = uam_bus_map_ram(&m->bus, "ram", ARM_RAM_BASE, cfg->ram_size ? cfg->ram_size : ARM_RAM_SIZE);
@@ -88,8 +91,25 @@ static uam_status arm_ref_build(uam_machine *m, const uam_board_config *cfg)
     return UAM_OK;
 }
 
+static uam_status arm_ref_build(uam_machine *m, const uam_board_config *cfg)
+{
+    return arm_ref_build_isa(m, cfg, &uam_isa_arm);
+}
+
+static uam_status armeb_ref_build(uam_machine *m, const uam_board_config *cfg)
+{
+    return arm_ref_build_isa(m, cfg, &uam_isa_armeb);
+}
+
 const uam_board uam_board_arm_ref = {
     .name = "arm-ref",
     .description = "ARMv7-A reference board (GIC, generic timer, NS16550A UART, test finisher)",
     .build = arm_ref_build,
+};
+
+const uam_board uam_board_armeb_ref = {
+    .name = "armeb-ref",
+    .description = "ARMv7-A big-endian (BE8) reference board (GIC, generic timer, NS16550A UART, "
+                   "test finisher)",
+    .build = armeb_ref_build,
 };

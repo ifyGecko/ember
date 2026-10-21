@@ -237,7 +237,7 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
             uam_log(UAM_LOG_WARN, "cov", "%u sites in a %u-byte map: site ids collide, and the map "
                     "differs from libcov's", c->pl.count, c->scheme.map_size);
         bool ok = sz_build_sites(&c->pl, bases, &c->scheme, aw, &c->sites, err, errlen);
-        if (ok && s->m->cpu.isa == &uam_isa_arm)
+        if (ok && uam_arm_is(s->m->cpu.isa))
             sz_arm_thumb_sites(&c->pl, c->sites);
         ok = ok && sz_namer_init(&c->namer, &c->pl, c->sites);
         free(bases);
@@ -271,7 +271,7 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
             snprintf(err, errlen, "%s: %s", c->boundary_path, e);
             return UAM_ERR_INVALID;
         }
-        if (s->m->cpu.isa == &uam_isa_arm)
+        if (uam_arm_is(s->m->cpu.isa))
             sz_arm_thumb_bounds(c->sites_path ? &c->pl : NULL, c->sites, &c->bounds);
         s->have_begin = true;
         s->begin_pc = c->bounds.begin_pc;

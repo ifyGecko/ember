@@ -265,7 +265,7 @@ suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
-`mips32le` or `armv7`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+`mips32le`, `armv7` or `armv7be`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|

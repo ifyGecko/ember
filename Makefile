@@ -2,7 +2,7 @@
 #
 #   make                 build $(BUILD)/uam-run and the libraries
 #   make lib             only the libraries (for out-of-tree projects)
-#   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE, ARM and Thumb),
+#   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE, ARM and Thumb LE/BE8),
 #                        external-board example,
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
@@ -121,6 +121,8 @@ FW_MIPS_BE := $(BUILD)/firmware-mips/selftest-be.elf
 FW_MIPS_EL := $(BUILD)/firmware-mips/selftest-el.elf
 FW_ARM    := $(BUILD)/firmware-arm/selftest-arm.elf
 FW_THUMB  := $(BUILD)/firmware-arm/selftest-thumb.elf
+FW_ARM_BE := $(BUILD)/firmware-arm/selftest-arm-be.elf
+FW_THUMB_BE := $(BUILD)/firmware-arm/selftest-thumb-be.elf
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
@@ -266,6 +268,8 @@ mips-test: $(RUN) firmware-mips
 arm-test: $(RUN) firmware-arm
 	$(RUN) -b arm-ref --stats $(FW_ARM) < /dev/null
 	$(RUN) -b arm-ref --stats $(FW_THUMB) < /dev/null
+	$(RUN) -b armeb-ref --stats $(FW_ARM_BE) < /dev/null
+	$(RUN) -b armeb-ref --stats $(FW_THUMB_BE) < /dev/null
 
 # The out-of-tree example builds against `make lib` output only, as an external project would.
 example-test: lib firmware-mips
@@ -281,6 +285,7 @@ snapshot-test: $(RUN) firmware firmware-mips firmware-arm example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL) 5000
 	sh tests/snapshot/snapshot-check.sh $(RUN) arm-ref $(FW_ARM) 900 30000 52000
 	sh tests/snapshot/snapshot-check.sh $(RUN) arm-ref $(FW_THUMB) 4321 40000 61000
+	sh tests/snapshot/snapshot-check.sh $(RUN) armeb-ref $(FW_THUMB_BE) 2500 52000 66000
 	sh tests/snapshot/snapshot-check.sh $(EXAMPLE) ext-mips $(FW_MIPS_BE) 4000
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
@@ -291,6 +296,7 @@ cov-test: $(RUN) firmware firmware-mips firmware-arm
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
 	sh tests/cov/cov-check.sh $(RUN) arm-ref $(FW_ARM)
 	sh tests/cov/cov-check.sh $(RUN) arm-ref $(FW_THUMB)
+	sh tests/cov/cov-check.sh $(RUN) armeb-ref $(FW_ARM_BE)
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
@@ -301,6 +307,8 @@ fuzz-test: $(RUN) firmware firmware-mips firmware-arm
 	sh tests/fuzz/fuzz-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf \
 	    $(BUILD)/firmware-arm/fuzztarget.bin
+	sh tests/fuzz/fuzz-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf \
+	    $(BUILD)/firmware-arm/fuzztarget-be.bin
 
 # suzzer's formats and the SZR1 executor through the runner (lists written by
 # tests/suzzer/mk_lists.py, and by suzzer's own generators when rizin is installed): the
@@ -313,10 +321,12 @@ suzzer-test: $(RUN) firmware firmware-mips firmware-arm
 	sh tests/suzzer/suzzer-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
 	sh tests/suzzer/suzzer-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf $(SUZZER_DIR)
 	sh tests/suzzer/suzzer-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf $(SUZZER_DIR)
+	sh tests/suzzer/suzzer-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf $(SUZZER_DIR)
 	sh tests/suzzer/gen-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
 	sh tests/suzzer/gen-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
 	sh tests/suzzer/gen-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf $(SUZZER_DIR)
 	sh tests/suzzer/gen-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf $(SUZZER_DIR)
+	sh tests/suzzer/gen-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf $(SUZZER_DIR)
 	sh tests/szr/brain-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
 	sh tests/szr/brain-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
 	sh tests/szr/brain-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf $(SUZZER_DIR)
@@ -324,6 +334,7 @@ suzzer-test: $(RUN) firmware firmware-mips firmware-arm
 	sh tests/szr/szr-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
 	sh tests/szr/szr-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
 	sh tests/szr/szr-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
+	sh tests/szr/szr-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf
 else
 suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"

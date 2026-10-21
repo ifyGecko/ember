@@ -1,7 +1,7 @@
 /*
  * uam/isa/arm.h - Public face of the ARM (AArch32) ISA module.
  *
- * ARMv7-A, little-endian: the ARM (A32) and Thumb/Thumb-2 (T32) instruction
+ * ARMv7-A: the ARM (A32) and Thumb/Thumb-2 (T32) instruction
  * sets with interworking, conditional execution and IT blocks, the processor
  * modes with their banked registers, the exception model (vectors at 0,
  * 0xffff0000 or VBAR), CP15 with a short-descriptor MMU (sections,
@@ -29,8 +29,22 @@
 
 #include "uam/isa.h"
 
-/* ARMv7-A, ARM + Thumb-2, CP15 with the short-descriptor MMU; little-endian. */
+/*
+ * ARMv7-A, ARM + Thumb-2, CP15 with the short-descriptor MMU. Two descriptors, by
+ * the byte order the hart resets with (the CFGEND pin): uam_isa_arm is
+ * little-endian; uam_isa_armeb is BE8, with SCTLR.EE and CPSR.E set at reset, so
+ * data is big-endian while instructions stay little-endian in memory (as a BE8
+ * linker writes them). Either can switch its data byte order at run time (SETEND,
+ * CPSR.E, SCTLR.EE for exceptions and translation table walks).
+ */
 extern const uam_isa uam_isa_arm;
+extern const uam_isa uam_isa_armeb;
+
+/* True for both ARM descriptors. */
+static inline bool uam_arm_is(const uam_isa *isa)
+{
+    return isa == &uam_isa_arm || isa == &uam_isa_armeb;
+}
 
 enum uam_arm_irq_line {
     UAM_ARM_IRQ = 0,   /* IRQ input (taken when CPSR.I = 0) */

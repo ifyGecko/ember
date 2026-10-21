@@ -4,7 +4,8 @@ Status: phases 1 and 2 implemented, plus two more ISAs (MIPS32 with a TLB, ARMv7
 MMU), the snapshot part of phase 3 and the JIT from phase 4. IR, interpreter and optimizer, an
 x86-64 JIT with block chaining, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
-(`mips-ref` / `mipsel-ref` boards) and ARMv7-A, ARM and Thumb-2 (`arm-ref` board), host
+(`mips-ref` / `mipsel-ref` boards) and ARMv7-A, ARM and Thumb-2, little-endian and BE8
+(`arm-ref` / `armeb-ref` boards), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -43,7 +44,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian`, optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state. An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state. An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -190,9 +191,9 @@ devices.
   placed by address; lookup by symbol name is planned.
 - **Stock boards**: `rv32-ref`, an RV32IMAC M-mode reference board (CLINT, PLIC, NS16550A UART,
   sifive,test finisher, virtio-net ports, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
-  (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` (ARMv7-A with a
-  GICv2-style interrupt controller fed by the generic timer and the NS16550A UART, a test
-  finisher, RAM at 0 under the vectors). Real devices are built out of tree on the library
+  (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` / `armeb-ref` (ARMv7-A,
+  little-endian and BE8, with a GICv2-style interrupt controller fed by the generic timer and
+  the NS16550A UART, a test finisher, RAM at 0 under the vectors). Real devices are built out of tree on the library
   (`examples/external-board/`).
 - **ARM state** (`isa/arm`, `uam/isa/arm.h`): Thumb state is bit 0 of the pc, the ARM
   convention for code addresses, so the translation cache, interrupted blocks and ELF entry
@@ -201,7 +202,10 @@ devices.
   name the pc with bit 0 set; the gdb stub and the suzzer importer (suzzer marks Thumb sites
   by their 2-byte length) translate. IT blocks are continuations (`UAM_IMARK_CONT`) so no
   interrupt splits one; only an exception return into the middle of one leaves IT state for
-  the next block, which `cpu->priv` then carries (`uam-isa.md` section 10b).
+  the next block, which `cpu->priv` then carries (`uam-isa.md` section 10b). Byte order is
+  BE8: code is always little-endian, data follows CPSR.E (also part of `cpu->priv`, so code
+  lifted for one order never runs in the other; SETEND, exception entry from SCTLR.EE and
+  return from SPSR switch it), and `uam_isa_armeb` resets big-endian.
 
 ## 6. Analysis and fuzzing
 
@@ -294,7 +298,7 @@ devices.
 4. Board description format, more peripherals, Cortex-M, JIT (*done*: x86-64, with block chaining).
 
 Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
-short-descriptor MMU, generic timer, a GIC), host networking, a gdb stub, the library build with
+short-descriptor MMU, generic timer, a GIC, little-endian and BE8), host networking, a gdb stub, the library build with
 an ABI handshake. Cortex-M (ARMv7-M: the NVIC exception model) is still planned.
 
 ## 8. Verification
@@ -307,7 +311,7 @@ Implemented (`make test`):
 - The IR verifier runs on every translated block (on by default; `--no-verify` skips it), before
   and after the optimizer.
 - Firmware self-tests: bare-metal RV32, MIPS32 (both byte orders) and ARMv7 (built as ARM and
-  as Thumb-2 code) programs that check themselves and report through the test finisher, run
+  as Thumb-2 code, little-endian and BE8) programs that check themselves and report through the test finisher, run
   on the interpreter (the snapshot check below runs them on the JIT as well).
 - Snapshot determinism: `tests/snapshot/snapshot-check.sh` splits a run with `--save-snapshot`
   / `--load-snapshot` at several points and requires the same console output, pc and icount as

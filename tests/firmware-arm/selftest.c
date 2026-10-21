@@ -1,6 +1,7 @@
 /*
- * selftest.c - Bare-metal ARMv7-A self-test for the UAM arm-ref board, built twice:
- * as ARM code and as Thumb-2 code (start.S is ARM either way).
+ * selftest.c - Bare-metal ARMv7-A self-test for the UAM arm-ref and armeb-ref boards,
+ * built as ARM code and as Thumb-2 code (start.S is ARM either way), each in both byte
+ * orders (big-endian: BE8, little-endian code).
  *
  * Exercises the emulator end to end: UART output, data processing and the flags
  * (carry chains, register-specified shifts, RRX), conditional execution (IT blocks
@@ -11,20 +12,33 @@
  * that is retried after the handler fixes it, the generic timer and an SGI through
  * the GIC with WFI, banked registers and SPSR access, the MMU (sections, small
  * pages, domains, permissions, XN, ATS1CPR, remapping executed code with TLBIALL),
- * User mode (permission faults, SVC back to the kernel) and CP15 identification.
+ * User mode (permission faults, SVC back to the kernel), CP15 identification, and the
+ * byte order: CPSR.E and SCTLR.EE at reset, SETEND, E on exception entry and return.
  *
- * Output is the same for both builds apart from the banner. The result is reported
+ * Output is the same for every build apart from the banner. The result is reported
  * through the board's test finisher.
  */
 #include <stdint.h>
 
 #ifdef __thumb__
 #define IS_THUMB 1
-#define BUILD "thumb"
+#define ISET "thumb"
 #else
 #define IS_THUMB 0
-#define BUILD "arm"
+#define ISET "arm"
 #endif
+#ifdef __ARMEB__
+#define IS_BE 1
+#define BUILD ISET ", big-endian"
+#define OTHER_END "le"
+#define NATIVE_END "be"
+#else
+#define IS_BE 0
+#define BUILD ISET
+#define OTHER_END "be"
+#define NATIVE_END "le"
+#endif
+#define E(le, be) (IS_BE ? (be) : (le))   /* an expectation that depends on the byte order */
 
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
 #define UART0    0x1c000000u
@@ -33,6 +47,11 @@
 #define GICD     0x1c010000u
 #define GICC     0x1c020000u
 #define BAD_ADDR 0x30000000u   /* nothing is mapped there */
+
+/* The GIC's registers are little-endian: a big-endian CPU swaps, as readl/writel do. */
+static uint32_t le32(uint32_t v) { return IS_BE ? __builtin_bswap32(v) : v; }
+#define GIC_W(a, v) (REG32(a) = le32(v))
+#define GIC_R(a)    le32(REG32(a))
 
 static void putc_(char c) { while (!(UART_LSR & 0x20)) {} UART_THR = (uint8_t)c; }
 static void puts_(const char *s) { for (; *s; s++) { if (*s == '\n') putc_('\r'); putc_(*s); } }
@@ -96,6 +115,7 @@ void user_resume(void);
 void enter_user(uint32_t pc, uint32_t arg);
 
 static volatile uint32_t trap_n, last_kind, last_lr, last_spsr, last_fsr, last_far, last_fault_pc;
+static volatile uint32_t last_handler_cpsr;
 static volatile uint32_t timer_ticks, sgi_n, spurious;
 static volatile int fix_reg = -1;      /* retry the faulting instruction with this register fixed */
 static volatile uint32_t fix_val;
@@ -105,7 +125,9 @@ static unsigned insn_len(uint32_t addr, int thumb)
 {
     if (!thumb)
         return 4;
-    uint16_t hw = *(volatile uint16_t *)(uintptr_t)addr;
+    uint16_t hw = *(volatile uint16_t *)(uintptr_t)addr;   /* code is little-endian (BE8) */
+    if (IS_BE)
+        hw = __builtin_bswap16(hw);
     return (hw >> 11) >= 0x1D ? 4 : 2;
 }
 
@@ -116,7 +138,7 @@ uint32_t trap_handler(uint32_t kind, uint32_t *frame)
     int t = (spsr >> 5) & 1;
 
     if (kind == 6) {                                   /* IRQ */
-        uint32_t iar = REG32(GICC + 0x0C), id = iar & 0x3FF;
+        uint32_t iar = GIC_R(GICC + 0x0C), id = iar & 0x3FF;
         if (id == 30) {
             timer_ticks++;
             mcr(0, 14, 2, 1, 0);                       /* CNTP_CTL = 0 */
@@ -126,7 +148,7 @@ uint32_t trap_handler(uint32_t kind, uint32_t *frame)
             spurious++;
         }
         if (id < 1020)
-            REG32(GICC + 0x10) = iar;
+            GIC_W(GICC + 0x10, iar);
         return lr - 4;
     }
 
@@ -138,6 +160,7 @@ uint32_t trap_handler(uint32_t kind, uint32_t *frame)
     default: fault_pc = lr - 8; last_fsr = mrc(0, 5, 0, 0); last_far = mrc(0, 6, 0, 0); break;
     }
     trap_n++;
+    __asm__ volatile("mrs %0, cpsr" : "=r"(last_handler_cpsr));
     last_kind = kind;
     last_lr = lr;
     last_spsr = spsr;
@@ -145,7 +168,7 @@ uint32_t trap_handler(uint32_t kind, uint32_t *frame)
 
     if (user_test && (spsr & 0x1F) == 0x10) {          /* back to the kernel */
         user_test = 0;
-        frame[0] = 0x1D3;                              /* SVC, A I F masked */
+        frame[0] = 0x1D3 | (IS_BE ? 1u << 9 : 0);      /* SVC, A I F masked, our byte order */
         return (uint32_t)user_resume;
     }
     if (g_guard[2]) {                                  /* a guarded call faulted */
@@ -421,37 +444,37 @@ static void t_loadstore(void)
     __asm__ volatile("ldrsb %0, [%1]" : "=r"(r) : "r"(p));
     EQ(r, 0xFFFFFF80u, "ldrsb");
     __asm__ volatile("ldrsh %0, [%1, #2]" : "=r"(r) : "r"(p));
-    EQ(r, 0xFFFF8382u, "ldrsh");
+    EQ(r, E(0xFFFF8382u, 0xFFFF8283u), "ldrsh");
     __asm__ volatile("ldrh %0, [%1, #2]" : "=r"(r) : "r"(p));
-    EQ(r, 0x8382, "ldrh");
+    EQ(r, E(0x8382, 0x8283), "ldrh");
     uint32_t q = p;
     __asm__ volatile("ldr %0, [%1], #4" : "=r"(r), "+r"(q));
-    EQ(r, 0x83828180u, "ldr post-index");
+    EQ(r, E(0x83828180u, 0x80818283u), "ldr post-index");
     EQ(q, p + 4, "post-index writeback");
     __asm__ volatile("ldr %0, [%1, #4]!" : "=r"(r), "+r"(q));
-    EQ(r, 0x8B8A8988u, "ldr pre-index");
+    EQ(r, E(0x8B8A8988u, 0x88898A8Bu), "ldr pre-index");
     EQ(q, p + 8, "pre-index writeback");
     uint32_t idx = 3 + V0;
     __asm__ volatile("ldrb %0, [%1, %2, lsl #2]" : "=r"(r) : "r"(p), "r"(idx));
     EQ(r, 0x8C, "ldrb register lsl");
     uint32_t a, b;
     __asm__ volatile("ldrd r4, r5, [%2, #8]\n\tmov %0, r4\n\tmov %1, r5" : "=r"(a), "=r"(b) : "r"(p) : "r4", "r5");
-    EQ(a, 0x8B8A8988u, "ldrd lo");
-    EQ(b, 0x8F8E8D8Cu, "ldrd hi");
+    EQ(a, E(0x8B8A8988u, 0x88898A8Bu), "ldrd lo");
+    EQ(b, E(0x8F8E8D8Cu, 0x8C8D8E8Fu), "ldrd hi");
     __asm__ volatile("mov r4, %0\n\tmov r5, %1\n\tstrd r4, r5, [%2, #16]" :: "r"(V5), "r"(V7), "r"(p) : "r4", "r5", "memory");
     EQ(*(volatile uint32_t *)(p + 16), 5, "strd lo");
     EQ(*(volatile uint32_t *)(p + 20), 7, "strd hi");
     __asm__ volatile("strh %0, [%1, #24]" :: "r"(0x12345678u + V0), "r"(p) : "memory");
-    EQ(*(volatile uint32_t *)(p + 24), 0x9B9A5678u, "strh");
+    EQ(*(volatile uint32_t *)(p + 24), E(0x9B9A5678u, 0x56789A9Bu), "strh");
 
     /* unaligned word and halfword accesses (SCTLR.A = 0) */
     __asm__ volatile("ldr %0, [%1, #1]" : "=r"(r) : "r"(p));
-    EQ(r, 0x84838281u, "unaligned ldr");
+    EQ(r, E(0x84838281u, 0x81828384u), "unaligned ldr");
     __asm__ volatile("ldrh %0, [%1, #3]" : "=r"(r) : "r"(p));
-    EQ(r, 0x8483, "unaligned ldrh");
+    EQ(r, E(0x8483, 0x8384), "unaligned ldrh");
     __asm__ volatile("str %0, [%1, #33]" :: "r"(0xDEADBEEFu + V0), "r"(p) : "memory");
-    EQ(*(volatile uint32_t *)(p + 32), 0xADBEEFA0u, "unaligned str (low)");
-    EQ(*(volatile uint8_t *)(p + 36), 0xDE, "unaligned str (high)");
+    EQ(*(volatile uint32_t *)(p + 32), E(0xADBEEFA0u, 0xA0DEADBEu), "unaligned str (low)");
+    EQ(*(volatile uint8_t *)(p + 36), E(0xDE, 0xEF), "unaligned str (high)");
 
     /* block transfers */
     static uint32_t words[8];
@@ -499,11 +522,11 @@ static void t_exclusive(void)
                      "mov %0, r4\n\tmov %1, r5"
                      : "=&r"(lo), "=&r"(hi), "=&r"(st) : "r"(&d), "r"(V5), "r"(V7)
                      : "r4", "r5", "r6", "r7", "memory");
-    EQ(lo, 0x33334444u, "ldrexd lo");
-    EQ(hi, 0x11112222u, "ldrexd hi");
+    EQ(lo, E(0x33334444u, 0x11112222u), "ldrexd: Rt is the word at the address");
+    EQ(hi, E(0x11112222u, 0x33334444u), "ldrexd: Rt2 the next");
     EQ(st, 0, "strexd succeeds");
-    EQ((uint32_t)d, 5, "strexd lo");
-    EQ((uint32_t)(d >> 32), 7, "strexd hi");
+    EQ((uint32_t)d, E(5, 7), "strexd: Rt to the word at the address");
+    EQ((uint32_t)(d >> 32), E(7, 5), "strexd: Rt2 to the next");
     static volatile uint8_t bb = 9;
     __asm__ volatile("ldrexb %0, [%2]\n\tstrexb %1, %3, [%2]" : "=&r"(v), "=&r"(st) : "r"(&bb), "r"(V3) : "memory");
     EQ(v, 9, "ldrexb");
@@ -557,9 +580,9 @@ static void t_exceptions(void)
     uint32_t at;
     trap_n = 0;
 #ifdef __thumb__
-    __asm__ volatile("adr %0, 1f\n1: .short 0xde00" : "=r"(at) :: "memory");   /* udf #0 */
+    __asm__ volatile("adr %0, 1f\n1: .inst.n 0xde00" : "=r"(at) :: "memory");  /* udf #0 */
 #else
-    __asm__ volatile("adr %0, 1f\n1: .word 0xe7f000f0" : "=r"(at) :: "memory");
+    __asm__ volatile("adr %0, 1f\n1: .inst 0xe7f000f0" : "=r"(at) :: "memory");  /* udf #0 */
 #endif
     EQ(trap_n, 1, "undefined trapped");
     EQ(last_kind, 1, "undefined vector");
@@ -619,10 +642,10 @@ static void t_exceptions(void)
 
 static void gic_init(void)
 {
-    REG32(GICD + 0x000) = 1;                          /* distributor on */
-    REG32(GICD + 0x100) = (1u << 30) | (1u << 1);     /* PPI 30 (timer), SGI 1 */
-    REG32(GICC + 0x004) = 0xF0;                       /* priority mask */
-    REG32(GICC + 0x000) = 1;                          /* CPU interface on */
+    GIC_W(GICD + 0x000, 1);                           /* distributor on */
+    GIC_W(GICD + 0x100, (1u << 30) | (1u << 1));      /* PPI 30 (timer), SGI 1 */
+    GIC_W(GICC + 0x004, 0xF0);                        /* priority mask */
+    GIC_W(GICC + 0x000, 1);                           /* CPU interface on */
 }
 
 static void t_timer_irq(void)
@@ -643,7 +666,7 @@ static void t_timer_irq(void)
         __asm__ volatile("wfi");
     __asm__ volatile("cpsid i");
     EQ(timer_ticks, 1, "timer interrupt through the GIC");
-    EQ(REG32(GICC + 0x18), 1023, "nothing pending after EOI");
+    EQ(GIC_R(GICC + 0x18), 1023, "nothing pending after EOI");
 
     /* masked: the interrupt is held until CPSR.I clears */
     mcr(0, 14, 2, 0, 50);
@@ -660,7 +683,7 @@ static void t_timer_irq(void)
 static void t_sgi(void)
 {
     sgi_n = 0;
-    REG32(GICD + 0xF00) = (2u << 24) | 1;             /* SGI 1 to this CPU */
+    GIC_W(GICD + 0xF00, (2u << 24) | 1);              /* SGI 1 to this CPU */
     EQ(sgi_n, 0, "SGI held while masked");
     __asm__ volatile("cpsie i\n\tnop\n\tnop\n\tcpsid i");
     EQ(sgi_n, 1, "SGI taken");
@@ -704,6 +727,8 @@ static void tlb_flush(void) { dsb(); mcr(0, 8, 7, 0, 0); mcr(0, 7, 5, 0, 0); dsb
 
 static uint32_t ld(uint32_t a) { return *(volatile uint32_t *)(uintptr_t)a; }
 static void st(uint32_t a, uint32_t v) { *(volatile uint32_t *)(uintptr_t)a = v; }
+/* An ARM instruction written as data: code is little-endian in either byte order (BE8). */
+static void st_insn(uint32_t a, uint32_t insn) { st(a, IS_BE ? __builtin_bswap32(insn) : insn); }
 
 static void expect_dabt(uint32_t fs, uint32_t far, const char *what)
 {
@@ -732,9 +757,9 @@ static void t_mmu(void)
     st(0x00900000u, 0x1234);
     st(0x00901000u, 0x5678);
     /* code: mov r0, #42 / bx lr at PA 0x00A00000; mov r0, #43 / bx lr at 0x00B00000 */
-    st(0x00A00000u, 0xE3A0002Au); st(0x00A00004u, 0xE12FFF1Eu);
-    st(0x00B00000u, 0xE3A0002Bu); st(0x00B00004u, 0xE12FFF1Eu);
-    st(0x00903000u, 0xE3A0002Cu); st(0x00903004u, 0xE12FFF1Eu);
+    st_insn(0x00A00000u, 0xE3A0002Au); st_insn(0x00A00004u, 0xE12FFF1Eu);
+    st_insn(0x00B00000u, 0xE3A0002Bu); st_insn(0x00B00004u, 0xE12FFF1Eu);
+    st_insn(0x00903000u, 0xE3A0002Cu); st_insn(0x00903004u, 0xE12FFF1Eu);
 
     mcr(0, 2, 0, 0, (uint32_t)l1);                    /* TTBR0 */
     mcr(0, 2, 0, 2, 0);                               /* TTBCR: N = 0 */
@@ -821,6 +846,38 @@ static void t_user(void)
     EQ(ld(0x80104000u), 0x99, "privileged read after return");
 }
 
+/* ---- byte order --------------------------------------------------------- */
+
+static void t_endian(void)
+{
+    EQ((cpsr() >> 9) & 1, IS_BE, "CPSR.E at reset");
+    EQ((mrc(0, 1, 0, 0) >> 25) & 1, IS_BE, "SCTLR.EE at reset");
+    static volatile uint32_t w = 0x11223344u;
+    static volatile uint16_t h = 0x5566u;
+    uint32_t r, rh, e;
+    /* the other byte order for a moment: the same bytes load swapped */
+    __asm__ volatile("setend " OTHER_END "\n\tldr %0, [%3]\n\tldrh %1, [%4]\n\tmrs %2, cpsr\n\t"
+                     "setend " NATIVE_END : "=&r"(r), "=&r"(rh), "=&r"(e)
+                     : "r"(&w), "r"(&h) : "memory");
+    EQ(r, 0x44332211u, "setend: word");
+    EQ(rh, 0x6655u, "setend: halfword");
+    EQ((e >> 9) & 1, !IS_BE, "setend: CPSR.E");
+    EQ(w, 0x11223344u, "back to the native order");
+
+    /* an exception taken in the other byte order: entered with E = SCTLR.EE, and the
+     * order comes back from SPSR */
+    trap_n = 0;
+    __asm__ volatile("setend " OTHER_END "\n\tsvc #7\n\tmrs %0, cpsr\n\tsetend " NATIVE_END
+                     : "=r"(e) :: "memory");
+    EQ(trap_n, 1, "svc taken");
+    EQ((last_handler_cpsr >> 9) & 1, IS_BE, "handler runs with E = SCTLR.EE");
+    EQ((last_spsr >> 9) & 1, !IS_BE, "SPSR.E holds the interrupted order");
+    EQ((e >> 9) & 1, !IS_BE, "exception return restores E");
+    __asm__ volatile("str %1, [%2]\n\tldr %0, [%2]" : "=&r"(r) : "r"(0xCAFEF00Du + V0), "r"(&w)
+                     : "memory");
+    EQ(r, 0xCAFEF00Du, "native order after the round trip");
+}
+
 /* ---- CP15 --------------------------------------------------------------- */
 
 static void t_cp15(void)
@@ -854,6 +911,7 @@ int main(void)
     run("mmu", t_mmu);
     run("user-mode", t_user);
     run("cp15", t_cp15);
+    run("endian", t_endian);
 
     puts_("result: ");
     puthex(n_pass);

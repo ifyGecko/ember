@@ -12,6 +12,10 @@
  * VFP/NEON and other coprocessors, Jazelle, SMC/HVC, banked-register MRS/MSR -
  * takes the Undefined Instruction exception.
  *
+ * Data accesses use the byte order CPSR.E selects (ARM_PRIV_BE in cpu->priv, so code
+ * lifted for one order is never run in the other); instructions are always fetched
+ * little-endian (BE8).
+ *
  * Conditional execution: the condition becomes a guard on every side effect of the
  * instruction (PUT, LD, ST, SYSWR, HELPER, TRAP, EXIT), so a block runs straight
  * through conditional code; an instruction that may branch ends the block with a
@@ -391,14 +395,14 @@ arm_lift_result arm_dp(arm_lift *L, unsigned op, bool s, unsigned rd, uam_ref a,
 
 static uam_ref load(arm_lift *L, unsigned size, unsigned flags, uam_ref addr)
 {
-    return uam_ld(L->b, size * 8, UAM_ACC_LE | flags, addr, L->guard);
+    return uam_ld(L->b, size * 8, L->endian | flags, addr, L->guard);
 }
 
 static void store(arm_lift *L, unsigned size, unsigned flags, uam_ref addr, uam_ref v)
 {
     if (size < 4)
         v = trunc_(L, v, size * 8);
-    uam_st(L->b, size * 8, UAM_ACC_LE | flags, addr, v, L->guard);
+    uam_st(L->b, size * 8, L->endian | flags, addr, v, L->guard);
 }
 
 /* The value a store of r15 writes (ARM: pc+8; Thumb cannot store pc). */
@@ -535,10 +539,11 @@ arm_lift_result arm_stm(arm_lift *L, unsigned rn, uint32_t list, bool inc, bool 
 arm_lift_result arm_ldrex(arm_lift *L, unsigned rt, unsigned rt2, uam_ref addr, unsigned size)
 {
     unsigned fl = UAM_ACC_ALIGNED | UAM_ACC_X;
-    if (size == 8) {
+    if (size == 8) {   /* Rt is the word at addr: the low half in LE, the high half in BE */
         uam_ref v = load(L, 8, fl, addr);
-        arm_put(L, rt, lo32(L, v));
-        arm_put(L, rt2, hi32(L, v));
+        bool be = L->endian & UAM_ACC_BE;
+        arm_put(L, rt, be ? hi32(L, v) : lo32(L, v));
+        arm_put(L, rt2, be ? lo32(L, v) : hi32(L, v));
         return ARM_SEQ;
     }
     uam_ref v = load(L, size, fl, addr);
@@ -552,12 +557,15 @@ arm_lift_result arm_strex(arm_lift *L, unsigned rd, unsigned rt, unsigned rt2, u
                           unsigned size)
 {
     uam_ref v = arm_reg(L, rt);
-    if (size == 8)
-        v = bin64(L, UAM_OP_OR, ext64(L, v, false),
-                  bin64(L, UAM_OP_SHL, ext64(L, arm_reg(L, rt2), false), imm(L, 32)));
+    if (size == 8) {   /* Rt goes to the word at addr */
+        bool be = L->endian & UAM_ACC_BE;
+        uam_ref lo = be ? arm_reg(L, rt2) : v, hi = be ? v : arm_reg(L, rt2);
+        v = bin64(L, UAM_OP_OR, ext64(L, lo, false),
+                  bin64(L, UAM_OP_SHL, ext64(L, hi, false), imm(L, 32)));
+    }
     else if (size < 4)
         v = trunc_(L, v, size * 8);
-    uam_ref ok = uam_stx(L->b, size * 8, UAM_ACC_LE | UAM_ACC_ALIGNED, addr, v, L->guard);
+    uam_ref ok = uam_stx(L->b, size * 8, L->endian | UAM_ACC_ALIGNED, addr, v, L->guard);
     arm_put(L, rd, bin(L, UAM_OP_XOR, z32(L, ok), imm(L, 1)));   /* 0 = success */
     return ARM_SEQ;
 }
@@ -978,6 +986,14 @@ arm_lift_result arm_hint(arm_lift *L, unsigned op)
     return ARM_DONE;
 }
 
+/* SETEND: the data byte order changes, and with it the code lifted after it. */
+arm_lift_result arm_setend(arm_lift *L, bool be)
+{
+    uam_syswr(L->b, 32, ARM_SR_SETEND, imm(L, be ? 1 : 0), L->guard);
+    L->end = true;
+    return ARM_SEQ;
+}
+
 arm_lift_result arm_barrier(arm_lift *L, unsigned op)
 {
     switch (op) {
@@ -1099,7 +1115,7 @@ static arm_lift_result a32_sync(arm_lift *L, uint32_t i)
         uam_ref v = arm_reg(L, rt);
         if (sz == 8)
             v = trunc_(L, v, 8);
-        uam_ref old = uam_amo(L->b, sz, UAM_ACC_LE | (sz == 32 ? UAM_ACC_ALIGNED : 0),
+        uam_ref old = uam_amo(L->b, sz, L->endian | (sz == 32 ? UAM_ACC_ALIGNED : 0),
                               UAM_AMO_XCHG, addr, v, L->guard);
         if (sz == 8)
             old = uam_unop(L->b, UAM_OP_ZEXT, 32, old);
@@ -1364,11 +1380,8 @@ static arm_lift_result a32_uncond(arm_lift *L, uint32_t i)
 {
     if ((i & 0x0FF10020u) == 0x01000000u)           /* CPS */
         return arm_cps(L, BITS(i, 19, 18), BIT(i, 17), BITS(i, 8, 6), BITS(i, 4, 0));
-    if ((i & 0x0FFF00F0u) == 0x01010000u) {          /* SETEND */
-        if (BIT(i, 9))
-            return arm_undef(L);                     /* big-endian data is not supported */
-        return ARM_SEQ;
-    }
+    if ((i & 0x0FFFFDFFu) == 0x01010000u)           /* SETEND */
+        return arm_setend(L, BIT(i, 9));
     if ((i & 0x0FFFFF00u) == 0x057FF000u) {          /* CLREX DSB DMB ISB */
         switch (BITS(i, 7, 4)) {
         case 1: return arm_barrier(L, 1);
@@ -1489,7 +1502,8 @@ static void fall_through(arm_lift *L, uint32_t pc, uint8_t it)
 uam_status arm_lift_block(uam_lift_ctx *lc)
 {
     arm_lift L = { .lc = lc, .b = lc->b, .thumb = lc->pc & 1,
-                   .user = lc->cpu->priv & ARM_PRIV_USER };
+                   .user = lc->cpu->priv & ARM_PRIV_USER,
+                   .endian = (lc->cpu->priv & ARM_PRIV_BE) ? UAM_ACC_BE : UAM_ACC_LE };
     uint32_t tbit = L.thumb ? 1u : 0u;
     uint32_t pc = (uint32_t)lc->pc & ~1u;
     uint8_t it = (uint8_t)ARM_PRIV_IT(lc->cpu->priv);

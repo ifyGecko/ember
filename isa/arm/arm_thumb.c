@@ -141,6 +141,8 @@ static arm_lift_result t16_misc(arm_lift *L, uint32_t hw)
         uint32_t list = BITS(hw, 7, 0) | (BIT(hw, 8) << ARM_LR);
         return arm_stm(L, ARM_SP, list, false, true, true, false);
     }
+    if (op == 0x32 && BIT(hw, 4) && !(hw & 7))      /* SETEND */
+        return arm_setend(L, BIT(hw, 3));
     if (op == 0x33) {                               /* CPS */
         if (L->user)
             return ARM_SEQ;
@@ -425,7 +427,7 @@ static arm_lift_result t32_dual(arm_lift *L, uint32_t i)
             uam_ref idx = arm_reg(L, BITS(i, 3, 0));
             if (h)
                 idx = arm_bin(L, UAM_OP_SHL, idx, imm(L, 1));
-            uam_ref v = uam_ld(L->b, h ? 16 : 8, UAM_ACC_LE, add(L, arm_reg(L, rn), idx), L->guard);
+            uam_ref v = uam_ld(L->b, h ? 16 : 8, L->endian, add(L, arm_reg(L, rn), idx), L->guard);
             v = uam_unop(L->b, UAM_OP_ZEXT, 32, v);
             uam_ref t = add(L, imm(L, (L->pc + 4) | 1u), arm_bin(L, UAM_OP_SHL, v, imm(L, 1)));
             return arm_branch(L, t, UAM_EXIT_JUMP);
