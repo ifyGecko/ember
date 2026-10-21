@@ -386,6 +386,13 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
         uam_bus_mark_code(cpu->bus, blk->page[i]);
         blk->page_gen[i] = uam_bus_page_gen(cpu->bus, blk->page[i]);
     }
+    /* A page that just became a code page must lose its JIT data-TLB write entry before
+     * this block runs, or a store to it (the block's own page, say) takes the inline
+     * path past the code-write hook: no invalidation, and the block is not ended. */
+    if (x->jit && cpu->bus->direct_gen != x->seen_dgen) {
+        uam_cpu_dtlb_flush(cpu);
+        x->seen_dgen = cpu->bus->direct_gen;
+    }
 
     uam_print_ctx pc_ctx = print_ctx(isa);
     if (x->verify) {
