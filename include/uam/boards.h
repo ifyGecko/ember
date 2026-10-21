@@ -14,6 +14,7 @@ extern const uam_board uam_board_mips_ref;    /* "mips-ref": MIPS32 big-endian *
 extern const uam_board uam_board_mipsel_ref;  /* "mipsel-ref": MIPS32 little-endian */
 extern const uam_board uam_board_arm_ref;     /* "arm-ref": ARMv7-A (ARM + Thumb-2) */
 extern const uam_board uam_board_armeb_ref;   /* "armeb-ref": ARMv7-A big-endian (BE8) */
+extern const uam_board uam_board_x86_64_ref;  /* "x86_64-ref": x86-64 (real-mode bring-up) */
 
 /* Register every stock board with uam_board_register(). */
 void uam_boards_register_stock(void);

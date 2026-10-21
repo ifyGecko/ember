@@ -2,11 +2,14 @@
 #
 #   make                 build $(BUILD)/uam-run and the libraries
 #   make lib             only the libraries (for out-of-tree projects)
-#   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE, ARM and Thumb LE/BE8),
+#   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE, ARM and Thumb LE/BE8,
+#                        x86-64 real/protected/long mode),
 #                        external-board example,
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
 #   make suzzer          clone suzzer into ./suzzer (ignored by git) for the suzzer integration
+#   make ovmf-check      boot an installed OVMF (OVMF_DIR, default /usr/share/OVMF) to the
+#                        UEFI shell on x86_64-ref (skipped if none is installed)
 #   make net-check       boot the network test on rv32-ref against a real tap and tun interface
 #                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
@@ -35,6 +38,8 @@ CC      ?= cc
 AR      ?= ar
 CFLAGS  ?= -O2 -g    # tunable from the command line, e.g. CFLAGS="-O1 -fsanitize=address"
 LDFLAGS ?=
+LDLIBS  := -lm      # the x87 model uses long-double libm functions
+OVMF_DIR ?= /usr/share/OVMF
 PREFIX  ?= /usr/local
 DESTDIR ?=
 # Required flags, always applied.
@@ -85,10 +90,16 @@ MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c
+X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
+               isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
+               isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
+               isa/x86/x86_gdb.c isa/x86/x86_system.c
 DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/sifive_test.c \
                devices/unknown_mmio.c devices/unimp.c devices/virtio_net.c devices/mmio_stub.c \
-               devices/gic.c
-BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/stock.c boards/mmio_rules.c
+               devices/gic.c devices/i8259.c devices/i8254.c devices/mc146818.c devices/lapic.c \
+               devices/ioapic.c devices/pci.c devices/q35_mch.c devices/ich9_lpc.c \
+               devices/cfi_flash.c devices/pc_misc.c
+BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
@@ -97,13 +108,13 @@ HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/h
                src/debug/gdbstub.c src/runner/runner.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
-LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
+LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
 obj = $(1:%.c=$(BUILD)/obj/%.o)
 LIB_OBJ  := $(call obj,$(LIB_SRC))
 
 LIB        := $(BUILD)/libuam.a
 MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mips.a \
-               $(BUILD)/libuam-arm.a \
+               $(BUILD)/libuam-arm.a $(BUILD)/libuam-x86.a \
                $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
                $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
@@ -123,11 +134,13 @@ FW_ARM    := $(BUILD)/firmware-arm/selftest-arm.elf
 FW_THUMB  := $(BUILD)/firmware-arm/selftest-thumb.elf
 FW_ARM_BE := $(BUILD)/firmware-arm/selftest-arm-be.elf
 FW_THUMB_BE := $(BUILD)/firmware-arm/selftest-thumb-be.elf
+FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
+        firmware-x86 x86-test \
         example-test \
-        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check install clean FORCE
+        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check ovmf-check install clean FORCE
 
 all: $(RUN) lib
 
@@ -162,6 +175,7 @@ $(BUILD)/libuam-core.a:    $(call obj,$(CORE_ALL))
 $(BUILD)/libuam-riscv.a:   $(call obj,$(RISCV_SRC))
 $(BUILD)/libuam-mips.a:    $(call obj,$(MIPS_SRC))
 $(BUILD)/libuam-arm.a:     $(call obj,$(ARM_SRC))
+$(BUILD)/libuam-x86.a:     $(call obj,$(X86_SRC))
 $(BUILD)/libuam-devices.a: $(call obj,$(DEV_SRC))
 $(BUILD)/libuam-boards.a:  $(call obj,$(BOARD_SRC))
 $(BUILD)/libuam-fuzz.a:    $(call obj,$(FUZZ_SRC))
@@ -172,7 +186,7 @@ $(MODULE_LIBS):
 
 # pkg-config file for prefix $(1), written to $(2).
 define write_pc
-	printf 'prefix=%s\nincludedir=$${prefix}/include\nlibdir=$${prefix}/lib\n\nName: uam\nDescription: UAM firmware emulator library\nVersion: 0.2\nCflags: -I$${includedir}\nLibs: -L$${libdir} -luam\n' '$(1)' > $(2)
+	printf 'prefix=%s\nincludedir=$${prefix}/include\nlibdir=$${prefix}/lib\n\nName: uam\nDescription: UAM firmware emulator library\nVersion: 0.2\nCflags: -I$${includedir}\nLibs: -L$${libdir} -luam -lm\n' '$(1)' > $(2)
 endef
 
 $(BUILD)/uam.pc: Makefile
@@ -180,31 +194,31 @@ $(BUILD)/uam.pc: Makefile
 	$(call write_pc,$(PREFIX),$@)
 
 $(RUN): $(BUILD)/obj/tools/uam-run.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_IR): $(BUILD)/obj/tests/unit/test_ir.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_CORE): $(BUILD)/obj/tests/unit/test_core.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_HOST): $(BUILD)/obj/tests/unit/test_host.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_SNAP): $(BUILD)/obj/tests/unit/test_snapshot.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_JIT): $(BUILD)/obj/tests/unit/test_jit.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_MMIO): $(BUILD)/obj/tests/unit/test_mmio.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_COV): $(BUILD)/obj/tests/unit/test_cov.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_FUZZ): $(BUILD)/obj/tests/unit/test_fuzz.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
@@ -212,7 +226,7 @@ $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.
 	$(CC) $(UAM_COMPILE) -Ifuzz/suzzer -I$(SUZZER_DIR)/src -MMD -MP -c $< -o $@
 
 $(TEST_SUZZER): $(BUILD)/obj/tests/unit/test_suzzer.o $(LIB)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # suzzer's format header must build on its own with ember's strict flags.
 $(BUILD)/suzzer-header-check.stamp: $(SUZZER_DIR)/src/lcv_formats.h $(BUILD)/suzzer.cfg
@@ -239,6 +253,9 @@ firmware-mips:
 
 firmware-arm:
 	$(MAKE) -C tests/firmware-arm OUT=$(abspath $(BUILD))/firmware-arm
+
+firmware-x86:
+	$(MAKE) -C tests/firmware-x86 OUT=$(abspath $(BUILD))/firmware-x86
 
 $(FIRMWARE): firmware
 
@@ -270,6 +287,11 @@ arm-test: $(RUN) firmware-arm
 	$(RUN) -b arm-ref --stats $(FW_THUMB) < /dev/null
 	$(RUN) -b armeb-ref --stats $(FW_ARM_BE) < /dev/null
 	$(RUN) -b armeb-ref --stats $(FW_THUMB_BE) < /dev/null
+
+# A flat image entered in real mode at 0; interpreter and JIT.
+x86-test: $(RUN) firmware-x86
+	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --stats $(FW_X86) < /dev/null
+	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit --stats $(FW_X86) < /dev/null
 
 # The out-of-tree example builds against `make lib` output only, as an external project would.
 example-test: lib firmware-mips
@@ -340,10 +362,14 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test example-test snapshot-test cov-test fuzz-test suzzer-test
+test: unit-test firmware-test mips-test arm-test x86-test example-test snapshot-test cov-test fuzz-test suzzer-test
 
 net-check: $(RUN) firmware
 	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both
+
+# Boot an installed OVMF to the UEFI shell on x86_64-ref (skipped without one).
+ovmf-check: $(RUN)
+	sh tests/uefi/ovmf-check.sh $(RUN) $(OVMF_DIR)
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include

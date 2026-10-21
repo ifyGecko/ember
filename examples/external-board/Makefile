@@ -20,7 +20,7 @@ CFLAGS := -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -O2 -g $(UAM_CFLAGS)
 
 $(OUT)/ext-run: ext_board.c main.c $(filter %.a,$(UAM_LIBS))
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -o $@ ext_board.c main.c $(UAM_LIBS)
+	$(CC) $(CFLAGS) -o $@ ext_board.c main.c $(UAM_LIBS) -lm
 
 .PHONY: clean
 clean:

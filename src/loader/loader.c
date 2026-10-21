@@ -186,3 +186,8 @@ uam_status uam_load_image(uam_bus *bus, uam_cpu *cpu, const char *path, uint64_t
         return uam_load_elf(bus, cpu, path, info);
     return uam_load_raw(bus, cpu, path, raw_base, info);
 }
+
+uam_status uam_load_file(const char *path, uint8_t **data, size_t *len)
+{
+    return read_file(path, data, len);
+}
