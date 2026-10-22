@@ -456,8 +456,32 @@ all are ISA-neutral and unused by ISAs that do not need them.
   before that instruction; PC hooks and debugger breakpoints use it to run at a
   precise instruction boundary without per-instruction checks.
 
-The ISA also declares `default_endian`, the byte order of instruction fetch,
-so the executor reads instructions in the guest's order (MIPS is bi-endian).
+The ISA also declares `default_endian`, the CPU's byte order, so the executor
+reads instructions in the guest's order (MIPS is bi-endian), and optionally
+`fetch_endian` when code and data differ (ARM BE8: little-endian instructions,
+big-endian data; the lifter puts the data order on each memory op).
+
+## 10b. Two instruction sets and IT blocks (ARMv7)
+
+ARM needed no new IR; these are conventions of its lifter (`isa/arm`).
+
+- **The instruction set is pc bit 0.** Thumb code runs at odd pcs (the address
+  plus one, as ARM's interworking branches and ELF symbols already write it),
+  ARM code at word-aligned pcs. Block and `IMARK` pcs carry the bit, so blocks
+  of either set are cached and resumed apart, and a branch that may switch sets
+  (`BX`, `LDR pc`, `POP {pc}`) is an ordinary computed `EXIT` to
+  `SELECT (addr & 1), addr, addr & ~3`. Code is fetched at the even address.
+- **Conditional execution is guards.** An instruction's condition becomes the
+  guard of each of its side effects; a conditional branch is a guarded `EXIT`
+  and the block falls through after it. Flags live in the register file, one
+  byte each, so a condition is one or two pure ops.
+- **IT blocks are continuations.** The instructions an IT instruction covers are
+  lifted with `UAM_IMARK_CONT` under their own conditions, so no interrupt is
+  taken inside an IT block, and a fault in one reports the IT instruction as
+  `parent_pc` (from which the ISA recomputes the IT state for SPSR). When a block
+  must stop inside an IT block, or an exception returns into one, the remaining
+  IT state goes into `cpu->priv`, which tags translated code: the next block is
+  lifted for it, one instruction at a time, until the IT block ends.
 
 ## 11. Opcode numbering and extension profiles
 

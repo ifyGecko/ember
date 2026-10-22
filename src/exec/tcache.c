@@ -13,6 +13,7 @@ struct uam_tc_entry {
     uam_block           *blk;
     unsigned             priv;       /* privilege level the block was translated at */
     bool                 mapped;     /* fetched through a non-fixed translation */
+    bool                 remappable; /* may be revalidated through tc->remap */
     uint32_t             xlate_gen;  /* cpu->xlate_gen at translation (if mapped) */
     struct uam_tc_entry *next;
 };
@@ -56,15 +57,22 @@ void uam_tcache_fini(uam_tcache *tc)
     tc->buckets = NULL;
 }
 
-static bool still_valid(uam_tcache *tc, const struct uam_tc_entry *e, unsigned priv,
+static bool still_valid(uam_tcache *tc, struct uam_tc_entry *e, unsigned priv,
                         uint32_t xlate_gen)
 {
     const uam_block *blk = e->blk;
-    if (e->priv != priv || (e->mapped && e->xlate_gen != xlate_gen))
+    if (e->priv != priv)
         return false;
     for (uint32_t i = 0; i < blk->n_pages; i++)
         if (uam_bus_page_gen(tc->bus, blk->page[i]) != blk->page_gen[i])
             return false;
+    if (e->mapped && e->xlate_gen != xlate_gen) {
+        /* The mappings may have changed: keep the block if its pages still
+         * translate to where it was fetched from. */
+        if (!e->remappable || !tc->remap || !tc->remap(tc->remap_ctx, blk))
+            return false;
+        e->xlate_gen = xlate_gen;
+    }
     return true;
 }
 
@@ -92,6 +100,12 @@ uam_block *uam_tcache_lookup(uam_tcache *tc, uint64_t pc, unsigned priv, uint32_
 uam_status uam_tcache_insert(uam_tcache *tc, uam_block *blk, unsigned priv, bool mapped,
                              uint32_t xlate_gen)
 {
+    return uam_tcache_insert_ex(tc, blk, priv, mapped, xlate_gen, true);
+}
+
+uam_status uam_tcache_insert_ex(uam_tcache *tc, uam_block *blk, unsigned priv, bool mapped,
+                                uint32_t xlate_gen, bool remappable)
+{
     if (tc->n_blocks >= TC_MAX_BLOCKS)
         uam_tcache_flush(tc);
     struct uam_tc_entry **head = &tc->buckets[hash_pc(blk->guest_pc, tc->n_buckets)];
@@ -102,6 +116,7 @@ uam_status uam_tcache_insert(uam_tcache *tc, uam_block *blk, unsigned priv, bool
             e->blk = blk;
             e->priv = priv;
             e->mapped = mapped;
+            e->remappable = remappable;
             e->xlate_gen = xlate_gen;
             return UAM_OK;
         }
@@ -113,6 +128,7 @@ uam_status uam_tcache_insert(uam_tcache *tc, uam_block *blk, unsigned priv, bool
     e->blk = blk;
     e->priv = priv;
     e->mapped = mapped;
+    e->remappable = remappable;
     e->xlate_gen = xlate_gen;
     e->next = *head;
     *head = e;

@@ -600,7 +600,7 @@ static void t_cp0(void)
     EQ((cfg >> 10) & 7, 1, "config.ar = release 2");
     EQ((cfg >> 7) & 7, 1, "config.mt = tlb");
     EQ((cfg1 >> 25) & 0x3F, 15, "config1.mmusize");
-    EQ(mfc0(15, 0) & 0x00FFFF00u, 0x00019300u, "prid 24K");
+    EQ(mfc0(15, 0) & 0x00FFFF00u, 0x00FF0000u, "prid reference");
 
     mtc0(12, 0, 0x10000000u);           /* CU0 */
     EHB();

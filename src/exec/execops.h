@@ -99,4 +99,48 @@ static inline uam_status uam_execops_store_x(uam_cpu *cpu, uint64_t addr, uint64
     return uam_execops_store(cpu, addr, val, flags, size, xfault);
 }
 
+/* The new value an AMO stores, given the old memory value and the operand. */
+static inline uint64_t uam_execops_amo_apply(uam_amo_op op, uint64_t old, uint64_t v, unsigned W)
+{
+    int64_t so = uam_sext(old, W), sv = uam_sext(v, W);
+    switch (op) {
+    case UAM_AMO_XCHG: return v;
+    case UAM_AMO_ADD:  return (old + v) & uam_mask(W);
+    case UAM_AMO_AND:  return old & v;
+    case UAM_AMO_OR:   return old | v;
+    case UAM_AMO_XOR:  return old ^ v;
+    case UAM_AMO_SMIN: return so < sv ? old : v;
+    case UAM_AMO_SMAX: return so > sv ? old : v;
+    case UAM_AMO_UMIN: return old < v ? old : v;
+    case UAM_AMO_UMAX: return old > v ? old : v;
+    case UAM_AMO__COUNT: break;
+    }
+    return v;
+}
+
+/*
+ * AMO / CAS (section 6.4): read-modify-write of one location. For an AMO, b is the
+ * operand and sub the operation; for a CAS (cas = true), b is the expected value and
+ * c the new one, written only on a match. *old receives the memory value. A fault on
+ * either half is reported as a store fault, as architectures do for atomics.
+ */
+static inline uam_status uam_execops_rmw(uam_cpu *cpu, bool cas, uam_amo_op sub, uint64_t addr,
+                                         uint64_t b, uint64_t c, unsigned flags, unsigned W,
+                                         uint64_t *old, uint32_t *xfault)
+{
+    const unsigned size = W / 8;
+    uint64_t pa;
+    *old = 0;
+    uam_status st = uam_execops_xlate(cpu, addr, UAM_XLATE_STORE, flags, size, &pa, xfault);
+    if (st == UAM_OK)
+        st = uam_bus_read(cpu->bus, pa, size, flags, old);
+    if (st != UAM_OK)
+        return st;
+    if (cas && *old != b)
+        return UAM_OK;
+    uint64_t nv = cas ? c : uam_execops_amo_apply(sub, *old, b, W);
+    *xfault = 0;
+    return uam_bus_write(cpu->bus, pa, size, flags, nv);
+}
+
 #endif /* UAM_EXECOPS_H */

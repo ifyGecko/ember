@@ -19,7 +19,7 @@
  * TLB-invalid exception, while other mapped addresses raise a TLB refill.
  *
  * The CPU identity (PRId, Config*, TLB size, writable Status bits) comes from
- * a uam_mips_config chosen by the board (default: 24Kc).
+ * a uam_mips_config chosen by the board (default: uam_mips_ref).
  */
 #include <stdlib.h>
 #include <string.h>
@@ -48,9 +48,9 @@ static const uam_regdesc mips_regs[] = {
 /* CPU models                                                                */
 /* ------------------------------------------------------------------------ */
 
-const uam_mips_config uam_mips_24kc = {
-    .name        = "24Kc",
-    .prid        = 0x00019300u,  /* MIPS Technologies, 24K, rev 0 */
+const uam_mips_config uam_mips_ref = {
+    .name        = "mips32r2-ref",
+    .prid        = 0x00FF0000u,  /* company 0xFF (unassigned), processor 0, rev 0 */
     /* M=1, AR=1 (release 2), MT=1 (standard TLB), K0=2 (uncached) */
     .config0     = (1u << 31) | (1u << 10) | (1u << 7) | 0x2u,
     /* M=1, IL=3 IA=1 (I$ 32B lines, 2-way), DL=3 DA=1, EP=1 (EJTAG). No FPU,
@@ -517,7 +517,9 @@ static uam_status mips_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     case CP0_BADVADDR: *val = s->c.badvaddr; break;
     case CP0_COUNT:    *val = mips_count_now(cpu); break;
     case CP0_COMPARE:  *val = s->c.compare; break;
-    case CP0_EBASE:    *val = s->c.ebase | (1u << 31); break; /* bit31 reads 1 */
+    case CP0_EBASE:    /* bit 31 reads 1; CPUNum (bits 9..0) is the processor number */
+        *val = s->c.ebase | (1u << 31) | (cpu->hartid & 0x3FFu);
+        break;
     case CP0_INTCTL:   *val = s->c.intctl; break;
     case CP0_SRSCTL:   *val = 0; break;
     case CP0_PRID:     *val = s->cfg.prid; break;
@@ -641,7 +643,7 @@ static uam_status mips_init(uam_cpu *cpu)
     if (!s)
         return UAM_ERR_NOMEM;
     cpu->isa_state = s;
-    s->cfg = uam_mips_24kc;
+    s->cfg = uam_mips_ref;
     uam_timer_init(&s->timer, timer_fire, cpu);
     return UAM_OK;
 }

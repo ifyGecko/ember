@@ -9,6 +9,8 @@
  * rewrites itself (on a page other blocks link into), interrupts it disables and
  * re-enables (DI/EI) while a CP0 timer fires, and an MMIO device. Between runs the
  * host rewrites code, adds and removes PC hooks, and takes and restores snapshots.
+ * A last check stores into the page of the block being run just after that page
+ * became a code page.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -427,11 +429,59 @@ static void test_stop_in_chain(void)
           (unsigned long long)at[0], (unsigned long long)at[1], (unsigned long long)at[2]);
 }
 
+/*
+ * Self-modifying code on a page that has just become a code page again. A store to a
+ * code page takes the slow path, which drops the page's translations and lets the
+ * page into the JIT's data-TLB for writes. The next block on that page makes it a code
+ * page once more; a store in that block must still take the slow path, so that the
+ * block ends and the instruction it rewrote runs as rewritten, as on the interpreter.
+ */
+static uam_hook_action halt_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)cpu; (void)pc;
+    uam_exec_stop(ctx, 0);
+    return UAM_HOOK_CONTINUE;
+}
+
+static void test_store_to_new_code_page(void)
+{
+    const uint32_t p = 0x80002000u;
+    const uint32_t patch = ADDIU(T1, ZERO, 3);
+    const uint32_t prog[] = {
+        (0x02u << 26) | (((p + 8) >> 2) & 0x3FFFFFFu), 0,  /* p+0  j p+8: p is a code page */
+        LUI(T0, 0x8000), ORI(T0, T0, 0x2000),        /* p+8  t0 = p */
+        SW(T0, 0x800, T0),                           /* p+16 data store into this code page */
+        LUI(T2, (uint16_t)(patch >> 16)),            /* p+20 a new block on the same page */
+        ORI(T2, T2, (uint16_t)patch),
+        SW(T2, 40, T0),                              /* p+28 rewrite p+40 */
+        ADDIU(T1, ZERO, 1),
+        ADDIU(T1, ZERO, 1),
+        ADDIU(T1, ZERO, 2),                          /* p+40 becomes t1 = 3 */
+        BEQ(ZERO, ZERO, p + 44, p + 44), 0,          /* p+44 */
+    };
+    for (mode md = INTERP; md <= JIT_CHAIN; md++) {
+        uam_machine m;
+        CHECK(uam_machine_init(&m, &uam_isa_mips32be) == UAM_OK, "machine init");
+        CHECK(uam_bus_map_ram(&m.bus, "ram", 0, 1 << 20) == UAM_OK, "map ram");
+        put_prog(&m, p & 0x1FFFFFFFu, prog, UAM_ARRAY_LEN(prog));
+        uam_machine_reset(&m, p);
+        if (md != INTERP)
+            CHECK(uam_exec_enable_jit(&m.exec), "jit");
+        m.exec.chain = md == JIT_CHAIN;
+        uam_exec_add_pc_hook(&m.exec, p + 44, halt_hook, &m.exec);
+        uam_exec_run(&m.exec, 1000);
+        CHECK(gpr(&m, T1) == 3, "%s: the rewritten instruction ran (t1 = %u)", mode_name[md],
+              gpr(&m, T1));
+        uam_machine_fini(&m);
+    }
+}
+
 int main(void)
 {
     test_equivalence();
     test_trace_disables();
     test_stop_in_chain();
+    test_store_to_new_code_page();
     printf("test_jit: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

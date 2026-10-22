@@ -29,7 +29,7 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 
 n=$(python3 "$here/mk_lists.py" "$fw" "$tmp")
-panic=0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')
+panic=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
 
 # 1. A plain run: every site is where the list says.
 rc=0

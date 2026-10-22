@@ -6,8 +6,9 @@
  *     (saturation at 255, prev chaining, no effect without coverage state);
  *   - passes: a no-op pass changes nothing, a counting pass sees every IMARK, a
  *     failing or invalid pass stops the run with an error;
- *   - coverage on a small program with a known loop, on RV32, MIPS32 BE and MIPS32
- *     LE, under the interpreter, the JIT and the JIT without chaining: the expected
+ *   - coverage on a small program with a known loop, on RV32, MIPS32 BE and LE and
+ *     ARMv7 (ARM and Thumb-2, Thumb-2 BE8 too), under the interpreter, the JIT and the JIT without
+ *     chaining: the expected
  *     hit counts and edge buckets, byte-identical maps across backends, saturation,
  *     block mode, delay-slot and duplicate-site rejection, and runs with coverage
  *     off (or on) indistinguishable from runs without it;
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "uam/isa/arm.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/riscv.h"
 #include "uam/machine.h"
@@ -286,6 +288,46 @@ static prog mips_prog(int n, bool be)
     p.site[2] = p.base + 12;
     p.site[3] = p.base + 20;
     p.delay = p.base + 16;
+    p.done = p.base + 24;
+    return p;
+}
+
+/* ARMv7: ARM state, or Thumb-2 state (32-bit encodings only, so the program is a list of
+ * words; its pcs carry bit 0, as Thumb code addresses do in ember). */
+#define T32(hw1, hw2) ((uint32_t)(hw1) | (uint32_t)(hw2) << 16)   /* first halfword lowest */
+
+static prog arm_prog(int n, bool thumb, bool be8)
+{
+    enum { R4 = 4 };
+    const uint32_t t = thumb ? 1 : 0;
+    /* BE8 code is little-endian like the rest (.be is the order the words are stored in) */
+    prog p = { .name = be8 ? (thumb ? "thumb2-be8" : "armv7-be8") : (thumb ? "thumb2" : "armv7"),
+               .isa = be8 ? &uam_isa_armeb : &uam_isa_arm, .base = 0x1000 | t,
+               .phys = 0x1000, .be = false, .xreg = R4 * 4 };
+    if (thumb) {
+        p.illegal = T32(0xF7F0, 0xA000);                                   /* udf.w #0 */
+        p.w[0] = T32(0xF04F, 0x0400);                                      /* mov.w r4, #0 */
+        p.w[1] = T32(0xF240 | ((n >> 12) & 0xF), ((n >> 8) & 7) << 12 | 0x500 | (n & 0xFF));
+        p.w[2] = T32(0xF104, 0x0401);                                      /* add.w r4, r4, #1 */
+        p.w[3] = T32(0xEBB4, 0x0F05);                                      /* cmp.w r4, r5 */
+        p.w[4] = T32(0xF47F, 0xAFFA);                                      /* bne.w base+8 */
+        p.w[5] = T32(0xF04F, 0x0607);                                      /* mov.w r6, #7 */
+        p.w[6] = T32(0xF7FF, 0xBFFE);                                      /* b.w . */
+    } else {
+        p.illegal = 0xE7F000F0u;                                           /* udf #0 */
+        p.w[0] = 0xE3A04000u;                                              /* mov r4, #0 */
+        p.w[1] = 0xE3005000u | ((uint32_t)n >> 12) << 16 | ((uint32_t)n & 0xFFF); /* movw r5, #n */
+        p.w[2] = 0xE2844001u;                                              /* add r4, r4, #1 */
+        p.w[3] = 0xE1540005u;                                              /* cmp r4, r5 */
+        p.w[4] = 0x1AFFFFFCu;                                              /* bne base+8 */
+        p.w[5] = 0xE3A06007u;                                              /* mov r6, #7 */
+        p.w[6] = 0xEAFFFFFEu;                                              /* b . */
+    }
+    p.n = 7;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 8;
+    p.site[2] = p.base + 12;
+    p.site[3] = p.base + 20;
     p.done = p.base + 24;
     return p;
 }
@@ -735,9 +777,13 @@ int main(void)
     test_ir_rules();
     test_ir_semantics();
 
-    const prog progs3[3] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false) };
-    const prog progs300[3] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false) };
-    for (int i = 0; i < 3; i++) {
+    const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
+                            arm_prog(3, false, false), arm_prog(3, true, false),
+                            arm_prog(3, true, true) };
+    const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
+                              arm_prog(300, false, false), arm_prog(300, true, false),
+                              arm_prog(300, true, true) };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);
         test_skip_repeat(&progs3[i]);

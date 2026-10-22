@@ -408,6 +408,185 @@ static void test_restore_loop(bool jit)
     uam_machine_fini(&m);
 }
 
+/*
+ * Two processors run one program: an LL/SC increment of a shared counter, each
+ * keeping a private sum (t5) of the values it obtained - which depends on how
+ * the two were interleaved - and storing each value into a page of its own.
+ */
+static void build_smp(uam_machine *m, bool jit)
+{
+    CHECK(uam_machine_init(m, &uam_isa_mips32be) == UAM_OK, "smp: machine init");
+    m->board_name = "snap-smp";
+    CHECK(uam_bus_map_ram(&m->bus, "ram", 0, RAM_SIZE) == UAM_OK, "smp: map ram");
+    CHECK(uam_machine_add_cpus(m, 1) == UAM_OK, "smp: second processor");
+    static const uint32_t prog[] = {
+        0x3C098010u, /* lui  t1, 0x8010         shared counter at 0x80100000 */
+        0x3C0A000Fu, /* lui  t2, 0x000f */
+        0x354AF000u, /* ori  t2, t2, 0xf000     page mask */
+        0xC1280000u, /* ll   t0, 0(t1)          loop */
+        0x25080001u, /* addiu t0, t0, 1 */
+        0x01006025u, /* or   t4, t0, zero */
+        0xE1280000u, /* sc   t0, 0(t1) */
+        0x1100FFFBu, /* beq  t0, zero, loop */
+        0x00000000u, /* nop */
+        0x01AC6821u, /* addu t5, t5, t4         private sum */
+        0x000C5B00u, /* sll  t3, t4, 12 */
+        0x016A5824u, /* and  t3, t3, t2 */
+        0x01695821u, /* addu t3, t3, t1 */
+        0xAD6C0004u, /* sw   t4, 4(t3)          one page per value */
+        0x1000FFF4u, /* b    loop */
+        0x00000000u, /* nop */
+    };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(prog); i++)
+        put32(m, 4 * i, prog[i]);
+    uam_machine_set_quantum(m, 97);
+    uam_machine_reset(m, 0x80000000u);
+    if (jit)
+        uam_exec_enable_jit(&m->exec);
+}
+
+static uint64_t smp_hash(uam_machine *m)
+{
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+#define MIX(v) (h = (h ^ (uint64_t)(v)) * UINT64_C(0x100000001b3))
+    const uam_region *ram = uam_bus_region(&m->bus, "ram");
+    for (uint64_t i = 0; i < ram->size; i += 8) {
+        uint64_t w;
+        memcpy(&w, ram->host + i, 8);
+        MIX(w);
+    }
+    for (unsigned c = 0; c < uam_machine_ncpus(m); c++) {
+        uam_cpu *cpu = uam_machine_cpu(m, c);
+        for (size_t i = 0; i < cpu->regfile_size; i++)
+            MIX(cpu->regfile[i]);
+        MIX(cpu->pc);
+        MIX(cpu->icount);
+    }
+    MIX(uam_sched_now(&m->sched));
+#undef MIX
+    return h;
+}
+
+/* A multiprocessor machine: snapshots hold every processor and where the
+ * interleaving stands (mid-slice here: 97 does not divide the run lengths),
+ * so restore + re-run is bit-identical, as is a run split in two. */
+static void test_smp(bool jit)
+{
+    const char *mode = jit ? "smp jit" : "smp interp";
+    uam_machine m, ref;
+    build_smp(&m, jit);
+    build_smp(&ref, jit);
+    uam_exec_run(&ref.exec, 50000);   /* one uninterrupted run */
+    const uint64_t want = smp_hash(&ref);
+    CHECK(gpr(&ref, 13) != 0 && uam_cpu_reg_read(uam_machine_cpu(&ref, 1), 13 * 4, 32) != 0,
+          "%s: both processors counted", mode);
+    uam_machine_fini(&ref);
+
+    uam_exec_run(&m.exec, 20000);
+    uam_snapshot *s = NULL;
+    CHECK(uam_snapshot_take(&m, &s) == UAM_OK && s, "%s: take", mode);
+    if (!s) {
+        uam_machine_fini(&m);
+        return;
+    }
+    const uint64_t h0 = smp_hash(&m);
+    uam_exec_run(&m.exec, 30000);
+    CHECK(smp_hash(&m) == want, "%s: a run split in two matches the uninterrupted one", mode);
+    for (int i = 0; i < 4; i++) {
+        CHECK(uam_snapshot_restore(&m, s) == UAM_OK, "%s: restore %d", mode, i);
+        CHECK(smp_hash(&m) == h0, "%s: state after restore %d matches the snapshot", mode, i);
+        uam_exec_run(&m.exec, 30000);
+        CHECK(smp_hash(&m) == want, "%s: re-run %d is bit-identical", mode, i);
+    }
+
+    /* A snapshot only fits a machine with as many processors. */
+    uam_machine one;
+    CHECK(uam_machine_init(&one, &uam_isa_mips32be) == UAM_OK, "smp: uniprocessor init");
+    one.board_name = "snap-smp";
+    uam_bus_map_ram(&one.bus, "ram", 0, RAM_SIZE);
+    CHECK(uam_snapshot_restore(&one, s) == UAM_ERR_INVALID, "%s: refused with one processor", mode);
+    uam_machine_fini(&one);
+    uam_snapshot_free(s);
+    uam_machine_fini(&m);
+}
+
+/* Instructions every processor has run (they all start at 0). */
+static uint64_t smp_insns(uam_machine *m)
+{
+    uint64_t n = 0;
+    for (unsigned c = 0; c < uam_machine_ncpus(m); c++)
+        n += uam_machine_cpu(m, c)->icount;
+    return n;
+}
+
+typedef struct smp_hook {
+    uam_machine  *m;
+    unsigned      arrivals, at;   /* act on arrival number `at` */
+    uam_snapshot *snap;           /* take: out; restore: in */
+    bool          restore, done;
+} smp_hook;
+
+static uam_hook_action smp_hook_fn(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)cpu; (void)pc;
+    smp_hook *h = ctx;
+    if (h->done || ++h->arrivals != h->at)
+        return UAM_HOOK_CONTINUE;
+    h->done = true;
+    if (h->restore)
+        CHECK(uam_snapshot_restore(h->m, h->snap) == UAM_OK, "smp hook: restore");
+    else
+        CHECK(uam_snapshot_take(h->m, &h->snap) == UAM_OK, "smp hook: take");
+    return UAM_HOOK_CONTINUE;
+}
+
+/* Snapshots taken and restored by a PC hook, in the middle of a slice of
+ * either processor, continue exactly like the uninterrupted run. */
+static void test_smp_in_hook(bool jit)
+{
+    const char *mode = jit ? "smp hook jit" : "smp hook interp";
+    uam_machine m;
+    build_smp(&m, jit);
+    uam_exec_run(&m.exec, 50000);
+    const uint64_t want = smp_hash(&m);
+    uam_machine_fini(&m);
+
+    for (unsigned c = 0; c < 2; c++) {
+        /* take on processor c's 300th store, mid-slice; finish the run; restore it
+         * between runs and run to the same total */
+        build_smp(&m, jit);
+        smp_hook h = { .m = &m, .at = 300 };
+        uam_exec_add_pc_hook(uam_machine_exec(&m, c), 0x80000034u, smp_hook_fn, &h);
+        uam_exec_run(&m.exec, 50000);
+        CHECK(h.done && h.snap, "%s: cpu %u: snapshot taken", mode, c);
+        CHECK(smp_hash(&m) == want, "%s: cpu %u: taking does not disturb the run", mode, c);
+        if (!h.snap) {
+            uam_machine_fini(&m);
+            continue;
+        }
+        uam_exec_remove_pc_hook(uam_machine_exec(&m, c), 0x80000034u, smp_hook_fn, &h);
+        CHECK(uam_snapshot_restore(&m, h.snap) == UAM_OK, "%s: cpu %u: restore", mode, c);
+        uam_exec_run(&m.exec, 50000 - smp_insns(&m));
+        CHECK(smp_hash(&m) == want, "%s: cpu %u: resumed from a mid-slice snapshot", mode, c);
+
+        /* restore that snapshot from a hook, later in another run */
+        smp_hook r = { .m = &m, .at = 500, .snap = h.snap, .restore = true };
+        uam_snapshot *start = NULL;
+        CHECK(uam_snapshot_take(&m, &start) == UAM_OK, "%s: take", mode);
+        uam_snapshot_restore(&m, h.snap);
+        uam_exec_run(&m.exec, 3000);
+        uam_exec_add_pc_hook(uam_machine_exec(&m, 1 - c), 0x80000034u, smp_hook_fn, &r);
+        uam_exec_run(&m.exec, 20000);
+        CHECK(r.done, "%s: cpu %u: restored from a hook", mode, c);
+        uam_exec_remove_pc_hook(uam_machine_exec(&m, 1 - c), 0x80000034u, smp_hook_fn, &r);
+        uam_exec_run(&m.exec, 50000 - smp_insns(&m));
+        CHECK(smp_hash(&m) == want, "%s: cpu %u: a hook's restore resumes exactly", mode, c);
+        uam_snapshot_free(start);
+        uam_snapshot_free(h.snap);
+        uam_machine_fini(&m);
+    }
+}
+
 /* Restoring a snapshot that is not the baseline (full compare), and files. */
 static void test_full_and_file(void)
 {
@@ -625,6 +804,10 @@ int main(void)
     test_timer_ties();
     test_restore_loop(false);
     test_restore_loop(true);
+    test_smp(false);
+    test_smp(true);
+    test_smp_in_hook(false);
+    test_smp_in_hook(true);
     test_full_and_file();
     test_refusals();
     test_extra_state();

@@ -95,6 +95,8 @@ static void usage(FILE *out)
         "                          for console/network input instead of skipping time; with\n"
         "                          no input source, stop (exit 128, livelock)\n"
         "                          (default 4194304; 0 = never)\n"
+        "      --quantum N         with several processors, run each N instructions at a\n"
+        "                          time before the next (default 4096)\n"
         "      --ram SIZE          RAM size in bytes (suffix K/M/G allowed)\n"
         "      --unknown-mmio P    unmapped accesses: fault (default), zero, echo\n"
         "      --mmio-rule RULE    answer unmodelled registers (repeatable; later rules win):\n"
@@ -157,7 +159,7 @@ static void usage(FILE *out)
         "                          22 hang, 23 timeout, 24 rejected (the most severe of\n"
         "                          any input: a crash, a hang, a timeout, a rejection)\n"
         "  -s, --stats             print execution statistics at exit\n"
-        "  -d, --dump-state        print hart state at exit\n"
+        "  -d, --dump-state        print hart state at exit (every processor's)\n"
         "  -v, --verbose           more logging (repeatable)\n"
         "  -h, --help\n");
     for (size_t i = 0; i < g_n_exts; i++)
@@ -225,12 +227,23 @@ static void on_console_quit(void *ctx)
 
 /* ---- PC hooks from the command line --------------------------------------- */
 
+/* " cpu N" for processors other than 0, as the trace marks them. */
+static const char *cpu_tag(const uam_cpu *cpu, char *buf, size_t n)
+{
+    if (cpu->hartid)
+        snprintf(buf, n, ", cpu %u", cpu->hartid);
+    else
+        buf[0] = '\0';
+    return buf;
+}
+
 static uam_hook_action log_pc_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
     uint64_t *hits = ctx;
+    char tag[24];
     (*hits)++;
-    fprintf(stderr, "uam-run: pc 0x%llx reached (hit %llu, icount %llu)\n", (unsigned long long)pc,
-            (unsigned long long)*hits, (unsigned long long)cpu->icount);
+    fprintf(stderr, "uam-run: pc 0x%llx reached (hit %llu, icount %llu%s)\n", (unsigned long long)pc,
+            (unsigned long long)*hits, (unsigned long long)cpu->icount, cpu_tag(cpu, tag, sizeof(tag)));
     return UAM_HOOK_CONTINUE;
 }
 
@@ -247,9 +260,11 @@ static uam_hook_action snapshot_at_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
     if (sa->done)
         return UAM_HOOK_CONTINUE;
     sa->done = true;
+    char tag[24];
     if (uam_machine_save_snapshot(sa->m, sa->path) == UAM_OK)
-        fprintf(stderr, "uam-run: snapshot saved to %s at pc 0x%llx (icount %llu)\n", sa->path,
-                (unsigned long long)pc, (unsigned long long)cpu->icount);
+        fprintf(stderr, "uam-run: snapshot saved to %s at pc 0x%llx (icount %llu%s)\n", sa->path,
+                (unsigned long long)pc, (unsigned long long)cpu->icount,
+                cpu_tag(cpu, tag, sizeof(tag)));
     else
         fprintf(stderr, "uam-run: saving a snapshot to %s failed\n", sa->path);
     return UAM_HOOK_CONTINUE;
@@ -258,8 +273,9 @@ static uam_hook_action snapshot_at_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 static uam_hook_action break_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
     (void)ctx;
-    fprintf(stderr, "uam-run: breakpoint at 0x%llx (icount %llu)\n", (unsigned long long)pc,
-            (unsigned long long)cpu->icount);
+    char tag[24];
+    fprintf(stderr, "uam-run: breakpoint at 0x%llx (icount %llu%s)\n", (unsigned long long)pc,
+            (unsigned long long)cpu->icount, cpu_tag(cpu, tag, sizeof(tag)));
     return UAM_HOOK_STOP;
 }
 
@@ -363,7 +379,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
            OPT_IMAGE, OPT_CONSOLE, OPT_REALTIME, OPT_TRACE_RANGE, OPT_TRACE_AFTER, OPT_LOG_PC,
-           OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL,
+           OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL, OPT_QUANTUM,
            OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT, OPT_MMIO_RULE, OPT_MMIO_INPUT,
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
@@ -378,6 +394,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "max-insns", required_argument, NULL, 'n' },
         { "max-ticks", required_argument, NULL, OPT_MAX_TICKS },
         { "max-stall", required_argument, NULL, OPT_MAX_STALL },
+        { "quantum", required_argument, NULL, OPT_QUANTUM },
         { "ram", required_argument, NULL, OPT_RAM },
         { "unknown-mmio", required_argument, NULL, OPT_UNKNOWN },
         { "mmio-rule", required_argument, NULL, OPT_MMIO_RULE },
@@ -434,6 +451,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     char *uart_input_spec = NULL;
     uint64_t raw_base = 0, entry = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
     uint64_t max_ticks = 0, max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
+    uint32_t quantum = 0;
     uint64_t realtime_tps = 0, log_pcs[MAX_LIST], break_pcs[MAX_LIST], log_hits[MAX_LIST] = { 0 };
     unsigned n_log = 0, n_break = 0;
     bool have_raw_base = false, have_entry = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
@@ -532,6 +550,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_VIRTUAL_TIME: virtual_time = true; break;
         case OPT_MAX_TICKS: max_ticks = strtoull(optarg, NULL, 0); break;
         case OPT_MAX_STALL: max_stall = strtoull(optarg, NULL, 0); break;
+        case OPT_QUANTUM: quantum = (uint32_t)strtoul(optarg, NULL, 0); break;
         case OPT_RAW_BASE: raw_base = strtoull(optarg, NULL, 0); have_raw_base = true; break;
         case OPT_ENTRY: entry = strtoull(optarg, NULL, 0); have_entry = true; break;
         case OPT_RAM: cfg.ram_size = parse_size(optarg); break;
@@ -848,12 +867,12 @@ static int run_main(int argc, char **argv, const ext_set *es)
     if (block_insns)
         m.exec.max_block_insns = block_insns;
     for (unsigned i = 0; i < n_log; i++)
-        uam_exec_add_pc_hook(&m.exec, log_pcs[i], log_pc_hook, &log_hits[i]);
+        uam_machine_add_pc_hook(&m, log_pcs[i], log_pc_hook, &log_hits[i]);
     snap_at snap_hook = { .m = &m, .path = save_snap };
     if (have_snap_at)
-        uam_exec_add_pc_hook(&m.exec, snap_at_pc, snapshot_at_hook, &snap_hook);
+        uam_machine_add_pc_hook(&m, snap_at_pc, snapshot_at_hook, &snap_hook);
     for (unsigned i = 0; i < n_break; i++)
-        uam_exec_add_pc_hook(&m.exec, break_pcs[i], break_hook, NULL);
+        uam_machine_add_pc_hook(&m, break_pcs[i], break_hook, NULL);
     uam_runner_setup xs = { .m = &m, .have_image = image != NULL, .image = info,
                             .have_raw_base = have_raw_base, .raw_base = raw_base,
                             .map_size_option = cov_map_size_given ? (uint32_t)cov_map_size : 0 };
@@ -905,19 +924,19 @@ static int run_main(int argc, char **argv, const ext_set *es)
         cov_map = calloc(1, cov_map_size);
         uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size, &xs.history);
         cov_state.skip_repeat = xs.skip_repeats;
-        if (!cov_map || uam_exec_set_coverage(&m.exec, xs.sites, xs.n_sites, &cov_state, err,
-                                              sizeof(err)) != UAM_OK) {
+        if (!cov_map || uam_machine_set_coverage(&m, xs.sites, xs.n_sites, &cov_state, err,
+                                                 sizeof(err)) != UAM_OK) {
             fprintf(stderr, "uam-run: cannot enable coverage: %s\n", err);
             uam_machine_fini(&m);
             goto out_host;
         }
-        if (xs.namer)
-            uam_cov_pass_set_namer(m.exec.cov_pass, xs.namer, xs.namer_ctx);
+        for (unsigned i = 0; xs.namer && i < uam_machine_ncpus(&m); i++)
+            uam_cov_pass_set_namer(uam_machine_exec(&m, i)->cov_pass, xs.namer, xs.namer_ctx);
     }
     if (cov_blocks && !fuzzing) {
         cov_map = calloc(1, cov_map_size);
         uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size, NULL);
-        if (!cov_map || uam_exec_set_block_coverage(&m.exec, &cov_state) != UAM_OK) {
+        if (!cov_map || uam_machine_set_block_coverage(&m, &cov_state) != UAM_OK) {
             fprintf(stderr, "uam-run: cannot enable coverage\n");
             uam_machine_fini(&m);
             goto out_host;
@@ -934,6 +953,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     uam_host_set_pacing(host, realtime ? UAM_PACE_REALTIME : UAM_PACE_VIRTUAL, realtime_tps, 0);
     m.exec.max_stall = max_stall;
+    if (quantum)
+        uam_machine_set_quantum(&m, quantum);
     if (max_ticks) {
         uint64_t now = uam_sched_now(&m.sched);
         m.exec.max_time = max_ticks < UAM_SCHED_TIME_MAX - now ? now + max_ticks : UAM_SCHED_TIME_MAX;
@@ -1003,9 +1024,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
     if (!fuzzing)
         fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
                 uam_stop_reason_str(why), (long long)m.exec.stop_status,
-                (unsigned long long)m.cpu.pc, (unsigned long long)m.cpu.icount);
+                (unsigned long long)m.cpu.pc, (unsigned long long)uam_machine_icount(&m));
     if (stats) {
-        const uam_exec_stats *s = &m.exec.stats;
+        uam_exec_stats sum;
+        uam_machine_get_stats(&m, &sum);
+        const uam_exec_stats *s = &sum;
         fprintf(stderr,
                 "stats: blocks translated=%llu executed=%llu exceptions=%llu interrupts=%llu "
                 "resets=%llu idle ticks=%llu virtual time=%llu\n",
@@ -1040,8 +1063,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 rc = 2;
         }
     }
-    if (dump)
-        m.cpu.isa->dump_state(&m.cpu, stderr);
+    if (dump) {
+        for (unsigned i = 0, n = uam_machine_ncpus(&m); i < n; i++) {
+            if (n > 1)
+                fprintf(stderr, "cpu %u: icount=%llu%s\n", i,
+                        (unsigned long long)uam_machine_cpu(&m, i)->icount,
+                        uam_machine_cpu(&m, i)->waiting ? " waiting" : "");
+            m.cpu.isa->dump_state(uam_machine_cpu(&m, i), stderr);
+        }
+    }
     if (save_snap && !have_snap_at) {
         if (why == UAM_STOP_ERROR || why == UAM_STOP_FAULT_LOOP)
             fprintf(stderr, "uam-run: not saving a snapshot after an internal error\n");

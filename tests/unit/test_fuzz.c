@@ -1,7 +1,8 @@
 /*
  * test_fuzz.c - The fuzz harness (uam/fuzz.h) and the replay frontend.
  *
- * A small target with planted bugs, hand-assembled for RV32, MIPS32 BE and MIPS32 LE:
+ * A small target with planted bugs, hand-assembled for RV32, MIPS32 BE and LE and ARMv7
+ * (little-endian and BE8):
  * after a short boot loop it reaches BEGIN, reads the input from guest memory (the
  * "mem:" route) and dispatches on its first byte:
  *   'B' a load from an unmapped address (bus fault)   'H' a tight loop (timeout)
@@ -17,6 +18,7 @@
 #include <unistd.h>
 
 #include "uam/fuzz.h"
+#include "uam/isa/arm.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/riscv.h"
 
@@ -169,6 +171,52 @@ static target mips_target(bool be)
     w[i++] = 0x70000010u;                         /* b+30 ILL */
     w[i++] = 0x42000020u;                         /* b+31 WAIT */
     w[i++] = 0x1000FFFEu; w[i++] = 0;
+    t.n = i;
+    return t;
+}
+
+/* ARMv7 (ARM state) */
+#define ARM_B(op, i, to) ((uint32_t)(op) | ((uint32_t)((int)(to) - (int)(i) - 2) & 0xFFFFFFu))
+
+/* be8: the big-endian (BE8) hart: little-endian code, so .be stays false, but the
+ * route's length word and the loads that read it are big-endian. */
+static target arm_target(bool be8)
+{
+    target t = { .name = be8 ? "armv7-be8" : "armv7", .isa = be8 ? &uam_isa_armeb : &uam_isa_arm,
+                 .be = false, .base = 0x1000, .phys = 0x1000,
+                 .route = "mem:0x8000,len=0x7ffc,max=64", .s0 = 4 * 4 };
+    uint32_t *w = t.w;
+    unsigned i = 0;
+    w[i++] = 0xE3A04000u;                         /* mov r4, #0 (iterations) */
+    w[i++] = 0xE3A05005u;                         /* mov r5, #5 */
+    w[i++] = 0xE2555001u;                         /* boot loop: subs r5, r5, #1 */
+    w[i] = ARM_B(0x1A000000u, i, 2); i++;         /* bne */
+    unsigned b = i;
+    t.begin = t.base + 4 * b;
+    enum { L_CRASH = 15, L_HANG = 18, L_ORACLE = 19, L_ILL = 20, L_WAIT = 21 };
+    w[i++] = 0xE3A03902u;                         /* b+0  mov r3, #0x8000 */
+    w[i++] = 0xE5136004u;                         /* b+1  ldr r6, [r3, #-4] (len) */
+    w[i++] = 0xE5D37000u;                         /* b+2  ldrb r7, [r3] */
+    static const char keys[5] = { 'B', 'H', 'O', 'I', 'W' };
+    static const unsigned dest[5] = { L_CRASH, L_HANG, L_ORACLE, L_ILL, L_WAIT };
+    for (unsigned k = 0; k < 5; k++) {            /* b+3 .. b+12 */
+        w[i++] = 0xE3570000u | (uint32_t)keys[k];  /* cmp r7, #key */
+        w[i] = ARM_B(0x0A000000u, i, b + dest[k]); i++;   /* beq */
+    }
+    w[i++] = 0xE2844001u;                         /* b+13 add r4, r4, #1 */
+    t.end = t.base + 4 * i;
+    w[i] = ARM_B(0xEA000000u, i, b); i++;         /* b+14 END: b BEGIN */
+    w[i++] = 0xE3A00101u;                         /* b+15 CRASH: mov r0, #0x40000000 */
+    t.fault_pc = t.base + 4 * i;
+    w[i++] = 0xE5901000u;                         /* b+16 ldr r1, [r0]: bus fault */
+    w[i++] = 0xEAFFFFFEu;                         /* b+17 b . */
+    w[i++] = 0xEAFFFFFEu;                         /* b+18 HANG */
+    t.oracle = t.base + 4 * i;
+    w[i++] = 0xEAFFFFFEu;                         /* b+19 ORACLE */
+    t.illegal = t.base + 4 * i;
+    w[i++] = 0xE7F000F0u;                         /* b+20 ILL: udf #0 */
+    w[i++] = 0xE320F003u;                         /* b+21 WAIT: wfi */
+    w[i] = ARM_B(0xEA000000u, i, i - 1); i++;
     t.n = i;
     return t;
 }
@@ -404,8 +452,8 @@ static void test_routes(const target *t)
     memset(big, 'A', sizeof(big));
     uam_fuzz_run_one(f, big, sizeof(big), &r);
     uint64_t len = 0;
-    /* physical 0x7ffc on both targets, in the guest byte order */
-    uam_bus_read(&m.bus, 0x7ffc, 4, (t->be ? UAM_ACC_BE : UAM_ACC_LE) | UAM_ACC_DEBUG, &len);
+    /* physical 0x7ffc on every target, in the CPU's (data) byte order */
+    uam_bus_read(&m.bus, 0x7ffc, 4, t->isa->default_endian | UAM_ACC_DEBUG, &len);
     EQ64(len, 64, "the length word is the truncated length");
 
     /* mem:...,reject refuses an input over max: nothing runs, the campaign goes on. */
@@ -827,6 +875,13 @@ static void enable_irqs(uam_machine *m, const target *t, unsigned *line, uint64_
         m->cpu.isa->sysreg_write(&m->cpu, 0x300, 1u << 3);               /* mstatus.MIE */
         const uint8_t spin[4] = { 0x6f, 0, 0, 0 };                       /* jal x0, 0 */
         uam_bus_load_bytes(&m->bus, 0x1800, spin, 4);
+    } else if (uam_arm_is(t->isa)) {
+        *line = UAM_ARM_IRQ;
+        *handler = 0x18;                                                 /* the IRQ vector */
+        m->cpu.isa->sysreg_write(&m->cpu, 0x00200001u, 0x13);            /* CPSR_c: SVC, I = F = 0 */
+        /* the vector's code is little-endian on both harts (BE8) */
+        const uint8_t spin[4] = { 0xfe, 0xff, 0xff, 0xea };              /* b . */
+        uam_bus_load_bytes(&m->bus, 0x18, spin, 4);
     } else {
         *line = UAM_MIPS_IRQ_HW0;
         *handler = 0x80000180u;                                          /* BEV=0, EBase 0x80000000 */
@@ -1052,8 +1107,9 @@ int main(void)
 {
     test_misc();
     test_nested();
-    const target ts[3] = { rv_target(), mips_target(true), mips_target(false) };
-    for (int i = 0; i < 3; i++) {
+    const target ts[] = { rv_target(), mips_target(true), mips_target(false), arm_target(false),
+                          arm_target(true) };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {
         test_verdicts(&ts[i]);
         test_modes(&ts[i]);
         test_routes(&ts[i]);

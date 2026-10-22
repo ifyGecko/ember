@@ -36,24 +36,6 @@ static uint64_t eval_pure(const uam_insn *in, uint64_t x, uint64_t y, uint64_t z
     abort();
 }
 
-static uint64_t amo_apply(uam_amo_op op, uint64_t old, uint64_t v, unsigned W)
-{
-    int64_t so = uam_sext(old, W), sv = uam_sext(v, W);
-    switch (op) {
-    case UAM_AMO_XCHG: return v;
-    case UAM_AMO_ADD:  return (old + v) & uam_mask(W);
-    case UAM_AMO_AND:  return old & v;
-    case UAM_AMO_OR:   return old | v;
-    case UAM_AMO_XOR:  return old ^ v;
-    case UAM_AMO_SMIN: return so < sv ? old : v;
-    case UAM_AMO_SMAX: return so > sv ? old : v;
-    case UAM_AMO_UMIN: return old < v ? old : v;
-    case UAM_AMO_UMAX: return old > v ? old : v;
-    case UAM_AMO__COUNT: break;
-    }
-    return v;
-}
-
 /* Where the current guest instruction stands, for precise exception reports. */
 typedef struct insn_pos {
     uint64_t pc;        /* the instruction being executed */
@@ -150,27 +132,13 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
         }
         case UAM_OP_AMO:
         case UAM_OP_CAS: {
-            /* Read-modify-write. Faults on either half are reported as store
-             * faults, as architectures do for atomics. */
-            uint64_t addr = opnd(blk, t, in->a, aw), pa, old = 0;
-            uam_status st = uam_execops_xlate(cpu, addr, UAM_XLATE_STORE, in->flags, size, &pa, &xf);
-            if (st == UAM_OK)
-                st = uam_bus_read(cpu->bus, pa, size, in->flags, &old);
+            uint64_t addr = opnd(blk, t, in->a, aw), old = 0;
+            const bool cas = in->op == UAM_OP_CAS;
+            uam_status st = uam_execops_rmw(cpu, cas, cas ? UAM_AMO_XCHG : (uam_amo_op)in->aux, addr,
+                                            opnd(blk, t, in->b, W),
+                                            cas ? opnd(blk, t, in->c, W) : 0, in->flags, W, &old, &xf);
             if (st != UAM_OK)
                 return fault(mem_fault_kind(st, true), &pos, addr, xf);
-            bool do_write = true;
-            uint64_t nv;
-            if (in->op == UAM_OP_AMO) {
-                nv = amo_apply((uam_amo_op)in->aux, old, opnd(blk, t, in->b, W), W);
-            } else {
-                do_write = old == opnd(blk, t, in->b, W);
-                nv = opnd(blk, t, in->c, W);
-            }
-            if (do_write) {
-                st = uam_bus_write(cpu->bus, pa, size, in->flags, nv);
-                if (st != UAM_OK)
-                    return fault(mem_fault_kind(st, true), &pos, addr, 0);
-            }
             t[in->dst] = old;
             break;
         }

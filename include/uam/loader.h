@@ -34,4 +34,8 @@ uam_status uam_load_raw(uam_bus *bus, uam_cpu *cpu, const char *path, uint64_t b
 uam_status uam_load_image(uam_bus *bus, uam_cpu *cpu, const char *path, uint64_t raw_base,
                           uam_image_info *info);
 
+/* Read a whole file into a malloc'd buffer the caller frees (for boards that
+ * place images themselves, e.g. into a flash device). */
+uam_status uam_load_file(const char *path, uint8_t **data, size_t *len);
+
 #endif /* UAM_LOADER_H */

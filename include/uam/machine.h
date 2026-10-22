@@ -121,6 +121,13 @@ struct uam_machine {
     /* Named inputs (uam_machine_add_input). */
     uam_machine_input *inputs;
     uint32_t           n_inputs, cap_inputs;
+    /* Further processors (uam_machine_add_cpus): processor i + 1 is
+     * aps[i] / ap_execs[i]; processor 0 is `cpu` / `exec`. */
+    uam_cpu          **aps;
+    uam_exec         **ap_execs;
+    uam_exec         **all_execs;          /* processor 0's first (exec.smp) */
+    uint32_t           n_aps;
+    uam_cov_state     *ap_cov;             /* coverage state of processor i + 1 (uam_machine_set_coverage) */
 };
 
 /*
@@ -164,6 +171,55 @@ void       uam_machine_add_device_abi(uam_machine *m, uam_device *dev, const uam
 /* Reset the hart and every device; start executing at `entry` (which becomes
  * the machine's reset_pc). RAM and the translation cache are preserved. */
 void       uam_machine_reset(uam_machine *m, uint64_t entry);
+
+/*
+ * Multiprocessor machines. Add `count` processors of the machine's ISA after
+ * uam_machine_init (and before the first reset): processor i has hartid i,
+ * its own registers, translation cache and JIT, and shares the bus and the
+ * clock. uam_exec_run(&m->exec, n) then runs all of them, interleaved
+ * deterministically in slices of `quantum` instructions (0 = default 4096;
+ * uam_machine_set_quantum), n counting every processor's instructions. The
+ * ISA decides what an extra processor does at reset (x86: waits for a
+ * startup IPI). Snapshots hold every processor and where the interleaving
+ * stands, so a restored machine interleaves exactly as the original would.
+ */
+uam_status uam_machine_add_cpus(uam_machine *m, unsigned count);
+unsigned   uam_machine_ncpus(const uam_machine *m);
+uam_cpu   *uam_machine_cpu(uam_machine *m, unsigned i);    /* NULL beyond the last */
+uam_exec  *uam_machine_exec(uam_machine *m, unsigned i);
+void       uam_machine_set_quantum(uam_machine *m, uint32_t insns);
+/*
+ * Observers on every processor: each processor's executor gets the same PC
+ * hook, exception or interrupt observer, or IR pass, and callbacks receive the
+ * processor that ran into them as `cpu` (cpu->hartid). With one processor these
+ * are the uam_exec_* calls on m->exec. Add them after uam_machine_add_cpus.
+ */
+uam_status uam_machine_add_pc_hook(uam_machine *m, uint64_t pc, uam_pc_hook_fn fn, void *ctx);
+bool       uam_machine_remove_pc_hook(uam_machine *m, uint64_t pc, uam_pc_hook_fn fn, void *ctx);
+void       uam_machine_set_exc_hook(uam_machine *m, uam_exc_hook_fn fn, void *ctx);
+void       uam_machine_set_irq_hook(uam_machine *m, uam_irq_hook_fn fn, void *ctx);
+uam_status uam_machine_add_pass(uam_machine *m, const uam_pass *p);
+bool       uam_machine_remove_pass(uam_machine *m, const uam_pass *p);
+/*
+ * Coverage on every processor, into `state`'s map (uam_exec_set_coverage):
+ * processor 0 counts in `state`, every other processor in a copy the machine
+ * keeps (same map and history shape, its own history), so an edge never joins
+ * two processors' paths and the map does not depend on where slices end
+ * beyond what the guest itself does. uam_machine_cov_state(m, i) is processor
+ * i's state (NULL with coverage off): reset each one's history
+ * (uam_cov_reset_prev) where `state`'s would be reset.
+ */
+uam_status uam_machine_set_coverage(uam_machine *m, const uam_cov_site *sites, size_t n,
+                                    uam_cov_state *state, char *err, size_t errlen);
+uam_status uam_machine_set_block_coverage(uam_machine *m, uam_cov_state *state);
+uam_cov_state *uam_machine_cov_state(uam_machine *m, unsigned i);
+/* Every processor's executor statistics, added up. */
+void       uam_machine_get_stats(const uam_machine *m, uam_exec_stats *out);
+/* Instructions every processor has retired (their icounts added up). */
+uint64_t   uam_machine_icount(const uam_machine *m);
+/* The processor running now (its hartid; 0 between runs and with one). For
+ * devices that answer each processor differently. Takes the machine. */
+unsigned   uam_machine_current_cpu(void *machine);
 /*
  * Register state that is neither a device nor the hart - board-private data,
  * state an analysis keeps alongside the guest - so snapshots save and restore

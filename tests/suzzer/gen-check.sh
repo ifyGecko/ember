@@ -18,7 +18,7 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
-panic=0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')
+panic=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
 if ! python3 "$suzzer/tools/gen_patchlist.py" --strategy entry "$fw" "$tmp/fw.lcv3" \
         > "$tmp/gen.log" 2>&1 \
    || ! python3 "$suzzer/tools/gen_boundary.py" --strategy entry --patchlist "$tmp/fw.lcv3" \

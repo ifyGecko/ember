@@ -26,7 +26,10 @@ import time
 
 HELLO, INPUT, COVERAGE, CRASH, BYE = 1, 2, 3, 4, 5
 GUEST_FAULT, ORACLE, MALFORMED, TIMEOUT, DELIVERY = 5, 6, 4, 8, 3
-SCRATCH = 0x81f00000   # RAM on every stock board, unused by the fuzz target
+# RAM the fuzz target does not use: rv32-ref and the MIPS boards (kseg0) reach it at
+# 0x81f00000; the ARM boards' RAM starts at 0.
+SCRATCH_OF = {"arm-ref": 0x03f00000, "armeb-ref": 0x03f00000}
+SCRATCH_DEFAULT = 0x81f00000
 FLAG_SCHEME, FLAG_MT, FLAG_LIVE_EMPTY = 0x4, 0x1, 0x2
 
 failures = []
@@ -114,7 +117,8 @@ def main():
     run, board, fw = sys.argv[1:4]
     sites = sys.argv[4:6] if len(sys.argv) >= 6 else None
     panic = sym(fw, "fuzz_panic")
-    arch = {"rv32-ref": "rv32", "mips-ref": "mips32be", "mipsel-ref": "mips32le"}[board]
+    arch = {"rv32-ref": "rv32", "mips-ref": "mips32be", "mipsel-ref": "mips32le",
+            "arm-ref": "armv7", "armeb-ref": "armv7be"}[board]
     modes = [("blocks", ["--cov-blocks", "--fuzz-begin", hex(sym(fw, "fuzz_iteration"))], 0)]
     if sites:
         modes.append(("sites", ["--cov-sites", sites[0], "--cov-boundary", sites[1]],
@@ -221,7 +225,8 @@ def main():
         check(rid == 2 and not (t == CRASH and p[8] == DELIVERY), f"{tag}: within max: it runs")
         send_frame(c, BYE)
 
-    rc, err = session(run, board, fw, [*blocks, "--fuzz-input", f"mem:{SCRATCH:#x},max=4,reject"],
+    scratch = SCRATCH_OF.get(board, SCRATCH_DEFAULT)
+    rc, err = session(run, board, fw, [*blocks, "--fuzz-input", f"mem:{scratch:#x},max=4,reject"],
                       rejecting)
     if not check(rc == 0, f"{board} reject: exit {rc}"):
         sys.stderr.write(err)

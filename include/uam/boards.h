@@ -12,6 +12,9 @@
 extern const uam_board uam_board_rv32_ref;    /* "rv32-ref": RV32IMAC */
 extern const uam_board uam_board_mips_ref;    /* "mips-ref": MIPS32 big-endian */
 extern const uam_board uam_board_mipsel_ref;  /* "mipsel-ref": MIPS32 little-endian */
+extern const uam_board uam_board_arm_ref;     /* "arm-ref": ARMv7-A (ARM + Thumb-2) */
+extern const uam_board uam_board_armeb_ref;   /* "armeb-ref": ARMv7-A big-endian (BE8) */
+extern const uam_board uam_board_x86_64_ref;  /* "x86_64-ref": x86-64 PC of generic components */
 
 /* Register every stock board with uam_board_register(). */
 void uam_boards_register_stock(void);
@@ -42,5 +45,15 @@ uam_status uam_board_add_mmio_rules(uam_machine *m, const uam_mmio_rule *rules, 
  * space is dropped. The stock boards publish "uart0".
  */
 uam_status uam_board_add_uart_input(uam_machine *m, const char *name, uam_device *uart);
+
+/*
+ * Open the disk image that option `key` names (-o KEY=PATH) with sectors of
+ * `sector_size` bytes. Option "KEY-mode" picks how: "rw" (the default),
+ * "ro", or "volatile" (writes stay in host memory). *out is NULL when the
+ * option is absent; an image that cannot be opened is UAM_ERR_INVALID.
+ */
+#include "uam/blockdev.h"
+uam_status uam_board_open_disk(const uam_board_config *cfg, const char *key,
+                               uint32_t sector_size, uam_blockdev **out);
 
 #endif /* UAM_BOARDS_H */

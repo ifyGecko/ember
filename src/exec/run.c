@@ -33,6 +33,26 @@ const char *uam_stop_reason_str(uam_stop_reason r)
 
 /* Bus hook: the running block may just have overwritten its own code, and blocks
  * on that page are stale (so are JIT links into them). */
+/* uam_tcache_remap_fn: do the block's virtual pages still map where its code
+ * was fetched from? (The first instruction's page, and the next page for a
+ * block that crosses into it.) */
+static bool block_still_mapped(void *ctx, const uam_block *blk)
+{
+    uam_exec *x = ctx;
+    uam_cpu *cpu = x->cpu;
+    if (!cpu->isa->translate || blk->n_pages == 0)
+        return true;
+    uint64_t va = blk->guest_pc & ~UINT64_C(1);   /* Thumb state bit */
+    for (uint32_t i = 0; i < blk->n_pages; i++) {
+        uint64_t v = i == 0 ? va : (va & UAM_PAGE_MASK) + UAM_PAGE_SIZE;
+        uam_xlate xl = { 0 };
+        if (cpu->isa->translate(cpu, v, UAM_XLATE_FETCH, &xl) != UAM_OK
+            || (xl.paddr & UAM_PAGE_MASK) != blk->page[i])
+            return false;
+    }
+    return true;
+}
+
 static void on_code_write(void *ctx, uint64_t page)
 {
     (void)page;
@@ -55,7 +75,10 @@ uam_status uam_exec_init(uam_exec *x, uam_cpu *cpu, uam_sched *sched)
     x->max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
     uam_builder_init(&x->b, cpu->isa->addr_width);
     uam_bus_set_code_write_hook(cpu->bus, on_code_write, x);
-    return uam_tcache_init(&x->tc, cpu->bus);
+    uam_status st = uam_tcache_init(&x->tc, cpu->bus);
+    x->tc.remap = block_still_mapped;
+    x->tc.remap_ctx = x;
+    return st;
 }
 
 void uam_exec_fini(uam_exec *x)
@@ -341,7 +364,8 @@ static uam_status lift_fetch(uam_lift_ctx *lc, uint64_t addr, unsigned size, uin
     if (!uam_builder_add_page(lc->b, pa0 & UAM_PAGE_MASK)
         || !uam_builder_add_page(lc->b, pa1 & UAM_PAGE_MASK))
         return UAM_ERR_INVALID;
-    st = uam_bus_read(x->cpu->bus, pa0, size, isa->default_endian | UAM_ACC_FETCH, val);
+    const unsigned order = isa->fetch_endian ? isa->fetch_endian : isa->default_endian;
+    st = uam_bus_read(x->cpu->bus, pa0, size, order | UAM_ACC_FETCH, val);
     if (st != UAM_OK && core->fault_st == UAM_OK) {
         core->fault_st = UAM_ERR_FAULT;
         core->fault_addr = addr;
@@ -356,6 +380,38 @@ static uam_print_ctx print_ctx(const uam_isa *isa)
 
 /* Translate the block at pc. On failure returns NULL and sets *st; a fetch
  * fault on the first instruction is described in *exc. */
+/*
+ * Mark the bytes a block was translated from as code, so that only writes to
+ * them (at the bus's 64-byte line granularity) drop it. The guest bytes run
+ * contiguously from the first IMARK's pc to the end of the last instruction;
+ * they lie on page[0] and, past its end, page[1]. Anything else marks the
+ * whole pages.
+ */
+static void mark_block_code(uam_bus *bus, const uam_block *blk)
+{
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (uint32_t i = 0; i < blk->n_insn; i++) {
+        const uam_insn *in = &blk->insn[i];
+        if (in->op != UAM_OP_IMARK || !uam_ref_is_imm(in->a))
+            continue;
+        uint64_t pc = blk->imm[uam_ref_index(in->a)] & ~UINT64_C(1);   /* Thumb state bit */
+        if (pc < lo) lo = pc;
+        if (pc + in->aux > hi) hi = pc + in->aux;
+    }
+    uint64_t first_room = lo == UINT64_MAX ? 0 : UAM_PAGE_SIZE - (lo & (UAM_PAGE_SIZE - 1));
+    if (lo == UINT64_MAX || hi <= lo || blk->n_pages == 0 ||
+        (blk->n_pages == 1 && hi - lo > first_room) ||
+        (blk->n_pages == 2 && hi - lo <= first_room)) {
+        for (uint32_t i = 0; i < blk->n_pages; i++)
+            uam_bus_mark_code(bus, blk->page[i]);
+        return;
+    }
+    uint64_t len = hi - lo, n0 = len < first_room ? len : first_room;
+    uam_bus_mark_code_range(bus, blk->page[0] + (lo & (UAM_PAGE_SIZE - 1)), n0);
+    if (blk->n_pages == 2)
+        uam_bus_mark_code_range(bus, blk->page[1], len - n0);
+}
+
 static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_exception *exc)
 {
     uam_cpu *cpu = x->cpu;
@@ -382,9 +438,15 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
         *st = UAM_ERR_NOMEM;
         return NULL;
     }
-    for (uint32_t i = 0; i < blk->n_pages; i++) {
-        uam_bus_mark_code(cpu->bus, blk->page[i]);
+    mark_block_code(cpu->bus, blk);
+    for (uint32_t i = 0; i < blk->n_pages; i++)
         blk->page_gen[i] = uam_bus_page_gen(cpu->bus, blk->page[i]);
+    /* A page that just became a code page must lose its JIT data-TLB write entry before
+     * this block runs, or a store to it (the block's own page, say) takes the inline
+     * path past the code-write hook: no invalidation, and the block is not ended. */
+    if (x->jit && cpu->bus->direct_gen != x->seen_dgen) {
+        uam_cpu_dtlb_flush(cpu);
+        x->seen_dgen = cpu->bus->direct_gen;
     }
 
     uam_print_ctx pc_ctx = print_ctx(isa);
@@ -454,7 +516,10 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
         x->temps = nt;
         x->temps_cap = ncap;
     }
-    *st = uam_tcache_insert(&x->tc, blk, cpu->priv, core.mapped, cpu->xlate_gen);
+    /* A fetch that failed during the lift (the block stops short of it) also
+     * depends on the current mappings: such a block is not revalidated. */
+    *st = uam_tcache_insert_ex(&x->tc, blk, cpu->priv, core.mapped, cpu->xlate_gen,
+                               core.fault_st == UAM_OK);
     if (*st != UAM_OK) {
         uam_block_free(blk);
         return NULL;
@@ -470,9 +535,10 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
 static bool deliver(uam_exec *x, const uam_exception *exc)
 {
     if (x->trace & UAM_TRACE_EXC)
-        fprintf(x->trace_out, "exc: kind=%d pc=0x%llx cause=0x%llx tval=0x%llx\n", exc->kind,
-                (unsigned long long)exc->pc, (unsigned long long)exc->cause,
-                (unsigned long long)exc->tval);
+        fprintf(x->trace_out, x->cpu->hartid ? "exc: kind=%d pc=0x%llx cause=0x%llx tval=0x%llx cpu=%u\n"
+                                             : "exc: kind=%d pc=0x%llx cause=0x%llx tval=0x%llx\n",
+                exc->kind, (unsigned long long)exc->pc, (unsigned long long)exc->cause,
+                (unsigned long long)exc->tval, x->cpu->hartid);
     if (x->exc_hook) {
         x->cpu->pc = (exc->flags & UAM_EXC_F_CONT) ? exc->parent_pc : exc->pc;
         if (x->exc_hook(x->exc_hook_ctx, x->cpu, exc) == UAM_HOOK_STOP)
@@ -511,8 +577,11 @@ static uint64_t time_limit(const uam_exec *x)
  * retired; the count restarts whenever one has. */
 static uint64_t stall_rounds(uam_exec *x)
 {
-    if (x->cpu->icount != x->stall_icount) {
-        x->stall_icount = x->cpu->icount;
+    uint64_t progress = x->cpu->icount;
+    for (uint32_t i = 1; i < x->n_smp; i++)
+        progress += x->smp[i]->cpu->icount;   /* every processor's (saved in snapshots) */
+    if (progress != x->stall_icount) {
+        x->stall_icount = progress;
         x->stall = 0;
     }
     return x->stall;
@@ -567,35 +636,48 @@ static uam_stop_reason idle(uam_exec *x, uint64_t tlimit)
     return UAM_STOP_NONE;
 }
 
-uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
+/* Internal results of run_loop in a multiprocessor slice. */
+#define STOP_SLICE ((uam_stop_reason)0x100)   /* the slice's instructions ran */
+#define STOP_IDLE  ((uam_stop_reason)0x101)   /* the processor waits */
+#define STOP_RESYNC ((uam_stop_reason)0x102)  /* a snapshot was restored: slice state is new */
+
+/* Run x's processor until `limit` (its icount) or a stop. In a slice (smp),
+ * reaching the limit is STOP_SLICE and waiting is STOP_IDLE: the caller
+ * decides. Requests, the host bridge and resets are the controlling
+ * executor's. */
+static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bool smp)
 {
     uam_cpu *cpu = x->cpu;
     const uam_isa *isa = cpu->isa;
-    const uint64_t limit = max_insns ? cpu->icount + max_insns : UINT64_MAX;
-    const uint64_t tlimit = time_limit(x);
+    uam_exec *c = x->ctl ? x->ctl : x;
 
     for (;;) {
-        if (x->stop_request)
+        if (c->stop_request)
             return UAM_STOP_REQUEST;
+        if (smp && c->smp_resync)
+            return STOP_RESYNC;
 
         /* 0. Reset requested (by a device, between instructions). */
-        if (x->reset_request) {
-            x->reset_request = false;
-            if (!x->reset_fn)
+        if (c->reset_request) {
+            c->reset_request = false;
+            if (!c->reset_fn)
                 return UAM_STOP_RESET;
-            x->stats.resets++;
-            if (x->trace & UAM_TRACE_EXC)
-                fprintf(x->trace_out, "reset: %s\n",
-                        x->reset_kind == UAM_RESET_SYSTEM ? "system" : "cpu");
-            x->reset_fn(x->reset_ctx, x->reset_kind);
-            if (x->jit)
-                uam_cpu_dtlb_flush(cpu);
-            x->last_fetch_fault_valid = false;
-            x->hook_fired = false;
+            c->stats.resets++;
+            if (c->trace & UAM_TRACE_EXC)
+                fprintf(c->trace_out, "reset: %s\n",
+                        c->reset_kind == UAM_RESET_SYSTEM ? "system" : "cpu");
+            c->reset_fn(c->reset_ctx, c->reset_kind);
+            for (uint32_t i = 0; i < (c->n_smp ? c->n_smp : 1); i++) {
+                uam_exec *e = c->n_smp ? c->smp[i] : c;
+                if (e->jit)
+                    uam_cpu_dtlb_flush(e->cpu);
+                e->last_fetch_fault_valid = false;
+                e->hook_fired = false;
+            }
             continue;
         }
         if (cpu->icount >= limit)
-            return UAM_STOP_INSN_LIMIT;
+            return smp ? STOP_SLICE : UAM_STOP_INSN_LIMIT;
         if (uam_sched_now(x->sched) >= tlimit)
             return UAM_STOP_TIME_LIMIT;
 
@@ -618,9 +700,9 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
                 return UAM_STOP_LIVELOCK;
             continue;
         }
-        if (x->host.poll && ++x->blocks_since_poll >= x->host.poll_interval) {
-            x->blocks_since_poll = 0;
-            x->host.poll(x->host.ctx);
+        if (c->host.poll && ++c->blocks_since_poll >= c->host.poll_interval) {
+            c->blocks_since_poll = 0;
+            c->host.poll(c->host.ctx);
         }
         cpu->exit_request = false;
 
@@ -630,7 +712,9 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             x->stats.interrupts++;
             cpu->waiting = false;
             if (x->trace & UAM_TRACE_EXC)
-                fprintf(x->trace_out, "irq: entered handler at 0x%llx\n", (unsigned long long)cpu->pc);
+                fprintf(x->trace_out, cpu->hartid ? "irq: entered handler at 0x%llx cpu=%u\n"
+                                                  : "irq: entered handler at 0x%llx\n",
+                        (unsigned long long)cpu->pc, cpu->hartid);
             if (x->irq_hook) {
                 const uam_interrupt irq = { .from_pc = from_pc, .handler_pc = cpu->pc,
                                             .lines = isa->irq_lines ? isa->irq_lines(cpu) : 0 };
@@ -644,6 +728,8 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             if (isa->irq_wakeup(cpu)) {
                 cpu->waiting = false;
             } else {
+                if (smp)
+                    return STOP_IDLE;
                 uam_stop_reason why = idle(x, tlimit);
                 if (why != UAM_STOP_NONE)
                     return why;
@@ -658,7 +744,7 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             uint64_t pc = cpu->pc;
             if (run_hooks(x))
                 return UAM_STOP_HOOK;
-            if (cpu->pc != pc || x->stop_request || x->reset_request)
+            if (cpu->pc != pc || x->stop_request || x->reset_request || c->smp_resync)
                 continue;
         }
 
@@ -711,17 +797,17 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
         if (blk->backend && blk->backend != UAM_JIT_INTERP) {
             uam_jit_chain ch = { .budget = 0, .link = false };
             if (x->chain && !(x->trace & UAM_TRACE_BLOCKS)) {
-                ch.budget = !x->host.poll ? UINT32_C(1) << 30
-                          : x->blocks_since_poll < x->host.poll_interval
-                              ? x->host.poll_interval - 1 - x->blocks_since_poll : 0;
+                ch.budget = !c->host.poll ? UINT32_C(1) << 30
+                          : c->blocks_since_poll < c->host.poll_interval
+                              ? c->host.poll_interval - 1 - c->blocks_since_poll : 0;
                 ch.link = !(x->n_hooks && uam_exec_has_pc_hook(x, blk->guest_pc));
             }
             uam_jit_run(x->jit, blk, x->temps, &ch, &r);
             x->stats.blocks_native += 1 + ch.hops;
             x->stats.blocks_executed += ch.hops;
             x->stats.blocks_chained += ch.hops;
-            if (x->host.poll)
-                x->blocks_since_poll += ch.hops;
+            if (c->host.poll)
+                c->blocks_since_poll += ch.hops;
         }
         else
             r = uam_interp_block(cpu, blk, &isa->helpers, x->temps);
@@ -757,4 +843,124 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
             break;
         }
     }
+}
+
+/* ---- multiprocessor scheduling ------------------------------------------ */
+
+/* Point the shared clock at `cpu` without moving it: now = icount + idle. */
+static void clock_to(uam_sched *s, uam_cpu *cpu)
+{
+    uint64_t now = uam_sched_now(s);
+    s->icount = &cpu->icount;
+    s->idle = now - cpu->icount;   /* modulo 2^64 */
+}
+
+/* Bring the other processors' executors in line with processor 0's. */
+static void sync_settings(uam_exec *x)
+{
+    for (uint32_t i = 1; i < x->n_smp; i++) {
+        uam_exec *e = x->smp[i];
+        e->max_block_insns = x->max_block_insns;
+        e->verify = x->verify;
+        e->optimize = x->optimize;
+        e->chain = x->chain;
+        e->trace = x->trace;
+        e->trace_out = x->trace_out;
+        e->trace_lo = x->trace_lo;
+        e->trace_hi = x->trace_hi;
+        e->trace_after = x->trace_after;
+        if (x->use_jit && !e->use_jit)
+            uam_exec_enable_jit(e);
+    }
+}
+
+static uam_stop_reason run_smp(uam_exec *x, uint64_t max_insns)
+{
+    const uint64_t tlimit = time_limit(x);
+    const uint64_t start = x->retired;
+    const uint32_t q = x->quantum ? x->quantum : 4096;
+    uam_sched *s = x->sched;
+    uam_stop_reason why = UAM_STOP_NONE;
+    sync_settings(x);
+
+    while (why == UAM_STOP_NONE) {
+        /* The rest of the round, from where the last run left it. */
+        while (x->slice_cpu < x->n_smp && why == UAM_STOP_NONE) {
+            const uint32_t i = x->slice_cpu;
+            uam_exec *e = x->smp[i];
+            uam_cpu *cpu = e->cpu;
+            uint64_t left = max_insns ? max_insns - (x->retired - start) : UINT64_MAX;
+            if (left == 0) {
+                why = UAM_STOP_INSN_LIMIT;
+                break;
+            }
+            if (!x->slice_left)
+                x->slice_left = q;
+            clock_to(s, cpu);
+            x->running = cpu;
+            if (i && cpu->isa->switch_in)
+                cpu->isa->switch_in(cpu);
+            uint64_t before = cpu->icount;
+            x->slice_base = before;
+            uam_stop_reason r = run_loop(e, before + (left < x->slice_left ? left : x->slice_left),
+                                         tlimit, true);
+            if (i && cpu->isa->switch_in)
+                x->cpu->isa->switch_in(x->cpu);   /* the platform view is processor 0's between slices */
+            if (r == STOP_RESYNC) {
+                /* A hook restored a snapshot: every processor and slice_* are the
+                 * snapshot's now. Carry on from there. */
+                x->smp_resync = false;
+                continue;
+            }
+            uint64_t ran = cpu->icount - before;
+            x->retired += ran;
+            x->round_ran |= ran != 0;
+            x->slice_left = ran < x->slice_left ? x->slice_left - ran : 0;
+            if (r == STOP_IDLE || !x->slice_left) {
+                /* The slice is over and other processors run next: they may write
+                 * what this one holds a reservation on, so it is lost (a
+                 * store-conditional may always fail; the next attempt runs within
+                 * one slice). Only here, so split runs interleave identically. */
+                cpu->resv.valid = false;
+                x->slice_cpu++;
+                x->slice_left = 0;
+            }
+            if (r != STOP_SLICE && r != STOP_IDLE)
+                why = r;
+        }
+        if (why != UAM_STOP_NONE)
+            break;
+        /* The round is over. */
+        bool ran = x->round_ran;
+        x->slice_cpu = 0;
+        x->round_ran = false;
+        if (!ran) {
+            /* every processor waits: skip time (or wait for the host) */
+            clock_to(s, x->cpu);
+            x->running = x->cpu;
+            uam_sched_run_due(s);
+            bool woke = false;
+            for (uint32_t i = 0; i < x->n_smp && !woke; i++)
+                woke = x->smp[i]->cpu->isa->irq_wakeup(x->smp[i]->cpu) ||
+                       !x->smp[i]->cpu->waiting;
+            if (!woke)
+                why = idle(x, tlimit);
+            if (why == UAM_STOP_NONE && uam_sched_now(s) >= tlimit)
+                why = UAM_STOP_TIME_LIMIT;
+        }
+    }
+    clock_to(s, x->cpu);
+    x->running = NULL;
+    return why;
+}
+
+uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
+{
+    if (x->n_smp > 1)
+        return run_smp(x, max_insns);
+    uint64_t before = x->cpu->icount;
+    uam_stop_reason r = run_loop(x, max_insns ? x->cpu->icount + max_insns : UINT64_MAX,
+                                 time_limit(x), false);
+    x->retired += x->cpu->icount - before;
+    return r;
 }
