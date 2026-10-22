@@ -4,6 +4,8 @@
  * A snapshot is two parts:
  *   - the component state: a state stream (uam/state.h) with one record per
  *     component - "cpu", "isa", "sched", "exec", "dev/<key>", "state/<name>";
+ *     a multiprocessor machine adds "cpu/<n>", "isa/<n>" and "exec/<n>" for
+ *     processor n >= 1 and "smp" (where the interleaving stands);
  *   - memory: a copy of each RAM/ROM/ROMD backing store, held in an anonymous
  *     mapping so that all-zero pages, which are never copied, cost nothing.
  *
@@ -271,6 +273,16 @@ static void restore_exec(uam_exec *x, uam_state_reader *r)
     x->stall_icount = uam_state_get_u64(r);
 }
 
+/* A per-processor record name: "cpu" for processor 0, "cpu/<n>" for the others. */
+static const char *cpu_key(char *buf, size_t n, const char *base, uint32_t i)
+{
+    if (i)
+        snprintf(buf, n, "%s/%u", base, (unsigned)i);
+    else
+        snprintf(buf, n, "%s", base);
+    return buf;
+}
+
 /* Write every component's record. Returns false (logged) if one cannot be saved. */
 static bool save_components(uam_machine *m, uam_state_writer *w, dev_table *devs)
 {
@@ -288,18 +300,46 @@ static bool save_components(uam_machine *m, uam_state_writer *w, dev_table *devs
         }
     }
 
-    uam_state_begin(w, "cpu");
-    save_cpu(&m->cpu, w);
-    uam_state_end(w);
-    uam_state_begin(w, "isa");
-    isa->save(&m->cpu, w);
-    uam_state_end(w);
+    for (uint32_t i = 0; i <= m->n_aps; i++) {
+        uam_cpu *cpu = uam_machine_cpu(m, i);
+        char key[32];
+        uam_state_begin(w, cpu_key(key, sizeof(key), "cpu", i));
+        save_cpu(cpu, w);
+        uam_state_end(w);
+        uam_state_begin(w, cpu_key(key, sizeof(key), "isa", i));
+        isa->save(cpu, w);
+        uam_state_end(w);
+        uam_state_begin(w, cpu_key(key, sizeof(key), "exec", i));
+        save_exec(uam_machine_exec(m, i), w);
+        uam_state_end(w);
+    }
+    /* Virtual time, as processor 0's offset (the clock follows the processor
+     * running, which a PC hook taking this snapshot mid-slice may not be). */
     uam_state_begin(w, "sched");
-    uam_state_put_u64(w, m->sched.idle);
+    uam_state_put_u64(w, uam_sched_now(&m->sched) - m->cpu.icount);
     uam_state_end(w);
-    uam_state_begin(w, "exec");
-    save_exec(&m->exec, w);
-    uam_state_end(w);
+    if (m->n_aps) {
+        /* Where the interleaving stands. Mid-slice (a PC hook), the running
+         * processor has used part of its slice since slice_left was set. */
+        const uam_exec *x = &m->exec;
+        uint32_t cpu = x->slice_cpu;
+        uint64_t left = x->slice_left;
+        bool ran = x->round_ran;
+        if (x->running) {
+            uint64_t used = x->running->icount - x->slice_base;
+            left = used < left ? left - used : 0;
+            ran |= used != 0;
+            if (!left && ++cpu == m->n_aps + 1) {
+                cpu = 0;
+                ran = false;
+            }
+        }
+        uam_state_begin(w, "smp");
+        uam_state_put_u32(w, cpu);
+        uam_state_put_u64(w, left);
+        uam_state_put_bool(w, ran);
+        uam_state_end(w);
+    }
     for (uint32_t i = 0; i < devs->n; i++) {
         uam_state_begin(w, devs->e[i].key);
         devs->e[i].dev->ops->save(devs->e[i].dev, w);
@@ -335,7 +375,8 @@ static bool save_components(uam_machine *m, uam_state_writer *w, dev_table *devs
 static void set_baseline(uam_machine *m, const uam_snapshot *s)
 {
     uam_bus_dirty_reset(&m->bus);
-    uam_cpu_dtlb_flush(&m->cpu);   /* cached write access to now-clean pages */
+    for (uint32_t i = 0; i <= m->n_aps; i++)
+        uam_cpu_dtlb_flush(uam_machine_cpu(m, i));   /* cached write access to now-clean pages */
     m->snap_base = s->id;
 }
 
@@ -406,16 +447,37 @@ uam_status uam_snapshot_take(uam_machine *m, uam_snapshot **out)
 
 /* ---- restore -------------------------------------------------------------- */
 
-typedef enum { REC_CPU, REC_ISA, REC_SCHED, REC_EXEC, REC_DEV, REC_PART, REC_UNKNOWN } rec_kind;
+typedef enum { REC_CPU, REC_ISA, REC_SCHED, REC_EXEC, REC_SMP, REC_DEV, REC_PART, REC_UNKNOWN } rec_kind;
 
-/* What a record name refers to in machine m. */
-static rec_kind classify(uam_machine *m, dev_table *devs, const char *name, uam_device **dev,
-                         uam_state_part **part)
+/* "base" (processor 0) or "base/<n>" for a processor this machine has: its number in *idx. */
+static bool per_cpu(const uam_machine *m, const char *name, const char *base, uint32_t *idx)
 {
-    if (!strcmp(name, "cpu"))   return REC_CPU;
-    if (!strcmp(name, "isa"))   return REC_ISA;
+    size_t n = strlen(base);
+    if (strncmp(name, base, n))
+        return false;
+    if (!name[n]) {
+        *idx = 0;
+        return true;
+    }
+    if (name[n] != '/' || name[n + 1] < '1' || name[n + 1] > '9')
+        return false;
+    char *end;
+    unsigned long v = strtoul(name + n + 1, &end, 10);
+    if (*end || v > m->n_aps)
+        return false;
+    *idx = (uint32_t)v;
+    return true;
+}
+
+/* What a record name refers to in machine m (a processor's number in *idx). */
+static rec_kind classify(uam_machine *m, dev_table *devs, const char *name, uam_device **dev,
+                         uam_state_part **part, uint32_t *idx)
+{
+    if (per_cpu(m, name, "cpu", idx))  return REC_CPU;
+    if (per_cpu(m, name, "isa", idx))  return REC_ISA;
+    if (per_cpu(m, name, "exec", idx)) return REC_EXEC;
     if (!strcmp(name, "sched")) return REC_SCHED;
-    if (!strcmp(name, "exec"))  return REC_EXEC;
+    if (!strcmp(name, "smp") && m->n_aps) return REC_SMP;
     if (!strncmp(name, "dev/", 4) && (*dev = dev_table_find(devs, name)))
         return REC_DEV;
     if (!strncmp(name, "state/", 6)) {
@@ -469,8 +531,9 @@ static bool compatible(uam_machine *m, const uam_snapshot *s, dev_table *devs)
     while (ok && (name = uam_state_next(rd))) {
         uam_device *d = NULL;
         uam_state_part *p = NULL;
-        switch (classify(m, devs, name, &d, &p)) {
-        case REC_CPU: case REC_ISA: case REC_SCHED: case REC_EXEC: n_core++; break;
+        uint32_t idx;
+        switch (classify(m, devs, name, &d, &p, &idx)) {
+        case REC_CPU: case REC_ISA: case REC_SCHED: case REC_EXEC: case REC_SMP: n_core++; break;
         case REC_DEV:
             n_dev++;
             if (!d->ops->restore) {
@@ -496,10 +559,12 @@ static bool compatible(uam_machine *m, const uam_snapshot *s, dev_table *devs)
         return false;
 
     unsigned want_dev = devs->n;
-    if (n_core != 4 || n_dev != want_dev || n_part != m->n_state_parts) {
-        uam_log(UAM_LOG_ERROR, "snapshot", "snapshot has state for %u devices and %u extra parts, "
-                "the machine has %u and %u (or a core record is missing)", n_dev, n_part, want_dev,
-                (unsigned)m->n_state_parts);
+    /* cpu, isa and exec per processor, sched, and smp with several */
+    unsigned want_core = 3 * (m->n_aps + 1) + 1 + (m->n_aps ? 1 : 0);
+    if (n_core != want_core || n_dev != want_dev || n_part != m->n_state_parts) {
+        uam_log(UAM_LOG_ERROR, "snapshot", "snapshot has %u core records, state for %u devices and "
+                "%u extra parts; the machine needs %u, %u and %u (a different processor count?)",
+                n_core, n_dev, n_part, want_core, want_dev, (unsigned)m->n_state_parts);
         return false;
     }
     return true;
@@ -518,11 +583,22 @@ static bool restore_components(uam_machine *m, const uam_snapshot *s, dev_table 
     while ((name = uam_state_next(r))) {
         uam_device *d = NULL;
         uam_state_part *p = NULL;
-        switch (classify(m, devs, name, &d, &p)) {
-        case REC_CPU:   restore_cpu(&m->cpu, r); break;
-        case REC_ISA:   m->cpu.isa->restore(&m->cpu, r); break;
-        case REC_SCHED: m->sched.idle = uam_state_get_u64(r); break;
-        case REC_EXEC:  restore_exec(&m->exec, r); break;
+        uint32_t i = 0;
+        switch (classify(m, devs, name, &d, &p, &i)) {
+        case REC_CPU:   restore_cpu(uam_machine_cpu(m, i), r); break;
+        case REC_ISA:   m->cpu.isa->restore(uam_machine_cpu(m, i), r); break;
+        case REC_SCHED:
+            m->sched.icount = &m->cpu.icount;   /* saved as processor 0's offset */
+            m->sched.idle = uam_state_get_u64(r);
+            break;
+        case REC_EXEC:  restore_exec(uam_machine_exec(m, i), r); break;
+        case REC_SMP:
+            m->exec.slice_cpu = uam_state_get_u32(r);
+            m->exec.slice_left = uam_state_get_u64(r);
+            m->exec.round_ran = uam_state_get_bool(r);
+            if (m->exec.slice_cpu > m->n_aps)
+                uam_state_fail(r, "smp: processor out of range");
+            break;
         case REC_DEV:   d->ops->restore(d, r); break;
         case REC_PART:  p->restore(p->ctx, r); break;
         case REC_UNKNOWN: uam_state_fail(r, "unexpected record"); break;
@@ -592,7 +668,12 @@ uam_status uam_snapshot_restore(uam_machine *m, const uam_snapshot *s)
     m->exec.stop_status = 0;
     /* TLB contents and privilege may differ: drop mapped translations and
      * stop any block in flight at the next boundary. */
-    uam_cpu_xlate_changed(&m->cpu);
+    for (uint32_t i = 0; i <= m->n_aps; i++)
+        uam_cpu_xlate_changed(uam_machine_cpu(m, i));
+    /* Restored from a PC hook in the middle of a slice: the scheduler resumes
+     * from the restored slice state rather than the one in flight. */
+    if (m->n_aps && m->exec.running)
+        m->exec.smp_resync = true;
     return UAM_OK;
 }
 

@@ -2,8 +2,10 @@
  * cfi_flash.c - Intel/Sharp command-set NOR flash as a ROM device
  * (uam/dev/cfi_flash.h).
  */
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "uam/dev/cfi_flash.h"
 
@@ -19,6 +21,10 @@ typedef struct flash {
     uint8_t     mode, pending, status;
     bool        protect;
     uint8_t     query[0x40];
+    bool      (*gate)(void *ctx, uint64_t off);
+    void       *gate_ctx;
+    int         fd;          /* write-through backing file, or -1 */
+    uint8_t     manuf, devid; /* read-identifier codes (board-supplied) */
 } flash;
 
 static flash *from_dev(uam_device *d) { return UAM_CONTAINER_OF(d, flash, dev); }
@@ -36,8 +42,8 @@ static uint8_t read_byte(flash *f, uint64_t off)
     case MODE_STATUS: return f->status;
     case MODE_ID:
         switch (off & 3) {
-        case 0: return 0x89;   /* Intel */
-        case 1: return 0x18;
+        case 0: return f->manuf;
+        case 1: return f->devid;
         default: return 0;     /* block unlocked */
         }
     case MODE_QUERY: {
@@ -58,26 +64,50 @@ static uam_status flash_read(uam_device *d, uint64_t off, unsigned size, uint64_
     return UAM_OK;
 }
 
+static bool may_write(flash *f, uint64_t off)
+{
+    return !f->protect && (!f->gate || f->gate(f->gate_ctx, off));
+}
+
+static void write_through(flash *f, uint64_t off, uint64_t len)
+{
+    if (f->fd < 0)
+        return;
+    const uint8_t *mem = uam_bus_romd_backing(f->region) + off;
+    while (len) {
+        ssize_t n = pwrite(f->fd, mem, len, (off_t)off);
+        if (n <= 0) {
+            uam_log(UAM_LOG_WARN, "cfi-flash", "%s: write-through failed", f->dev.name);
+            return;
+        }
+        mem += n;
+        off += (uint64_t)n;
+        len -= (uint64_t)n;
+    }
+}
+
 static void program(flash *f, uint64_t off, uint8_t v)
 {
-    if (f->protect) {
+    if (!may_write(f, off)) {
         f->status |= SR_PROG_ERR | SR_PROTECT;
         return;
     }
     uint8_t *mem = uam_bus_romd_backing(f->region);
     mem[off] &= v;   /* NOR programming only clears bits */
     uam_bus_romd_dirty(f->bus, f->region, off, 1);
+    write_through(f, off, 1);
 }
 
 static void erase(flash *f, uint64_t off)
 {
-    if (f->protect) {
+    if (!may_write(f, off)) {
         f->status |= SR_ERASE_ERR | SR_PROTECT;
         return;
     }
     uint64_t base = off & ~(f->block - 1);
     memset(uam_bus_romd_backing(f->region) + base, 0xFF, f->block);
     uam_bus_romd_dirty(f->bus, f->region, base, f->block);
+    write_through(f, base, f->block);
 }
 
 static void write_byte(flash *f, uint64_t off, uint8_t v)
@@ -131,7 +161,13 @@ static void flash_reset(uam_device *d)
     set_mode(f, MODE_ARRAY);
 }
 
-static void flash_destroy(uam_device *d) { free(from_dev(d)); }
+static void flash_destroy(uam_device *d)
+{
+    flash *f = from_dev(d);
+    if (f->fd >= 0)
+        close(f->fd);
+    free(f);
+}
 
 /* The array itself is RAM-like backing store: the bus's snapshot code saves it. */
 static void flash_save(uam_device *d, uam_state_writer *w)
@@ -154,7 +190,7 @@ static void flash_restore(uam_device *d, uam_state_reader *r)
 }
 
 static const uam_device_ops flash_ops = {
-    .type = "cfi-flash,intel", .read = flash_read, .write = flash_write, .reset = flash_reset,
+    .type = "cfi-flash", .read = flash_read, .write = flash_write, .reset = flash_reset,
     .destroy = flash_destroy, .save = flash_save, .restore = flash_restore,
 };
 
@@ -189,6 +225,7 @@ uam_device *uam_cfi_flash_map(uam_bus *bus, const char *name, uint64_t base, uin
     f->size = size;
     f->block = block_size;
     f->status = SR_READY;
+    f->fd = -1;
     build_query(f);
     if (uam_bus_map_romd(bus, name, base, size, &f->dev, NULL, 0, NULL, &f->region) != UAM_OK) {
         free(f);
@@ -204,3 +241,31 @@ uam_device *uam_cfi_flash_map(uam_bus *bus, const char *name, uint64_t base, uin
 uam_region *uam_cfi_flash_region(uam_device *d) { return from_dev(d)->region; }
 
 void uam_cfi_flash_set_protected(uam_device *d, bool on) { from_dev(d)->protect = on; }
+
+void uam_cfi_flash_set_write_gate(uam_device *d, bool (*allowed)(void *ctx, uint64_t off), void *ctx)
+{
+    flash *f = from_dev(d);
+    f->gate = allowed;
+    f->gate_ctx = ctx;
+}
+
+uam_status uam_cfi_flash_set_backing_file(uam_device *d, const char *path)
+{
+    flash *f = from_dev(d);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        uam_log(UAM_LOG_ERROR, "cfi-flash", "cannot open %s for writing", path);
+        return UAM_ERR_INVALID;
+    }
+    if (f->fd >= 0)
+        close(f->fd);
+    f->fd = fd;
+    return UAM_OK;
+}
+
+void uam_cfi_flash_set_ids(uam_device *dev, uint8_t manufacturer, uint8_t device)
+{
+    flash *f = from_dev(dev);
+    f->manuf = manufacturer;
+    f->devid = device;
+}

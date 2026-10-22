@@ -882,7 +882,7 @@ static void t_endian(void)
 
 static void t_cp15(void)
 {
-    EQ(mrc(0, 0, 0, 0), 0x410FC075u, "MIDR");
+    EQ(mrc(0, 0, 0, 0), 0x000F0000u, "MIDR");
     EQ((mrc(0, 0, 2, 0) >> 24) & 0xF, 2, "ID_ISAR0.Divide");
     mcr(0, 13, 0, 2, 0xC0FFEE);
     EQ(mrc(0, 13, 0, 2), 0xC0FFEE, "TPIDRURW");

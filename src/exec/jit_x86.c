@@ -158,6 +158,31 @@ static int jit_br_store(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t f
     return 0;
 }
 
+/* Store-conditional: jc->scratch = 1 if the store was performed, 0 if not. */
+static int jit_br_store_x(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t flags, uint32_t size)
+{
+    uint32_t xf = 0;
+    bool ok = false;
+    uam_status st = uam_execops_store_x(jc->cpu, addr, val, flags, size, &ok, &xf);
+    chain_check(jc);
+    if (st != UAM_OK)
+        return jit_fault(jc, st, addr, xf, true);
+    jc->scratch = ok;
+    return 0;
+}
+
+/* AMO / CAS: jc->scratch = the old memory value. packed = op | sub << 8 | width << 16. */
+static int jit_br_rmw(uam_jit_ctx *jc, uint64_t addr, uint64_t b, uint64_t c, uint32_t flags,
+                      uint32_t packed)
+{
+    uint32_t xf = 0;
+    const bool cas = (packed & 0xff) == UAM_OP_CAS;
+    uam_status st = uam_execops_rmw(jc->cpu, cas, (uam_amo_op)((packed >> 8) & 0xff), addr, b, c,
+                                    flags, (packed >> 16) & 0xff, &jc->scratch, &xf);
+    chain_check(jc);
+    return st == UAM_OK ? 0 : jit_fault(jc, st, addr, xf, true);
+}
+
 static int jit_fault_simple(uam_jit_ctx *jc, uam_exc_kind kind, uint64_t tval)
 {
     uam_block_result *r = &jc->res;
@@ -190,6 +215,24 @@ static int jit_br_syswr(uam_jit_ctx *jc, uint32_t id, uint64_t val)
     return st == UAM_OK ? 0 : jit_fault_simple(jc, UAM_EXC_SYSREG, id);
 }
 
+/* HELPER: the ISA's C function, as the interpreter calls it (arguments and
+ * result masked to their declared widths). Returns 1 on fault. */
+static int jit_br_helper(uam_jit_ctx *jc, uint32_t id, uint64_t a, uint64_t b, uint64_t c)
+{
+    const uam_helper_desc *hd = &jc->helpers->desc[id];
+    const uint64_t args[3] = { a, b, c };
+    uint64_t v[3] = { 0, 0, 0 };
+    for (unsigned k = 0; k < hd->n_args; k++)
+        v[k] = args[k] & uam_mask(hd->arg_width[k]);
+    uam_status st = UAM_OK;
+    uint64_t r = hd->fn(jc->cpu, v[0], v[1], v[2], &st);
+    chain_check(jc);
+    if (st != UAM_OK)
+        return jit_fault_simple(jc, UAM_EXC_HELPER, id);
+    jc->scratch = hd->result_width ? r & uam_mask(hd->result_width) : 0;
+    return 0;
+}
+
 /* packed = op | width << 8 | src_w << 16 */
 static uint64_t jit_br_eval(uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 {
@@ -206,7 +249,7 @@ static uint64_t jit_br_eval(uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 #define MAX_SLOTS  64u           /* EXITs per block that get a link (more just return) */
 
 /* Host registers. */
-enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, RDI = 7, R8 = 8,
+enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, RDI = 7, R8 = 8, R9 = 9,
        R12 = 12, R13 = 13, R14 = 14, R15 = 15 };
 
 struct uam_jit {
@@ -571,6 +614,7 @@ static bool op_supported(uam_opcode op)
     case UAM_OP_EXIT: case UAM_OP_COV:
         return true;
     case UAM_OP_SYSRD: case UAM_OP_SYSWR: case UAM_OP_TRAP: case UAM_OP_WAIT:
+    case UAM_OP_HELPER: case UAM_OP_AMO: case UAM_OP_CAS: case UAM_OP_FENCE:
         return true;
     default:
         break;
@@ -712,8 +756,6 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         uam_opcode op = (uam_opcode)blk->insn[i].op;
         if (!op_supported(op))
             return false;
-        if (op == UAM_OP_ST && (blk->insn[i].flags & UAM_ACC_X))
-            return false;   /* store-conditional: left to the interpreter */
     }
 
     /* prologue */
@@ -801,7 +843,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                         break;
                     continue;
                 }
-                if ((uam_opinfo_table[o2].props & UAM_P_FAULT) || o2 == UAM_OP_TRAP) {
+                /* a helper may fault (its descriptor says; any one is assumed to) */
+                if ((uam_opinfo_table[o2].props & UAM_P_FAULT) || o2 == UAM_OP_TRAP ||
+                    o2 == UAM_OP_HELPER) {
                     needs_pc = true;
                     break;
                 }
@@ -868,7 +912,25 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 patch(j, done);
             break;
         }
-        case UAM_OP_ST: {
+        case UAM_OP_ST:
+            if (in->flags & UAM_ACC_X) {               /* store-conditional: always the bridge */
+                st_mem(j, R13, R14, CPU(icount));
+                mov_rr(j, RDI, RBX);
+                load_operand(j, RSI, blk, in->a, aw);
+                load_operand(j, RDX, blk, in->b, W);
+                movabs(j, RCX, in->flags);
+                movabs(j, R8, W / 8);
+                movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_store_x);
+                g8(j, 0xFF); modrm_reg(j, 2, RAX);
+                g8(j, 0x85); modrm_reg(j, RAX, RAX);
+                epi[n_epi++] = jcc_fwd(j, 0x85);
+                if (!uam_ref_is_none(in->dst)) {
+                    ld_mem(j, RAX, RBX, OFF(scratch));
+                    st_temp(j, in->dst, RAX);
+                }
+                break;
+            }
+            {
             unsigned size = W / 8;
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
@@ -895,7 +957,35 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             if (fast)
                 patch(j, done);
             break;
+            }
+        case UAM_OP_AMO:
+        case UAM_OP_CAS: {
+            const bool cas = op == UAM_OP_CAS;
+            st_mem(j, R13, R14, CPU(icount));
+            mov_rr(j, RDI, RBX);
+            load_operand(j, RSI, blk, in->a, aw);       /* addr */
+            load_operand(j, RDX, blk, in->b, W);        /* operand / expected */
+            if (cas)
+                load_operand(j, RCX, blk, in->c, W);    /* new value */
+            else
+                movabs(j, RCX, 0);
+            movabs(j, R8, in->flags);
+            movabs(j, R9, (uint32_t)op | (cas ? 0 : (uint32_t)in->aux << 8) | (uint32_t)W << 16);
+            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_rmw);
+            g8(j, 0xFF); modrm_reg(j, 2, RAX);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);
+            epi[n_epi++] = jcc_fwd(j, 0x85);
+            if (!uam_ref_is_none(in->dst)) {
+                ld_mem(j, RAX, RBX, OFF(scratch));
+                st_temp(j, in->dst, RAX);
+            }
+            break;
         }
+        case UAM_OP_FENCE:
+            /* Ordering is a no-op: a hart's blocks run one at a time and harts are
+             * interleaved only between blocks. FENCE.INSN needs nothing either: code
+             * writes invalidate translations and the block ends here (see interp.c). */
+            break;
         case UAM_OP_EXIT:
             set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
             if (j->n_slots < MAX_SLOTS)
@@ -925,6 +1015,28 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
             break;
+        case UAM_OP_HELPER: {
+            const uam_ref args[3] = { in->a, in->b, in->c };
+            const int regs[3] = { RDX, RCX, R8 };
+            st_mem(j, R13, R14, CPU(icount));
+            for (unsigned k = 0; k < 3; k++) {
+                if (uam_ref_is_none(args[k]))
+                    movabs(j, regs[k], 0);
+                else
+                    load_operand(j, regs[k], blk, args[k], 64);
+            }
+            mov_rr(j, RDI, RBX);
+            movabs(j, RSI, in->aux);
+            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_helper);
+            g8(j, 0xFF); modrm_reg(j, 2, RAX);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);
+            epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
+            if (!uam_ref_is_none(in->dst)) {
+                ld_mem(j, RAX, RBX, OFF(scratch));
+                st_temp(j, in->dst, RAX);
+            }
+            break;
+        }
         case UAM_OP_TRAP:
             /* res = { TRAP, class, exc{TRAP, flags=cont, pc, parent_pc, cause, tval} } */
             ld_mem(j, RAX, RBX, OFF(cur_pc));   st_mem(j, RAX, RBX, RES(pc));
@@ -952,7 +1064,8 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         }
 
         if (guarded) {
-            if (op == UAM_OP_LD && !uam_ref_is_none(in->dst)) {
+            /* guard false: no effect, dst = 0 (section 4.1) */
+            if (!uam_ref_is_none(in->dst)) {
                 size_t over = jmp_fwd(j);
                 patch(j, guard_skip);
                 movabs(j, RAX, 0);

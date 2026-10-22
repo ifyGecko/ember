@@ -44,21 +44,22 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state. An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
 | `sched.h` | Instruction-count clock (saturating at a 2^62-tick horizon), event queue with a per-call firing budget, a kick when the earliest deadline moves (the machine turns it into an exit request), cancel-all, list consistency checks | the core |
 | `signal.h` | Interrupt, GPIO and reset lines: raise, lower, connect; edge and level | the core |
+| `blockdev.h` | Fixed-size sectors between a storage controller (AHCI, NVMe) and the host: read, write, flush; read-only and volatile (in-memory overlay) modes | core interface; the file backend in `src/host` |
 | `chardev.h` | Byte streams between a device and the host (UART consoles); input can be held back until the run starts (`uam_chardev_hold`) | core plumbing; backends in `src/host` |
 | `netdev.h` | Ethernet frames between a device and the host (NICs, switches, radio "air") | core plumbing; backends in `src/host` |
-| `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports), extra snapshot state (`uam_machine_add_state`), named inputs a board publishes (`uam_machine_add_input`: a UART FIFO, a DMA buffer), ABI handshake | `src/machine`, `boards/*` |
+| `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports), extra snapshot state (`uam_machine_add_state`), named inputs a board publishes (`uam_machine_add_input`: a UART FIFO, a DMA buffer), extra processors (`uam_machine_add_cpus`: each with its own translation cache, sharing bus and clock; `uam_machine_current_cpu` for per-processor devices) and observers on all of them (`uam_machine_add_pc_hook`, `_set_exc_hook`, `_set_irq_hook`, `_add_pass`, `_set_coverage` with a coverage history per processor, `_get_stats`), ABI handshake | `src/machine`, `boards/*` |
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into) and the core services ISA modules may call (`uam_cpu_xlate_changed`, ...) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics | `exec/interp`, `exec/jit_x86` |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit_x86` |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
-| `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb` | `src/debug` |
+| `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
 | `boards.h` | The stock boards and their registration | `boards/stock.c` |
 | `pass.h` | IR → IR transformations run on every new block, after the optimizer and before native compilation (instrumentation); block editing helpers | `analysis/*`; registered with `uam_exec_add_pass` |
@@ -113,26 +114,33 @@ Implemented:
 ```
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
                   loader.h machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
-                  state.h snapshot.h pass.h cov.h
-include/uam/dev/  clint.h plic.h gic.h uart16550.h sifive_test.h unknown_mmio.h unimp.h
-                  mmio_stub.h virtio_net.h
-include/uam/isa/  riscv.h mips32.h arm.h
+                  state.h snapshot.h pass.h cov.h blockdev.h
+include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.h unimp.h
+                  mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
+                  i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
+                  i8237.h ide.h fdc.h vga.h lpt.h
+include/uam/isa/  riscv.h mips32.h arm.h x86.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit_x86.c coverage.c jit.h execops.h
 analysis/         cov.c (the edge-coverage pass)
 src/loader/       loader.c
 src/machine/      machine.c snapshot.c
-src/host/         chardev_backends.c netdev_backends.c hostloop.c
+src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.c
 src/debug/        gdbstub.c
 src/runner/       runner.c
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips.h (private)
 isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32) arm_system.c
                   arm.h (private)
-devices/          clint.c plic.c gic.c uart16550.c sifive_test.c unknown_mmio.c unimp.c
-                  mmio_stub.c virtio_net.c
-boards/           rv32_ref.c mips_ref.c arm_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_helpers.c
+                  x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
+                  x86.h (private)
+devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.c unimp.c
+                  mmio_stub.c virtio_net.c i8259.c i8254.c mc146818.c lapic.c ioapic.c hpet.c
+                  i8042.c acpi_pm.c pc_misc.c pci.c ata_core.c ahci.c ide.c nvme.c cfi_flash.c
+                  ipi.c i8237.c fdc.c vga.c lpt.c
+boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
@@ -190,11 +198,32 @@ devices.
   (`uam_exec_add_pc_hook`): the hook reads arguments, writes results and sets the pc. Hooks are
   placed by address; lookup by symbol name is planned.
 - **Stock boards**: `rv32-ref`, an RV32IMAC M-mode reference board (CLINT, PLIC, NS16550A UART,
-  sifive,test finisher, virtio-net ports, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
+  test finisher, virtio-net ports, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
   (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` / `armeb-ref` (ARMv7-A,
   little-endian and BE8, with a GICv2-style interrupt controller fed by the generic timer and
   the NS16550A UART, a test finisher, RAM at 0 under the vectors). Real devices are built out of tree on the library
   (`examples/external-board/`).
+- **Multiprocessor machines** (`-o cpus=N` on every reference board): processors share the
+  bus and the clock and run in deterministic instruction slices (`--quantum`). Every processor
+  starts at the reset address and firmware tells them apart by its architectural number:
+  `mhartid`; EBase.CPUNum; MPIDR.Aff0; the x86 initial APIC ID, where the others wait for
+  INIT/SIPI. Per-processor interrupts come from generic parts that know several CPUs: the
+  CLINT (a msip and mtimecmp per hart) and PLIC contexts on RISC-V, IPI doorbells
+  (`devices/ipi.c`) on MIPS, the GIC on ARM (banked SGIs/PPIs, SGI sources, ITARGETSR-routed
+  SPIs, a CPU interface per processor), local APICs on an APIC bus on x86.
+  `tests/smp/smp_test.h` is one self-test for all four: per-processor timer and IPI interrupts
+  and a shared log written with atomics, whose hash depends on the interleaving.
+- **Legacy PC** (for emulators of real boards that run their BIOS image): the x86 core has
+  virtual-8086 mode (IOPL-sensitive instructions, interrupts out of it and IRET back), call
+  gates (with the inner-stack switch and parameter copy), hardware task switches (TSS 16/32,
+  task gates in the GDT and IDT, nested tasks and IRET, busy bits), the TSS I/O permission
+  bitmap, A20M# (the A20 gate), and MMX. The generic devices a PC BIOS drives are there to
+  compose: the 8237 DMA controllers, an 82077 floppy controller, an IDE controller (PIO, CHS,
+  48-bit, ATAPI, bus-master DMA; its drive side `ata_core.c` is shared with AHCI), a VGA
+  (registers, planar memory and the read/write modes, text and graphics rendering for the
+  host), a parallel port, and PCI expansion ROMs for option ROMs. `x86_64-ref` offers them as
+  options and boots a legacy BIOS image (`--image bios=`: at 4 GiB, its last 128 KiB below 1
+  MiB). A board emulator adds its own chipset (shadow RAM, PAM, the board's I/O) out of tree.
 - **ARM state** (`isa/arm`, `uam/isa/arm.h`): Thumb state is bit 0 of the pc, the ARM
   convention for code addresses, so the translation cache, interrupted blocks and ELF entry
   points need nothing ARM-specific, and interworking branches stay plain IR (`BX` compiles and
@@ -224,7 +253,9 @@ devices.
   translation or privilege change). Interrupts are still taken only by the run loop, so an ISA
   must request an exit on anything that can make `irq_take` newly succeed (`isa.h`). Chained runs
   are bit-identical to unchained ones and to the interpreter; `--no-chain` turns it off.
-- **Snapshots** (`snapshot.h`): the hart and ISA state, every RAM/ROM/ROMD backing store, virtual
+- **Snapshots** (`snapshot.h`): every hart's state and ISA state (with several processors, also
+  where their interleaving stands: a run that stops mid-slice resumes there, so split and restored
+  runs interleave exactly as one run), every RAM/ROM/ROMD backing store, virtual
   time and armed timers, each device's state (`save`/`restore` over `state.h`), and extra state
   a board or analysis registers. Taking or restoring a snapshot makes it the machine's baseline
   and turns on the bus's per-4 KiB dirty bitmap: `uam_bus_page_host` withholds write access to
@@ -269,12 +300,16 @@ devices.
   through the generic runner-extension interface (`runner.h`), so nothing outside
   `fuzz/suzzer/` names suzzer.
 - **Planned** (phase 3, on top of snapshots):
-  - More passes: cmp-logging, memory hooks, taint (these need `HELPER` support in the JIT).
+  - More passes: cmp-logging, memory hooks, taint (`HELPER` calls, which such passes would
+    insert, compile in the JIT like every other IR op).
   - More crash checks: execution outside code regions, an icount watchdog per function.
 
   PC hooks, watchpoints and `uam_exec_stop` are already available to build oracles by hand.
 - **GDB stub** against the abstract state (`--gdb PORT`): breakpoints are PC hooks, watchpoints
-  are bus watches, registers come from `isa->gdb`.
+  are bus watches, registers come from `isa->gdb` (per-register widths for mixed files: the
+  x86 view is gdb's whole amd64 core set, x87 included). Every processor is a thread in
+  all-stop mode; a stop names the processor that hit the breakpoint or watchpoint, and
+  registers and steps follow the selected thread.
 - **Host I/O** is outside the machine: devices use `chardev.h` / `netdev.h`; backends (stdio,
   pty, sockets, tap, tun, UDP, in-process pairs, pcap capture) and the host loop live in `src/host`.
   Virtual-time pacing (the default) keeps runs deterministic; an idle hart skips straight to its
@@ -295,11 +330,11 @@ devices.
 3. Snapshots (*done*), coverage (*done*: IR passes, `UAM_OP_COV`, the coverage pass) and
    cmp-log passes, unknown-MMIO fuzz policy (*done*: per-register rules with an `input`
    policy), a persistent-mode fuzz harness (*done*, with a replay frontend).
-4. Board description format, more peripherals, Cortex-M, JIT (*done*: x86-64, with block chaining).
+4. Board description format, more peripherals, ARMv7-M, JIT (*done*: x86-64 host, with block chaining; every IR op compiles, so no block falls back to the interpreter).
 
 Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
 short-descriptor MMU, generic timer, a GIC, little-endian and BE8), host networking, a gdb stub, the library build with
-an ABI handshake. Cortex-M (ARMv7-M: the NVIC exception model) is still planned.
+an ABI handshake. ARMv7-M (the M-profile NVIC exception model) is still planned.
 
 ## 8. Verification
 
@@ -312,7 +347,15 @@ Implemented (`make test`):
   and after the optimizer.
 - Firmware self-tests: bare-metal RV32, MIPS32 (both byte orders) and ARMv7 (built as ARM and
   as Thumb-2 code, little-endian and BE8) programs that check themselves and report through the test finisher, run
-  on the interpreter (the snapshot check below runs them on the JIT as well).
+  on the interpreter and on the JIT; and a multiprocessor self-test on four processors of each
+  architecture (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
+  `tests/firmware-x86/legacy.asm` (task switches, gates, the I/O bitmap, virtual-8086 mode,
+  A20, MMX) and `biosrom.asm`, a BIOS-style ROM from the reset vector through VGA, floppy (DMA),
+  IDE and the printer into a boot sector (`bios-check.py`).
+- Multiprocessor observers (`test_smp`): machine-wide hooks and the exception observer see every
+  processor, per-processor coverage history gives the same map whatever the slicing, and the
+  fuzz harness reports the processor that ended an iteration. `tests/gdb/gdb-check.py` drives
+  the gdb stub over the remote protocol on four processors.
 - Snapshot determinism: `tests/snapshot/snapshot-check.sh` splits a run with `--save-snapshot`
   / `--load-snapshot` at several points and requires the same console output, pc and icount as
   the uninterrupted run, with the interpreter and the JIT on either side.

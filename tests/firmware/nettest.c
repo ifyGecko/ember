@@ -5,7 +5,7 @@
  *   2. ping the host (ICMP echo request, wait for the reply),
  *   3. answer ARP and ICMP echo requests until the host has pinged us
  *      PINGS_TO_SERVE times,
- * then report through the sifive,test finisher. The driver sleeps in WFI
+ * then report through the test finisher. The driver sleeps in WFI
  * and is woken by the virtio interrupt (PLIC source 1), so the host loop's
  * idle wait on the network backend is exercised too.
  *

@@ -40,8 +40,6 @@ lr x_lift_string(xl *x)
         w = 32;
     uam_ref cnt = NONE;
 
-    if (io)
-        x_iopl_check(x);
     if (rep) {
         cnt = x_reg(x, X86_RCX, aw);
         uam_exit(x->b, x_bin(x, UAM_OP_EQ, aw, cnt, zero), x_imm(x, x->next), UAM_EXIT_JUMP);
@@ -50,6 +48,8 @@ lr x_lift_string(xl *x)
     bool adv_si = false, adv_di = false;
     switch (op) {
     case 0x6C: case 0x6D: {   /* INS */
+        x_io_begin(x, x_reg(x, X86_RDX, 16), w, X86_IO_INS | (rep ? X86_IO_REP : 0),
+                   idx_lin(x, X86_SEG_ES, X86_RDI));
         uam_ref a = x_io_addr(x, x_reg(x, X86_RDX, 16));
         uam_ref v = uam_ld(x->b, w, UAM_ACC_LE | UAM_ACC_PHYS, a, NONE);
         x_st(x, w, idx_lin(x, X86_SEG_ES, X86_RDI), v);
@@ -58,6 +58,8 @@ lr x_lift_string(xl *x)
     }
     case 0x6E: case 0x6F: {   /* OUTS */
         uam_ref v = x_ld(x, w, idx_lin(x, src, X86_RSI));
+        x_io_begin(x, x_reg(x, X86_RDX, 16), w, X86_IO_OUTS | (rep ? X86_IO_REP : 0),
+                   idx_lin(x, src, X86_RSI));
         uam_st(x->b, w, UAM_ACC_LE | UAM_ACC_PHYS, x_io_addr(x, x_reg(x, X86_RDX, 16)), v, NONE);
         adv_si = true;
         break;

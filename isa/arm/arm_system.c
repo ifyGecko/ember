@@ -53,11 +53,11 @@ static const uam_regdesc arm_regs[] = {
 /* CPU models                                                                */
 /* ------------------------------------------------------------------------ */
 
-const uam_arm_config uam_arm_cortex_a7 = {
-    .name     = "cortex-a7",
-    .midr     = 0x410FC075u,     /* ARM, r0p5, Cortex-A7 */
+const uam_arm_config uam_arm_ref = {
+    .name     = "armv7a-ref",
+    .midr     = 0x000F0000u,     /* implementer 0 (software use), CPUID scheme, part 0 */
     .ctr      = 0x84448003u,     /* 64-byte lines */
-    .mpidr    = 0x80000000u,     /* uniprocessor-style affinity 0 */
+    .mpidr    = 0x80000000u,     /* MP format; Aff0 is the processor number */
     .id_pfr0  = 0x00001131u,     /* ARM, Thumb-2, ThumbEE-less, Jazelle trivial */
     .id_pfr1  = 0x00010001u,     /* programmers' model, generic timer */
     .id_mmfr0 = 0x00000003u,     /* VMSAv7 */
@@ -638,7 +638,7 @@ static uam_status cp15_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     switch (id) {
     case CP15(0, 0, 0, 0): *val = a->cfg.midr; break;
     case CP15(0, 0, 0, 1): *val = a->cfg.ctr; break;
-    case CP15(0, 0, 0, 5): *val = a->cfg.mpidr; break;
+    case CP15(0, 0, 0, 5): *val = a->cfg.mpidr | (cpu->hartid & 0xFFu); break;   /* Aff0 */
     case CP15(0, 0, 1, 0): *val = a->cfg.id_pfr0; break;
     case CP15(0, 0, 1, 1): *val = a->cfg.id_pfr1; break;
     case CP15(0, 0, 1, 4): *val = a->cfg.id_mmfr0; break;
@@ -909,7 +909,7 @@ static uam_status arm_init(uam_cpu *cpu)
     if (!a)
         return UAM_ERR_NOMEM;
     cpu->isa_state = a;
-    a->cfg = uam_arm_cortex_a7;
+    a->cfg = uam_arm_ref;
     uam_timer_init(&a->timer[0], timer_fire_phys, cpu);
     uam_timer_init(&a->timer[1], timer_fire_virt, cpu);
     return UAM_OK;

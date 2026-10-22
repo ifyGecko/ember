@@ -171,18 +171,37 @@ static uam_status xlate(uam_cpu *cpu, uint64_t va, uam_xlate_kind kind, bool use
     return UAM_OK;
 }
 
+uint64_t x86_smrr_filter(uam_cpu *cpu, uint64_t pa)
+{
+    x86_state *s = x86_st(cpu);
+    if (cpu->priv & X86_PRIV_A20M)
+        pa &= ~(1ull << 20);
+    if (s->in_smm || !(s->smrr_mask & (1u << 11)))
+        return pa;
+    uint64_t mask = s->smrr_mask & 0x000FFFFFFFFFF000ull;
+    uint64_t base = s->smrr_base & mask;
+    return (pa & mask) == base ? UAM_X86_SMRR_SINK + (pa - base) : pa;
+}
+
 uam_status x86_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_xlate *out)
 {
     x86_state *s = x86_st(cpu);
     out->fault = 0;
     if (!(s->cr0 & CR0_PG)) {
         out->paddr = (s->efer & EFER_LMA) ? vaddr : (vaddr & 0xFFFFFFFFull);
-        out->fixed = true;   /* paging changes re-key code through cpu->priv */
+        if (kind != UAM_XLATE_DEBUG)
+            out->paddr = x86_smrr_filter(cpu, out->paddr);
+        /* paging and SMM changes re-key code through cpu->priv; SMRR and SMM
+         * changes also bump xlate_gen, which drops cached data translations */
+        out->fixed = true;
         return UAM_OK;
     }
     out->fixed = false;
     bool user = kind != UAM_XLATE_DEBUG && x86_priv_cpl(cpu->priv) == 3;
-    return xlate(cpu, vaddr, kind, user, &out->paddr, &out->fault);
+    uam_status st = xlate(cpu, vaddr, kind, user, &out->paddr, &out->fault);
+    if (st == UAM_OK && kind != UAM_XLATE_DEBUG)
+        out->paddr = x86_smrr_filter(cpu, out->paddr);
+    return st;
 }
 
 /* ---- linear-address access from C ---------------------------------------- */
@@ -210,6 +229,7 @@ static uam_status lin_access(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t
         } else if (!(s->efer & EFER_LMA)) {
             pa &= 0xFFFFFFFFull;
         }
+        pa = x86_smrr_filter(cpu, pa);
         /* bytes [done, done + n) in one physical piece; n is a power of two or split bytewise */
         for (unsigned i = 0; i < n;) {
             unsigned chunk = (n - i >= 8 && !((pa + i) & 7)) ? 8 : (n - i >= 4 && !((pa + i) & 3)) ? 4

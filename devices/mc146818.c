@@ -368,12 +368,12 @@ static void rtc_restore(uam_device *d, uam_state_reader *rd)
 }
 
 static const uam_device_ops rtc_ops = {
-    .type = "motorola,mc146818", .impl_min = 1, .impl_max = 1,
+    .type = "pc,rtc-cmos", .impl_min = 1, .impl_max = 1,
     .read = bank0_read, .write = bank0_write, .reset = rtc_reset, .destroy = rtc_destroy,
     .save = rtc_save, .restore = rtc_restore,
 };
 static const uam_device_ops bank1_ops = {
-    .type = "motorola,mc146818-bank1", .impl_min = 1, .impl_max = 1,
+    .type = "pc,rtc-cmos-bank1", .impl_min = 1, .impl_max = 1,
     .read = bank1_read, .write = bank1_write, .flags = UAM_DEVICE_STATELESS,
 };
 

@@ -10,7 +10,7 @@ FW_CFLAGS     := $(ARCH_FLAGS) -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -f
               -fno-pic -fno-stack-protector -nostdlib -nostartfiles
 FW_LDFLAGS    := -static -T link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf
+all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf $(OUT)/smptest.elf
 
 $(OUT)/selftest.elf: start.S selftest.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
@@ -27,5 +27,10 @@ $(OUT)/fuzztarget.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
 	@mkdir -p $(OUT)
 	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S fuzztarget.c -o $@
+
+$(OUT)/smptest.elf: smpstart.S smptest.c ../smp/smp_test.h link.ld
+	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
+	@mkdir -p $(OUT)
+	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) smpstart.S smptest.c -o $@
 
 .PHONY: all

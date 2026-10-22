@@ -8,8 +8,6 @@
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
 #   make suzzer          clone suzzer into ./suzzer (ignored by git) for the suzzer integration
-#   make ovmf-check      boot an installed OVMF (OVMF_DIR, default /usr/share/OVMF) to the
-#                        UEFI shell on x86_64-ref (skipped if none is installed)
 #   make net-check       boot the network test on rv32-ref against a real tap and tun interface
 #                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
@@ -39,7 +37,6 @@ AR      ?= ar
 CFLAGS  ?= -O2 -g    # tunable from the command line, e.g. CFLAGS="-O1 -fsanitize=address"
 LDFLAGS ?=
 LDLIBS  := -lm      # the x87 model uses long-double libm functions
-OVMF_DIR ?= /usr/share/OVMF
 PREFIX  ?= /usr/local
 DESTDIR ?=
 # Required flags, always applied.
@@ -91,20 +88,22 @@ RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c
 X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
-               isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
+               isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
-               isa/x86/x86_gdb.c isa/x86/x86_system.c
-DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/sifive_test.c \
+               isa/x86/x86_gdb.c isa/x86/x86_system.c isa/x86/x86_task.c
+DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_finisher.c \
                devices/unknown_mmio.c devices/unimp.c devices/virtio_net.c devices/mmio_stub.c \
                devices/gic.c devices/i8259.c devices/i8254.c devices/mc146818.c devices/lapic.c \
-               devices/ioapic.c devices/pci.c devices/q35_mch.c devices/ich9_lpc.c \
-               devices/cfi_flash.c devices/pc_misc.c
+               devices/ioapic.c devices/pci.c devices/ata_core.c devices/ahci.c devices/ide.c devices/nvme.c \
+               devices/cfi_flash.c devices/pc_misc.c devices/acpi_pm.c devices/ipi.c devices/i8237.c devices/vga.c devices/fdc.c devices/lpt.c \
+               devices/i8042.c devices/hpet.c
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
                $(if $(HAVE_SUZZER),$(SUZZER_SRC))
-HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/hostloop.c \
+HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/blockdev_file.c \
+               src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
@@ -125,6 +124,7 @@ TEST_SNAP := $(BUILD)/test_snapshot
 TEST_JIT  := $(BUILD)/test_jit
 TEST_MMIO := $(BUILD)/test_mmio
 TEST_COV  := $(BUILD)/test_cov
+TEST_SMP  := $(BUILD)/test_smp
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -140,7 +140,7 @@ EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 .PHONY: all lib test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test \
         example-test \
-        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check ovmf-check install clean FORCE
+        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test install clean FORCE
 
 all: $(RUN) lib
 
@@ -220,6 +220,9 @@ $(TEST_COV): $(BUILD)/obj/tests/unit/test_cov.o $(LIB)
 $(TEST_FUZZ): $(BUILD)/obj/tests/unit/test_fuzz.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_SMP): $(BUILD)/obj/tests/unit/test_smp.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -260,6 +263,7 @@ firmware-x86:
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
+           $(TEST_SMP) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -269,29 +273,53 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_MMIO)
 	$(TEST_COV)
 	$(TEST_FUZZ)
+	$(TEST_SMP)
 ifeq ($(HAVE_SUZZER),1)
 	$(TEST_SUZZER) $(SUZZER_DIR)/test/vectors
 else
 	@echo "test_suzzer: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
+# Each self-test runs on the interpreter and on the JIT.
 firmware-test: $(RUN) firmware
 	$(RUN) --stats $(FIRMWARE) < /dev/null
+	$(RUN) --jit --stats $(FIRMWARE) < /dev/null
+	$(RUN) -o cpus=4 $(dir $(FIRMWARE))smptest.elf < /dev/null
+	$(RUN) -o cpus=4 --jit $(dir $(FIRMWARE))smptest.elf < /dev/null
 
 mips-test: $(RUN) firmware-mips
 	$(RUN) -b mips-ref --stats $(FW_MIPS_BE) < /dev/null
 	$(RUN) -b mipsel-ref --stats $(FW_MIPS_EL) < /dev/null
+	$(RUN) -b mips-ref --jit --stats $(FW_MIPS_BE) < /dev/null
+	$(RUN) -b mipsel-ref --jit --stats $(FW_MIPS_EL) < /dev/null
+	$(RUN) -b mips-ref -o cpus=4 $(dir $(FW_MIPS_BE))smptest-be.elf < /dev/null
+	$(RUN) -b mipsel-ref -o cpus=4 --jit $(dir $(FW_MIPS_EL))smptest-el.elf < /dev/null
 
 arm-test: $(RUN) firmware-arm
 	$(RUN) -b arm-ref --stats $(FW_ARM) < /dev/null
 	$(RUN) -b arm-ref --stats $(FW_THUMB) < /dev/null
 	$(RUN) -b armeb-ref --stats $(FW_ARM_BE) < /dev/null
 	$(RUN) -b armeb-ref --stats $(FW_THUMB_BE) < /dev/null
+	$(RUN) -b arm-ref --jit --stats $(FW_ARM) < /dev/null
+	$(RUN) -b arm-ref --jit --stats $(FW_THUMB) < /dev/null
+	$(RUN) -b armeb-ref --jit --stats $(FW_ARM_BE) < /dev/null
+	$(RUN) -b armeb-ref --jit --stats $(FW_THUMB_BE) < /dev/null
+	$(RUN) -b arm-ref -o cpus=4 $(dir $(FW_ARM))smptest-arm.elf < /dev/null
+	$(RUN) -b armeb-ref -o cpus=4 --jit $(dir $(FW_ARM))smptest-thumb-be.elf < /dev/null
 
 # A flat image entered in real mode at 0; interpreter and JIT.
 x86-test: $(RUN) firmware-x86
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --stats $(FW_X86) < /dev/null
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit --stats $(FW_X86) < /dev/null
+	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 $(dir $(FW_X86))legacy.bin < /dev/null
+	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit $(dir $(FW_X86))legacy.bin < /dev/null
+	python3 tests/firmware-x86/bios-check.py $(RUN) $(dir $(FW_X86))biosrom.bin
+	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 $(dir $(FW_X86))smp.bin < /dev/null
+	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smp.bin < /dev/null
+
+# The gdb stub over the remote protocol, on a four-processor machine.
+gdb-test: $(RUN) firmware-x86
+	python3 tests/gdb/gdb-check.py $(RUN) $(dir $(FW_X86))smp.bin $(dir $(FW_X86))smp.lst
 
 # The out-of-tree example builds against `make lib` output only, as an external project would.
 example-test: lib firmware-mips
@@ -301,7 +329,7 @@ example-test: lib firmware-mips
 
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
-snapshot-test: $(RUN) firmware firmware-mips firmware-arm example-test
+snapshot-test: $(RUN) firmware firmware-mips firmware-arm firmware-x86 example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
 	sh tests/snapshot/snapshot-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL) 5000
@@ -309,6 +337,17 @@ snapshot-test: $(RUN) firmware firmware-mips firmware-arm example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) arm-ref $(FW_THUMB) 4321 40000 61000
 	sh tests/snapshot/snapshot-check.sh $(RUN) armeb-ref $(FW_THUMB_BE) 2500 52000 66000
 	sh tests/snapshot/snapshot-check.sh $(EXAMPLE) ext-mips $(FW_MIPS_BE) 4000
+	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(FW_X86) 1000 5000 15000 -- --raw-base 0 --entry 0
+	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))legacy.bin 300 700 900 \
+	    -- --raw-base 0 --entry 0
+	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))smp.bin 1 5000 20001 40000 \
+	    -- -o cpus=4 --quantum 1000 --raw-base 0 --entry 0
+	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(dir $(FIRMWARE))smptest.elf 3000 70001 \
+	    -- -o cpus=4 --quantum 97
+	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(dir $(FW_MIPS_BE))smptest-be.elf 50000 \
+	    -- -o cpus=4 --quantum 333
+	sh tests/snapshot/snapshot-check.sh $(RUN) armeb-ref $(dir $(FW_ARM))smptest-thumb-be.elf 40000 \
+	    -- -o cpus=4 --quantum 211
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
@@ -362,14 +401,11 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test example-test snapshot-test cov-test fuzz-test suzzer-test
+test: unit-test firmware-test mips-test arm-test x86-test example-test snapshot-test cov-test fuzz-test suzzer-test \
+      gdb-test
 
 net-check: $(RUN) firmware
 	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both
-
-# Boot an installed OVMF to the UEFI shell on x86_64-ref (skipped without one).
-ovmf-check: $(RUN)
-	sh tests/uefi/ovmf-check.sh $(RUN) $(OVMF_DIR)
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include
@@ -388,4 +424,5 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_snapshot.d \
          $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
+         $(BUILD)/obj/tests/unit/test_smp.d \
          $(BUILD)/obj/tests/unit/test_suzzer.d

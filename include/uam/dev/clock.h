@@ -18,10 +18,12 @@ static inline uint64_t uam_clock_from_ticks(uint64_t t, uint64_t tick_hz, uint64
     return (uint64_t)((unsigned __int128)t * dev_hz / tick_hz);
 }
 
-/* The first virtual tick at which `cycles` device-clock cycles have elapsed. */
+/* The first virtual tick at which `cycles` device-clock cycles have elapsed;
+ * UINT64_MAX (never) when that lies beyond the range of virtual time. */
 static inline uint64_t uam_clock_to_ticks(uint64_t cycles, uint64_t tick_hz, uint64_t dev_hz)
 {
-    return (uint64_t)(((unsigned __int128)cycles * tick_hz + dev_hz - 1) / dev_hz);
+    unsigned __int128 t = ((unsigned __int128)cycles * tick_hz + dev_hz - 1) / dev_hz;
+    return t > UINT64_MAX ? UINT64_MAX : (uint64_t)t;
 }
 
 #endif /* UAM_DEV_CLOCK_H */

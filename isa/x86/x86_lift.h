@@ -78,7 +78,11 @@ lr      x_trap_err(xl *x, unsigned vec, uint32_t err);
 lr      x_ud(xl *x);
 uam_ref x_helper(xl *x, unsigned id, uam_ref a, uam_ref b, uam_ref c);
 uam_ref x_io_addr(xl *x, uam_ref port16);
-void    x_iopl_check(xl *x);                    /* IN/OUT/CLI/STI at CPL > 0 */
+/* Record an I/O instruction's SMM I/O state (X86_IO_* type, width in bits,
+ * linear memory address for INS/OUTS) before its port access. */
+void    x_io_begin(xl *x, uam_ref port16, unsigned width, unsigned type, uam_ref mem);
+uam_ref x_io_misc(xl *x, uam_ref port16, unsigned width, unsigned type);   /* IOMisc */
+uint64_t x_io_rip(const xl *x);                                         /* this instruction's RIP */
 
 /* ---- shared one-byte-map pieces (x86_lift.c) ---- */
 uint64_t x_sx(uint64_t v, unsigned from_bits);              /* sign-extend to 64 */

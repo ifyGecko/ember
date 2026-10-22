@@ -347,7 +347,8 @@ static lr soft_int(xl *x, unsigned vec, bool intn)
 /* Far transfers go through helpers in every mode; they return the new linear pc. */
 static lr far_jmp(xl *x, uam_ref sel, uam_ref off)
 {
-    uam_ref pc = x_helper(x, X86_H_FAR_JMP, x_zext(x, 64, 16, sel), x_zext(x, 64, 64, off), NONE);
+    uam_ref pc = x_helper(x, X86_H_FAR_JMP, x_zext(x, 64, 16, sel), x_zext(x, 64, 64, off),
+                          x_imm(x, x->next));   /* where a task switch saves this task */
     x_jump(x, pc, UAM_EXIT_JUMP);
     return LR_END;
 }
@@ -371,11 +372,11 @@ static void far_ptr(xl *x, xop *o, uam_ref *sel, uam_ref *off)
 
 /* ---- segment registers --------------------------------------------------- */
 
-/* Load a data/stack segment register. Real mode is inline (base = sel << 4);
- * protected and long mode check the descriptor in a helper. */
+/* Load a data/stack segment register. Real and virtual-8086 mode are inline
+ * (base = sel << 4); protected and long mode check the descriptor in a helper. */
 void x_load_seg(xl *x, unsigned seg, uam_ref sel16)
 {
-    if (x86_priv_mode(x->priv) == X86_MODE_REAL) {
+    if (x86_priv_realseg(x->priv)) {
         uam_ref base = x_bin(x, UAM_OP_SHL, 64, x_zext(x, 64, 16, sel16), x_imm(x, 4));
         uam_put(x->b, 16, X86_OFF_SEG_SEL(seg), sel16, NONE);
         uam_put(x->b, 64, X86_OFF_SEG_BASE(seg), base, NONE);
@@ -481,12 +482,14 @@ static unsigned io_width(xl *x)
 static lr in_out(xl *x, bool out, uam_ref port)
 {
     unsigned w = io_width(x);
-    x_iopl_check(x);
-    uam_ref a = x_io_addr(x, port);
-    if (out)
-        uam_st(x->b, w, UAM_ACC_LE | UAM_ACC_PHYS, a, x_reg(x, X86_RAX, w), NONE);
-    else
-        x_setreg(x, X86_RAX, w, uam_ld(x->b, w, UAM_ACC_LE | UAM_ACC_PHYS, a, NONE));
+    bool imm = x->in.op < 0xEC;                      /* E4-E7: imm8 port; EC-EF: DX */
+    unsigned type = out ? (imm ? X86_IO_OUT_IMM : X86_IO_OUT_DX)
+                        : (imm ? X86_IO_IN_IMM : X86_IO_IN_DX);
+    /* one helper records the SMM I/O state and accesses the port */
+    uam_ref v = x_helper(x, X86_H_IO_PORT, x_io_misc(x, port, w, type), x_imm(x, x_io_rip(x)),
+                         out ? x_zext(x, 64, w, x_reg(x, X86_RAX, w)) : x_imm(x, 0));
+    if (!out)
+        x_setreg(x, X86_RAX, w, x_trunc(x, w, 64, v));
     return LR_CONT;
 }
 
@@ -892,7 +895,7 @@ static lr lift_c0(xl *x)
         return LR_CONT;
     }
     case 0xCF: {
-        uam_ref pc = x_helper(x, X86_H_IRET, x_imm(x, w), NONE, NONE);
+        uam_ref pc = x_helper(x, X86_H_IRET, x_imm(x, w), x_imm(x, x->next), NONE);
         x_jump(x, pc, UAM_EXIT_EXC_RETURN);
         return LR_END;
     }
@@ -983,7 +986,9 @@ uam_status x86_lift(uam_lift_ctx *lc)
     bool shadow = false;   /* the previous instruction holds off interrupts */
 
     for (uint32_t n = 0;; n++) {
-        if (n >= lc->max_insns && !shadow) {
+        /* one slot stays free: an instruction that opens an interrupt shadow
+         * (STI, MOV SS) takes the next one into the block */
+        if (n + 1 >= lc->max_insns && !shadow) {
             uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
             return UAM_OK;
         }

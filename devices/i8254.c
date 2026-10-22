@@ -346,7 +346,7 @@ static void pit_restore(uam_device *d, uam_state_reader *r)
 }
 
 static const uam_device_ops pit_ops = {
-    .type = "intel,8254", .impl_min = 1, .impl_max = 1,
+    .type = "pc,8254-pit", .impl_min = 1, .impl_max = 1,
     .read = pit_read, .write = pit_write, .reset = pit_reset, .destroy = pit_destroy,
     .save = pit_save, .restore = pit_restore,
 };

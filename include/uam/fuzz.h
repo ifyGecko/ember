@@ -111,8 +111,9 @@ typedef struct uam_fuzz_result {
     uam_fuzz_verdict verdict;
     uint64_t         detail;
     uam_stop_reason  stop;        /* how uam_exec_run returned */
-    uint64_t         pc;          /* hart pc when it stopped */
-    uint64_t         insns;       /* instructions the iteration retired */
+    uint64_t         pc;          /* pc of the processor that ended it (a boundary, crash pc,
+                                   * exception or interrupt; else processor 0) */
+    uint64_t         insns;       /* instructions the iteration retired (all processors) */
     bool             exc_valid;   /* a crashing exception: */
     uam_exception    exc;
     bool             reset;       /* the machine was reset during the iteration */

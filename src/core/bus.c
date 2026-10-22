@@ -28,6 +28,7 @@ void uam_bus_fini(uam_bus *bus)
             munmap(r->host, r->size);
         free(r->page_gen);
         free(r->code_page);
+        free(r->code_lines);
         free(r->dirty);
         free(r);
     }
@@ -100,11 +101,13 @@ static uam_status map_backed(uam_bus *bus, const uam_region *proto, const void *
     r.host = host;
     r.page_gen = calloc(npages, sizeof(uint32_t));
     r.code_page = calloc(npages, 1);
+    r.code_lines = calloc(npages, sizeof(uint64_t));
     r.dirty = calloc((npages + 63) / 64, sizeof(uint64_t));
-    if (!r.page_gen || !r.code_page || !r.dirty) {
+    if (!r.page_gen || !r.code_page || !r.code_lines || !r.dirty) {
         munmap(host, r.size);
         free(r.page_gen);
         free(r.code_page);
+        free(r.code_lines);
         free(r.dirty);
         return UAM_ERR_NOMEM;
     }
@@ -121,6 +124,7 @@ static uam_status map_backed(uam_bus *bus, const uam_region *proto, const void *
         munmap(host, r.size);
         free(r.page_gen);
         free(r.code_page);
+        free(r.code_lines);
         free(r.dirty);
     }
     return st;
@@ -474,16 +478,41 @@ static uam_status dev_write(const uam_region *r, uam_device *d, uint64_t off, un
 
 /* ---- accesses ---------------------------------------------------------- */
 
+/* The 64-byte lines of one page that [off, off+len) touches (within the page). */
+static uint64_t line_mask(uint64_t off, uint64_t len)
+{
+    unsigned first = (unsigned)(off & (UAM_PAGE_SIZE - 1)) >> 6;
+    unsigned last = (unsigned)((off + len - 1) & (UAM_PAGE_SIZE - 1)) >> 6;
+    uint64_t hi = last == 63 ? ~0ull : (1ull << (last + 1)) - 1;
+    return hi & ~((1ull << first) - 1);
+}
+
+/* Bytes [off, off+len) of r's backing store changed. A page with translated
+ * code loses it (new generation, hook) when a written line holds code. */
+static void note_write(uam_bus *bus, uam_region *r, uint64_t off, uint64_t len)
+{
+    while (len) {
+        uint64_t pidx = off >> UAM_PAGE_SHIFT;
+        uint64_t room = UAM_PAGE_SIZE - (off & (UAM_PAGE_SIZE - 1));
+        uint64_t n = room < len ? room : len;
+        if (!r->code_page[pidx]) {
+            r->page_gen[pidx] = ++bus->gen_seq;
+        } else if (r->code_lines[pidx] & line_mask(off, n)) {
+            r->page_gen[pidx] = ++bus->gen_seq;
+            r->code_page[pidx] = 0;
+            r->code_lines[pidx] = 0;
+            r->n_code_pages--;
+            if (bus->on_code_write)
+                bus->on_code_write(bus->code_write_ctx, (r->base + off) & UAM_PAGE_MASK);
+        }
+        off += n;
+        len -= n;
+    }
+}
+
 static void note_code_change(uam_bus *bus, uam_region *r, uint64_t off)
 {
-    uint64_t pidx = off >> UAM_PAGE_SHIFT;
-    r->page_gen[pidx] = ++bus->gen_seq;
-    if (!r->code_page[pidx])
-        return;
-    r->code_page[pidx] = 0;
-    r->n_code_pages--;
-    if (bus->on_code_write)
-        bus->on_code_write(bus->code_write_ctx, (r->base + off) & UAM_PAGE_MASK);
+    note_write(bus, r, off & UAM_PAGE_MASK, UAM_PAGE_SIZE);
 }
 
 /* Mark the pages of r's backing store in [off, off+len) dirty (len > 0). */
@@ -607,11 +636,8 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
         case UAM_REGION_RAM:
             val_to_bytes(h.r->host + h.off, size, be, val);
             mark_dirty(h.r, h.off, size);
-            if (h.r->n_code_pages) {
-                note_code_change(bus, h.r, h.off);
-                if (((h.off + size - 1) >> UAM_PAGE_SHIFT) != (h.off >> UAM_PAGE_SHIFT))
-                    note_code_change(bus, h.r, h.off + size - 1);
-            }
+            if (h.r->n_code_pages)
+                note_write(bus, h.r, h.off, size);
             st = UAM_OK;
             break;
         case UAM_REGION_MMIO:
@@ -645,7 +671,7 @@ uam_status uam_bus_load_bytes(uam_bus *bus, uint64_t addr, const void *data, siz
             room = h.r->size - h.off;
         size_t n = (size_t)room < len ? (size_t)room : len;
         memcpy(h.r->host + h.off, src, n);
-        note_code_change(bus, h.r, h.off);
+        note_write(bus, h.r, h.off, n);
         mark_dirty(h.r, h.off, n);
         addr += n;
         src += n;
@@ -700,7 +726,7 @@ uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_
         if (st != UAM_OK)
             return st;
         memcpy(h.r->host + h.off, src, n);
-        note_code_change(bus, h.r, h.off);
+        note_write(bus, h.r, h.off, n);
         mark_dirty(h.r, h.off, n);
         addr += n;
         src += n;
@@ -819,17 +845,29 @@ void uam_bus_region_store(uam_bus *bus, uam_region *r, uint64_t off, const void 
 
 /* ---- code pages -------------------------------------------------------- */
 
+void uam_bus_mark_code_range(uam_bus *bus, uint64_t addr, uint64_t len)
+{
+    while (len) {
+        uint64_t room = UAM_PAGE_SIZE - (addr & (UAM_PAGE_SIZE - 1));
+        uint64_t n = room < len ? room : len;
+        hit h;
+        if (resolve(bus, addr, 1, &h) == RES_ONE && has_backing(h.r)) {
+            uint64_t p = h.off >> UAM_PAGE_SHIFT;
+            h.r->code_lines[p] |= line_mask(h.off, n);
+            if (!h.r->code_page[p]) {
+                h.r->code_page[p] = 1;
+                h.r->n_code_pages++;
+                bus->direct_gen++;   /* writes to this page must now take the slow path */
+            }
+        }
+        addr += n;
+        len -= n;
+    }
+}
+
 void uam_bus_mark_code(uam_bus *bus, uint64_t addr)
 {
-    hit h;
-    if (resolve(bus, addr, 1, &h) == RES_ONE && has_backing(h.r)) {
-        uint64_t p = h.off >> UAM_PAGE_SHIFT;
-        if (!h.r->code_page[p]) {
-            h.r->code_page[p] = 1;
-            h.r->n_code_pages++;
-            bus->direct_gen++;   /* writes to this page must now take the slow path */
-        }
-    }
+    uam_bus_mark_code_range(bus, addr & UAM_PAGE_MASK, UAM_PAGE_SIZE);
 }
 
 uint8_t *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write)

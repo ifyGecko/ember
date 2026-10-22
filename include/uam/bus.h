@@ -74,6 +74,7 @@ typedef struct uam_region {
     struct uam_device *dev;          /* MMIO/ROMD target */
     uint32_t          *page_gen;     /* RAM/ROM/ROMD: per-page generation */
     uint8_t           *code_page;    /* RAM/ROM/ROMD: 1 if the page holds translated code */
+    uint64_t          *code_lines;   /* RAM/ROM/ROMD: per page, bit n = 64-byte line n does */
     uint64_t           n_code_pages; /* number of code_page entries set */
     uint64_t          *dirty;        /* RAM/ROM/ROMD: bitmap of pages written since the last
                                       * uam_bus_dirty_reset (snapshots) */
@@ -227,6 +228,15 @@ void       uam_bus_region_store(uam_bus *bus, uam_region *r, uint64_t off, const
 
 /* Code-page tracking for the translation cache. */
 void       uam_bus_mark_code(uam_bus *bus, uint64_t addr);
+/*
+ * Mark the bytes [addr, addr+len) as translated code. Code is tracked in
+ * 64-byte lines: a write to a code page invalidates its translations (bumps
+ * its generation and calls the code-write hook) only when it touches a line
+ * holding code, so data that shares a page with code (firmware sections are
+ * often not page-aligned) does not throw the code away. uam_bus_mark_code
+ * marks the whole page.
+ */
+void       uam_bus_mark_code_range(uam_bus *bus, uint64_t addr, uint64_t len);
 uint32_t   uam_bus_page_gen(uam_bus *bus, uint64_t addr);
 
 /* The region an access to addr goes to (an alias is returned as itself). */

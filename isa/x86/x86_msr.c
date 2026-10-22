@@ -2,7 +2,8 @@
  * x86_msr.c - CPUID and model-specific registers.
  *
  * CPUID describes exactly what this module implements: x86-64 with SSE2,
- * CMPXCHG16B, POPCNT, RDRAND, NX, 1 GiB pages, RDTSCP, PAT and MTRRs.
+ * CMPXCHG16B, POPCNT, RDRAND, NX, 1 GiB pages, RDTSCP, PAT and MTRRs (with
+ * the SMM range registers).
  * Vendor, signature, brand, topology and physical-address width come from
  * the board (uam_x86_set_cpuid). MSRs the core does not implement go first
  * to the platform hook, then to the configured policy.
@@ -15,8 +16,8 @@
 void x86_cpuid_defaults(uam_x86_cpuid_info *info)
 {
     memset(info, 0, sizeof(*info));
-    memcpy(info->vendor, "GenuineIntel", 13);
-    info->signature = 0x000506E3u;   /* family 6 */
+    memcpy(info->vendor, "UAMx86RefCPU", 13);   /* no vendor: boards set a real one */
+    info->signature = 0x00000600u;              /* family 6, model 0, stepping 0 */
     strcpy(info->brand, "UAM x86-64 reference processor");
     info->logical_cpus = 1;
     info->phys_addr_bits = 39;
@@ -50,7 +51,9 @@ void x86_cpuid(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4])
     case 1:
         r[0] = c->signature;
         r[1] = (8u << 8) | ((n & 0xFF) << 16) | (c->initial_apic_id << 24);
-        r[2] = (1u << 13) | (1u << 23) | (1u << 30);          /* CX16 POPCNT RDRAND */
+        r[2] = (1u << 13) | (1u << 23) | (1u << 30) |         /* CX16 POPCNT RDRAND */
+               ((c->features & UAM_X86_FEAT_X2APIC) ? (1u << 21) : 0) |
+               ((c->features & UAM_X86_FEAT_TSC_DEADLINE) ? (1u << 24) : 0);
         r[3] = (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 8) |
                (1u << 9) | (1u << 12) | (1u << 13) | (1u << 15) | (1u << 16) | (1u << 17) |
                (1u << 19) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26) |
@@ -119,11 +122,30 @@ static bool is_mtrr(uint32_t msr)
            (msr >= 0x268 && msr <= 0x26F);
 }
 
+/* x2APIC registers exist only in x2APIC mode; IA32_TSC_DEADLINE only with
+ * the feature. Both are then the platform's (its local APIC model). */
+static bool apic_msr_absent(const x86_state *s, uint32_t msr)
+{
+    if (msr >= 0x800 && msr <= 0x8FF)
+        return (s->apic_base & 0xC00) != 0xC00;
+    if (msr == 0x6E0)
+        return !(s->cpuid.features & UAM_X86_FEAT_TSC_DEADLINE);
+    return false;
+}
+
+uint64_t uam_x86_read_tsc(void *cpu)
+{
+    uam_cpu *c = cpu;
+    return x86_tsc_base(c) + x86_st(c)->tsc_offset;
+}
+
 uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val)
 {
     x86_state *s = x86_st(cpu);
+    if (apic_msr_absent(s, msr))
+        return x86_raise(cpu, X86_EXC_GP, true, 0);
     switch (msr) {
-    case MSR_TSC:             *val = cpu->icount + s->tsc_offset; return UAM_OK;
+    case MSR_TSC:             *val = x86_tsc_base(cpu) + s->tsc_offset; return UAM_OK;
     case MSR_PLATFORM_ID:     *val = 0; return UAM_OK;
     case MSR_APIC_BASE:       *val = s->apic_base; return UAM_OK;
     case MSR_FEATURE_CONTROL: *val = s->feature_control; return UAM_OK;
@@ -132,7 +154,12 @@ uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val)
     case MSR_SMBASE:
         if (!s->in_smm) break;
         *val = s->smbase; return UAM_OK;
-    case MSR_MTRRCAP:         *val = 0x508; return UAM_OK;   /* 8 variable, fixed, WC */
+    case MSR_MTRRCAP:         *val = 0xD08; return UAM_OK;   /* 8 variable, fixed, WC, SMRR */
+    case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
+        if (!s->in_smm)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        *val = msr == MSR_SMRR_PHYSBASE ? s->smrr_base : s->smrr_mask;
+        return UAM_OK;
     case MSR_SYSENTER_CS:     *val = s->sysenter_cs; return UAM_OK;
     case MSR_SYSENTER_ESP:    *val = s->sysenter_esp; return UAM_OK;
     case MSR_SYSENTER_EIP:    *val = s->sysenter_eip; return UAM_OK;
@@ -181,13 +208,26 @@ static uam_status write_efer(uam_cpu *cpu, uint64_t v)
 uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
 {
     x86_state *s = x86_st(cpu);
+    if (apic_msr_absent(s, msr))
+        return x86_raise(cpu, X86_EXC_GP, true, 0);
     switch (msr) {
-    case MSR_TSC:             s->tsc_offset = val - cpu->icount; return UAM_OK;
-    case MSR_APIC_BASE:
-        s->apic_base = val;
+    case MSR_TSC:             s->tsc_offset = val - x86_tsc_base(cpu); return UAM_OK;
+    case MSR_APIC_BASE: {
+        /* BSP flag (8) is read-only; EXTD (10) needs x2APIC support and EN;
+         * leaving x2APIC mode only to disabled (SDM 10.12.5) */
+        uint64_t keep = s->apic_base & (1u << 8);
+        unsigned pab = s->cpuid.phys_addr_bits ? s->cpuid.phys_addr_bits : 36;
+        uint64_t rw = (((1ull << pab) - 1) & ~0xFFFull) | (1u << 11) |
+                      ((s->cpuid.features & UAM_X86_FEAT_X2APIC) ? (1u << 10) : 0);
+        bool extd = val & (1u << 10), en = val & (1u << 11);
+        bool was_x2 = (s->apic_base & 0xC00) == 0xC00;
+        if ((val & ~(rw | (1u << 8))) || (extd && !en) || (was_x2 && en && !extd))
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        s->apic_base = keep | (val & rw);
         if (s->plat.wrmsr)
-            (void)s->plat.wrmsr(s->plat.ctx, msr, val);   /* the APIC moves */
+            (void)s->plat.wrmsr(s->plat.ctx, msr, s->apic_base);   /* the APIC moves */
         return UAM_OK;
+    }
     case MSR_FEATURE_CONTROL:
         if (s->feature_control & 1)
             return x86_raise(cpu, X86_EXC_GP, true, 0);   /* locked */
@@ -198,6 +238,13 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
         if (!s->in_smm) break;
         s->smbase = val & 0xFFFFFFFFu; return UAM_OK;
     case MSR_MTRRCAP:         return x86_raise(cpu, X86_EXC_GP, true, 0);
+    case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
+        if (!s->in_smm)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        if (msr == MSR_SMRR_PHYSBASE) s->smrr_base = val & 0x000FFFFFFFFFF0FFull;
+        else                          s->smrr_mask = val & 0x000FFFFFFFFFF800ull;
+        uam_cpu_xlate_changed(cpu);
+        return UAM_OK;
     case MSR_SYSENTER_CS:     s->sysenter_cs = val; return UAM_OK;
     case MSR_SYSENTER_ESP:    s->sysenter_esp = val; return UAM_OK;
     case MSR_SYSENTER_EIP:    s->sysenter_eip = val; return UAM_OK;

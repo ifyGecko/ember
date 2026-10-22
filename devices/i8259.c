@@ -291,16 +291,16 @@ static void i8259_restore(uam_device *d, uam_state_reader *r)
 }
 
 static const uam_device_ops master_ops = {
-    .type = "intel,8259a", .impl_min = 1, .impl_max = 1,
+    .type = "pc,8259-pic", .impl_min = 1, .impl_max = 1,
     .read = master_read, .write = master_write, .reset = i8259_reset, .destroy = i8259_destroy,
     .save = i8259_save, .restore = i8259_restore,
 };
 static const uam_device_ops slave_ops = {
-    .type = "intel,8259a-slave", .impl_min = 1, .impl_max = 1,
+    .type = "pc,8259-pic-slave", .impl_min = 1, .impl_max = 1,
     .read = slave_read, .write = slave_write, .flags = UAM_DEVICE_STATELESS,
 };
 static const uam_device_ops elcr_ops = {
-    .type = "intel,8259a-elcr", .impl_min = 1, .impl_max = 1,
+    .type = "pc,8259-elcr", .impl_min = 1, .impl_max = 1,
     .read = elcr_read, .write = elcr_write, .flags = UAM_DEVICE_STATELESS,
 };
 

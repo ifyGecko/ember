@@ -1,5 +1,6 @@
 /*
- * uam/dev/plic.h - SiFive-compatible Platform-Level Interrupt Controller.
+ * uam/dev/plic.h - RISC-V Platform-Level Interrupt Controller (RISC-V PLIC
+ * specification).
  *
  * Level-triggered sources 1..n_sources-1 feed per-context outputs. Register
  * map (offsets from base):

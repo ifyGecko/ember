@@ -4,7 +4,7 @@
 CROSS ?= arm-linux-gnueabi-
 OUT   ?= ../../build/firmware-arm
 
-FW_CFLAGS  = -mcpu=cortex-a7 -mfloat-abi=soft -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding \
+FW_CFLAGS  = -march=armv7ve -mfloat-abi=soft -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding \
              -fno-builtin -fno-pic -fno-stack-protector -fno-unwind-tables \
              -fno-asynchronous-unwind-tables -nostdlib -nostartfiles
 FW_LDFLAGS = -static -no-pie -Wl,-T,link.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments
@@ -13,7 +13,17 @@ BE := -mbig-endian -Wl,--be8   # big-endian data, little-endian code (BE8)
 
 all: $(OUT)/selftest-arm.elf $(OUT)/selftest-thumb.elf $(OUT)/fuzztarget.elf $(OUT)/fuzztarget.bin \
      $(OUT)/selftest-arm-be.elf $(OUT)/selftest-thumb-be.elf $(OUT)/fuzztarget-be.elf \
-     $(OUT)/fuzztarget-be.bin
+     $(OUT)/fuzztarget-be.bin \
+     $(OUT)/smptest-arm.elf $(OUT)/smptest-thumb-be.elf
+
+# The multiprocessor self-test: ARM little-endian, and Thumb-2 BE8.
+$(OUT)/smptest-arm.elf: smpstart.S smptest.c ../smp/smp_test.h link.ld
+	@mkdir -p $(OUT)
+	$(CROSS)gcc -marm $(FW_CFLAGS) $(FW_LDFLAGS) smpstart.S smptest.c -o $@
+
+$(OUT)/smptest-thumb-be.elf: smpstart.S smptest.c ../smp/smp_test.h link.ld
+	@mkdir -p $(OUT)
+	$(CROSS)gcc -mthumb $(BE) $(FW_CFLAGS) $(FW_LDFLAGS) smpstart.S smptest.c -o $@
 
 $(OUT)/selftest-arm.elf: start.S selftest.c link.ld
 	@mkdir -p $(OUT)

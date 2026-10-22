@@ -33,6 +33,7 @@
 
 #include "uam/bus.h"
 #include "uam/isa/x86.h"
+#include "uam/sched.h"
 
 /* ---- register file layout ------------------------------------------------ */
 
@@ -95,16 +96,18 @@ enum {
  * cpu->priv encodes everything decoding and translation depend on, so
  * translated code is never reused across a change of any of them:
  *   bits 0-1  CPL
- *   bits 2-3  mode (real / protected / IA-32e)
+ *   bits 2-3  mode (real / protected / IA-32e / virtual-8086)
  *   bit  4    SMM
  *   bits 5-6  default code size: 0 = 16, 1 = 32, 2 = 64 (CS.D / CS.L)
  *   bit  7    32-bit stack (SS.B), outside 64-bit code
  *   bit  8    paging enabled (CR0.PG)
+ *   bit  9    A20M# in effect (physical address bit 20 forced to 0)
  */
 enum x86_mode {
     X86_MODE_REAL = 0,   /* real mode (reset state) */
     X86_MODE_PROT,       /* protected mode */
     X86_MODE_LONG,       /* IA-32e: 64-bit or compatibility submode */
+    X86_MODE_V86,        /* virtual-8086: protected mode with EFLAGS.VM, CPL 3 */
 };
 enum { X86_CODE16 = 0, X86_CODE32 = 1, X86_CODE64 = 2 };
 
@@ -113,12 +116,19 @@ enum { X86_CODE16 = 0, X86_CODE32 = 1, X86_CODE64 = 2 };
 #define X86_PRIV_CODE_SHIFT 5
 #define X86_PRIV_STACK32    (1u << 7)
 #define X86_PRIV_PG         (1u << 8)
+#define X86_PRIV_A20M       (1u << 9)
 
 static inline enum x86_mode x86_priv_mode(unsigned priv)
 {
     return (enum x86_mode)((priv >> X86_PRIV_MODE_SHIFT) & 3u);
 }
 static inline unsigned x86_priv_cpl(unsigned priv)   { return priv & 3u; }
+/* Segment registers load as in real mode (base = selector << 4): real and
+ * virtual-8086 mode. */
+static inline bool x86_priv_realseg(unsigned priv)
+{
+    return x86_priv_mode(priv) == X86_MODE_REAL || x86_priv_mode(priv) == X86_MODE_V86;
+}
 static inline bool x86_priv_smm(unsigned priv)       { return (priv & X86_PRIV_SMM) != 0; }
 static inline unsigned x86_priv_code(unsigned priv)  { return (priv >> X86_PRIV_CODE_SHIFT) & 3u; }
 /* stack-pointer width in bits */
@@ -154,6 +164,8 @@ enum {
     MSR_BIOS_SIGN_ID     = 0x0000008B,
     MSR_SMBASE           = 0x0000009E,
     MSR_MTRRCAP          = 0x000000FE,
+    MSR_SMRR_PHYSBASE    = 0x000001F2,
+    MSR_SMRR_PHYSMASK    = 0x000001F3,
     MSR_SYSENTER_CS      = 0x00000174,
     MSR_SYSENTER_ESP     = 0x00000175,
     MSR_SYSENTER_EIP     = 0x00000176,
@@ -230,10 +242,21 @@ enum {
     X86_SR_TSC_AUX,      /* RDTSCP / RDPID */
     X86_SR_XCR0,         /* XGETBV / XSETBV with ECX = 0 */
     X86_SR_RDRAND,       /* RDRAND / RDSEED */
-    X86_SR_IOPL_CHECK,   /* read: faults #GP unless CPL <= IOPL (IN/OUT/INS/OUTS) */
     X86_SR_CPL0_CHECK,   /* read: faults #GP unless CPL 0 (HLT, INVD, ...) */
     X86_SR__COUNT
 };
+
+/* An I/O instruction as the SMRAM save state describes it. */
+typedef struct x86_io {
+    uint64_t misc;      /* IOMisc: SMI flag, length (1/2/4) << 1, type << 4, port << 16 */
+    uint64_t rip;       /* the instruction's RIP */
+    uint64_t mem;       /* INS/OUTS: the linear memory address */
+    uint64_t rcx, rsi, rdi;   /* before the instruction (string restart) */
+} x86_io;
+
+/* IOMisc instruction types */
+enum { X86_IO_OUT_DX = 0x0, X86_IO_IN_DX = 0x1, X86_IO_OUTS = 0x2, X86_IO_INS = 0x3,
+       X86_IO_REP = 0x4, X86_IO_OUT_IMM = 0x8, X86_IO_IN_IMM = 0x9 };
 
 /* ---- helper ids (index into x86_helpers) --------------------------------- */
 
@@ -259,6 +282,8 @@ enum {
     X86_H_SWAPGS,
     X86_H_SSE,           /* (descriptor, linear address of a memory operand): see x86_sse.c */
     X86_H_X87,           /* (descriptor, linear address): the x87 control/status subset */
+    X86_H_IO,            /* (IOMisc, rip, memory address): INS/OUTS begin their access */
+    X86_H_IO_PORT,       /* (IOMisc, rip, value) -> value: IN/OUT, recorded and done */
     X86_H__COUNT
 };
 extern const uam_helper_desc x86_helpers[X86_H__COUNT];
@@ -309,6 +334,7 @@ typedef struct x86_state {
     x86_dtr  gdtr, idtr;
     x86_sysseg ldtr, tr;
     uint64_t smbase;              /* SMRAM base; reset value 0x30000 */
+    uint64_t smrr_base, smrr_mask;/* IA32_SMRR_PHYSBASE / PHYSMASK (bit 11: valid) */
     uint64_t apic_base;           /* IA32_APIC_BASE */
     uint64_t kernel_gs_base, star, lstar, cstar, fmask, tsc_aux, pat;
     uint64_t sysenter_cs, sysenter_esp, sysenter_eip;
@@ -324,12 +350,25 @@ typedef struct x86_state {
     bool     in_smm;
     bool     halted_in_smm;       /* auto-HALT restart in the save state */
     bool     shutdown;            /* triple fault: the hart stops */
+    bool     wait_sipi;           /* an application processor waiting for a startup IPI */
+    /* SMM I/O state (I/O instruction restart): the I/O instruction executing
+     * (recorded by X86_H_IO, valid while icount == io_icount), what an SMI
+     * it raised latched, and what the SMM handler may restart */
+    x86_io   io_cur, io_smi, io_smm;
+    uint64_t io_icount;
+    bool     smi_io, smm_io;
+    bool     sipi_pending;
+    uint8_t  sipi_vector;
 
     /* a fault raised by a helper or SYSRD/SYSWR: delivered by take_exception */
     bool     pend_valid;
     uint8_t  pend_vec;
     bool     pend_has_err;
     uint32_t pend_err;
+    /* ... raised after a task switch committed: it belongs to the new task,
+     * whose instruction at pend_pc it is reported at */
+    bool     pend_in_task;
+    uint64_t pend_pc;
     unsigned exc_depth;           /* nesting while delivering (for #DF) */
 
     /* MSRs nobody implements, stored per the policy */
@@ -342,6 +381,11 @@ typedef struct x86_state {
     long double fpr[8];
     uint64_t    fpu_ip, fpu_dp;   /* last instruction / operand pointers (FNSTENV) */
     uint16_t    fpu_op;
+    /* MMX registers. They alias the x87 registers' significands on hardware;
+     * here they are kept apart and FXSAVE/FXRSTOR carry them in the x87 slots
+     * while MMX is in use (`mmx`: an MMX instruction ran since EMMS) */
+    uint64_t    mm[8];
+    bool        mmx;
 
     uam_x86_platform   plat;
     uam_x86_cpuid_info cpuid;
@@ -366,6 +410,13 @@ uint16_t x86_seg_attr(uam_cpu *cpu, unsigned seg);
 void     x86_seg_set(uam_cpu *cpu, unsigned seg, uint16_t sel, uint64_t base,
                      uint32_t limit, uint16_t attr);
 void     x86_seg_set_real(uam_cpu *cpu, unsigned seg, uint16_t sel);
+/* The time-stamp counter before the offset: virtual time (one count per
+ * tick, idle time included), or the instruction count without a scheduler. */
+static inline uint64_t x86_tsc_base(const uam_cpu *cpu)
+{
+    return cpu->sched ? uam_sched_now(cpu->sched) : cpu->icount;
+}
+
 static inline uint64_t x86_gpr(uam_cpu *cpu, unsigned r) { return uam_cpu_reg_read(cpu, X86_OFF_GPR(r), 64); }
 static inline void x86_set_gpr(uam_cpu *cpu, unsigned r, uint64_t v) { uam_cpu_reg_write(cpu, X86_OFF_GPR(r), 64, v); }
 /* current rIP (pc minus CS base) */
@@ -387,6 +438,9 @@ uam_status x86_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_
 uam_status x86_lin_read(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t *val, bool sup);
 uam_status x86_lin_write(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t val, bool sup);
 void       x86_tlb_flush(uam_cpu *cpu);
+/* A physical address as the processor emits it: bit 20 cleared under A20M#,
+ * and the SMRR range outside SMM goes to UAM_X86_SMRR_SINK. */
+uint64_t   x86_smrr_filter(uam_cpu *cpu, uint64_t pa);
 
 /* descriptors and far transfers (x86_seg.c) */
 uam_status x86_load_seg(uam_cpu *cpu, unsigned seg, uint16_t sel);   /* MOV/POP Sreg rules */
@@ -398,13 +452,34 @@ uam_status x86_load_seg_nocheck(uam_cpu *cpu, unsigned seg, uint16_t sel);
 uam_status x86_read_desc(uam_cpu *cpu, uint16_t sel, uint64_t *lo, uint64_t *hi, bool wide);
 void       x86_desc_unpack(uint64_t d, uint64_t *base, uint32_t *limit, uint16_t *attr);
 /* Far transfers; each returns the new linear pc. */
-uam_status x86_far_jmp(uam_cpu *cpu, uint16_t sel, uint64_t off, uint64_t *pc);
+/* next_lin: the linear pc after the JMP (where a task switch saves the old task). */
+uam_status x86_far_jmp(uam_cpu *cpu, uint16_t sel, uint64_t off, uint64_t next_lin, uint64_t *pc);
 uam_status x86_far_call(uam_cpu *cpu, uint16_t sel, unsigned osz, uint64_t off,
                         uint64_t ret_rip, uint64_t *pc);
 uam_status x86_retf(uam_cpu *cpu, unsigned osz, unsigned imm16, uint64_t *pc);
-uam_status x86_iret(uam_cpu *cpu, unsigned osz, uint64_t *pc);
+uam_status x86_iret(uam_cpu *cpu, unsigned osz, uint64_t next_lin, uint64_t *pc);
 uam_status x86_lldt(uam_cpu *cpu, uint16_t sel);
 uam_status x86_ltr(uam_cpu *cpu, uint16_t sel);
+/* The inner stack for `cpl` (or 64-bit IST slot `ist`) from the current TSS:
+ * 64-bit, 32-bit or 16-bit. */
+uam_status x86_tss_stack(uam_cpu *cpu, bool lm, unsigned cpl, unsigned ist, uint64_t *sp,
+                         uint16_t *ss);
+/* Null DS/ES/FS/GS where they name data the new (outer) CPL may not use. */
+void       x86_null_outer_segs(uam_cpu *cpu);
+
+/* task switches and the I/O permission bitmap (x86_task.c) */
+enum x86_task_reason { X86_TASK_JMP, X86_TASK_CALL, X86_TASK_IRET, X86_TASK_INT };
+/* Switch to the task whose TSS selector is `sel` (already found through a
+ * gate, if any). `ret` is the linear pc the old task resumes at. For an
+ * exception through a task gate, has_err/err is pushed on the new task's
+ * stack. On success *pc is the new task's linear pc. */
+uam_status x86_task_switch(uam_cpu *cpu, uint16_t sel, enum x86_task_reason why, uint64_t ret,
+                           bool has_err, uint32_t err, uint64_t *pc);
+/* IN/OUT/INS/OUTS permission: CPL <= IOPL outside virtual-8086 mode, else
+ * the TSS I/O permission bitmap; #GP(0) if denied. */
+uam_status x86_io_permitted(uam_cpu *cpu, unsigned port, unsigned size);
+/* Load the six segment registers of virtual-8086 mode from selectors. */
+void       x86_v86_segs(uam_cpu *cpu, const uint16_t sel[X86_NSEG]);
 /* LAR (lsl = false) / LSL: sets ZF; the value is valid when ZF = 1 */
 uint64_t   x86_lar(uam_cpu *cpu, uint16_t sel, bool lsl);
 

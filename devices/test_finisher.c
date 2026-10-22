@@ -1,19 +1,19 @@
 /*
- * sifive_test.c - Simulation finisher (uam/dev/sifive_test.h).
+ * test_finisher.c - Test finisher (uam/dev/test_finisher.h).
  */
 #include <stdlib.h>
 
-#include "uam/dev/sifive_test.h"
+#include "uam/dev/test_finisher.h"
 
 #define FINISHER_FAIL  0x3333u
 #define FINISHER_PASS  0x5555u
 #define FINISHER_RESET 0x7777u
 
-typedef struct sifive_test {
+typedef struct finisher {
     uam_device    dev;
     uam_finish_fn finish;
     void         *ctx;
-} sifive_test;
+} finisher;
 
 static uam_status test_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
 {
@@ -24,7 +24,7 @@ static uam_status test_read(uam_device *d, uint64_t off, unsigned size, uint64_t
 
 static uam_status test_write(uam_device *d, uint64_t off, unsigned size, uint64_t v)
 {
-    sifive_test *t = UAM_CONTAINER_OF(d, sifive_test, dev);
+    finisher *t = UAM_CONTAINER_OF(d, finisher, dev);
     if (off != 0 || size != 4)
         return UAM_OK;
     /* The command is in the low 16 bits and the exit code in the high 16.
@@ -51,20 +51,20 @@ static uam_status test_write(uam_device *d, uint64_t off, unsigned size, uint64_
 
 static void test_destroy(uam_device *d)
 {
-    free(UAM_CONTAINER_OF(d, sifive_test, dev));
+    free(UAM_CONTAINER_OF(d, finisher, dev));
 }
 
 static const uam_device_ops test_ops = {
-    .type = "sifive,test0",
+    .type = "uam,test-finisher",
     .read = test_read,
     .write = test_write,
     .destroy = test_destroy,
     .flags = UAM_DEVICE_STATELESS,
 };
 
-uam_device *uam_sifive_test_create(const char *name, uam_finish_fn finish, void *ctx)
+uam_device *uam_test_finisher_create(const char *name, uam_finish_fn finish, void *ctx)
 {
-    sifive_test *t = calloc(1, sizeof(*t));
+    finisher *t = calloc(1, sizeof(*t));
     if (!t)
         return NULL;
     uam_device_init(&t->dev, &test_ops, name);

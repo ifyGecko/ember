@@ -8,7 +8,7 @@
  *
  * Output is deterministic (no timestamps or counters are printed), so the
  * console log can be compared between runs and execution backends.
- * The result is reported through the sifive,test finisher.
+ * The result is reported through the test finisher.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -548,6 +548,6 @@ int main(void)
     puts_(" failed\n");
     puts_(n_fail ? "SELFTEST FAIL\n" : "SELFTEST PASS\n");
 
-    /* sifive,test finisher word: 0x5555 = pass, (code << 16) | 0x3333 = fail */
+    /* test finisher word: 0x5555 = pass, (code << 16) | 0x3333 = fail */
     return n_fail ? (int)((n_fail << 16) | 0x3333) : 0x5555;
 }

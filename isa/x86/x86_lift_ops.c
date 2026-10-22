@@ -356,8 +356,22 @@ uam_ref x_io_addr(xl *x, uam_ref port16)
     return x_bin(x, UAM_OP_ADD, 64, x_imm(x, UAM_X86_PIO_BASE), x_zext(x, 64, 16, port16));
 }
 
-void x_iopl_check(xl *x)
+/* X86_H_IO: the SMM I/O state of this instruction (before its access). */
+uam_ref x_io_misc(xl *x, uam_ref port16, unsigned width, unsigned type)
 {
-    if (x->cpl > 0)
-        (void)uam_sysrd(x->b, 64, X86_SR_IOPL_CHECK, NONE);
+    uint64_t fixed = 1u | (uint64_t)(width / 8) << 1 | (uint64_t)type << 4;
+    return x_bin(x, UAM_OP_OR, 64, x_imm(x, fixed),
+                 x_bin(x, UAM_OP_SHL, 64, x_zext(x, 64, 16, port16), x_imm(x, 16)));
 }
+
+uint64_t x_io_rip(const xl *x)
+{
+    uint64_t rip = x->pc - x->cs_base;
+    return x->code == X86_CODE64 ? rip : rip & 0xFFFFFFFFu;
+}
+
+void x_io_begin(xl *x, uam_ref port16, unsigned width, unsigned type, uam_ref mem)
+{
+    x_helper(x, X86_H_IO, x_io_misc(x, port16, width, type), x_imm(x, x_io_rip(x)), mem);
+}
+

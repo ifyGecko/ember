@@ -92,8 +92,11 @@ void x86_update_priv(uam_cpu *cpu)
     if (s->efer & EFER_LMA)
         mode = X86_MODE_LONG;
     else if (s->cr0 & CR0_PE)
-        mode = X86_MODE_PROT;
-    if (mode != X86_MODE_REAL) {
+        mode = (uam_cpu_reg_read(cpu, X86_OFF_RFLAGS_HI, 32) & RFLAGS_VM) ? X86_MODE_V86
+                                                                          : X86_MODE_PROT;
+    if (mode == X86_MODE_V86) {
+        cpl = 3;                                  /* 16-bit code and stack, CPL 3 */
+    } else if (mode != X86_MODE_REAL) {
         cpl = x86_seg_sel(cpu, X86_SEG_CS) & 3u;
         if (mode == X86_MODE_LONG && (cs & SEGA_L))
             code = X86_CODE64;
@@ -103,10 +106,12 @@ void x86_update_priv(uam_cpu *cpu)
     unsigned p = cpl | mode << X86_PRIV_MODE_SHIFT | code << X86_PRIV_CODE_SHIFT;
     if (s->in_smm)
         p |= X86_PRIV_SMM;
-    if (x86_seg_attr(cpu, X86_SEG_SS) & SEGA_DB)
+    if ((x86_seg_attr(cpu, X86_SEG_SS) & SEGA_DB) && mode != X86_MODE_V86)
         p |= X86_PRIV_STACK32;
     if (s->cr0 & CR0_PG)
         p |= X86_PRIV_PG;
+    if ((s->irq_lines & (1u << UAM_X86_IRQ_A20M)) && !s->in_smm)
+        p |= X86_PRIV_A20M;
     if (p != cpu->priv) {
         cpu->priv = p;
         uam_cpu_request_exit(cpu);
@@ -175,7 +180,7 @@ static void power_on_state(uam_cpu *cpu, uint64_t entry)
     s->dr[6] = 0xFFFF0FF0u;
     s->dr[7] = 0x400;
     s->smbase = 0x30000;
-    s->apic_base = 0xFEE00000ull | (1u << 11) | (s->cpuid.initial_apic_id == 0 ? (1u << 8) : 0);
+    s->apic_base = 0xFEE00000ull | (1u << 11) | (cpu->hartid == 0 ? (1u << 8) : 0);
     s->misc_enable = 1;
     s->xcr0 = 1;
     x86_set_rflags(cpu, RFLAGS_ALWAYS_1);
@@ -191,9 +196,39 @@ static void power_on_state(uam_cpu *cpu, uint64_t entry)
     uam_cpu_xlate_changed(cpu);
 }
 
+/* An application processor (hartid > 0) leaves reset, and INIT, waiting for
+ * a startup IPI; the bootstrap processor starts at `entry`. */
+static void enter_wait_sipi(uam_cpu *cpu)
+{
+    x86_state *s = x86_st(cpu);
+    s->wait_sipi = true;
+    cpu->waiting = true;
+}
+
 static void x86_reset(uam_cpu *cpu, uint64_t entry)
 {
     power_on_state(cpu, entry);
+    if (cpu->hartid != 0)
+        enter_wait_sipi(cpu);   /* power_on_state cleared any pending SIPI */
+}
+
+void uam_x86_sipi(void *ctx, uint8_t vector)
+{
+    uam_cpu *cpu = ctx;
+    x86_state *s = x86_st(cpu);
+    if (!s->wait_sipi && !s->init_pending)
+        return;                  /* only a processor waiting for one (or about to) takes it */
+    s->sipi_pending = true;
+    s->sipi_vector = vector;
+    uam_cpu_request_exit(cpu);
+}
+
+/* Multiprocessor switch: the platform's SMRAM view follows the processor. */
+static void x86_switch_in(uam_cpu *cpu)
+{
+    x86_state *s = x86_st(cpu);
+    if (s->plat.smm_changed)
+        s->plat.smm_changed(s->plat.ctx, s->in_smm);
 }
 
 /* ---- exception and interrupt delivery ------------------------------------ */
@@ -263,39 +298,15 @@ static uam_status deliver_real(uam_cpu *cpu, unsigned vec, uint64_t ret)
     return UAM_OK;
 }
 
-/* Read the inner stack for `cpl` (or IST slot `ist`) from the TSS. */
-static uam_status tss_stack(uam_cpu *cpu, bool lm, unsigned cpl, unsigned ist,
-                            uint64_t *sp, uint16_t *ss)
-{
-    x86_state *s = x86_st(cpu);
-    uint64_t v = 0;
-    uam_status st;
-    if (lm) {
-        uint32_t off = ist ? 0x24u + (ist - 1) * 8u : 4u + cpl * 8u;
-        if (off + 7 > s->tr.limit)
-            return x86_raise(cpu, X86_EXC_TS, true, s->tr.sel & ~3u);
-        st = x86_lin_read(cpu, s->tr.base + off, 8, &v, true);
-        *sp = v;
-        *ss = 0;
-        return st;
-    }
-    uint32_t off = 4u + cpl * 8u;
-    if (off + 5 > s->tr.limit)
-        return x86_raise(cpu, X86_EXC_TS, true, s->tr.sel & ~3u);
-    if ((st = x86_lin_read(cpu, s->tr.base + off, 4, &v, true)) != UAM_OK)
-        return st;
-    *sp = v;
-    if ((st = x86_lin_read(cpu, s->tr.base + off + 4, 2, &v, true)) != UAM_OK)
-        return st;
-    *ss = (uint16_t)v;
-    return UAM_OK;
-}
-
 static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_t err,
                                bool intn, uint64_t ret)
 {
     x86_state *s = x86_st(cpu);
     bool lm = x86_priv_mode(cpu->priv) == X86_MODE_LONG;
+    bool v86 = x86_priv_mode(cpu->priv) == X86_MODE_V86;
+    /* INT n in virtual-8086 mode is IOPL-sensitive */
+    if (v86 && intn && ((x86_get_rflags(cpu) & RFLAGS_IOPL) >> 12) < 3)
+        return x86_raise(cpu, X86_EXC_GP, true, 0);
     unsigned gsz = lm ? 16 : 8;
     uint32_t gerr = vec * 8u + 2u;   /* IDT, external bit clear */
     uint64_t lo = 0, hi = 0;
@@ -311,13 +322,22 @@ static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
     unsigned type = (lo >> 40) & 0xF, dpl = (lo >> 45) & 3;
     bool trap_gate = (type & 1) != 0;
     bool gate32 = lm || (type & 8);
-    if (lm ? (type != 0xE && type != 0xF) : (type != 0xE && type != 0xF && type != 0x6 && type != 0x7))
-        return x86_raise(cpu, X86_EXC_GP, true, gerr);   /* task gates are not supported */
+    bool task_gate = !lm && type == 0x5;
+    if (!task_gate && (lm ? (type != 0xE && type != 0xF)
+                          : (type != 0xE && type != 0xF && type != 0x6 && type != 0x7)))
+        return x86_raise(cpu, X86_EXC_GP, true, gerr);
     unsigned cpl = x86_priv_cpl(cpu->priv);
     if (intn && dpl < cpl)
         return x86_raise(cpu, X86_EXC_GP, true, gerr);
     if (!(lo & (1ull << 47)))
         return x86_raise(cpu, X86_EXC_NP, true, gerr);
+    if (task_gate) {   /* the handler is a task */
+        uint64_t npc = 0;
+        uam_status ts = x86_task_switch(cpu, (uint16_t)(lo >> 16), X86_TASK_INT, ret, has_err, err, &npc);
+        if (ts == UAM_OK)
+            cpu->pc = npc;
+        return ts;
+    }
 
     uint16_t sel = (uint16_t)(lo >> 16);
     uint64_t off = (lo & 0xFFFF) | ((lo >> 32) & 0xFFFF0000ull);
@@ -340,6 +360,9 @@ static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
     unsigned ncpl = (cattr & 0x4) ? cpl : ((cattr & SEGA_DPL) >> 5);   /* conforming keeps CPL */
     if (ncpl > cpl)
         return x86_raise(cpu, X86_EXC_GP, true, sel & ~3u);
+    /* out of virtual-8086 mode: only to a non-conforming CPL 0 handler */
+    if (v86 && ncpl != 0)
+        return x86_raise(cpu, X86_EXC_GP, true, sel & ~3u);
 
     uint64_t old_ss = x86_seg_sel(cpu, X86_SEG_SS);
     uint64_t old_sp = x86_gpr(cpu, X86_RSP);
@@ -353,7 +376,7 @@ static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
     if (switch_stack) {
         uint64_t nsp = 0;
         uint16_t nss = 0;
-        if ((st = tss_stack(cpu, lm, ncpl, ist, &nsp, &nss)) != UAM_OK)
+        if ((st = x86_tss_stack(cpu, lm, ncpl, ist, &nsp, &nss)) != UAM_OK)
             return st;
         if (lm) {
             f = (frame){ nsp & ~0xFull, 0, 64 };
@@ -365,6 +388,12 @@ static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
             f = (frame){ nsp, sb, (sa & SEGA_DB) ? 32u : 16u };
         }
         unsigned b = lm ? 8 : gate32 ? 4 : 2;
+        if (v86) {   /* the virtual-8086 data segments, which the handler finds null */
+            static const unsigned vseg[] = { X86_SEG_GS, X86_SEG_FS, X86_SEG_DS, X86_SEG_ES };
+            for (unsigned i = 0; i < UAM_ARRAY_LEN(vseg); i++)
+                if ((st = fpush(cpu, &f, b, x86_seg_sel(cpu, vseg[i]))) != UAM_OK)
+                    return st;
+        }
         if ((st = fpush(cpu, &f, b, old_ss)) != UAM_OK ||
             (st = fpush(cpu, &f, b, old_sp)) != UAM_OK)
             return st;
@@ -397,6 +426,10 @@ static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
     if (lm && (cattr & SEGA_L))
         cbase = 0;
     x86_seg_set(cpu, X86_SEG_CS, (uint16_t)((sel & ~3u) | ncpl), cbase, climit, cattr);
+    if (v86)
+        for (unsigned i = 0; i < X86_NSEG; i++)
+            if (i != X86_SEG_CS && i != X86_SEG_SS)
+                x86_seg_set(cpu, i, 0, 0, 0, 0);
     clear_entry_flags(cpu, !trap_gate);
     x86_update_priv(cpu);
     cpu->pc = (x86_priv_code(cpu->priv) == X86_CODE64) ? off : ((cbase + off) & 0xFFFFFFFFull);
@@ -408,6 +441,7 @@ static uam_status deliver_once(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
 {
     x86_state *s = x86_st(cpu);
     s->pend_valid = false;
+    s->pend_in_task = false;
     if (x86_priv_mode(cpu->priv) == X86_MODE_REAL)
         return deliver_real(cpu, vec, ret);
     return deliver_prot(cpu, vec, has_err, err, intn, ret);
@@ -441,6 +475,10 @@ void x86_deliver(uam_cpu *cpu, unsigned vec, bool has_err, uint32_t err,
         bool e2 = s->pend_valid ? s->pend_has_err : true;
         uint32_t c2 = s->pend_valid ? s->pend_err : 0;
         s->pend_valid = false;
+        if (s->pend_in_task) {   /* the task gate's switch committed: the new task faults */
+            s->pend_in_task = false;
+            fault_pc = s->pend_pc;
+        }
         if (vec == X86_EXC_DF) {
             shutdown(cpu);
             return;
@@ -487,6 +525,9 @@ static void x86_take_exception(uam_cpu *cpu, const uam_exception *exc)
     case UAM_EXC_HELPER: case UAM_EXC_SYSREG:
         if (s->pend_valid) {
             vec = s->pend_vec; has_err = s->pend_has_err; err = s->pend_err;
+            if (s->pend_in_task)   /* after a task switch committed: in the new task */
+                cpu->pc = ret = s->pend_pc;
+            s->pend_in_task = false;
         } else {
             vec = (exc->kind == UAM_EXC_SYSREG) ? X86_EXC_GP : X86_EXC_UD;
             has_err = vec == X86_EXC_GP;
@@ -513,10 +554,26 @@ static void x86_irq_input(uam_cpu *cpu, unsigned line, int level)
     uint32_t bit = 1u << line;
     bool rising = level && !(s->irq_lines & bit);
     if (level) s->irq_lines |= bit; else s->irq_lines &= ~bit;
+    if (line == UAM_X86_IRQ_A20M) {   /* every physical address may change: re-key */
+        x86_update_priv(cpu);
+        uam_cpu_xlate_changed(cpu);
+    }
     if (rising) {   /* NMI, SMI and INIT are edge-triggered */
         if (line == UAM_X86_IRQ_NMI) s->nmi_pending = true;
-        if (line == UAM_X86_IRQ_SMI) s->smi_pending = true;
-        if (line == UAM_X86_IRQ_INIT) s->init_pending = true;
+        if (line == UAM_X86_IRQ_SMI) {
+            s->smi_pending = true;
+            /* raised by the I/O instruction executing now: SMM sees which */
+            if (s->io_icount == cpu->icount && s->io_cur.misc && !s->in_smm) {
+                s->io_smi = s->io_cur;
+                s->smi_io = true;
+            }
+        }
+        if (line == UAM_X86_IRQ_INIT) {
+            if (s->wait_sipi)
+                s->sipi_pending = false;   /* INIT while waiting: back to waiting, now */
+            else
+                s->init_pending = true;
+        }
     }
     uam_cpu_request_exit(cpu);
 }
@@ -530,6 +587,8 @@ static bool intr_ready(uam_cpu *cpu)
 static bool x86_irq_wakeup(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
+    if (s->wait_sipi)
+        return s->sipi_pending || s->init_pending;
     if (s->shutdown)
         return s->init_pending;
     return (s->smi_pending && !s->in_smm) || (s->init_pending && !s->in_smm) ||
@@ -539,6 +598,23 @@ static bool x86_irq_wakeup(uam_cpu *cpu)
 static bool x86_irq_take(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
+    if (s->wait_sipi) {          /* only INIT and SIPI are recognised */
+        if (s->init_pending) {
+            s->init_pending = false;
+            enter_wait_sipi(cpu);
+            return false;
+        }
+        if (!s->sipi_pending)
+            return false;
+        s->wait_sipi = s->sipi_pending = false;
+        cpu->waiting = false;
+        uint64_t base = (uint64_t)s->sipi_vector << 12;
+        x86_seg_set(cpu, X86_SEG_CS, (uint16_t)(s->sipi_vector << 8), base, 0xFFFF,
+                    SEGA_P | SEGA_S | 0xB);
+        cpu->pc = base;
+        uam_cpu_xlate_changed(cpu);
+        return true;
+    }
     if (s->smi_pending && !s->in_smm && !s->shutdown) {
         s->smi_pending = false;
         s->halted_in_smm = cpu->waiting;
@@ -549,7 +625,26 @@ static bool x86_irq_take(uam_cpu *cpu)
     if (s->init_pending && !s->in_smm) {
         s->init_pending = false;
         cpu->waiting = false;
+        bool bsp = s->apic_base & (1u << 8);
+        bool sipi = s->sipi_pending;            /* a SIPI that came after this INIT */
+        uint8_t vec = s->sipi_vector;
+        /* INIT keeps what only RESET clears: SMBASE (SMM relocation survives
+         * an INIT-SIPI restart), the SMM range and PAT, the APIC base */
+        uint64_t smbase = s->smbase, smrr_base = s->smrr_base, smrr_mask = s->smrr_mask;
+        uint64_t pat = s->pat, apic_base = s->apic_base;
         power_on_state(cpu, 0xFFFFFFF0ull);
+        s->smbase = smbase;
+        s->smrr_base = smrr_base;
+        s->smrr_mask = smrr_mask;
+        s->pat = pat;
+        s->apic_base = apic_base;
+        if (!bsp) {
+            s->apic_base &= ~(uint64_t)(1u << 8);
+            s->sipi_pending = sipi;
+            s->sipi_vector = vec;
+            enter_wait_sipi(cpu);
+            return false;
+        }
         return true;
     }
     if (s->shutdown)
@@ -615,8 +710,10 @@ static uam_status write_rflags_popf(uam_cpu *cpu, uint64_t v)
         if (cpl > 0) mask &= ~(uint32_t)RFLAGS_IOPL;
         if (cpl > iopl(cpu)) mask &= ~(uint32_t)RFLAGS_IF;
     }
+    if (x86_priv_mode(cpu->priv) == X86_MODE_V86 && iopl(cpu) < 3)
+        return x86_raise(cpu, X86_EXC_GP, true, 0);   /* IOPL-sensitive in virtual-8086 mode */
     uint32_t nv = (cur & ~mask) | ((uint32_t)v & mask);
-    nv &= ~(uint32_t)(RFLAGS_RF | RFLAGS_VM);
+    nv = (nv & ~(uint32_t)(RFLAGS_RF | RFLAGS_VM)) | (cur & RFLAGS_VM);   /* VM stays */
     x86_set_rflags(cpu, nv);
     if ((nv & RFLAGS_IF) && !(cur & RFLAGS_IF))
         uam_cpu_request_exit(cpu);
@@ -642,7 +739,11 @@ uam_status x86_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     case X86_SR_DR0: case X86_SR_DR1: case X86_SR_DR2: case X86_SR_DR3:
     case X86_SR_DR4: case X86_SR_DR5: case X86_SR_DR6: case X86_SR_DR7:
         *val = s->dr[id - X86_SR_DR0]; return UAM_OK;
-    case X86_SR_RFLAGS: *val = x86_get_rflags(cpu) & ~(uint32_t)(RFLAGS_RF | RFLAGS_VM); return UAM_OK;
+    case X86_SR_RFLAGS:
+        if (x86_priv_mode(cpu->priv) == X86_MODE_V86 && iopl(cpu) < 3)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);   /* PUSHF/POPF: IOPL-sensitive */
+        *val = x86_get_rflags(cpu) & ~(uint32_t)(RFLAGS_RF | RFLAGS_VM);
+        return UAM_OK;
     case X86_SR_GDTR_BASE:  *val = s->gdtr.base; return UAM_OK;
     case X86_SR_GDTR_LIMIT: *val = s->gdtr.limit; return UAM_OK;
     case X86_SR_IDTR_BASE:  *val = s->idtr.base; return UAM_OK;
@@ -653,14 +754,11 @@ uam_status x86_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     case X86_SR_TSC:
         if ((s->cr4 & CR4_TSD) && x86_priv_cpl(cpu->priv) > 0)
             return x86_raise(cpu, X86_EXC_GP, true, 0);
-        *val = cpu->icount + s->tsc_offset;
+        *val = x86_tsc_base(cpu) + s->tsc_offset;
         return UAM_OK;
     case X86_SR_TSC_AUX: *val = s->tsc_aux; return UAM_OK;
     case X86_SR_XCR0: *val = s->xcr0; return UAM_OK;
     case X86_SR_RDRAND: *val = next_rand(s); return UAM_OK;
-    case X86_SR_IOPL_CHECK:
-        *val = 0;
-        return iopl_ok(cpu) ? UAM_OK : x86_raise(cpu, X86_EXC_GP, true, 0);
     case X86_SR_CPL0_CHECK:
         *val = 0;
         return x86_priv_cpl(cpu->priv) == 0 ? UAM_OK : x86_raise(cpu, X86_EXC_GP, true, 0);
@@ -746,6 +844,11 @@ void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info)
     s->cpuid.brand[48] = 0;
 }
 
+void uam_x86_get_cpuid(uam_cpu *cpu, uam_x86_cpuid_info *info)
+{
+    *info = x86_st(cpu)->cpuid;
+}
+
 /* ---- debug dump and snapshots -------------------------------------------- */
 
 static void x86_dump_state(uam_cpu *cpu, FILE *out)
@@ -781,6 +884,12 @@ static uint64_t *saved_u64(x86_state *s, size_t i)
         &s->apic_base, &s->kernel_gs_base, &s->star, &s->lstar, &s->cstar, &s->fmask,
         &s->tsc_aux, &s->pat, &s->sysenter_cs, &s->sysenter_esp, &s->sysenter_eip,
         &s->misc_enable, &s->feature_control, &s->tsc_offset, &s->mtrr_def_type, &s->rng,
+        &s->smrr_base, &s->smrr_mask, &s->io_icount,
+        &s->io_cur.misc, &s->io_cur.rip, &s->io_cur.mem, &s->io_cur.rcx, &s->io_cur.rsi,
+        &s->io_cur.rdi, &s->io_smi.misc, &s->io_smi.rip, &s->io_smi.mem, &s->io_smi.rcx,
+        &s->io_smi.rsi, &s->io_smi.rdi, &s->io_smm.misc, &s->io_smm.rip, &s->io_smm.mem,
+        &s->io_smm.rcx, &s->io_smm.rsi, &s->io_smm.rdi,
+        &s->mm[0], &s->mm[1], &s->mm[2], &s->mm[3], &s->mm[4], &s->mm[5], &s->mm[6], &s->mm[7],
     };
     return i < UAM_ARRAY_LEN(f) ? f[i] : NULL;
 }
@@ -796,8 +905,10 @@ static void x86_save(uam_cpu *cpu, uam_state_writer *w)
     uam_state_put_u16(w, s->ldtr.sel); uam_state_put_u16(w, s->ldtr.attr);
     uam_state_put_u16(w, s->tr.sel); uam_state_put_u16(w, s->tr.attr);
     uam_state_put_u32(w, s->irq_lines);
+    uam_state_put_u8(w, s->sipi_vector);
     const bool b[] = { s->nmi_pending, s->smi_pending, s->init_pending, s->nmi_blocked,
-                       s->in_smm, s->halted_in_smm, s->shutdown };
+                       s->in_smm, s->halted_in_smm, s->shutdown, s->wait_sipi, s->sipi_pending,
+                       s->smi_io, s->smm_io, s->mmx };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         uam_state_put_bool(w, b[i]);
     for (unsigned i = 0; i < 8; i++) {
@@ -823,8 +934,10 @@ static void x86_restore(uam_cpu *cpu, uam_state_reader *r)
     s->ldtr.sel = uam_state_get_u16(r); s->ldtr.attr = uam_state_get_u16(r);
     s->tr.sel = uam_state_get_u16(r); s->tr.attr = uam_state_get_u16(r);
     s->irq_lines = uam_state_get_u32(r);
+    s->sipi_vector = uam_state_get_u8(r);
     bool *const b[] = { &s->nmi_pending, &s->smi_pending, &s->init_pending, &s->nmi_blocked,
-                        &s->in_smm, &s->halted_in_smm, &s->shutdown };
+                        &s->in_smm, &s->halted_in_smm, &s->shutdown, &s->wait_sipi,
+                        &s->sipi_pending, &s->smi_io, &s->smm_io, &s->mmx };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         *b[i] = uam_state_get_bool(r);
     for (unsigned i = 0; i < 8; i++) {
@@ -879,4 +992,5 @@ const uam_isa uam_isa_x86_64 = {
     .save           = x86_save,
     .restore        = x86_restore,
     .irq_lines      = x86_irq_lines,
+    .switch_in      = x86_switch_in,
 };

@@ -33,6 +33,15 @@ extern const uam_isa uam_isa_x86_64;
 static inline uint64_t uam_x86_pio(uint16_t port) { return UAM_X86_PIO_BASE + port; }
 
 /*
+ * Outside SMM, accesses to the range the SMM range registers (IA32_SMRR_*)
+ * protect are redirected to UAM_X86_SMRR_SINK + (address - range base). Boards
+ * leave the sink unmapped, so the access gets the board's unclaimed-access
+ * behaviour (a PC master-aborts: reads all ones, writes dropped), or map a
+ * device there to observe it.
+ */
+#define UAM_X86_SMRR_SINK  0x0000800000000000ull  /* 2^47 */
+
+/*
  * Interrupt input lines, as numbered for isa->irq_input. A PC has one wire
  * into the core (INTR, from the local APIC or the legacy 8259), plus the
  * non-maskable and system-management pins, and INIT (a soft reset that keeps
@@ -45,6 +54,8 @@ enum uam_x86_irq_line {
     UAM_X86_IRQ_NMI  = 1,   /* non-maskable interrupt (edge: taken once per rise) */
     UAM_X86_IRQ_SMI  = 2,   /* system-management interrupt -> SMM entry (edge) */
     UAM_X86_IRQ_INIT = 3,   /* INIT# (edge) */
+    UAM_X86_IRQ_A20M = 4,   /* A20M# (level): high forces physical address bit 20 to 0
+                             * (the PC's A20 gate; ignored in SMM) */
 };
 
 /*
@@ -84,21 +95,50 @@ typedef enum uam_x86_msr_policy {
 void uam_x86_set_msr_policy(uam_cpu *cpu, uam_x86_msr_policy p, bool trace);
 
 /*
+ * The time-stamp counter counts virtual-time ticks (TSC frequency = the
+ * machine's tick rate), idle time included.
+ *
  * The processor identity CPUID reports. The defaults describe a generic
- * 64-bit Intel-architecture processor with the features this module
- * implements (no AVX, no VMX); a board for a specific platform can override
- * the family/model/stepping signature, the brand string and the logical
- * processor count, which firmware uses to pick microcode and silicon paths.
+ * x86-64 processor with the features this module implements (no AVX, no
+ * VMX) and name no vendor ("UAMx86RefCPU", family 6 model 0); a board for a
+ * specific platform sets the vendor, the family/model/stepping signature,
+ * the brand string and the logical processor count, which firmware uses to
+ * pick microcode and silicon paths.
  */
 typedef struct uam_x86_cpuid_info {
-    char     vendor[13];      /* "GenuineIntel" */
+    char     vendor[13];      /* 12 characters, leaf 0 EBX/EDX/ECX */
     uint32_t signature;       /* leaf 1 EAX: stepping/model/family */
     char     brand[49];       /* leaves 0x80000002..4 */
     unsigned logical_cpus;    /* leaf 1 EBX[23:16], leaf 4/0xB topology */
     unsigned phys_addr_bits;  /* leaf 0x80000008 EAX[7:0] */
     unsigned initial_apic_id; /* leaf 1 EBX[31:24] */
+    unsigned features;        /* UAM_X86_FEAT_*: what the board's devices add */
 } uam_x86_cpuid_info;
 
+/* Features that depend on the platform's devices, reported only when the
+ * board sets them: the local APIC's x2APIC mode (also lets software set
+ * IA32_APIC_BASE.EXTD) and its TSC-deadline timer. */
+enum {
+    UAM_X86_FEAT_X2APIC       = 1u << 0,
+    UAM_X86_FEAT_TSC_DEADLINE = 1u << 1,
+};
+
 void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info);
+
+/*
+ * Multiprocessor start-up. Processor 0 (hartid 0) is the bootstrap processor
+ * (IA32_APIC_BASE.BSP); every other processor leaves reset, and INIT, in the
+ * wait-for-SIPI state, where only INIT and a startup IPI are recognised. A
+ * startup IPI with `vector` starts it in real mode at vector << 12 (CS =
+ * vector << 8). The local APIC model delivers it through this call.
+ */
+void uam_x86_sipi(void *cpu, uint8_t vector);   /* `cpu` is the uam_cpu */
+/* The identity in effect (the defaults until a board sets one). */
+void uam_x86_get_cpuid(uam_cpu *cpu, uam_x86_cpuid_info *info);
+
+/* The processor's current TSC (IA32_TSC), for devices that compare against
+ * it (a local APIC's TSC-deadline timer: uam_lapic_set_tsc). `cpu` is the
+ * uam_cpu. */
+uint64_t uam_x86_read_tsc(void *cpu);
 
 #endif /* UAM_ISA_X86_H */

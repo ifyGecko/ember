@@ -20,11 +20,11 @@ static uint64_t h_load_seg(void *env, uint64_t seg, uint64_t sel, uint64_t c, ua
     return 0;
 }
 
-static uint64_t h_far_jmp(void *env, uint64_t sel, uint64_t off, uint64_t c, uam_status *st)
+static uint64_t h_far_jmp(void *env, uint64_t sel, uint64_t off, uint64_t next, uam_status *st)
 {
-    CPU; (void)c;
+    CPU;
     uint64_t pc = 0;
-    CHECK(x86_far_jmp(cpu, (uint16_t)sel, off, &pc));
+    CHECK(x86_far_jmp(cpu, (uint16_t)sel, off, next, &pc));
     return pc;
 }
 
@@ -44,11 +44,11 @@ static uint64_t h_retf(void *env, uint64_t osz, uint64_t imm, uint64_t c, uam_st
     return pc;
 }
 
-static uint64_t h_iret(void *env, uint64_t osz, uint64_t b, uint64_t c, uam_status *st)
+static uint64_t h_iret(void *env, uint64_t osz, uint64_t next, uint64_t c, uam_status *st)
 {
-    CPU; (void)b; (void)c;
+    CPU; (void)c;
     uint64_t pc = 0;
-    CHECK(x86_iret(cpu, (unsigned)osz, &pc));
+    CHECK(x86_iret(cpu, (unsigned)osz, next, &pc));
     return pc;
 }
 
@@ -165,8 +165,13 @@ static uint64_t h_fxsave(void *env, uint64_t lin, uint64_t b, uint64_t c, uam_st
         uint64_t lo = 0;
         x86_f80_store(fb, x86_st(cpu)->fpr[(top + i) & 7]);
         for (unsigned k = 0; k < 8; k++) lo |= (uint64_t)fb[k] << (8 * k);
+        uint64_t hi8 = fb[8] | (uint64_t)fb[9] << 8;
+        if (x86_st(cpu)->mmx) {   /* MMi in slot i: significand, exponent all ones */
+            lo = x86_st(cpu)->mm[i];
+            hi8 = 0xFFFF;
+        }
         CHECK(x86_lin_write(cpu, lin + 32 + i * 16, 8, lo, false));
-        CHECK(x86_lin_write(cpu, lin + 40 + i * 16, 8, fb[8] | (uint64_t)fb[9] << 8, false));
+        CHECK(x86_lin_write(cpu, lin + 40 + i * 16, 8, hi8, false));
     }
     for (unsigned i = 0; i < 32; i++)   /* XMM0-15 */
         CHECK(x86_lin_write(cpu, lin + 160 + i * 8, 8,
@@ -193,6 +198,7 @@ static uint64_t h_fxrstor(void *env, uint64_t lin, uint64_t b, uint64_t c, uam_s
         fb[8] = (uint8_t)f[2 * i + 1];
         fb[9] = (uint8_t)(f[2 * i + 1] >> 8);
         x86_st(cpu)->fpr[(top + i) & 7] = x86_f80_load(fb);
+        x86_st(cpu)->mm[i] = f[2 * i];   /* the significand is MMi */
     }
     uam_cpu_reg_write(cpu, X86_OFF_FCW, 16, w0 & 0xFFFF);
     uam_cpu_reg_write(cpu, X86_OFF_FSW, 16, (w0 >> 16) & 0xFFFF);
@@ -261,6 +267,46 @@ static uint64_t h_swapgs(void *env, uint64_t a, uint64_t b, uint64_t c, uam_stat
     return 0;
 }
 
+/* An I/O instruction is about to access its port: what an SMI it raises
+ * reports (SMRAM IOMisc and friends), and the registers a restart needs. */
+static uint64_t h_io(void *env, uint64_t misc, uint64_t rip, uint64_t mem, uam_status *st)
+{
+    uam_cpu *cpu = env;
+    x86_state *s = x86_st(cpu);
+    /* CPL > IOPL, or virtual-8086 mode: the TSS I/O permission bitmap decides */
+    if ((*st = x86_io_permitted(cpu, (unsigned)(misc >> 16) & 0xFFFF, (unsigned)(misc >> 1) & 7))
+        != UAM_OK)
+        return 0;
+    s->io_cur = (x86_io){ .misc = misc, .rip = rip, .mem = mem, .rcx = x86_gpr(cpu, X86_RCX),
+                          .rsi = x86_gpr(cpu, X86_RSI), .rdi = x86_gpr(cpu, X86_RDI) };
+    s->io_icount = cpu->icount;
+    return 0;
+}
+
+/* IN/OUT: record the SMM I/O state and access the port, in one call. The
+ * IOMisc word gives the port, length and direction (odd types are IN). */
+static uint64_t h_io_port(void *env, uint64_t misc, uint64_t rip, uint64_t val, uam_status *st)
+{
+    uam_cpu *cpu = env;
+    h_io(env, misc, rip, 0, st);
+    if (*st != UAM_OK)
+        return 0;
+    uint64_t addr = UAM_X86_PIO_BASE + (misc >> 16 & 0xFFFF);
+    unsigned size = (unsigned)(misc >> 1) & 7;
+    uam_status r;
+    if ((misc >> 4) & 1) {
+        uint64_t v = 0;
+        r = uam_bus_read(cpu->bus, addr, size, UAM_ACC_LE | UAM_ACC_PHYS, &v);
+        val = v;
+    } else {
+        r = uam_bus_write(cpu->bus, addr, size, UAM_ACC_LE | UAM_ACC_PHYS, val);
+        val = 0;
+    }
+    if (r != UAM_OK)
+        *st = x86_raise(cpu, X86_EXC_GP, true, 0);
+    return val;
+}
+
 /* ---- the table ----------------------------------------------------------- */
 
 #define RW (UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE)
@@ -269,10 +315,10 @@ static uint64_t h_swapgs(void *env, uint64_t a, uint64_t b, uint64_t c, uam_stat
 
 const uam_helper_desc x86_helpers[X86_H__COUNT] = {
     H(X86_H_LOAD_SEG, "x86_load_seg", 2, 0,  RWF, h_load_seg),
-    H(X86_H_FAR_JMP,  "x86_far_jmp",  2, 64, RWF, h_far_jmp),
+    H(X86_H_FAR_JMP,  "x86_far_jmp",  3, 64, RWF, h_far_jmp),
     H(X86_H_FAR_CALL, "x86_far_call", 3, 64, RWF, h_far_call),
     H(X86_H_RETF,     "x86_retf",     2, 64, RWF, h_retf),
-    H(X86_H_IRET,     "x86_iret",     1, 64, RWF, h_iret),
+    H(X86_H_IRET,     "x86_iret",     2, 64, RWF, h_iret),
     H(X86_H_CPUID,    "x86_cpuid",    0, 0,  RW,  h_cpuid),
     H(X86_H_RDMSR,    "x86_rdmsr",    0, 0,  RWF, h_rdmsr),
     H(X86_H_WRMSR,    "x86_wrmsr",    0, 0,  RWF, h_wrmsr),
@@ -289,4 +335,6 @@ const uam_helper_desc x86_helpers[X86_H__COUNT] = {
     H(X86_H_SWAPGS,   "x86_swapgs",   0, 0,  RW,  h_swapgs),
     H(X86_H_SSE,      "x86_sse",      2, 0,  RWF, x86_h_sse),
     H(X86_H_X87,      "x86_x87",      2, 0,  RWF, x86_h_x87),
+    H(X86_H_IO,       "x86_io",       3, 0,  RWF, h_io),
+    H(X86_H_IO_PORT,  "x86_io_port",  3, 64, RWF, h_io_port),
 };

@@ -5,7 +5,9 @@
 ; switches to 32-bit protected mode and to 64-bit long mode (identity-mapped
 ; with 2 MiB pages), checking arithmetic, flags, string instructions,
 ; interrupts and exceptions through the IVT and the IDT, paging faults,
-; SYSCALL and SSE along the way. The result goes to the test finisher at
+; SYSCALL and SSE along the way, and SMM: SMIs sent through the local APIC,
+; SMBASE relocation, a handler changing the saved state, the SMM range
+; registers (SMRR), and an SMI taken from long mode. The result goes to the test finisher at
 ; port 0x700: 0x5555 on success, (test << 16) | 0x3333 on the first failure.
 
 %define TEST_PORT 0x700
@@ -17,6 +19,13 @@
 %define PD0       0x12000
 %define SCRATCH   0x30000
 %define STACK_TOP 0x90000
+%define LAPIC     0xFEE00000
+%define SMM_COUNT    0x5000      ; SMIs handled
+%define SMM_NEWBASE  0x5004      ; non-zero: relocate SMBASE there
+%define SMM_SET_SMRR 0x5008      ; non-zero: program the SMRR for 0x40000-0x4FFFF
+%define SMM_PROBE    0x500C      ; a dword of 0x48000 as read inside SMM
+%define SMM_IOMISC   0x5010      ; the save state's IOMisc, as the handler saw it
+%define SMM_RESTART  0x5014      ; non-zero: ask for an I/O instruction restart (once)
 
 ; CHECK reg, value, test-number: fail unless reg == value (32-bit immediates)
 %macro CHECK 3
@@ -290,6 +299,68 @@ pm32:
         mov     ax, 0x10
         mov     ds, ax
 
+        ; SMM: the handler at the default SMBASE (0x30000) and at 0x40000
+        mov     esi, smi_handler
+        mov     edi, 0x38000
+        mov     ecx, smi_handler_end - smi_handler
+        rep movsb
+        mov     esi, smi_handler
+        mov     edi, 0x48000
+        mov     ecx, smi_handler_end - smi_handler
+        rep movsb
+        mov     dword [SMM_COUNT], 0
+        mov     dword [SMM_IOMISC], 0
+        mov     dword [SMM_RESTART], 0
+        mov     dword [SMM_NEWBASE], 0x40000
+        mov     dword [SMM_SET_SMRR], 0
+        or      dword [LAPIC + 0xF0], 0x100        ; APIC software enable
+        ; 70-72: an SMI; the handler sets the saved RAX and relocates SMBASE
+        xor     eax, eax
+        mov     ebp, 0x5A5A
+        call    send_smi32
+        CHECK   eax, 0x1234, 70
+        CHECK   ebp, 0x5A5A, 71
+        CHECK   dword [SMM_COUNT], 1, 72
+        ; 73-74: the next SMI runs at the new SMBASE (the old copy only RSMs)
+        mov     word [0x38000], 0xAA0F              ; RSM
+        mov     dword [SMM_SET_SMRR], 1
+        xor     eax, eax
+        call    send_smi32
+        CHECK   dword [SMM_COUNT], 2, 73
+        CHECK   eax, 0x1234, 74
+        ; 75-76: SMRR: all ones outside SMM, the handler's bytes inside
+        CHECK   dword [0x48000], 0xFFFFFFFF, 75
+        mov     eax, [SMM_PROBE]
+        cmp     eax, [smi_handler]
+        FAILIF  ne, 76
+
+        ; 67-69, 77-79, 96-97: SMIs raised by I/O instructions (the software
+        ; SMI port 0xB2) and I/O instruction restart
+        CHECK   dword [SMM_IOMISC], 0, 67           ; the APIC's SMIs were not I/O
+        mov     ebx, [SMM_COUNT]
+        mov     dword [SMM_RESTART], 1
+        mov     al, 0x5A
+        mov     dx, 0xB2
+        out     dx, al                              ; SMI; restarted: a second one
+        mov     ecx, [SMM_COUNT]
+        sub     ecx, ebx
+        CHECK   ecx, 2, 68
+        CHECK   dword [SMM_IOMISC], 0x00B20003, 69  ; port B2, OUT DX, byte, SMI
+        out     0xB2, al
+        CHECK   dword [SMM_IOMISC], 0x00B20083, 77  ; OUT imm8
+        mov     ebx, [SMM_COUNT]
+        mov     dword [SMM_RESTART], 1
+        mov     esi, fp_vec
+        mov     ecx, 3
+        cld
+        rep outsb                                   ; 3 SMIs, the first restarted: 4
+        mov     edx, [SMM_COUNT]
+        sub     edx, ebx
+        CHECK   edx, 4, 78
+        CHECK   ecx, 0, 79
+        CHECK   esi, fp_vec + 3, 96
+        CHECK   dword [SMM_IOMISC], 0x00B20063, 97  ; REP OUTS
+
         ; identity-map 4 GiB with 2 MiB pages and enter long mode
         mov     edi, PML4
         xor     eax, eax
@@ -323,6 +394,12 @@ pm32:
         or      eax, 0x80000000
         mov     cr0, eax
         jmp     0x18:lm64
+
+send_smi32:
+        mov     dword [LAPIC + 0x310], 0
+        mov     dword [LAPIC + 0x300], 0x00040200   ; to self, delivery mode SMI
+        nop                                         ; taken at an instruction boundary
+        ret
 
 sub_triple:
         enter   8, 0
@@ -511,10 +588,121 @@ lm64:
         syscall
         CHECK   ebp, 0x5C, 60
 
+        ; 62-64: an SMI from long mode returns to long mode
+        mov     r8, 0x1122334455667788
+        xor     eax, eax
+        mov     rdi, LAPIC
+        mov     dword [rdi + 0x310], 0
+        mov     dword [rdi + 0x300], 0x00040200
+        nop
+        CHECK   eax, 0x1234, 62
+        CHECK64 r8, 0x1122334455667788, 63
+        CHECK   dword [SMM_COUNT], 10, 64
+
+        ; 65-66: HPET: 14.31818 MHz period, and the counter runs once enabled
+        mov     rdi, 0xFED00000
+        mov     eax, [rdi + 4]
+        CHECK   eax, 69841279, 65
+        mov     dword [rdi + 0x10], 1               ; ENABLE_CNF
+        mov     rax, [rdi + 0xF0]
+        mov     ecx, 1000
+.spin:  loop    .spin
+        mov     rbx, [rdi + 0xF0]
+        cmp     rbx, rax
+        FAILIF  be, 66
+
+        ; 80-86: SSE/SSE2 floating point
+        mov     eax, 3
+        cvtsi2sd xmm0, eax                  ; 3.0
+        mov     eax, 4
+        cvtsi2sd xmm1, eax                  ; 4.0
+        mulsd   xmm0, xmm0
+        mulsd   xmm1, xmm1
+        addsd   xmm0, xmm1                  ; 25.0
+        sqrtsd  xmm0, xmm0                  ; 5.0
+        cvttsd2si eax, xmm0
+        CHECK   eax, 5, 80
+        mov     eax, 7
+        cvtsi2ss xmm2, eax
+        mov     eax, 2
+        cvtsi2ss xmm3, eax
+        divss   xmm2, xmm3                  ; 3.5
+        cvtss2si eax, xmm2                  ; round to nearest even: 4
+        CHECK   eax, 4, 81
+        cvttss2si eax, xmm2                 ; truncate: 3
+        CHECK   eax, 3, 82
+        comiss  xmm3, xmm2                  ; 2.0 < 3.5
+        FAILIF  ae, 83
+        cvtss2sd xmm4, xmm2
+        ucomisd xmm4, xmm4
+        FAILIF  ne, 84
+        movdqu  xmm5, [rel fp_vec]          ; 1.5 2.5 -1.0 8.0
+        movdqu  xmm6, [rel fp_vec + 16]     ; 0.5 0.5 0.5 0.5
+        addps   xmm5, xmm6                  ; 2.0 3.0 -0.5 8.5
+        cmpltps xmm6, xmm5                  ; 0.5 < x: T T F T
+        movmskps eax, xmm6
+        CHECK   eax, 0xB, 85
+        cvtps2dq xmm7, xmm5                 ; 2 3 0 8 (nearest even)
+        movd    eax, xmm7
+        pshufd  xmm7, xmm7, 0xFF
+        movd    ecx, xmm7
+        add     eax, ecx
+        CHECK   eax, 10, 86
+
+        ; 90-95: x2APIC mode and the TSC-deadline timer
+        cli
+        mov     eax, 1
+        cpuid
+        bt      ecx, 21                     ; x2APIC
+        FAILIF  nc, 90
+        bt      ecx, 24                     ; TSC-deadline
+        FAILIF  nc, 90
+        mov     ecx, 0x1B                   ; IA32_APIC_BASE: EN | EXTD
+        rdmsr
+        or      eax, 0xC00
+        wrmsr
+        mov     ecx, 0x802                  ; x2APIC ID
+        rdmsr
+        CHECK   eax, 0, 91
+        mov     ecx, 0x80F                  ; SVR: software enable
+        mov     eax, 0x1FF
+        xor     edx, edx
+        wrmsr
+        mov     ecx, 0x83F                  ; SELF IPI, vector 0x41
+        mov     eax, 0x41
+        wrmsr
+        mov     ecx, 0x822                  ; IRR[95:64]
+        rdmsr
+        CHECK   eax, 2, 92
+        mov     ecx, 0x832                  ; LVT timer: vector 0x40, TSC-deadline
+        mov     eax, 0x40 | (2 << 17)
+        xor     edx, edx
+        wrmsr
+        rdtsc
+        shl     rdx, 32
+        or      rax, rdx
+        add     rax, 3000
+        mov     rdx, rax
+        shr     rdx, 32
+        mov     ecx, 0x6E0                  ; IA32_TSC_DEADLINE
+        wrmsr
+        mov     ecx, 0x822
+        rdmsr
+        CHECK   eax, 2, 93                  ; not yet
+        mov     ecx, 4000
+.dl:    loop    .dl
+        mov     ecx, 0x822
+        rdmsr
+        CHECK   eax, 3, 94                  ; vector 0x40 pending now
+        mov     ecx, 0x6E0                  ; the deadline disarmed itself
+        rdmsr
+        or      eax, edx
+        CHECK   eax, 0, 95
+
         ; 61: CPUID vendor
         xor     eax, eax
         cpuid
-        CHECK   ebx, 0x756E6547, 61     ; "Genu"
+        CHECK   ebx, 0x784D4155, 61     ; "UAMx"
 
         lea     rsi, [rel msg_pass]
         call    puts64
@@ -571,9 +759,53 @@ fail64:
         jmp     fail64
 
 ; ---------------------------------------------------------------------------
+; SMI handler: copied to SMBASE + 0x8000, runs in SMM's real-address mode
+; with CS.base = SMBASE and flat data segments
+; ---------------------------------------------------------------------------
+        bits    16
+smi_handler:
+        inc     dword [SMM_COUNT]
+        xor     ebx, ebx
+        mov     bx, cs
+        shl     ebx, 4                              ; SMBASE
+        mov     dword [ebx + 0xFF5C], 0x1234        ; saved RAX
+        mov     dword [ebx + 0xFF60], 0
+        mov     eax, [SMM_NEWBASE]
+        test    eax, eax
+        jz      .norelocate
+        mov     [ebx + 0xFEF8], eax                 ; saved SMBASE: relocate
+        mov     dword [SMM_NEWBASE], 0
+.norelocate:
+        cmp     dword [SMM_SET_SMRR], 0
+        je      .nosmrr
+        mov     dword [SMM_SET_SMRR], 0
+        mov     ecx, 0x1F2                          ; IA32_SMRR_PHYSBASE: 0x40000, WB
+        mov     eax, 0x00040006
+        xor     edx, edx
+        wrmsr
+        mov     ecx, 0x1F3                          ; IA32_SMRR_PHYSMASK: 64 KiB, valid
+        mov     eax, 0xFFFF0800
+        mov     edx, 0x7F
+        wrmsr
+.nosmrr:
+        mov     eax, [dword 0x48000]
+        mov     [SMM_PROBE], eax
+        mov     eax, [ebx + 0xFFA4]                 ; IOMisc
+        mov     [SMM_IOMISC], eax
+        cmp     dword [SMM_RESTART], 0
+        je      .norestart
+        mov     dword [SMM_RESTART], 0
+        mov     byte [ebx + 0xFF00], 0xFF           ; I/O instruction restart
+.norestart:
+        rsm
+smi_handler_end:
+
+; ---------------------------------------------------------------------------
 ; data
 ; ---------------------------------------------------------------------------
         align   16
+fp_vec: dd 1.5, 2.5, -1.0, 8.0
+        dd 0.5, 0.5, 0.5, 0.5
 vec_a:  dd      2, 3, 4, 5
 vec_b:  dd      3, 4, 5, 6
 rip_slot: dd    0

@@ -5,9 +5,14 @@
  * SMBASE + 0xFC00 (SMM revision 0x30064: SMBASE relocation supported). The
  * hidden parts of the segment and descriptor-table registers, which the map
  * does not document, are kept in its reserved area at 0x7C00, as hardware
- * does. The platform's smm_changed hook is called before the save state is
- * written on entry and after it is read on RSM, so a chipset model can open
- * and close SMRAM for the processor.
+ * does. Auto-HALT restart and I/O instruction restart are supported: an SMI
+ * raised by an IN/OUT/INS/OUTS port access (the chipset traps the access)
+ * describes it in IOMisc, IOMemAddr and the I/O RIP; if the handler leaves
+ * FFh in the I/O restart field, RSM re-executes the instruction - for a
+ * string instruction, the iteration that was trapped (rCX, rSI and rDI as
+ * before it). The platform's smm_changed hook is called before
+ * the save state is written on entry and after it is read on RSM, so a
+ * chipset model can open and close SMRAM for the processor.
  */
 #include "uam/bus.h"
 #include "x86.h"
@@ -21,11 +26,12 @@ enum {
     SS_LDTR_BASE = 0x7C68, SS_LDTR_LIMIT = 0x7C70, SS_LDTR_ATTR = 0x7C74,
     SS_TR_BASE = 0x7C78, SS_TR_LIMIT = 0x7C80, SS_TR_ATTR = 0x7C84,
     SS_CR2 = 0x7C88, SS_XCR0 = 0x7C90, SS_NMI_BLOCKED = 0x7C98,
-    SS_GDT_HI = 0x7DD0, SS_LDT_HI = 0x7DD4, SS_IDT_HI = 0x7DD8,
+    SS_GDT_HI = 0x7DD0, SS_LDT_HI = 0x7DD4, SS_IDT_HI = 0x7DD8, SS_IO_RIP = 0x7DE8,
     SS_CR4 = 0x7E40,
     SS_GDT_LO = 0x7E8C, SS_IDT_LO = 0x7E94, SS_LDT_LO = 0x7E9C,
     SS_SMBASE = 0x7EF8, SS_REVID = 0x7EFC, SS_IORESTART = 0x7F00, SS_AUTOHALT = 0x7F02,
     SS_R15 = 0x7F1C,             /* R15..R8, then RAX RCX RDX RBX RSP RBP RSI RDI */
+    SS_IO_MEM = 0x7F9C, SS_IO_MISC = 0x7FA4,
     SS_ES = 0x7FA8,              /* ES CS SS DS FS GS selectors, u32 each */
     SS_LDTR = 0x7FC0, SS_TR = 0x7FC4,
     SS_DR7 = 0x7FC8, SS_DR6 = 0x7FD0, SS_RIP = 0x7FD8, SS_EFER = 0x7FE0,
@@ -86,6 +92,12 @@ void x86_smm_enter(uam_cpu *cpu)
     put(cpu, SS_SMBASE, 4, s->smbase);
     put(cpu, SS_REVID, 4, SMM_REVID);
     put(cpu, SS_IORESTART, 2, 0);
+    s->smm_io = s->smi_io;           /* the I/O instruction behind this SMI, if any */
+    s->io_smm = s->io_smi;
+    s->smi_io = false;
+    put(cpu, SS_IO_MISC, 4, s->smm_io ? s->io_smm.misc : 0);
+    put(cpu, SS_IO_MEM, 8, s->smm_io ? s->io_smm.mem : 0);
+    put(cpu, SS_IO_RIP, 8, s->smm_io ? s->io_smm.rip : 0);
     put(cpu, SS_AUTOHALT, 2, halted ? 1 : 0);
     for (unsigned i = 0; i < 16; i++)
         put(cpu, SS_R15 + i * 8, 8, x86_gpr(cpu, map_gpr(i)));
@@ -151,6 +163,22 @@ uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t *new_pc)
     x86_set_rflags(cpu, (uint32_t)get(cpu, SS_RFLAGS, 8));
     uint64_t rip = get(cpu, SS_RIP, 8);
     uint64_t smbase = get(cpu, SS_SMBASE, 4);   /* the handler may relocate SMBASE */
+    /* Auto-HALT restart: the SMI interrupted HLT and the handler left bit 0
+     * set, so execution resumes at the HLT (one byte back) and halts again. */
+    /* I/O instruction restart: back to the trapped I/O instruction (the
+     * iteration it was, for a string instruction) */
+    bool io_restart = s->smm_io && (get(cpu, SS_IORESTART, 2) & 0xFF) == 0xFF;
+    if (io_restart) {
+        rip = s->io_smm.rip;
+        if ((s->io_smm.misc >> 4) & X86_IO_OUTS) {          /* INS/OUTS: types 2, 3, 6, 7 */
+            x86_set_gpr(cpu, X86_RCX, s->io_smm.rcx);
+            x86_set_gpr(cpu, X86_RSI, s->io_smm.rsi);
+            x86_set_gpr(cpu, X86_RDI, s->io_smm.rdi);
+        }
+    } else if (get(cpu, SS_AUTOHALT, 2) & 1) {
+        rip -= 1;
+    }
+    s->smm_io = false;
 
     s->in_smm = false;
     if (s->plat.smm_changed)

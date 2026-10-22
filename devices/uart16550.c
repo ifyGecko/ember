@@ -185,7 +185,7 @@ static void uart_restore(uam_device *d, uam_state_reader *r)
 }
 
 static const uam_device_ops uart_ops = {
-    .type = "ns16550a",
+    .type = "16550a-uart",
     .read = uart_read,
     .write = uart_write,
     .reset = uart_reset,

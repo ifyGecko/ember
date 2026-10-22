@@ -2,14 +2,14 @@
  * ext_board.c - "ext-mips": a board defined outside the UAM tree.
  *
  * The same memory map as the stock mips-ref board (so the MIPS self-test runs
- * on it), plus what out-of-tree boards typically need: a 24Kc CPU model chosen
- * by the board, a catch-all window for the not-yet-modelled peripheral block
+ * on it), plus what out-of-tree boards typically need: a CPU identity of the
+ * board's own (here derived from the reference identity), a catch-all window for the not-yet-modelled peripheral block
  * under the real devices, a board option (-o banner=TEXT) and a named image
  * slot (--image rom=FILE, loaded at the reset vector).
  */
 #include <stdio.h>
 
-#include "uam/dev/sifive_test.h"
+#include "uam/dev/test_finisher.h"
 #include "uam/dev/uart16550.h"
 #include "uam/dev/unimp.h"
 #include "uam/isa/mips32.h"
@@ -38,7 +38,11 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
         return st;
     m->board_name = "ext-mips";
     m->reset_pc = 0xBFC00000u;
-    if ((st = uam_mips_configure(&m->cpu, &uam_mips_24kc)) != UAM_OK)
+    /* A board describes its own processor; this one keeps the reference
+     * feature set under its own name. */
+    uam_mips_config cpu = uam_mips_ref;
+    cpu.name = "ext-core";
+    if ((st = uam_mips_configure(&m->cpu, &cpu)) != UAM_OK)
         return st;
 
     if ((st = uam_bus_map_ram(&m->bus, "ram", 0, cfg->ram_size ? cfg->ram_size : RAM_SIZE)) != UAM_OK)
@@ -56,7 +60,7 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
 
     uam_device *uart = uam_uart16550_create("uart0", cfg->console);
     if ((st = attach(m, uart, UART_PHYS, 8)) != UAM_OK
-        || (st = attach(m, uam_sifive_test_create("test", uam_machine_stop_cb, m), TEST_PHYS, 0x10))
+        || (st = attach(m, uam_test_finisher_create("test", uam_machine_stop_cb, m), TEST_PHYS, 0x10))
                != UAM_OK)
         return st;
     uam_signal_connect(uam_uart16550_irq_line(uart), uam_cpu_irq_sink, &m->cpu, UAM_MIPS_IRQ_HW0);

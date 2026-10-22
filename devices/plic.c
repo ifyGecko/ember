@@ -1,5 +1,5 @@
 /*
- * plic.c - SiFive-compatible PLIC (uam/dev/plic.h).
+ * plic.c - RISC-V PLIC (uam/dev/plic.h).
  *
  * Gateway model (level-triggered): a source becomes pending while its input
  * is high and it is not already being serviced. A claim returns the highest
@@ -224,7 +224,7 @@ static void plic_restore(uam_device *d, uam_state_reader *r)
 }
 
 static const uam_device_ops plic_ops = {
-    .type = "sifive,plic-1.0.0",
+    .type = "riscv,plic0",
     .read = plic_read,
     .write = plic_write,
     .reset = plic_reset,

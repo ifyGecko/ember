@@ -173,7 +173,7 @@ static void ioapic_restore(uam_device *d, uam_state_reader *r)
 }
 
 static const uam_device_ops ioapic_ops = {
-    .type = "intel,ioapic", .impl_min = 4, .impl_max = 4,
+    .type = "x86,ioapic", .impl_min = 4, .impl_max = 4,
     .read = ioapic_read, .write = ioapic_write, .reset = ioapic_reset,
     .destroy = ioapic_destroy, .save = ioapic_save, .restore = ioapic_restore,
 };

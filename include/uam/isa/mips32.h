@@ -9,7 +9,9 @@
  * The CPU identity (PRId, Config registers, TLB size, writable Status bits) is
  * a property of the SoC, so the board selects it with uam_mips_configure()
  * after uam_machine_init() and before the first uam_machine_reset(). Without
- * that call the hart is a 24Kc (uam_mips_24kc).
+ * that call the hart is uam_mips_ref, a MIPS32 release 2 reference identity
+ * that names no company; a board for a specific SoC defines that SoC's
+ * identity in its own uam_mips_config.
  */
 #ifndef UAM_ISA_MIPS32_H
 #define UAM_ISA_MIPS32_H
@@ -43,7 +45,7 @@ typedef struct uam_mips_config {
     unsigned    tlb_entries;  /* joint TLB entries, 1..64 */
 } uam_mips_config;
 
-extern const uam_mips_config uam_mips_24kc;  /* MIPS 24Kc: 16-entry TLB, no FPU */
+extern const uam_mips_config uam_mips_ref;  /* MIPS32r2 reference: 16-entry TLB, no FPU */
 
 /* Select the CPU model of a MIPS hart. Takes effect at the next reset.
  * Returns UAM_ERR_INVALID if cpu is not a MIPS32 hart or cfg is malformed. */

@@ -1,10 +1,14 @@
 /*
  * gdbstub.c - gdb remote serial protocol server (uam/gdbstub.h).
  *
- * One client, one hart. Packets supported: ? g G p P m M c s vCont vCont?
- * Z0-Z4 z0-z4 k D qSupported qXfer:features:read qAttached qC
- * qfThreadInfo qsThreadInfo H T. Anything else gets the empty reply, which
- * gdb treats as "not supported".
+ * One client. Every processor of the machine is a thread (id = processor
+ * number + 1) in all-stop mode: the whole machine runs or stops together, a
+ * stop reply names the thread that caused it, and registers, memory
+ * translation and single steps act on the thread gdb selected (Hg).
+ * Packets supported: ? g G p P m M c s vCont vCont? Z0-Z4 z0-z4 k D
+ * qSupported qXfer:features:read qAttached qC qfThreadInfo qsThreadInfo
+ * qThreadExtraInfo H T. Anything else gets the empty reply, which gdb treats
+ * as "not supported".
  */
 #include <errno.h>
 #include <netinet/in.h>
@@ -47,7 +51,9 @@ struct uam_gdb {
     int          watch_type;
     bool         bp_hit;
     bool         interrupted;
-    uint64_t     end_icount;     /* overall instruction limit (UINT64_MAX: none) */
+    uint64_t     end_icount;     /* overall instruction limit, all processors (UINT64_MAX: none) */
+    unsigned     cur;            /* the selected thread's processor (Hg; a stop selects its own) */
+    unsigned     stop_cpu;       /* the processor that hit a breakpoint or watchpoint */
     char         pkt[PKT_MAX];
     char         out[PKT_MAX];
 };
@@ -189,9 +195,61 @@ static bool get_reg(uam_gdb *g, const char **pp, unsigned bytes, uint64_t *v)
     return true;
 }
 
+static uam_cpu *cur_cpu(uam_gdb *g) { return uam_machine_cpu(g->m, g->cur); }
+
+#define WIDE_MAX 16u   /* bytes in the widest register a description may have */
+
+static unsigned reg_size(const uam_gdb_arch *a, unsigned r)
+{
+    return a->reg_sizes ? a->reg_sizes[r] : a->reg_bytes;
+}
+
+/* Register r as hex at p; NULL if the ISA cannot read it. */
+static char *read_one(uam_gdb *g, uam_cpu *cpu, char *p, unsigned r)
+{
+    const uam_gdb_arch *a = cpu->isa->gdb;
+    unsigned n = reg_size(a, r);
+    if (n > 8) {
+        uint8_t buf[WIDE_MAX];
+        if (n > WIDE_MAX || !a->read_wide || !a->read_wide(cpu, r, buf))
+            return NULL;
+        for (unsigned i = 0; i < n; i++) {
+            *p++ = hexd[buf[i] >> 4];
+            *p++ = hexd[buf[i] & 15];
+        }
+        return p;
+    }
+    uint64_t v = 0;
+    if (!a->read_reg(cpu, r, &v))
+        return NULL;
+    return put_reg(g, p, v, n);
+}
+
+/* Register r from the hex at *pp (advanced); false if malformed or not writable. */
+static bool write_one(uam_gdb *g, uam_cpu *cpu, const char **pp, unsigned r)
+{
+    const uam_gdb_arch *a = cpu->isa->gdb;
+    unsigned n = reg_size(a, r);
+    if (n > 8) {
+        uint8_t buf[WIDE_MAX];
+        if (n > WIDE_MAX)
+            return false;
+        for (unsigned i = 0; i < n; i++) {
+            int h = hexval((*pp)[0]), l = hexval((*pp)[1]);
+            if (h < 0 || l < 0)
+                return false;
+            buf[i] = (uint8_t)((h << 4) | l);
+            *pp += 2;
+        }
+        return a->write_wide && a->write_wide(cpu, r, buf);
+    }
+    uint64_t v;
+    return get_reg(g, pp, n, &v) && a->write_reg(cpu, r, v);
+}
+
 static bool vtop(uam_gdb *g, uint64_t va, uint64_t *pa)
 {
-    uam_cpu *cpu = &g->m->cpu;
+    uam_cpu *cpu = cur_cpu(g);
     if (!cpu->isa->translate) {
         *pa = va;
         return true;
@@ -244,8 +302,11 @@ static void write_mem(uam_gdb *g, uint64_t addr, uint64_t len, const char *hex)
 
 static uam_hook_action bp_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    (void)cpu; (void)pc;
-    ((uam_gdb *)ctx)->bp_hit = true;
+    (void)pc;
+    uam_gdb *g = ctx;
+    if (!g->bp_hit)
+        g->stop_cpu = cpu->hartid;
+    g->bp_hit = true;
     return UAM_HOOK_STOP;
 }
 
@@ -264,9 +325,11 @@ static void watch_cb(void *ctx, uint64_t addr, unsigned size, bool is_write, uin
         g->watch_hit = true;
         g->watch_type = w->type;
         g->watch_addr = w->vaddr + (addr > w->paddr ? addr - w->paddr : 0);
+        /* the processor whose access this is */
+        g->stop_cpu = uam_machine_current_cpu(g->m);
         /* Stop after this instruction, without touching the guest's stop status. */
         g->m->exec.stop_request = true;
-        uam_cpu_request_exit(&g->m->cpu);
+        uam_cpu_request_exit(uam_machine_cpu(g->m, g->stop_cpu));
         return;
     }
 }
@@ -282,18 +345,18 @@ static uint64_t state_bits(const uam_gdb *g)
 static bool bp_hooks(uam_gdb *g, uint64_t addr, bool insert)
 {
     const uint64_t sb = state_bits(g);
-    if (insert) {
-        if (uam_exec_add_pc_hook(&g->m->exec, addr, bp_hook, g) != UAM_OK)
+    if (insert) {   /* on every processor */
+        if (uam_machine_add_pc_hook(g->m, addr, bp_hook, g) != UAM_OK)
             return false;
-        if (sb && uam_exec_add_pc_hook(&g->m->exec, addr | sb, bp_hook, g) != UAM_OK) {
-            uam_exec_remove_pc_hook(&g->m->exec, addr, bp_hook, g);
+        if (sb && uam_machine_add_pc_hook(g->m, addr | sb, bp_hook, g) != UAM_OK) {
+            uam_machine_remove_pc_hook(g->m, addr, bp_hook, g);
             return false;
         }
         return true;
     }
-    uam_exec_remove_pc_hook(&g->m->exec, addr, bp_hook, g);
+    uam_machine_remove_pc_hook(g->m, addr, bp_hook, g);
     if (sb)
-        uam_exec_remove_pc_hook(&g->m->exec, addr | sb, bp_hook, g);
+        uam_machine_remove_pc_hook(g->m, addr | sb, bp_hook, g);
     return true;
 }
 
@@ -358,18 +421,25 @@ static void clear_points(uam_gdb *g)
 /* Instructions left before the overall limit (0 = unlimited for exec_run). */
 static uint64_t remaining(const uam_gdb *g)
 {
-    return g->end_icount == UINT64_MAX ? 0 : g->end_icount - g->m->cpu.icount;
+    return g->end_icount == UINT64_MAX ? 0 : g->end_icount - uam_machine_icount(g->m);
 }
 
-/* Run (or step) until something gdb should hear about. */
+/* Run (or step) until something gdb should hear about. A step runs the machine
+ * until the selected processor has retired one instruction (the others run on in
+ * their turns, as all-stop mode has it). */
 static uam_stop_reason resume(uam_gdb *g, bool step)
 {
     uam_exec *x = &g->m->exec;
+    const uam_cpu *cpu = cur_cpu(g);
+    const uint64_t step_from = cpu->icount;
+    unsigned polls = 0;
     g->bp_hit = g->watch_hit = g->interrupted = false;
+    g->stop_cpu = g->cur;
     for (;;) {
-        if (g->m->cpu.icount >= g->end_icount)
+        uint64_t done = uam_machine_icount(g->m);
+        if (done >= g->end_icount)
             return UAM_STOP_INSN_LIMIT;
-        uint64_t slice = step ? 1 : SLICE, left = g->end_icount - g->m->cpu.icount;
+        uint64_t slice = step ? 1 : SLICE, left = g->end_icount - done;
         if (slice > left)
             slice = left;
         uam_stop_reason why = uam_exec_run(x, slice);
@@ -377,8 +447,10 @@ static uam_stop_reason resume(uam_gdb *g, bool step)
             x->stop_request = false;
             return UAM_STOP_DEBUG;
         }
-        if (why == UAM_STOP_INSN_LIMIT && !step && g->m->cpu.icount < g->end_icount) {
-            if (ctrl_c_pending(g)) {
+        if (why == UAM_STOP_INSN_LIMIT && uam_machine_icount(g->m) < g->end_icount) {
+            if (step && cpu->icount != step_from)
+                return why;
+            if ((!step || ++polls % 4096 == 0) && ctrl_c_pending(g)) {
                 g->interrupted = true;
                 return UAM_STOP_DEBUG;
             }
@@ -386,6 +458,13 @@ static uam_stop_reason resume(uam_gdb *g, bool step)
         }
         return why;
     }
+}
+
+/* The stop reply's "thread:" field, with a trailing ';'. */
+static const char *thread_field(uam_gdb *g, char *buf, size_t n)
+{
+    snprintf(buf, n, "thread:%x;", g->stop_cpu + 1);
+    return buf;
 }
 
 static void report(uam_gdb *g, uam_stop_reason why, bool *done)
@@ -408,7 +487,7 @@ static void report(uam_gdb *g, uam_stop_reason why, bool *done)
         put_packet(g, "T0e");      /* SIGALRM: the virtual time budget is spent */
         return;
     case UAM_STOP_INSN_LIMIT:
-        if (g->m->cpu.icount >= g->end_icount) {
+        if (uam_machine_icount(g->m) >= g->end_icount) {
             put_packet(g, "T0e");  /* SIGALRM: the instruction budget is spent */
             return;
         }
@@ -416,19 +495,65 @@ static void report(uam_gdb *g, uam_stop_reason why, bool *done)
     default:
         break;
     }
+    /* gdb switches to the thread a stop names; so do we */
+    g->cur = g->stop_cpu;
+    char th[32], buf[96];
+    thread_field(g, th, sizeof(th));
     if (g->interrupted) {
-        put_packet(g, "T02");
+        snprintf(buf, sizeof(buf), "T02%s", th);
     } else if (g->watch_hit) {
         static const char *const kind[] = { "", "", "watch", "rwatch", "awatch" };
-        char buf[64];
-        snprintf(buf, sizeof(buf), "T05%s:%llx;", kind[g->watch_type],
-                 (unsigned long long)g->watch_addr);
-        put_packet(g, buf);
+        snprintf(buf, sizeof(buf), "T05%s:%llx;%s", kind[g->watch_type],
+                 (unsigned long long)g->watch_addr, th);
     } else if (g->bp_hit) {
-        put_packet(g, "T05swbreak:;");
+        snprintf(buf, sizeof(buf), "T05swbreak:;%s", th);
     } else {
-        put_packet(g, "T05");
+        snprintf(buf, sizeof(buf), "T05%s", th);
     }
+    put_packet(g, buf);
+}
+
+/* A thread id from a packet: the processor, or -1 for "any"/"all" (0, -1), or
+ * UINT32_MAX if there is no such thread. */
+static long thread_of(uam_gdb *g, const char *s)
+{
+    if (!strcmp(s, "-1") || !strcmp(s, "0"))
+        return -1;
+    char *end;
+    unsigned long t = strtoul(s, &end, 16);
+    if (*end || t == 0 || t > uam_machine_ncpus(g->m))
+        return (long)UINT32_MAX;
+    return (long)(t - 1);
+}
+
+static void thread_list(uam_gdb *g)
+{
+    char *o = g->out;
+    *o++ = 'm';
+    for (unsigned i = 0, n = uam_machine_ncpus(g->m); i < n; i++)
+        o += snprintf(o, 16, i ? ",%x" : "%x", i + 1);
+    *o = 0;
+    put_packet(g, g->out);
+}
+
+/* qThreadExtraInfo: "cpu N", and whether it waits. */
+static void thread_info(uam_gdb *g, const char *id)
+{
+    long t = thread_of(g, id);
+    if (t < 0 || t == (long)UINT32_MAX) {
+        put_packet(g, "E01");
+        return;
+    }
+    const uam_cpu *cpu = uam_machine_cpu(g->m, (unsigned)t);
+    char text[48];
+    snprintf(text, sizeof(text), "cpu %ld%s", t, cpu->waiting ? " (waiting)" : "");
+    char *o = g->out;
+    for (const char *c = text; *c; c++) {
+        *o++ = hexd[(*c >> 4) & 15];
+        *o++ = hexd[*c & 15];
+    }
+    *o = 0;
+    put_packet(g, g->out);
 }
 
 /* ---- packet dispatch ------------------------------------------------------- */
@@ -459,12 +584,12 @@ static void handle_qxfer(uam_gdb *g, const char *args)
 
 uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
 {
-    uam_cpu *cpu = &g->m->cpu;
-    const uam_gdb_arch *a = cpu->isa->gdb;
+    const uam_gdb_arch *a = g->m->cpu.isa->gdb;
     uam_stop_reason last = UAM_STOP_DEBUG;
-    g->end_icount = max_insns ? cpu->icount + max_insns : UINT64_MAX;
+    g->end_icount = max_insns ? uam_machine_icount(g->m) + max_insns : UINT64_MAX;
 
     for (;;) {
+        uam_cpu *cpu = cur_cpu(g);
         int n = get_packet(g);
         if (n < 0) {
             /* Client vanished: behave like a detach. */
@@ -473,39 +598,46 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
         }
         char *p = g->pkt;
         switch (p[0]) {
-        case '?':
-            put_packet(g, "S05");
+        case '?': {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "T05thread:%x;", g->cur + 1);
+            put_packet(g, buf);
             break;
+        }
         case 'g': {
             char *o = g->out;
             for (unsigned r = 0; r < a->n_regs; r++) {
-                uint64_t v = 0;
-                a->read_reg(cpu, r, &v);
-                o = put_reg(g, o, v, a->reg_bytes);
+                char *next = read_one(g, cpu, o, r);
+                if (!next) {   /* unreadable: zeros */
+                    next = o;
+                    for (unsigned i = 0; i < 2 * reg_size(a, r); i++)
+                        *next++ = '0';
+                }
+                o = next;
             }
             *o = 0;
             put_packet(g, g->out);
             break;
         }
         case 'G': {
+            /* Registers that cannot be written (x86 selectors) keep their value. */
             const char *q = p + 1;
-            for (unsigned r = 0; r < a->n_regs; r++) {
-                uint64_t v;
-                if (!get_reg(g, &q, a->reg_bytes, &v))
-                    break;
-                a->write_reg(cpu, r, v);
+            for (unsigned r = 0; r < a->n_regs && strlen(q) >= 2 * reg_size(a, r); r++) {
+                const char *at = q;
+                if (!write_one(g, cpu, &q, r))
+                    q = at + 2 * reg_size(a, r);
             }
             put_packet(g, "OK");
             break;
         }
         case 'p': {
             unsigned r = (unsigned)strtoul(p + 1, NULL, 16);
-            uint64_t v = 0;
-            if (!a->read_reg(cpu, r, &v)) {
+            char *o = r < a->n_regs ? read_one(g, cpu, g->out, r) : NULL;
+            if (!o) {
                 put_packet(g, "E01");
                 break;
             }
-            *put_reg(g, g->out, v, a->reg_bytes) = 0;
+            *o = 0;
             put_packet(g, g->out);
             break;
         }
@@ -513,9 +645,7 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
             char *eq = strchr(p, '=');
             unsigned r = (unsigned)strtoul(p + 1, NULL, 16);
             const char *q = eq ? eq + 1 : "";
-            uint64_t v;
-            put_packet(g, eq && get_reg(g, &q, a->reg_bytes, &v) && a->write_reg(cpu, r, v)
-                              ? "OK" : "E01");
+            put_packet(g, eq && r < a->n_regs && write_one(g, cpu, &q, r) ? "OK" : "E01");
             break;
         }
         case 'm': {
@@ -549,7 +679,19 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
             if (!strcmp(p, "vCont?")) {
                 put_packet(g, "vCont;c;C;s;S");
             } else if (!strncmp(p, "vCont;", 6)) {
+                /* The first action: all-stop, so the machine runs as a whole; a
+                 * step steps the thread it names (or the selected one). */
                 char act = p[6];
+                if (act == 's' || act == 'S') {
+                    const char *colon = strchr(p + 6, ':');
+                    if (colon) {
+                        char id[16];
+                        snprintf(id, sizeof(id), "%.*s", (int)strcspn(colon + 1, ";"), colon + 1);
+                        long t = thread_of(g, id);
+                        if (t >= 0 && t != (long)UINT32_MAX)
+                            g->cur = (unsigned)t;
+                    }
+                }
                 bool done;
                 last = resume(g, act == 's' || act == 'S');
                 report(g, last, &done);
@@ -577,10 +719,22 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
             close(g->fd);
             g->fd = -1;
             return uam_exec_run(&g->m->exec, remaining(g));
-        case 'H':
-        case 'T':
+        case 'H': {   /* Hg selects the thread for registers and memory; Hc is all-stop */
+            long t = thread_of(g, p + 2);
+            if (t == (long)UINT32_MAX) {
+                put_packet(g, "E01");
+                break;
+            }
+            if (p[1] == 'g' && t >= 0)
+                g->cur = (unsigned)t;
             put_packet(g, "OK");
             break;
+        }
+        case 'T': {
+            long t = thread_of(g, p + 1);
+            put_packet(g, t >= 0 && t != (long)UINT32_MAX ? "OK" : "E01");
+            break;
+        }
         case 'q':
             if (!strncmp(p, "qSupported", 10))
                 put_packet(g, "PacketSize=3fff;qXfer:features:read+;swbreak+;hwbreak+");
@@ -588,10 +742,14 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
                 handle_qxfer(g, p + 20);
             else if (!strcmp(p, "qAttached"))
                 put_packet(g, "1");
-            else if (!strcmp(p, "qC"))
-                put_packet(g, "QC1");
-            else if (!strcmp(p, "qfThreadInfo"))
-                put_packet(g, "m1");
+            else if (!strcmp(p, "qC")) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "QC%x", g->cur + 1);
+                put_packet(g, buf);
+            } else if (!strcmp(p, "qfThreadInfo"))
+                thread_list(g);
+            else if (!strncmp(p, "qThreadExtraInfo,", 17))
+                thread_info(g, p + 17);
             else if (!strcmp(p, "qsThreadInfo"))
                 put_packet(g, "l");
             else

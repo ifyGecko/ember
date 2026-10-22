@@ -38,7 +38,9 @@ struct uam_fuzz {
     uam_cov_state  cov;
     uam_cov_site  *marker;         /* sites at the begin and end pcs, counted by the hooks */
     size_t         n_marker;
-    uint64_t       snap_last_pc;   /* cov.last_pc when the snapshot was taken */
+    uint64_t      *snap_last_pc;   /* each processor's cov last_pc when the snapshot was taken */
+    unsigned       ncpus;
+    uam_cpu       *hit_cpu;        /* the processor a boundary, crash or exception stopped */
     const char    *scheme;
     char           scheme_buf[32];
     bool           has_cov;
@@ -171,13 +173,15 @@ static unsigned exc_class(uam_exc_kind k)
  * the begin, with an empty history. The snapshot is taken at the begin pc with its
  * hook already run, so the begin instruction there is never counted twice.
  */
-static void count_marker(uam_fuzz *f, uint64_t pc)
+static void count_marker(uam_fuzz *f, uam_cpu *cpu, uint64_t pc)
 {
     if (!f->has_cov)
         return;
+    /* in the processor's own history (uam_machine_set_coverage) */
+    uam_cov_state *cs = cpu->cov ? cpu->cov : &f->cov;
     for (size_t i = 0; i < f->n_marker; i++) {
         if (f->marker[i].pc == pc) {
-            uam_cov_count(&f->cov, pc, f->marker[i].a, f->marker[i].b);
+            uam_cov_count(cs, pc, f->marker[i].a, f->marker[i].b);
             return;
         }
     }
@@ -185,19 +189,20 @@ static void count_marker(uam_fuzz *f, uint64_t pc)
 
 static uam_hook_action begin_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    (void)cpu;
     uam_fuzz *f = ctx;
     if (f->ph == PH_IDLE)
         return UAM_HOOK_CONTINUE;
-    count_marker(f, pc);
+    count_marker(f, cpu, pc);
     if (f->ph == PH_BOOT) {
         if (f->boot_arrivals++ < f->cfg.begin_skip)
             return UAM_HOOK_CONTINUE;   /* a start-up pass (begin_skip): part of INIT */
         f->at_begin = true;
+        f->hit_cpu = cpu;
         return UAM_HOOK_STOP;
     }
     if (!f->n_end_pcs) {   /* begin-only: back at begin */
         f->ended = true;
+        f->hit_cpu = cpu;
         return UAM_HOOK_STOP;
     }
     if (f->cfg.nested)
@@ -207,49 +212,49 @@ static uam_hook_action begin_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 
 static uam_hook_action end_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    (void)cpu;
     uam_fuzz *f = ctx;
     if (f->ph == PH_IDLE)
         return UAM_HOOK_CONTINUE;
-    count_marker(f, pc);
+    count_marker(f, cpu, pc);
     if (f->ph != PH_ITER)
         return UAM_HOOK_CONTINUE;
     if (f->cfg.nested && --f->depth > 0)
         return UAM_HOOK_CONTINUE;
     f->ended = true;
+    f->hit_cpu = cpu;
     return UAM_HOOK_STOP;
 }
 
 static uam_hook_action crash_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    (void)cpu;
     uam_fuzz *f = ctx;
     if (f->ph != PH_ITER)
         return UAM_HOOK_CONTINUE;
     f->oracle = true;
     f->oracle_pc = pc;
+    f->hit_cpu = cpu;
     return UAM_HOOK_STOP;
 }
 
 static uam_hook_action exc_hook(void *ctx, uam_cpu *cpu, const uam_exception *e)
 {
-    (void)cpu;
     uam_fuzz *f = ctx;
     if (f->ph != PH_ITER || !(exc_class(e->kind) & f->cfg.crash_exc))
         return UAM_HOOK_CONTINUE;
     f->exc_crash = true;
     f->exc = *e;
+    f->hit_cpu = cpu;
     return UAM_HOOK_STOP;
 }
 
 static uam_hook_action irq_hook(void *ctx, uam_cpu *cpu, const uam_interrupt *irq)
 {
-    (void)cpu;
     uam_fuzz *f = ctx;
     if (f->ph != PH_ITER || !(irq->lines & f->cfg.crash_irq_lines))
         return UAM_HOOK_CONTINUE;
     f->irq_crash = true;
     f->irq = *irq;
+    f->hit_cpu = cpu;
     return UAM_HOOK_STOP;
 }
 
@@ -335,25 +340,33 @@ uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err,
     f->cfg.n_more_begin_pcs = f->n_begin_pcs - 1;
     uam_cov_state_init(&f->cov, f->map, map_size, &cfg->history);
     f->cov.skip_repeat = cfg->skip_repeats;
-    f->snap_last_pc = UAM_COV_NO_PC;
+    f->ncpus = uam_machine_ncpus(m);
+    f->snap_last_pc = malloc(sizeof(uint64_t) * f->ncpus);
+    if (!f->snap_last_pc) {
+        uam_fuzz_destroy(f);
+        set_err(err, errlen, "out of memory");
+        return NULL;
+    }
+    for (unsigned i = 0; i < f->ncpus; i++)
+        f->snap_last_pc[i] = UAM_COV_NO_PC;
     f->scheme = "none";
 
-    uam_exec *x = &m->exec;
+    /* Every processor's arrivals, exceptions and interrupts count. */
     uam_status st = UAM_OK;
     for (size_t i = 0; st == UAM_OK && i < f->n_begin_pcs; i++)
-        st = uam_exec_add_pc_hook(x, f->begin_pcs[i], begin_hook, f);
+        st = uam_machine_add_pc_hook(m, f->begin_pcs[i], begin_hook, f);
     for (size_t i = 0; st == UAM_OK && i < f->n_end_pcs; i++)
-        st = uam_exec_add_pc_hook(x, f->end_pcs[i], end_hook, f);
+        st = uam_machine_add_pc_hook(m, f->end_pcs[i], end_hook, f);
     for (size_t i = 0; st == UAM_OK && i < cfg->n_crash_pcs; i++)
-        st = uam_exec_add_pc_hook(x, cfg->crash_pcs[i], crash_hook, f);
+        st = uam_machine_add_pc_hook(m, cfg->crash_pcs[i], crash_hook, f);
     if (st != UAM_OK) {
         uam_fuzz_destroy(f);
         set_err(err, errlen, "cannot install the boundary hooks");
         return NULL;
     }
-    uam_exec_set_exc_hook(x, exc_hook, f);
+    uam_machine_set_exc_hook(m, exc_hook, f);
     if (cfg->crash_irq_lines)
-        uam_exec_set_irq_hook(x, irq_hook, f);
+        uam_machine_set_irq_hook(m, irq_hook, f);
     f->prev_reset = m->on_reset;
     f->prev_reset_ctx = m->on_reset_ctx;
     m->on_reset = reset_hook;
@@ -368,21 +381,22 @@ void uam_fuzz_destroy(uam_fuzz *f)
     uam_machine *m = f->m;
     uam_exec *x = &m->exec;
     for (size_t i = 0; i < f->n_begin_pcs; i++)
-        uam_exec_remove_pc_hook(x, f->begin_pcs[i], begin_hook, f);
+        uam_machine_remove_pc_hook(m, f->begin_pcs[i], begin_hook, f);
     for (size_t i = 0; i < f->n_end_pcs; i++)
-        uam_exec_remove_pc_hook(x, f->end_pcs[i], end_hook, f);
+        uam_machine_remove_pc_hook(m, f->end_pcs[i], end_hook, f);
     for (size_t i = 0; i < f->cfg.n_crash_pcs; i++)
-        uam_exec_remove_pc_hook(x, f->crash_pcs[i], crash_hook, f);
+        uam_machine_remove_pc_hook(m, f->crash_pcs[i], crash_hook, f);
     if (x->exc_hook == exc_hook)
-        uam_exec_set_exc_hook(x, NULL, NULL);
+        uam_machine_set_exc_hook(m, NULL, NULL);
     if (x->irq_hook == irq_hook)
-        uam_exec_set_irq_hook(x, NULL, NULL);
+        uam_machine_set_irq_hook(m, NULL, NULL);
     if (m->on_reset == reset_hook) {
         m->on_reset = f->prev_reset;
         m->on_reset_ctx = f->prev_reset_ctx;
     }
     if (f->has_cov)
-        uam_exec_set_coverage(x, NULL, 0, NULL, NULL, 0);
+        uam_machine_set_coverage(m, NULL, 0, NULL, NULL, 0);
+    free(f->snap_last_pc);
     uam_snapshot_free(f->snap);
     for (size_t i = 0; i < f->n_routes; i++)
         free(f->routes[i].name);
@@ -444,7 +458,7 @@ uam_status uam_fuzz_set_sites(uam_fuzz *f, const uam_cov_site *sites, size_t n,
     f->marker = marker;
     f->n_marker = n_marker;
     /* With only boundary sites there is no pass at all (n_body 0 turns it off). */
-    uam_status st = uam_exec_set_coverage(&f->m->exec, body, n_body, &f->cov, err, errlen);
+    uam_status st = uam_machine_set_coverage(f->m, body, n_body, &f->cov, err, errlen);
     free(body);
     f->has_cov = st == UAM_OK && n;
     if (!f->has_cov)
@@ -457,7 +471,7 @@ uam_status uam_fuzz_set_block_coverage(uam_fuzz *f)
 {
     if (f->booted)
         return UAM_ERR_INVALID;
-    uam_status st = uam_exec_set_block_coverage(&f->m->exec, &f->cov);
+    uam_status st = uam_machine_set_block_coverage(f->m, &f->cov);
     f->has_cov = st == UAM_OK;
     name_scheme(f, f->has_cov ? "blocks" : "none");
     return st;
@@ -625,11 +639,12 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
         return UAM_ERR_INVALID;
     clear_flags(f);
     f->boot_arrivals = 0;
-    uint64_t ic0 = m->cpu.icount;
+    uint64_t ic0 = uam_machine_icount(m);
+    f->hit_cpu = &m->cpu;
     if (is_begin(f, m->cpu.pc)) {
         /* Already there (e.g. resumed from a snapshot taken at begin): an arrival whose
          * hook must not run again when the hart starts. */
-        count_marker(f, m->cpu.pc);
+        count_marker(f, &m->cpu, m->cpu.pc);
         if (f->boot_arrivals++ >= f->cfg.begin_skip) {
             f->at_begin = true;
             r->stop = UAM_STOP_HOOK;
@@ -644,8 +659,8 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
         r->stop = uam_exec_run(&m->exec, f->cfg.boot_insns);
         f->ph = PH_IDLE;
     }
-    r->pc = m->cpu.pc;
-    r->insns = m->cpu.icount - ic0;
+    r->pc = f->hit_cpu->pc;
+    r->insns = uam_machine_icount(m) - ic0;
     if (!f->at_begin || f->aborted) {
         if (!f->aborted)
             uam_log(UAM_LOG_ERROR, "fuzz", "boot did not reach the begin pc 0x%llx%s%s: %s at pc "
@@ -657,9 +672,10 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     }
     /* The hooks have run for this arrival at begin: iterations start past them, in the
      * snapshot as well, so begin-only mode does not end an iteration at its first pc. */
-    m->exec.hook_fired = true;
-    m->exec.hook_fired_pc = m->cpu.pc;
-    m->exec.hook_fired_icount = m->cpu.icount;
+    uam_exec *hx = uam_machine_exec(m, f->hit_cpu->hartid);
+    hx->hook_fired = true;
+    hx->hook_fired_pc = f->hit_cpu->pc;
+    hx->hook_fired_icount = f->hit_cpu->icount;
     uam_status st = f->boot_fn ? f->boot_fn(f->boot_ctx, f, m) : UAM_OK;
     if (st != UAM_OK)
         return st;
@@ -668,7 +684,10 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
         uam_log(UAM_LOG_ERROR, "fuzz", "cannot snapshot the machine at the begin pc");
         return st;
     }
-    f->snap_last_pc = f->cov.last_pc;
+    for (unsigned i = 0; i < f->ncpus; i++) {
+        const uam_cov_state *cs = uam_machine_cov_state(m, i);
+        f->snap_last_pc[i] = (cs ? cs : &f->cov)->last_pc;
+    }
     f->booted = true;
     f->last = *r;
     return UAM_OK;
@@ -753,7 +772,14 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     }
     memset(f->map, 0, f->cfg.map_size);
     uam_cov_reset_prev(&f->cov);
-    f->cov.last_pc = f->snap_last_pc;
+    f->cov.last_pc = f->snap_last_pc[0];
+    for (unsigned i = 1; i < f->ncpus; i++) {
+        uam_cov_state *cs = uam_machine_cov_state(m, i);
+        if (cs) {
+            uam_cov_reset_prev(cs);
+            cs->last_pc = f->snap_last_pc[i];
+        }
+    }
     clear_flags(f);
     st = f->deliver(f->deliver_ctx, m, data, len);
     if (st == UAM_ERR_REJECTED) {
@@ -770,12 +796,13 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
                 uam_status_str(st));
         return st;
     }
-    uint64_t ic0 = m->cpu.icount;
+    uint64_t ic0 = uam_machine_icount(m);
+    f->hit_cpu = &m->cpu;
     f->ph = PH_ITER;
     r->stop = uam_exec_run(&m->exec, f->cfg.iter_insns);
     f->ph = PH_IDLE;
-    r->pc = m->cpu.pc;
-    r->insns = m->cpu.icount - ic0;
+    r->pc = f->hit_cpu->pc;   /* the processor that ended it (processor 0 otherwise) */
+    r->insns = uam_machine_icount(m) - ic0;
     if (f->aborted)
         return UAM_ERR_INVALID;
     if (r->stop == UAM_STOP_ERROR) {

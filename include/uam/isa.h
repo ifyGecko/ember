@@ -36,6 +36,12 @@ typedef struct uam_gdb_arch {
      * puts a breakpoint at every state of an address, and a pc gdb sets keeps the
      * current state. 0 for most ISAs. */
     uint64_t pc_state_bits;
+    /* Optional, for register files of mixed widths: each register's size in
+     * bytes (NULL: all reg_bytes), and access to the ones wider than 64 bits
+     * as bytes in target order (an x87 register's 10). */
+    const uint8_t *reg_sizes;
+    bool (*read_wide)(uam_cpu *cpu, unsigned regno, uint8_t *buf);
+    bool (*write_wide)(uam_cpu *cpu, unsigned regno, const uint8_t *buf);
 } uam_gdb_arch;
 
 /* What went wrong, delivered to take_exception (docs/uam-isa.md section 9). */
@@ -173,6 +179,11 @@ typedef struct uam_isa {
      * Where the hardware leaves the choice among pending lines to software (MIPS),
      * every pending enabled line. For the executor's interrupt observer (exec.h). */
     uint64_t   (*irq_lines)(uam_cpu *cpu);
+
+    /* Optional, multiprocessor machines: `cpu` is about to run after another
+     * processor ran. State the platform keeps once for every processor (a
+     * chipset's view of SMRAM, say) is switched to this processor's here. */
+    void       (*switch_in)(uam_cpu *cpu);
 } uam_isa;
 
 #endif /* UAM_ISA_H */

@@ -23,5 +23,22 @@ uam_device *uam_cfi_flash_map(uam_bus *bus, const char *name, uint64_t base, uin
 uam_region *uam_cfi_flash_region(uam_device *dev);
 /* Write-protect the whole array (programs and erases fail with a status error). */
 void        uam_cfi_flash_set_protected(uam_device *dev, bool on);
+/*
+ * Write gate: every program and erase first asks `allowed(ctx, offset)`; a
+ * refusal fails the operation with a status error, as a protected part does.
+ * Chipset models use it for their own rules (writes only in SMM, only with a
+ * BIOS-write-enable bit set, protected ranges). NULL removes the gate.
+ */
+void        uam_cfi_flash_set_write_gate(uam_device *dev, bool (*allowed)(void *ctx, uint64_t off),
+                                         void *ctx);
+/*
+ * Keep a host file in step with the array: every program and erase is
+ * written through to `path` at the same offset, so the contents persist
+ * across runs. The file is opened read-write (it must exist).
+ */
+uam_status  uam_cfi_flash_set_backing_file(uam_device *dev, const char *path);
+/* The manufacturer and device codes the read-identifier command returns
+ * (default 0 and 0: the part names no vendor). */
+void        uam_cfi_flash_set_ids(uam_device *dev, uint8_t manufacturer, uint8_t device);
 
 #endif /* UAM_DEV_CFI_FLASH_H */

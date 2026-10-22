@@ -69,9 +69,14 @@ struct uam_tc_entry;
  *     (the bus bumps it on any write to a page holding translated code),
  *   - the hart runs at the privilege level the block was translated at, and
  *   - if any of its code was fetched through a non-fixed mapping
- *     (uam_xlate.fixed == false), cpu->xlate_gen is unchanged.
+ *     (uam_xlate.fixed == false), cpu->xlate_gen is unchanged - or, after it
+ *     changed, the `remap` callback confirms that the block's pages still
+ *     translate to the same physical pages (then the block is kept and
+ *     re-stamped with the new generation). Blocks whose lift saw a failed
+ *     translation are never revalidated that way (uam_tcache_insert_ex).
  * Stale blocks are dropped lazily at lookup.
  */
+typedef bool (*uam_tcache_remap_fn)(void *ctx, const uam_block *blk);
 typedef struct uam_tcache {
     struct uam_tc_entry **buckets;  /* chained hash on guest pc */
     uint32_t              n_buckets;/* power of two */
@@ -79,6 +84,8 @@ typedef struct uam_tcache {
     uint32_t              gen;      /* bumped whenever a block is freed or may have gone
                                      * stale (code write); JIT block links depend on it */
     uam_bus              *bus;
+    uam_tcache_remap_fn   remap;    /* optional, see above */
+    void                 *remap_ctx;
 } uam_tcache;
 
 uam_status uam_tcache_init(uam_tcache *tc, uam_bus *bus);
@@ -87,6 +94,11 @@ void       uam_tcache_fini(uam_tcache *tc);
 uam_block *uam_tcache_lookup(uam_tcache *tc, uint64_t pc, unsigned priv, uint32_t xlate_gen);
 uam_status uam_tcache_insert(uam_tcache *tc, uam_block *blk, unsigned priv, bool mapped,
                              uint32_t xlate_gen);
+/* As uam_tcache_insert; `remappable` false keeps the block from being
+ * revalidated through `remap` (it also depended on a translation that failed
+ * while it was lifted, e.g. a fetch that cut it short). */
+uam_status uam_tcache_insert_ex(uam_tcache *tc, uam_block *blk, unsigned priv, bool mapped,
+                                uint32_t xlate_gen, bool remappable);
 void       uam_tcache_flush(uam_tcache *tc);
 
 /* ------------------------------------------------------------------------ */
@@ -284,6 +296,28 @@ typedef struct uam_exec {
     /* fault-loop detection */
     bool             last_fetch_fault_valid;
     uint64_t         last_fetch_fault_pc, last_fetch_fault_icount;
+
+    /* Multiprocessor machines (uam_machine_add_cpus). Processor 0's executor
+     * runs them all: `smp` lists every processor's executor, its own first,
+     * and uam_exec_run(processor 0's) interleaves them in slices of `quantum`
+     * instructions on the shared virtual clock (time advances while any
+     * processor runs; idle skips happen only when every one waits). The
+     * others point `ctl` at it: stop and reset requests, the host bridge,
+     * the instruction budget and the time bounds are its; PC, exception and
+     * interrupt observers and IR passes are per executor. Where the
+     * interleaving stands (slice_*) is machine state: a run that stops
+     * mid-slice resumes there, so splitting a run into several - or saving and
+     * restoring a snapshot in between - interleaves exactly as one run would. */
+    struct uam_exec **smp;
+    uint32_t         n_smp, quantum;
+    struct uam_exec *ctl;
+    uam_cpu         *running;        /* the processor in its slice (NULL: single) */
+    uint64_t         retired;        /* instructions all processors retired */
+    uint32_t         slice_cpu;      /* the processor whose slice is current */
+    uint64_t         slice_left;     /* instructions left in it (0: a fresh slice) */
+    bool             round_ran;      /* a processor has run in the current round */
+    uint64_t         slice_base;     /* the running processor's icount when slice_left was set */
+    bool             smp_resync;     /* a snapshot was restored mid-slice: resume from slice_* */
 } uam_exec;
 
 uam_status      uam_exec_init(uam_exec *x, uam_cpu *cpu, uam_sched *sched);

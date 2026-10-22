@@ -4,8 +4,11 @@
  * A snapshot holds everything that decides what the machine does next:
  *
  *   - every RAM, ROM and ROMD backing store (and each ROMD region's mode),
- *   - the hart (pc, registers, instruction count, WAIT, privilege,
- *     reservation) and the ISA module's private state (isa->save),
+ *   - every hart (pc, registers, instruction count, WAIT, privilege,
+ *     reservation) and the ISA module's private state (isa->save); with
+ *     several processors (uam_machine_add_cpus), also where their
+ *     interleaving stands, so the restored machine interleaves exactly as
+ *     the original would (it fits only a machine with as many processors),
  *   - virtual time and every armed timer,
  *   - each device's state (device ops save/restore, state.h),
  *   - extra state registered with uam_machine_add_state (board data, ...),
@@ -72,7 +75,7 @@ typedef struct uam_snapshot uam_snapshot;
 typedef struct uam_snapshot_info {
     const char *board;        /* board name ("" if the board set none) */
     const char *isa;          /* ISA name */
-    uint64_t    pc, icount;   /* hart at the snapshot */
+    uint64_t    pc, icount;   /* processor 0 at the snapshot */
     uint64_t    now;          /* virtual time */
     uint64_t    mem_bytes;    /* backed memory covered (RAM, ROM, ROMD) */
     uint64_t    mem_pages;    /* pages stored (all-zero pages are not) */

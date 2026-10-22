@@ -59,7 +59,7 @@ static lr mov_cr_dr(xl *x)
 static lr grp6(xl *x)
 {
     unsigned sub = x->in.reg & 7;
-    if (x86_priv_mode(x->priv) == X86_MODE_REAL)
+    if (x86_priv_realseg(x->priv))   /* not in real or virtual-8086 mode */
         return x_ud(x);
     xop o = x_rm(x);
     switch (sub) {
@@ -409,7 +409,7 @@ static lr rdtsc(xl *x)
 /* LAR / LSL: the helper sets ZF and returns the value to load when ZF = 1. */
 static lr lar_lsl(xl *x)
 {
-    if (x86_priv_mode(x->priv) == X86_MODE_REAL)
+    if (x86_priv_realseg(x->priv))
         return x_ud(x);
     unsigned w = x->in.osz;
     xop s = x_rm(x);

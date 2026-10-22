@@ -22,7 +22,9 @@
  * The CPU identity (MIDR and the other identification registers, counter
  * frequency) is a property of the SoC, so the board selects it with
  * uam_arm_configure() after uam_machine_init() and before the first
- * uam_machine_reset(). Without that call the hart is uam_arm_cortex_a7.
+ * uam_machine_reset(). Without that call the hart is uam_arm_ref, an ARMv7-A
+ * reference identity that names no implementer; a board for a specific SoC
+ * defines that SoC's identity in its own uam_arm_config.
  */
 #ifndef UAM_ISA_ARM_H
 #define UAM_ISA_ARM_H
@@ -62,14 +64,15 @@ typedef struct uam_arm_config {
     const char *name;
     uint32_t    midr;         /* Main ID */
     uint32_t    ctr;          /* Cache Type */
-    uint32_t    mpidr;        /* Multiprocessor Affinity */
+    uint32_t    mpidr;        /* Multiprocessor Affinity; each processor reads its number
+                               * (uam_cpu.hartid) ORed into Aff0 */
     uint32_t    id_pfr0, id_pfr1;
     uint32_t    id_mmfr0;
     uint32_t    id_isar0;
     uint32_t    cntfrq;       /* reset CNTFRQ; the counter advances one per virtual tick */
 } uam_arm_config;
 
-extern const uam_arm_config uam_arm_cortex_a7;  /* Cortex-A7 identity, no FPU */
+extern const uam_arm_config uam_arm_ref;  /* ARMv7-A reference identity, no FPU */
 
 /* Select the CPU model of an ARM hart. Takes effect at the next reset.
  * Returns UAM_ERR_INVALID if cpu is not an ARM hart or cfg is NULL. */

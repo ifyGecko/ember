@@ -8,15 +8,19 @@ with one module per concern.
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: three guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
+Status: four guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
-boards with a GIC - run by a
+boards with a GIC, and x86-64 (real, protected, virtual-8086 and long mode, SMM, x87/MMX/
+SSE2) on the `x86_64-ref` board, which also boots UEFI firmware and legacy BIOS images - run by a
 reference interpreter or, with `--jit`, a native x86-64 JIT
-with block chaining (a block optimizer feeds both). Machine snapshots (boot once, resume in
-milliseconds), a gdb stub, host console and network backends (tap, tun, UDP, pcap; virtio-net
-on `rv32-ref`), and a library build for out-of-tree boards. C11, no dependencies beyond libc.
+with block chaining (a block optimizer feeds both). Every reference board takes `-o cpus=N`:
+the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
+stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
+once, resume in milliseconds), a gdb stub, host console and network backends (tap, tun, UDP,
+pcap; virtio-net on `rv32-ref`), and a library build for out-of-tree boards. C11, no
+dependencies beyond libc.
 
 ## Build and test
 
@@ -242,16 +246,23 @@ src/core/          bus, scheduler, logging, chardev/netdev plumbing, state strea
 src/exec/          interpreter, translation cache, run loop, x86-64 JIT (jit_x86.c)
 src/loader/        ELF / raw loaders
 src/machine/       machine lifecycle, resets, board registry, snapshots
-src/host/          chardev/netdev backends, host loop, real-time pacing
+src/host/          chardev/netdev/block-device backends, host loop, real-time pacing
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
-devices/           clint, plic, gic, uart16550, sifive_test, unknown_mmio, unimp, mmio_stub,
-                   virtio_net
-boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM): the only files that
+isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87, MMX,
+                   SSE/SSE2) and system architecture (segmentation, call gates, hardware
+                   task switching, the I/O permission bitmap, paging, SMM, A20M#, CPUID/MSRs)
+devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
+                   virtio_net; PC architecture: i8259, i8254, mc146818, lapic, ioapic, hpet,
+                   i8042, acpi_pm, pc_misc (port 92, A20 gate, POST codes), i8237 DMA, fdc
+                   (82077), ide (PIO + bus master), lpt, vga; pci (bridges, MSI/MSI-X,
+                   expansion ROMs), ahci, nvme, cfi_flash; ipi
+boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
+                   x86_64_ref.c (x86-64): reference boards of generic parts, the only files that
                    pair an ISA with devices; mmio_rules.c: per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 examples/          external-board: an out-of-tree board using the library
