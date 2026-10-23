@@ -78,6 +78,12 @@ typedef struct uam_x86_platform {
     /* The hart entered (true) or left (false) SMM - SMIACT#. The chipset uses
      * it to open and close SMRAM to the processor. */
     void (*smm_changed)(void *ctx, bool in_smm);
+    /* CPUID: called after the module has computed its answer r[0..3] (EAX,
+     * EBX, ECX, EDX) for (leaf, subleaf); the board may change any of it. For
+     * what the module does not describe itself: vendor-specific leaves (an
+     * extended signature in 0x80000001, topology, cache descriptors) or a
+     * raised maximum leaf. Default: the module's answer. */
+    void (*cpuid)(void *ctx, uint32_t leaf, uint32_t subleaf, uint32_t r[4]);
 } uam_x86_platform;
 
 void uam_x86_set_platform(uam_cpu *cpu, const uam_x86_platform *p);
