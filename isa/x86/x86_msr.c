@@ -38,7 +38,7 @@ static unsigned log2_ceil(unsigned n)
     return l;
 }
 
-void x86_cpuid(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4])
+static void cpuid_module(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4])
 {
     const uam_x86_cpuid_info *c = &x86_st(cpu)->cpuid;
     unsigned n = c->logical_cpus ? c->logical_cpus : 1;
@@ -84,6 +84,15 @@ void x86_cpuid(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4])
         r[0] = (c->phys_addr_bits ? c->phys_addr_bits : 39) | (48u << 8);
         return;
     }
+}
+
+/* The module's answer, then the platform's changes (uam_x86_platform.cpuid). */
+void x86_cpuid(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4])
+{
+    const x86_state *s = x86_st(cpu);
+    cpuid_module(cpu, leaf, sub, r);
+    if (s->plat.cpuid)
+        s->plat.cpuid(s->plat.ctx, leaf, sub, r);
 }
 
 /* ---- the MSR store ------------------------------------------------------- */

@@ -31,6 +31,26 @@
 
 #define MAX_LIST 64
 
+/* A growable list of addresses (--log-pc, --break): no limit on how many are given. */
+typedef struct pc_list {
+    uint64_t *pc;
+    unsigned  n, cap;
+} pc_list;
+
+static bool pc_list_add(pc_list *l, uint64_t pc)
+{
+    if (l->n == l->cap) {
+        unsigned ncap = l->cap ? l->cap * 2 : 16;
+        uint64_t *np = realloc(l->pc, sizeof(*np) * ncap);
+        if (!np)
+            return false;
+        l->pc = np;
+        l->cap = ncap;
+    }
+    l->pc[l->n++] = pc;
+    return true;
+}
+
 /* Whole file into a new buffer. */
 static bool read_file(const char *path, uint8_t **data, size_t *len)
 {
@@ -452,8 +472,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint64_t raw_base = 0, entry = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
     uint64_t max_ticks = 0, max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
     uint32_t quantum = 0;
-    uint64_t realtime_tps = 0, log_pcs[MAX_LIST], break_pcs[MAX_LIST], log_hits[MAX_LIST] = { 0 };
-    unsigned n_log = 0, n_break = 0;
+    uint64_t realtime_tps = 0, *log_hits = NULL;
+    pc_list log_pcs = { 0 }, break_pcs = { 0 };
     bool have_raw_base = false, have_entry = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
     bool show_map = false, virtual_time = false, cov_blocks = false;
     const char *cov_out = NULL;
@@ -579,12 +599,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         case OPT_TRACE_AFTER: trace_after = strtoull(optarg, NULL, 0); break;
         case OPT_LOG_PC:
-            if (n_log < MAX_LIST)
-                log_pcs[n_log++] = strtoull(optarg, NULL, 0);
-            break;
         case OPT_BREAK:
-            if (n_break < MAX_LIST)
-                break_pcs[n_break++] = strtoull(optarg, NULL, 0);
+            if (!pc_list_add(c == OPT_LOG_PC ? &log_pcs : &break_pcs, strtoull(optarg, NULL, 0))) {
+                fprintf(stderr, "uam-run: out of memory\n");
+                return 2;
+            }
             break;
         case OPT_GDB: gdb_port = optarg; break;
         case OPT_LOAD_SNAP: load_snap = optarg; break;
@@ -866,13 +885,20 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: the JIT is unavailable on this host; using the interpreter\n");
     if (block_insns)
         m.exec.max_block_insns = block_insns;
-    for (unsigned i = 0; i < n_log; i++)
-        uam_machine_add_pc_hook(&m, log_pcs[i], log_pc_hook, &log_hits[i]);
+    log_hits = calloc(log_pcs.n ? log_pcs.n : 1, sizeof(*log_hits));
+    bool hooks_ok = log_hits != NULL;
+    for (unsigned i = 0; hooks_ok && i < log_pcs.n; i++)
+        hooks_ok = uam_machine_add_pc_hook(&m, log_pcs.pc[i], log_pc_hook, &log_hits[i]) == UAM_OK;
     snap_at snap_hook = { .m = &m, .path = save_snap };
-    if (have_snap_at)
-        uam_machine_add_pc_hook(&m, snap_at_pc, snapshot_at_hook, &snap_hook);
-    for (unsigned i = 0; i < n_break; i++)
-        uam_machine_add_pc_hook(&m, break_pcs[i], break_hook, NULL);
+    if (hooks_ok && have_snap_at)
+        hooks_ok = uam_machine_add_pc_hook(&m, snap_at_pc, snapshot_at_hook, &snap_hook) == UAM_OK;
+    for (unsigned i = 0; hooks_ok && i < break_pcs.n; i++)
+        hooks_ok = uam_machine_add_pc_hook(&m, break_pcs.pc[i], break_hook, NULL) == UAM_OK;
+    if (!hooks_ok) {
+        fprintf(stderr, "uam-run: cannot install the --log-pc/--break/--snapshot-at hooks\n");
+        uam_machine_fini(&m);
+        goto out_host;
+    }
     uam_runner_setup xs = { .m = &m, .have_image = image != NULL, .image = info,
                             .have_raw_base = have_raw_base, .raw_base = raw_base,
                             .map_size_option = cov_map_size_given ? (uint32_t)cov_map_size : 0 };
@@ -1103,6 +1129,9 @@ out_host:
     free(mmio_input_data);
     free(cov_map);   /* after the machine: the hart pointed at it */
     free(uart_input_spec);
+    free(log_pcs.pc);
+    free(break_pcs.pc);
+    free(log_hits);   /* after the machine: the log hooks counted into it */
     return rc;
 }
 

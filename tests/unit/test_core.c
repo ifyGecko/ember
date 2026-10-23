@@ -28,7 +28,9 @@
 #include "uam/dev/pci.h"
 #include "uam/dev/unimp.h"
 #include "uam/device.h"
+#include "uam/isa.h"
 #include "uam/isa/mips32.h"
+#include "uam/isa/x86.h"
 #include "uam/machine.h"
 #include "uam/signal.h"
 
@@ -1495,6 +1497,71 @@ static bool init_refused(const uam_abi_layout *abi)
     return WIFEXITED(ws) && WEXITSTATUS(ws) == UAM_ABI_EXIT_STATUS;
 }
 
+/* ---- x86 CPUID platform hook ------------------------------------------- */
+
+typedef struct cpuid_seen {
+    uint32_t leaf, sub, module_ebx;
+    unsigned calls;
+} cpuid_seen;
+
+static void cpuid_hook(void *ctx, uint32_t leaf, uint32_t sub, uint32_t r[4])
+{
+    cpuid_seen *c = ctx;
+    c->calls++;
+    c->leaf = leaf;
+    c->sub = sub;
+    c->module_ebx = r[1];
+    if (leaf == 0x80000001)
+        r[1] = 0x12345678;   /* a leaf register the module leaves 0 */
+}
+
+static uam_hook_action cpuid_halt(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx; (void)cpu; (void)pc;
+    return UAM_HOOK_STOP;
+}
+
+static uint64_t x86_reg(uam_machine *m, unsigned gdb_regno)
+{
+    uint64_t v = 0;
+    m->cpu.isa->gdb->read_reg(&m->cpu, gdb_regno, &v);
+    return v;
+}
+
+/* The board's cpuid hook sees the module's answer for the leaf and subleaf the
+ * instruction asked for, and what it changes is what the guest reads. */
+static void test_x86_cpuid_hook(void)
+{
+    static const uint8_t prog[] = {
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x80,   /* mov eax, 0x80000001 */
+        0x66, 0xB9, 0x07, 0x00, 0x00, 0x00,   /* mov ecx, 7 */
+        0x0F, 0xA2,                           /* cpuid */
+        0xEB, 0xFE,                           /* 14: jmp $ */
+    };
+    for (int hooked = 0; hooked <= 1; hooked++) {
+        uam_machine m;
+        cpuid_seen seen = { 0 };
+        CHECK(uam_machine_init(&m, &uam_isa_x86_64) == UAM_OK, "x86 machine init");
+        CHECK(uam_bus_map_ram(&m.bus, "ram", 0, 1 << 20) == UAM_OK, "map ram");
+        CHECK(uam_bus_load_bytes(&m.bus, 0, prog, sizeof(prog)) == UAM_OK, "load code");
+        uam_machine_reset(&m, 0);
+        if (hooked)
+            uam_x86_set_platform(&m.cpu, &(uam_x86_platform){ .ctx = &seen, .cpuid = cpuid_hook });
+        uam_exec_add_pc_hook(&m.exec, 14, cpuid_halt, NULL);
+        EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_HOOK, "cpuid program ran to its end");
+        /* gdb amd64 numbering: rax 0, rbx 1, rcx 2, rdx 3 */
+        EQ64(x86_reg(&m, 1), hooked ? 0x12345678 : 0, hooked ? "hooked EBX of leaf 0x80000001" : "module EBX of leaf 0x80000001");
+        EQ64(x86_reg(&m, 3) & (1u << 29), 1u << 29, "module's long-mode bit kept");
+        if (hooked) {
+            EQ64(seen.calls, 1, "hook called once");
+            EQ64(seen.leaf, 0x80000001, "hook saw the leaf");
+            EQ64(seen.sub, 7, "hook saw the subleaf");
+            EQ64(seen.module_ebx, 0, "hook saw the module's answer");
+        }
+        uam_machine_fini(&m);
+    }
+}
+
 static void test_abi(void)
 {
     EQ64(uam_abi_version(), UAM_ABI_VERSION, "library ABI version");
@@ -1535,6 +1602,7 @@ int main(void)
     test_vga();
     test_code_lines();
     test_wait_livelock();
+    test_x86_cpuid_hook();
     test_abi();
     printf("test_core: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
