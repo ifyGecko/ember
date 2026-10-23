@@ -10,8 +10,9 @@
  *                          processor's A20M# output, high (A20 masked) while
  *                          no input enables A20.
  *   uam_postcode_create    POST-code latch (PC: port 0x80): the last byte
- *                          written reads back, and each code is logged at
- *                          debug level.
+ *                          written reads back. A code that differs from the
+ *                          last one is logged at info level, a repeat (an
+ *                          I/O delay write) at debug level.
  *   uam_master_abort_create  Unclaimed accesses: reads all ones.
  *   uam_smi_port_create    Software SMI port (PC: port 0xB2): every write
  *                          keeps the byte and pulses the output line, which

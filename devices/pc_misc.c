@@ -142,8 +142,12 @@ static uam_status post_write(uam_device *d, uint64_t off, unsigned size, uint64_
 {
     (void)off;
     postcode *p = to_post(d);
+    /* A new code is boot progress (info, uam-run -v); the same byte again is
+     * usually an I/O delay write to port 0x80 (debug, -vv). */
+    bool changed = (uint8_t)v != p->last;
     p->last = (uint8_t)v;
-    uam_log(UAM_LOG_DEBUG, "post", "code 0x%0*llx", (int)size * 2, (unsigned long long)v);
+    uam_log(changed ? UAM_LOG_INFO : UAM_LOG_DEBUG, "post", "code 0x%0*llx", (int)size * 2,
+            (unsigned long long)v);
     return UAM_OK;
 }
 
