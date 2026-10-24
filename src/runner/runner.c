@@ -51,6 +51,103 @@ static bool pc_list_add(pc_list *l, uint64_t pc)
     return true;
 }
 
+/* --dump-mem: guest memory shown or saved when the run stops. */
+typedef struct mem_dump {
+    uint64_t    addr, len;
+    bool        phys;
+    const char *file;   /* raw bytes to this file; NULL: hex dump on stderr */
+} mem_dump;
+
+/* [p:]ADDR+LEN[=FILE]; LEN takes K/M/G suffixes. */
+static bool parse_mem_dump(char *s, mem_dump *d)
+{
+    char *end;
+    *d = (mem_dump){ 0 };
+    if (!strncmp(s, "p:", 2)) {
+        d->phys = true;
+        s += 2;
+    }
+    d->addr = strtoull(s, &end, 0);
+    if (end == s || *end != '+')
+        return false;
+    s = end + 1;
+    d->len = strtoull(s, &end, 0);
+    if (end == s)
+        return false;
+    switch (*end) {
+    case 'k': case 'K': d->len <<= 10; end++; break;
+    case 'm': case 'M': d->len <<= 20; end++; break;
+    case 'g': case 'G': d->len <<= 30; end++; break;
+    default: break;
+    }
+    if (*end == '=' && end[1])
+        d->file = end + 1;
+    else if (*end)
+        return false;
+    return d->len > 0 && d->len <= (UINT64_C(1) << 30);
+}
+
+/* Read d's bytes the way a debugger does (no device side effects). Returns how many
+ * leading bytes were readable. */
+static uint64_t read_mem_dump(uam_machine *m, const mem_dump *d, uint8_t *buf)
+{
+    uam_cpu *cpu = uam_machine_cpu(m, 0);
+    for (uint64_t i = 0; i < d->len; i++) {
+        uint64_t pa = d->addr + i, b;
+        if (!d->phys && cpu->isa->translate) {
+            uam_xlate xl = { 0 };
+            if (cpu->isa->translate(cpu, d->addr + i, UAM_XLATE_DEBUG, &xl) != UAM_OK)
+                return i;
+            pa = xl.paddr;
+        }
+        if (uam_bus_read(&m->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK)
+            return i;
+        buf[i] = (uint8_t)b;
+    }
+    return d->len;
+}
+
+static bool dump_memory(uam_machine *m, const mem_dump *d)
+{
+    uint8_t *buf = malloc(d->len);
+    if (!buf) {
+        fprintf(stderr, "uam-run: --dump-mem: out of memory\n");
+        return false;
+    }
+    uint64_t got = read_mem_dump(m, d, buf);
+    const char *space = d->phys ? "physical" : "virtual";
+    if (got < d->len)
+        fprintf(stderr, "uam-run: --dump-mem: %s 0x%llx is not readable; %llu of %llu bytes\n",
+                space, (unsigned long long)(d->addr + got), (unsigned long long)got,
+                (unsigned long long)d->len);
+    bool ok = true;
+    if (d->file) {
+        FILE *f = fopen(d->file, "wb");
+        ok = f && fwrite(buf, 1, got, f) == got;
+        if (f && fclose(f) != 0)
+            ok = false;
+        if (ok)
+            fprintf(stderr, "uam-run: %s memory 0x%llx+0x%llx written to %s\n", space,
+                    (unsigned long long)d->addr, (unsigned long long)got, d->file);
+        else
+            fprintf(stderr, "uam-run: cannot write the memory dump to %s\n", d->file);
+    } else if (got) {
+        fprintf(stderr, "uam-run: %s memory 0x%llx+0x%llx:\n", space, (unsigned long long)d->addr,
+                (unsigned long long)got);
+        for (uint64_t i = 0; i < got; i += 16) {
+            char hex[16 * 3 + 1] = "", asc[17] = "";
+            for (unsigned k = 0; k < 16 && i + k < got; k++) {
+                uint8_t c = buf[i + k];
+                snprintf(hex + 3 * k, 4, "%02x ", c);
+                asc[k] = c >= 0x20 && c < 0x7F ? (char)c : '.';
+            }
+            fprintf(stderr, "  %016llx  %-48s |%s|\n", (unsigned long long)(d->addr + i), hex, asc);
+        }
+    }
+    free(buf);
+    return ok;
+}
+
 /* Whole file into a new buffer. */
 static bool read_file(const char *path, uint8_t **data, size_t *len)
 {
@@ -107,9 +204,10 @@ static void usage(FILE *out)
         "                          image's load address)\n"
         "      --image NAME=PATH   named image for the board to place (repeatable)\n"
         "  -o, --option KEY=VALUE  board-specific option (repeatable)\n"
-        "  -n, --max-insns N       stop after N guest instructions (0 = unlimited)\n"
-        "      --max-ticks N       stop after N ticks of virtual time, idle time included\n"
-        "                          (0 = unlimited; exit 124 like --max-insns)\n"
+        "  -n, --max-insns N       stop after N guest instructions, counted from where the run\n"
+        "                          starts (after --load-snapshot: from the snapshot; 0 = unlimited)\n"
+        "      --max-ticks N       stop after N ticks of virtual time from where the run starts,\n"
+        "                          idle time included (0 = unlimited; exit 124 like --max-insns)\n"
         "      --max-stall N       after N consecutive timer events with no instruction\n"
         "                          retired (e.g. WAIT whose interrupt is not wired), wait\n"
         "                          for console/network input instead of skipping time; with\n"
@@ -134,11 +232,18 @@ static void usage(FILE *out)
         "                          implied by a --nic with a host interface\n"
         "      --virtual-time      keep virtual pacing even with host network interfaces\n"
         "      --block-insns N     max guest instructions per block (default 32)\n"
-        "  -t, --trace LIST        comma list of: blocks, ir, exc\n"
+        "  -t, --trace LIST        comma list of: blocks, ir, exc (blocks: every block executed,\n"
+        "                          also with --jit, which does not chain blocks while tracing)\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
-        "      --trace-after N     trace blocks only after N instructions\n"
+        "      --trace-after N     trace blocks only once the instruction count reaches N. N is\n"
+        "                          absolute, like every icount the runner prints (a snapshot\n"
+        "                          keeps the count); +N: N instructions after the run starts\n"
         "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
+        "      --dump-mem [p:]ADDR+LEN[=FILE]  when the run stops (--break, -n, ...), hex-dump\n"
+        "                          LEN bytes of guest memory at ADDR to stderr, or write them\n"
+        "                          raw to FILE (repeatable). ADDR is virtual, translated as\n"
+        "                          processor 0 sees it (as gdb does; x86: linear); p: physical\n"
         "      --gdb PORT          wait for a gdb connection on localhost:PORT\n"
         "      --load-snapshot FILE  start from a snapshot instead of the reset state (same\n"
         "                          board and options; IMAGE is not needed)\n"
@@ -404,7 +509,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
-           OPT_EXT_BASE = 1000 };
+           OPT_DUMP_MEM, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -435,6 +540,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "save-snapshot", required_argument, NULL, OPT_SAVE_SNAP },
         { "snapshot-at", required_argument, NULL, OPT_SNAP_AT },
         { "map", no_argument, NULL, OPT_MAP },
+        { "dump-mem", required_argument, NULL, OPT_DUMP_MEM },
         { "no-verify", no_argument, NULL, OPT_NO_VERIFY },
         { "no-opt", no_argument, NULL, OPT_NO_OPT },
         { "jit", no_argument, NULL, OPT_JIT },
@@ -474,6 +580,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint32_t quantum = 0;
     uint64_t realtime_tps = 0, *log_hits = NULL;
     pc_list log_pcs = { 0 }, break_pcs = { 0 };
+    mem_dump mem_dumps[MAX_LIST];
+    unsigned n_mem_dumps = 0;
+    bool trace_after_rel = false;
     bool have_raw_base = false, have_entry = false, stats = false, dump = false, verify = true, optimize = true, use_jit = false, chain = true, realtime = false;
     bool show_map = false, virtual_time = false, cov_blocks = false;
     const char *cov_out = NULL;
@@ -597,7 +706,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
             trace_hi = *end == ':' ? strtoull(end + 1, NULL, 0) : 0;
             break;
         }
-        case OPT_TRACE_AFTER: trace_after = strtoull(optarg, NULL, 0); break;
+        case OPT_TRACE_AFTER:
+            trace_after_rel = optarg[0] == '+';
+            trace_after = strtoull(optarg + trace_after_rel, NULL, 0);
+            break;
         case OPT_LOG_PC:
         case OPT_BREAK:
             if (!pc_list_add(c == OPT_LOG_PC ? &log_pcs : &break_pcs, strtoull(optarg, NULL, 0))) {
@@ -610,6 +722,14 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_SAVE_SNAP: save_snap = optarg; break;
         case OPT_SNAP_AT: snap_at_pc = strtoull(optarg, NULL, 0); have_snap_at = true; break;
         case OPT_MAP: show_map = true; break;
+        case OPT_DUMP_MEM:
+            if (n_mem_dumps == MAX_LIST || !parse_mem_dump(optarg, &mem_dumps[n_mem_dumps])) {
+                fprintf(stderr, "uam-run: bad --dump-mem '%s' (at most %d; [p:]ADDR+LEN[=FILE], "
+                        "LEN up to 1G)\n", optarg, MAX_LIST);
+                return 2;
+            }
+            n_mem_dumps++;
+            break;
         case OPT_UNKNOWN:
             if (!strcmp(optarg, "fault"))     cfg.unknown_mmio = UAM_UNKNOWN_FAULT;
             else if (!strcmp(optarg, "zero")) cfg.unknown_mmio = UAM_UNKNOWN_ZERO;
@@ -877,6 +997,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
     m.exec.trace = trace;
     m.exec.trace_lo = trace_lo;
     m.exec.trace_hi = trace_hi;
+    /* --trace-after compares with the absolute instruction count, which a snapshot
+     * restores; +N is relative to where this run starts. */
+    uint64_t start_icount = uam_machine_cpu(&m, 0)->icount;
+    if (trace_after_rel)
+        trace_after += start_icount;
+    else if (load_snap && (trace & UAM_TRACE_BLOCKS) && trace_after && trace_after <= start_icount)
+        fprintf(stderr, "uam-run: --trace-after %llu is before the snapshot (icount %llu): blocks are "
+                "traced from the start; --trace-after +N counts from the snapshot\n",
+                (unsigned long long)trace_after, (unsigned long long)start_icount);
     m.exec.trace_after = trace_after;
     m.exec.verify = verify;
     m.exec.optimize = optimize;
@@ -1098,6 +1227,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
             m.cpu.isa->dump_state(uam_machine_cpu(&m, i), stderr);
         }
     }
+    for (unsigned i = 0; i < n_mem_dumps && !fuzzing; i++)
+        if (!dump_memory(&m, &mem_dumps[i]) && rc == 0)
+            rc = 2;
     if (save_snap && !have_snap_at) {
         if (why == UAM_STOP_ERROR || why == UAM_STOP_FAULT_LOOP)
             fprintf(stderr, "uam-run: not saving a snapshot after an internal error\n");

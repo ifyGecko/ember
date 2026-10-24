@@ -137,7 +137,7 @@ FW_THUMB_BE := $(BUILD)/firmware-arm/selftest-thumb-be.elf
 FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
-.PHONY: all lib test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
+.PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test \
         example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test install clean FORCE
@@ -402,7 +402,11 @@ suzzer-test:
 endif
 
 test: unit-test firmware-test mips-test arm-test x86-test example-test snapshot-test cov-test fuzz-test suzzer-test \
-      gdb-test
+      gdb-test runner-test
+
+# uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit)
+runner-test: $(RUN) firmware-x86
+	sh tests/runner/runner-check.sh $(RUN) $(FW_X86)
 
 net-check: $(RUN) firmware
 	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both

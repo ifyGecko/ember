@@ -124,11 +124,17 @@ build/uam-run --mmio-rule 0x18020000+0x100=echo,set=0x60 fw.elf       # read bac
 build/uam-run --mmio-rule 0x18060010=input,width=1 --mmio-input case.bin fw.elf
 ```
 `--trace ir` prints every translated block in the IR's text form; `--trace blocks`
-can be narrowed with `--trace-range LO:HI` and `--trace-after N`.
+can be narrowed with `--trace-range LO:HI` and `--trace-after N`. A block trace lists every
+block also with `--jit`: blocks are not chained while it is on. `--trace-after N` is an
+absolute instruction count, like the `icount` the runner prints, and a snapshot keeps that
+count; `--trace-after +N` counts from where the run starts. `-n` and `--max-ticks` always
+count from where the run starts (after `--load-snapshot`, from the snapshot).
 
 ```bash
 build/uam-run --log-pc 0x8023f00c fw.elf      # report every arrival at a pc
 build/uam-run --break 0x8023f00c -d fw.elf    # stop there and dump the hart
+build/uam-run --break 0x8023f00c --dump-mem 0x80100000+256 fw.elf   # and hex-dump guest memory
+build/uam-run --break 0x8023f00c --dump-mem p:0x100000+64K=heap.bin fw.elf  # physical, raw to a file
 build/uam-run --gdb 1234 fw.elf               # then: gdb-multiarch fw.elf -ex 'target remote :1234'
 build/uam-run --console pty fw.elf            # console on a pseudo-terminal (also tcp:PORT, unix:PATH,
                                               # stdio-raw, file:OUT[,in=FILE], string:TEXT, null)
