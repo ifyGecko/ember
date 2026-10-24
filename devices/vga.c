@@ -151,7 +151,9 @@ static long window(const vga *v, uint64_t off)
 
 static uint8_t *plane(vga *v, uint32_t o, unsigned p) { return &v->vram[((o & 0xFFFF) << 2) | p]; }
 
-static uint8_t mem_read8(vga *v, uint64_t off)
+/* A read of the memory window; `latch` loads the plane latches as the
+ * hardware does (a peek leaves them alone). */
+static uint8_t mem_read8(vga *v, uint64_t off, bool latch)
 {
     long r = window(v, off);
     if (r < 0)
@@ -161,16 +163,19 @@ static uint8_t mem_read8(vga *v, uint64_t off)
         return *plane(v, a >> 2, a & 3);
     if (!(v->seq[4] & 0x04))                            /* odd/even */
         return *plane(v, a & ~1u, (v->gc[4] & 2) | (a & 1));
+    uint8_t lat[4];
     for (unsigned p = 0; p < 4; p++)
-        v->latch[p] = *plane(v, a, p);
+        lat[p] = *plane(v, a, p);
+    if (latch)
+        memcpy(v->latch, lat, sizeof(lat));
     if (!(v->gc[5] & 0x08))                             /* read mode 0 */
-        return v->latch[v->gc[4] & 3];
+        return lat[v->gc[4] & 3];
     uint8_t r1 = 0;                                     /* read mode 1: colour compare */
     for (unsigned bit = 0; bit < 8; bit++) {
         bool match = true;
         for (unsigned p = 0; p < 4; p++)
             if ((v->gc[7] >> p) & 1)
-                match &= ((v->latch[p] >> bit) & 1) == ((v->gc[2] >> p) & 1);
+                match &= ((lat[p] >> bit) & 1) == ((v->gc[2] >> p) & 1);
         if (match)
             r1 |= (uint8_t)(1u << bit);
     }
@@ -243,7 +248,16 @@ static uam_status mem_read(uam_device *d, uint64_t off, unsigned size, uint64_t 
     vga *v = from_mem(d);
     *val = 0;
     for (unsigned i = 0; i < size; i++)
-        *val |= (uint64_t)mem_read8(v, off + i) << (8 * i);
+        *val |= (uint64_t)mem_read8(v, off + i, true) << (8 * i);
+    return UAM_OK;
+}
+
+static uam_status mem_peek(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
+{
+    vga *v = from_mem(d);
+    *val = 0;
+    for (unsigned i = 0; i < size; i++)
+        *val |= (uint64_t)mem_read8(v, off + i, false) << (8 * i);
     return UAM_OK;
 }
 
@@ -459,7 +473,7 @@ static const uam_device_ops io_ops = {
 };
 static const uam_device_ops mem_ops = {
     .type = "vga-memory", .read = mem_read, .write = mem_write, .destroy = mem_destroy,
-    .flags = UAM_DEVICE_STATELESS,
+    .flags = UAM_DEVICE_STATELESS, .peek = mem_peek,
 };
 
 uam_device *uam_vga_create(const char *name, uint16_t vendor, uint16_t device, uint8_t revision)

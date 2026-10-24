@@ -88,20 +88,34 @@ static bool parse_mem_dump(char *s, mem_dump *d)
 }
 
 /* Read d's bytes the way a debugger does (no device side effects). Returns how many
- * leading bytes were readable. */
-static uint64_t read_mem_dump(uam_machine *m, const mem_dump *d, uint8_t *buf)
+ * leading bytes were readable; if not all, `why` says what stopped it. */
+static uint64_t read_mem_dump(uam_machine *m, const mem_dump *d, uint8_t *buf, char *why,
+                              size_t why_len)
 {
     uam_cpu *cpu = uam_machine_cpu(m, 0);
     for (uint64_t i = 0; i < d->len; i++) {
         uint64_t pa = d->addr + i, b;
         if (!d->phys && cpu->isa->translate) {
             uam_xlate xl = { 0 };
-            if (cpu->isa->translate(cpu, d->addr + i, UAM_XLATE_DEBUG, &xl) != UAM_OK)
+            if (cpu->isa->translate(cpu, d->addr + i, UAM_XLATE_DEBUG, &xl) != UAM_OK) {
+                snprintf(why, why_len, "processor 0 does not map this virtual address");
                 return i;
+            }
             pa = xl.paddr;
         }
-        if (uam_bus_read(&m->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK)
+        if (uam_bus_read(&m->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK) {
+            const uam_region *r = uam_bus_find(&m->bus, pa);
+            if (!r)
+                snprintf(why, why_len, "nothing is mapped at physical 0x%llx", (unsigned long long)pa);
+            else if (r->kind == UAM_REGION_MMIO && r->dev && !r->dev->ops->peek)
+                snprintf(why, why_len, "physical 0x%llx is device region '%s', whose device (%s) has "
+                         "no side-effect-free read (uam_device_ops.peek)", (unsigned long long)pa,
+                         r->name, r->dev->ops->type);
+            else
+                snprintf(why, why_len, "region '%s' refused a debug read at physical 0x%llx",
+                         r->name, (unsigned long long)pa);
             return i;
+        }
         buf[i] = (uint8_t)b;
     }
     return d->len;
@@ -114,14 +128,15 @@ static bool dump_memory(uam_machine *m, const mem_dump *d)
         fprintf(stderr, "uam-run: --dump-mem: out of memory\n");
         return false;
     }
-    uint64_t got = read_mem_dump(m, d, buf);
+    char why[256] = "";
+    uint64_t got = read_mem_dump(m, d, buf, why, sizeof(why));
     const char *space = d->phys ? "physical" : "virtual";
     if (got < d->len)
-        fprintf(stderr, "uam-run: --dump-mem: %s 0x%llx is not readable; %llu of %llu bytes\n",
-                space, (unsigned long long)(d->addr + got), (unsigned long long)got,
-                (unsigned long long)d->len);
-    bool ok = true;
-    if (d->file) {
+        fprintf(stderr, "uam-run: --dump-mem: %s 0x%llx is not readable (%s); %llu of %llu bytes%s\n",
+                space, (unsigned long long)(d->addr + got), why, (unsigned long long)got,
+                (unsigned long long)d->len, got == 0 && d->file ? ", nothing written" : "");
+    bool ok = got > 0;
+    if (d->file && got) {
         FILE *f = fopen(d->file, "wb");
         ok = f && fwrite(buf, 1, got, f) == got;
         if (f && fclose(f) != 0)

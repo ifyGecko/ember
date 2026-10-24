@@ -25,6 +25,7 @@
 #include "uam/dev/ide.h"
 #include "uam/dev/vga.h"
 #include "uam/dev/nvme.h"
+#include "uam/dev/pc_misc.h"
 #include "uam/dev/pci.h"
 #include "uam/dev/unimp.h"
 #include "uam/device.h"
@@ -1497,6 +1498,96 @@ static bool init_refused(const uam_abi_layout *abi)
     return WIFEXITED(ws) && WEXITSTATUS(ws) == UAM_ABI_EXIT_STATUS;
 }
 
+/* ---- debugger reads of device regions (uam_device_ops.peek) ------------- */
+
+typedef struct peekdev {
+    uam_device dev;
+    unsigned   reads, peeks;
+} peekdev;
+
+static uam_status pd_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
+{
+    (void)size;
+    UAM_CONTAINER_OF(d, peekdev, dev)->reads++;   /* a side effect */
+    *val = 0xA0 + off;
+    return UAM_OK;
+}
+
+static uam_status pd_peek(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
+{
+    (void)size;
+    UAM_CONTAINER_OF(d, peekdev, dev)->peeks++;
+    *val = 0xA0 + off;
+    return UAM_OK;
+}
+
+static uam_status pd_write(uam_device *d, uint64_t off, unsigned size, uint64_t val)
+{
+    (void)d; (void)off; (void)size; (void)val;
+    return UAM_OK;
+}
+
+static void pd_destroy(uam_device *d) { (void)d; }
+
+static const uam_device_ops pd_plain_ops = {
+    .type = "test,plain", .impl_min = 1, .impl_max = 1, .read = pd_read, .write = pd_write,
+    .destroy = pd_destroy, .flags = UAM_DEVICE_STATELESS,
+};
+static const uam_device_ops pd_peek_ops = {
+    .type = "test,peek", .impl_min = 1, .impl_max = 1, .read = pd_read, .write = pd_write,
+    .destroy = pd_destroy, .flags = UAM_DEVICE_STATELESS, .peek = pd_peek,
+};
+
+/* A debug read of a device region goes to its peek handler, never its read
+ * handler; without one it faults. Fetches from devices still fault. */
+static void test_device_peek(void)
+{
+    uam_bus bus;
+    uam_bus_init(&bus);
+    peekdev plain = { 0 }, pk = { 0 };
+    uam_device_init(&plain.dev, &pd_plain_ops, "plain");
+    uam_device_init(&pk.dev, &pd_peek_ops, "peek");
+    CHECK(uam_bus_map_mmio(&bus, "plain", 0x1000, 0x100, &plain.dev) == UAM_OK, "map plain");
+    CHECK(uam_bus_map_mmio(&bus, "peek", 0x2000, 0x100, &pk.dev) == UAM_OK, "map peek");
+    uint64_t v = 0;
+    CHECK(uam_bus_read(&bus, 0x1004, 1, UAM_ACC_DEBUG, &v) == UAM_ERR_FAULT, "no peek: debug read faults");
+    EQ64(plain.reads, 0, "no peek: the read handler was not called");
+    CHECK(uam_bus_read(&bus, 0x2004, 4, UAM_ACC_LE | UAM_ACC_DEBUG, &v) == UAM_OK, "peek: debug read");
+    EQ64(v, 0xA7A6A5A4, "peek: bytes as a read would give them");
+    EQ64(pk.peeks, 4, "peek: served byte by byte (impl_max 1)");
+    EQ64(pk.reads, 0, "peek: the read handler was not called");
+    CHECK(uam_bus_read(&bus, 0x2004, 4, UAM_ACC_LE | UAM_ACC_FETCH, &v) == UAM_ERR_FAULT,
+          "peek: fetching from a device still faults");
+    EQ64(rd(&bus, 0x2004, 1, 0), 0xA4, "peek: a normal read uses the read handler");
+    EQ64(pk.reads, 1, "peek: normal read counted");
+    CHECK(uam_bus_write(&bus, 0x2004, 1, UAM_ACC_DEBUG, 0) == UAM_ERR_FAULT, "debug writes to devices fault");
+    uam_bus_fini(&bus);
+}
+
+/* The master abort reads all ones at any width and drops writes; it names up
+ * to 4 windows. */
+static void test_master_abort(void)
+{
+    uam_device *ma = uam_master_abort_create("ma");
+    uam_bus bus;
+    uam_bus_init(&bus);
+    uam_bus_set_unmapped(&bus, ma);
+    uam_log_level saved = uam_log_threshold;
+    uam_log_threshold = UAM_LOG_ERROR;   /* its warnings are expected here */
+    EQ64(rd(&bus, 0x12345678, 1, 0), 0xFF, "master abort: byte");
+    EQ64(rd(&bus, 0x12345678, 8, 0), ~0ull, "master abort: quadword");
+    CHECK(uam_bus_write(&bus, 0x12345678, 4, 0, 0) == UAM_OK, "master abort: write dropped");
+    uint64_t v;
+    CHECK(uam_bus_read(&bus, 0x12345678, 4, UAM_ACC_DEBUG, &v) == UAM_ERR_FAULT,
+          "master abort: a debugger sees unmapped memory as unmapped");
+    for (int i = 0; i < 4; i++)
+        CHECK(uam_master_abort_name_window(ma, (uint64_t)i << 32, 0x1000, "w", i & 1), "window %d", i);
+    CHECK(!uam_master_abort_name_window(ma, 5ull << 32, 0x1000, "w", false), "no fifth window");
+    uam_bus_fini(&bus);
+    ma->ops->destroy(ma);
+    uam_log_threshold = saved;
+}
+
 /* ---- x86 CPUID platform hook ------------------------------------------- */
 
 typedef struct cpuid_seen {
@@ -1602,6 +1693,8 @@ int main(void)
     test_vga();
     test_code_lines();
     test_wait_livelock();
+    test_device_peek();
+    test_master_abort();
     test_x86_cpuid_hook();
     test_abi();
     printf("test_core: %d/%d checks passed\n", n_checks - n_failed, n_checks);

@@ -14,7 +14,11 @@ while [ $# -gt 0 ] && [ "$1" != "--" ]; do splits="$splits $1"; shift; done
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-"$run" -b "$board" -d "$@" "$fw" </dev/null >"$tmp/full.out" 2>"$tmp/full.err" || true
+# Diagnostics that depend on where a run started are not compared: the master
+# abort's report of unclaimed accesses (each run reports what it saw).
+diag='^\[warn\] master-abort:'
+"$run" -b "$board" -d "$@" "$fw" </dev/null >"$tmp/full.out" 2>"$tmp/full0.err" || true
+grep -v "$diag" "$tmp/full0.err" >"$tmp/full.err" || true
 fail=0
 for n in $splits; do
     for backends in ":" "--jit:" ":--jit"; do
@@ -24,7 +28,7 @@ for n in $splits; do
         "$run" -b "$board" $second -d --load-snapshot "$tmp/s.snap" "$@" \
             </dev/null >"$tmp/b.out" 2>"$tmp/b.err" || true
         cat "$tmp/a.out" "$tmp/b.out" >"$tmp/ab.out"
-        grep -v '^uam-run: resumed from' "$tmp/b.err" >"$tmp/b2.err" || true
+        grep -v -e '^uam-run: resumed from' -e "$diag" "$tmp/b.err" >"$tmp/b2.err" || true
         if cmp -s "$tmp/full.out" "$tmp/ab.out" && cmp -s "$tmp/full.err" "$tmp/b2.err"; then
             echo "[ ok ] $board split at $n (${first:-interp} -> ${second:-interp})"
         else

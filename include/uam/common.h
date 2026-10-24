@@ -51,7 +51,7 @@ static inline int64_t uam_sext(uint64_t v, unsigned width)
  * changes. Entry points check it together with the struct sizes the caller
  * was compiled with (uam_abi_layout in uam/machine.h).
  */
-#define UAM_ABI_VERSION 11u
+#define UAM_ABI_VERSION 12u
 
 /* The UAM_ABI_VERSION the library itself was built with. */
 unsigned uam_abi_version(void);

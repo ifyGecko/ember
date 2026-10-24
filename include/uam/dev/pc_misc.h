@@ -13,7 +13,8 @@
  *                          written reads back. A code that differs from the
  *                          last one is logged at info level, a repeat (an
  *                          I/O delay write) at debug level.
- *   uam_master_abort_create  Unclaimed accesses: reads all ones.
+ *   uam_master_abort_create  Unclaimed accesses: reads all ones; the first
+ *                          access to each place is logged (warning).
  *   uam_smi_port_create    Software SMI port (PC: port 0xB2): every write
  *                          keeps the byte and pulses the output line, which
  *                          the board wires to the processors' SMI# - the
@@ -48,7 +49,18 @@ uam_device *uam_smi_port_create(const char *name);
 uam_signal *uam_smi_port_line(uam_device *dev);
 
 /* Master abort: what a PC returns for an access no device claims. Reads are
- * all ones, writes are dropped. Boards install it as the bus's unmapped device. */
+ * all ones, writes are dropped. Boards install it as the bus's unmapped device.
+ * All ones reads like an absent device to firmware, which then quietly takes
+ * another path, so the first access to each place - a 4 KiB memory page, or an
+ * I/O port - is logged as a warning, and the most frequent places are listed
+ * when the device is destroyed (the end of the run). Up to 256 places are
+ * reported; further ones are only counted. */
 uam_device *uam_master_abort_create(const char *name);
+/* Name the window [base, base + size) in the log: an access there is reported
+ * as "<what> +offset", e.g. what = "I/O port" for a PC board's port space.
+ * `per_address`: each address is its own place (ports), else each 4 KiB page.
+ * Up to 4 windows; false if there is no room. */
+bool        uam_master_abort_name_window(uam_device *dev, uint64_t base, uint64_t size,
+                                         const char *what, bool per_address);
 
 #endif /* UAM_DEV_PC_MISC_H */

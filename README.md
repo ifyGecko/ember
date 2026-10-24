@@ -142,6 +142,13 @@ build/uam-run --realtime fw.elf               # pace virtual time to the host cl
 build/uam-run --map -b mips-ref               # print the bus map
 ```
 
+`--dump-mem` and gdb read memory without side effects. A device region (a ROM or flash window
+served by a read handler, a frame buffer) is readable only if its device implements
+`uam_device_ops.peek`, a side-effect-free read (ember's VGA memory and PCI option ROMs do);
+otherwise the dump names the region and its device and writes no file. On PC boards an access
+no device claims reads all ones (master abort), as on hardware; the first one at each memory
+page or I/O port is logged as a warning, and the most frequent are listed at the end of the run.
+
 Fixed console input (`string:TEXT`, `file:OUT,in=FILE`) reaches the guest when the run starts,
 after the board's power-on reset and any `--load-snapshot`, never while the board is being built.
 Firmware that drains its UART while booting discards input typed ahead like this, as real

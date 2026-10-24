@@ -405,8 +405,12 @@ static unsigned unit_size(const uam_device_ops *o, unsigned size)
     return size < mn ? mn : size > mx ? mx : size;
 }
 
-static uam_status dev_read(const uam_region *r, uam_device *d, uint64_t off, unsigned size,
-                           bool acc_be, uint64_t *val)
+/* A device read through `rd`: the device's read handler, or its peek handler
+ * for a debugger. */
+typedef uam_status (*dev_reader)(uam_device *dev, uint64_t off, unsigned size, uint64_t *val);
+
+static uam_status dev_read_with(const uam_region *r, uam_device *d, dev_reader rd, uint64_t off,
+                                unsigned size, bool acc_be, uint64_t *val)
 {
     const uam_device_ops *o = d->ops;
     const bool dbe = dev_is_be(r, d);
@@ -414,7 +418,7 @@ static uam_status dev_read(const uam_region *r, uam_device *d, uint64_t off, uns
 
     if (u == size && (!o->impl_min || (off & (o->impl_min - 1)) == 0)) {
         uint64_t v = 0;
-        uam_status st = o->read(d, off, size, &v);
+        uam_status st = rd(d, off, size, &v);
         if (st != UAM_OK)
             return st;
         v &= uam_mask(size * 8);
@@ -426,7 +430,7 @@ static uam_status dev_read(const uam_region *r, uam_device *d, uint64_t off, uns
     uint8_t bytes[8];
     for (uint64_t ub = off & ~(uint64_t)(u - 1); ub < off + size; ub += u) {
         uint64_t uv = 0;
-        uam_status st = o->read(d, ub, u, &uv);
+        uam_status st = rd(d, ub, u, &uv);
         if (st != UAM_OK)
             return st;
         for (unsigned k = 0; k < u; k++) {
@@ -437,6 +441,12 @@ static uam_status dev_read(const uam_region *r, uam_device *d, uint64_t off, uns
     }
     *val = bytes_to_val(bytes, size, acc_be);
     return UAM_OK;
+}
+
+static uam_status dev_read(const uam_region *r, uam_device *d, uint64_t off, unsigned size,
+                           bool acc_be, uint64_t *val)
+{
+    return dev_read_with(r, d, d->ops->read, off, size, acc_be, val);
 }
 
 static uam_status dev_write(const uam_region *r, uam_device *d, uint64_t off, unsigned size,
@@ -574,9 +584,13 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
             st = UAM_OK;
             break;
         case UAM_REGION_MMIO:
-            if (side_effect_free)
-                return UAM_ERR_FAULT; /* no execution from or peeking into devices */
-            st = dev_read(h.r, h.r->dev, h.off, size, be, val);
+            /* No execution from devices; a debugger reads only what a device
+             * can serve without side effects (its peek handler). */
+            if ((attrs & UAM_ACC_FETCH) || (side_effect_free && !h.r->dev->ops->peek))
+                return UAM_ERR_FAULT;
+            st = side_effect_free
+                ? dev_read_with(h.r, h.r->dev, h.r->dev->ops->peek, h.off, size, be, val)
+                : dev_read(h.r, h.r->dev, h.off, size, be, val);
             break;
         default:
             return UAM_ERR_FAULT;

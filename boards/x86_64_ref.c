@@ -613,6 +613,11 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
                                                       : UAM_UNKNOWN_POLICY_ZERO);
     if ((st = add(m, um)) != UAM_OK)
         return st;
+    if (cfg->unknown_mmio == UAM_UNKNOWN_FAULT) {
+        uam_master_abort_name_window(um, UAM_X86_PIO_BASE, UAM_X86_PIO_SIZE, "I/O port", true);
+        uam_master_abort_name_window(um, UAM_X86_SMRR_SINK, UINT64_C(1) << 32,
+                                     "SMRR range outside SMM", false);
+    }
     uam_bus_set_unmapped(&m->bus, um);
 
     uam_machine_reset(m, m->reset_pc);

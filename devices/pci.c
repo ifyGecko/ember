@@ -569,7 +569,7 @@ static void rom_destroy(uam_device *d) { free(UAM_CONTAINER_OF(d, rom_image, dev
 
 static const uam_device_ops rom_ops = {
     .type = "pci-rom-image", .read = rom_read, .write = rom_write, .destroy = rom_destroy,
-    .flags = UAM_DEVICE_STATELESS,
+    .flags = UAM_DEVICE_STATELESS, .peek = rom_read,   /* reads are pure */
 };
 
 uam_device *uam_pci_rom_image_create(const char *name, const uint8_t *data, size_t len)

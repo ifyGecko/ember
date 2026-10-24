@@ -32,6 +32,14 @@
  * With every field left 0 the bus passes accesses through unchanged and treats
  * the device as little-endian.
  *
+ * Debuggers (gdb, uam-run --dump-mem) read memory with side-effect-free
+ * accesses (UAM_ACC_DEBUG). A device region answers them only through `peek`:
+ * a read with no side effects (no latches, FIFOs, read-to-clear, logging),
+ * served like `read` (same sizes and byte order). A device that serves memory
+ * through its read handler - a ROM or flash window, a frame buffer - should
+ * implement it (often `.peek = .read` when reads are pure); without it a
+ * debugger cannot see the region at all.
+ *
  * Snapshots (snapshot.h): a device takes part by implementing `save` and
  * `restore` with the state stream in state.h, or by setting
  * UAM_DEVICE_STATELESS when it holds no guest-visible state. Taking a snapshot
@@ -68,6 +76,8 @@ typedef struct uam_device_ops {
     void       (*save)(uam_device *dev, uam_state_writer *w);
     void       (*restore)(uam_device *dev, uam_state_reader *r);
     unsigned    flags;                       /* enum uam_device_flag */
+    /* Optional: a read without side effects, for debuggers (see above). */
+    uam_status (*peek)(uam_device *dev, uint64_t off, unsigned size, uint64_t *val);
 } uam_device_ops;
 
 struct uam_device {

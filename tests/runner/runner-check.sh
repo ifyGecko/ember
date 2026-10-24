@@ -3,7 +3,9 @@
 # x86_64-ref with the raw x86 self-test (loaded at 0, entered at 0):
 #   --log-pc     more than 64 addresses all take effect
 #   --dump-mem   at --break: the bytes are the image's (raw file and hex dump, virtual and
-#                p: physical); an unreadable range is reported
+#                p: physical); an unreadable range is reported with the reason (unmapped,
+#                a device without a peek handler: no empty file); device memory with a
+#                peek handler (VGA) is readable
 #   --trace-after  +N counts from a loaded snapshot; an absolute N before the snapshot is
 #                warned about; interpreter and --jit block traces are the same after it
 set -eu
@@ -33,7 +35,17 @@ cmp -s "$T/p.bin" "$T/want.bin" || fail "--dump-mem: physical bytes differ from 
 first=$(od -An -tx1 -N16 "$FW" | tr -s ' ' | sed 's/^ //; s/ $//')
 grep -q "^  0000000000000000  $first " "$T/log" || fail "--dump-mem: hex dump line wrong"
 $X --break 0 --dump-mem p:0xfffffffffff0+16 "$FW" </dev/null 2>"$T/log" >/dev/null || true
-grep -q 'not readable; 0 of 16 bytes' "$T/log" || fail "--dump-mem: unreadable range not reported"
+grep -q 'not readable (nothing is mapped at physical 0xfffffffffff0); 0 of 16 bytes' "$T/log" ||
+    fail "--dump-mem: unmapped range not reported"
+# a device region without a peek handler (HPET registers): named, and no empty file
+$X --break 0 --dump-mem p:0xfed00000+16="$T/h.bin" "$FW" </dev/null 2>"$T/log" >/dev/null || true
+grep -q "device region 'hpet', whose device (ia-pc,hpet) has no side-effect-free read" "$T/log" ||
+    fail "--dump-mem: device without peek not explained"
+grep -q "0 of 16 bytes, nothing written" "$T/log" || fail "--dump-mem: empty file not refused"
+[ ! -e "$T/h.bin" ] || fail "--dump-mem: an empty file was written"
+# device memory served through a peek handler (VGA text buffer) is readable
+$X -o vga=1 --break 0 --dump-mem p:0xb8000+32="$T/vga.bin" "$FW" </dev/null >/dev/null 2>&1 || true
+[ "$(wc -c <"$T/vga.bin" 2>/dev/null || echo 0)" -eq 32 ] || fail "--dump-mem: VGA memory not read through peek"
 if $X --dump-mem 0x1000 "$FW" </dev/null >/dev/null 2>&1; then fail "--dump-mem without +LEN accepted"; fi
 
 # --trace-after after --load-snapshot

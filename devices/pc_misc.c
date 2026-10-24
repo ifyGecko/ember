@@ -2,6 +2,7 @@
  * pc_misc.c - System Control Port A, POST-code latch and debug console port
  * (uam/dev/pc_misc.h).
  */
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "uam/dev/pc_misc.h"
@@ -215,30 +216,149 @@ uam_device *uam_debugcon_create(const char *name, uam_chardev *out, uint8_t read
 
 /* ---- master abort -------------------------------------------------------- */
 
+#define ABORT_PLACES 256u   /* places reported and counted; power of two */
+#define ABORT_HOT    10u    /* listed at the end */
+
+typedef struct abort_place {
+    uint64_t key;           /* memory: the page address; I/O: the port address */
+    uint64_t reads, writes;
+    bool     used;
+} abort_place;
+
+#define ABORT_WINDOWS 4u
+
+typedef struct abort_window {
+    uint64_t    base, size;
+    const char *what;
+    bool        per_address;
+} abort_window;
+
+typedef struct master_abort {
+    uam_device   dev;
+    abort_window win[ABORT_WINDOWS];
+    unsigned     n_win;
+    uint64_t     total, untracked;
+    size_t      n_used;
+    abort_place table[ABORT_PLACES];
+} master_abort;
+
+static master_abort *to_abort(uam_device *d) { return UAM_CONTAINER_OF(d, master_abort, dev); }
+
+static const abort_window *abort_window_of(const master_abort *a, uint64_t addr)
+{
+    for (unsigned i = 0; i < a->n_win; i++)
+        if (addr - a->win[i].base < a->win[i].size)
+            return &a->win[i];
+    return NULL;
+}
+
+/* "0x1234", or "<window> +0x34" */
+static void abort_where(const master_abort *a, uint64_t addr, char *buf, size_t n)
+{
+    const abort_window *w = abort_window_of(a, addr);
+    if (w)
+        snprintf(buf, n, "%s +0x%llx", w->what, (unsigned long long)(addr - w->base));
+    else
+        snprintf(buf, n, "0x%llx", (unsigned long long)addr);
+}
+
+/* Count an access; the first one to its place is logged. */
+static void abort_note(master_abort *a, uint64_t addr, unsigned size, bool is_write, uint64_t v)
+{
+    const abort_window *w = abort_window_of(a, addr);
+    uint64_t key = w && w->per_address ? addr : addr & ~(uint64_t)0xFFF;
+    a->total++;
+    uint32_t h = (uint32_t)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 56) & (ABORT_PLACES - 1);
+    for (uint32_t probe = 0; probe < ABORT_PLACES; probe++) {
+        abort_place *p = &a->table[(h + probe) & (ABORT_PLACES - 1)];
+        if (!p->used) {
+            p->used = true;
+            p->key = key;
+            a->n_used++;
+            char where[80];
+            abort_where(a, addr, where, sizeof(where));
+            if (is_write)
+                uam_log(UAM_LOG_WARN, "master-abort", "first write of %u bytes to %s: 0x%llx, nothing "
+                        "claims it (dropped)", size, where, (unsigned long long)v);
+            else
+                uam_log(UAM_LOG_WARN, "master-abort", "first read of %u bytes at %s: nothing claims it, "
+                        "reads all ones", size, where);
+        }
+        if (p->key == key) {
+            if (is_write) p->writes++; else p->reads++;
+            return;
+        }
+    }
+    if (a->untracked++ == 0)
+        uam_log(UAM_LOG_WARN, "master-abort", "more than %u places accessed; further ones are only counted",
+                ABORT_PLACES);
+}
+
 static uam_status abort_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
 {
-    (void)d; (void)off;
+    abort_note(to_abort(d), off, size, false, 0);
     *val = size >= 8 ? ~0ull : (1ull << (8 * size)) - 1;
     return UAM_OK;
 }
 
 static uam_status abort_write(uam_device *d, uint64_t off, unsigned size, uint64_t v)
 {
-    (void)d; (void)off; (void)size; (void)v;
+    abort_note(to_abort(d), off, size, true, v);
     return UAM_OK;
 }
 
+static void abort_destroy(uam_device *d)
+{
+    master_abort *a = to_abort(d);
+    if (a->total) {
+        uam_log(UAM_LOG_WARN, "master-abort", "%llu unclaimed accesses at %zu places%s; most frequent:", (unsigned long long)a->total, a->n_used, a->untracked ? " (and more)" : "");
+        bool listed[ABORT_PLACES] = { false };
+        for (unsigned n = 0; n < ABORT_HOT; n++) {
+            int best = -1;
+            for (unsigned i = 0; i < ABORT_PLACES; i++) {
+                const abort_place *p = &a->table[i];
+                if (p->used && !listed[i]
+                    && (best < 0 || p->reads + p->writes > a->table[best].reads + a->table[best].writes))
+                    best = (int)i;
+            }
+            if (best < 0)
+                break;
+            listed[best] = true;
+            const abort_place *p = &a->table[best];
+            const abort_window *w = abort_window_of(a, p->key);
+            char where[80];
+            abort_where(a, p->key, where, sizeof(where));
+            uam_log(UAM_LOG_WARN, "master-abort", "  %s%s: %llu reads, %llu writes", where,
+                    w && w->per_address ? "" : " (4 KiB page)", (unsigned long long)p->reads,
+                    (unsigned long long)p->writes);
+        }
+    }
+    free(a);
+}
+
 static const uam_device_ops abort_ops = {
-    .type = "pc,master-abort", .read = abort_read, .write = abort_write, .destroy = free_dev,
+    .type = "pc,master-abort", .read = abort_read, .write = abort_write, .destroy = abort_destroy,
     .flags = UAM_DEVICE_STATELESS,
 };
 
 uam_device *uam_master_abort_create(const char *name)
 {
-    uam_device *d = calloc(1, sizeof(*d));
-    if (d)
-        uam_device_init(d, &abort_ops, name);
-    return d;
+    master_abort *a = calloc(1, sizeof(*a));
+    if (!a)
+        return NULL;
+    uam_device_init(&a->dev, &abort_ops, name);
+    return &a->dev;
+}
+
+bool uam_master_abort_name_window(uam_device *d, uint64_t base, uint64_t size, const char *what,
+                                  bool per_address)
+{
+    master_abort *a = to_abort(d);
+    if (a->n_win == ABORT_WINDOWS)
+        return false;
+    a->win[a->n_win++] = (abort_window){ .base = base, .size = size, .what = what,
+                                         .per_address = per_address };
+    return true;
 }
 
 /* ---- software SMI port ------------------------------------------------------ */
