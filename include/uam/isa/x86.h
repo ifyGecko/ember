@@ -132,6 +132,24 @@ enum {
 void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info);
 
 /*
+ * The SMRAM save-state map an SMI writes below SMBASE + 0x10000 and RSM reads
+ * back: the processor vendor's, which its SMM handler (SMBASE relocation, I/O
+ * trap decoding) is written for. The two overlap, so the handler and the map
+ * must agree. Set per processor, like the identity; kept across reset and INIT.
+ *   INTEL64  Intel 64 (default): SMBASE + 0xFC00..0xFFFF; SMBASE at +0xFEF8,
+ *            RIP at +0xFFD8, I/O restart at +0xFF00, IOMisc at +0xFFA4.
+ *   AMD64    AMD64: SMBASE + 0xFE00..0xFFFF; SMBASE at +0xFF00, RIP at
+ *            +0xFF78, I/O restart at +0xFEC8, SMM I/O trap at +0xFEC0; also
+ *            the SMM_BASE MSR (C001_0111h), which reads and sets SMBASE.
+ */
+typedef enum uam_x86_smm_map {
+    UAM_X86_SMM_MAP_INTEL64 = 0,
+    UAM_X86_SMM_MAP_AMD64,
+} uam_x86_smm_map;
+
+void uam_x86_set_smm_map(uam_cpu *cpu, uam_x86_smm_map map);
+
+/*
  * Multiprocessor start-up. Processor 0 (hartid 0) is the bootstrap processor
  * (IA32_APIC_BASE.BSP); every other processor leaves reset, and INIT, in the
  * wait-for-SIPI state, where only INIT and a startup IPI are recognised. A

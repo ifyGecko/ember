@@ -158,7 +158,7 @@ static void power_on_state(uam_cpu *cpu, uint64_t entry)
     memset(s, 0, sizeof(*s));
     s->msrs = keep.msrs; s->n_msrs = keep.n_msrs; s->cap_msrs = keep.cap_msrs;
     s->msr_policy = keep.msr_policy; s->msr_trace = keep.msr_trace;
-    s->plat = keep.plat; s->cpuid = keep.cpuid;
+    s->plat = keep.plat; s->cpuid = keep.cpuid; s->smm_map = keep.smm_map;
     s->mtrr_def_type = keep.mtrr_def_type; s->pat = 0x0007040600070406ull;
     s->rng = 0x853c49e6748fea9bull;
     memset(cpu->regfile, 0, cpu->regfile_size);
@@ -842,6 +842,11 @@ void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info)
     s->cpuid = *info;
     s->cpuid.vendor[12] = 0;
     s->cpuid.brand[48] = 0;
+}
+
+void uam_x86_set_smm_map(uam_cpu *cpu, uam_x86_smm_map map)
+{
+    x86_st(cpu)->smm_map = map;
 }
 
 void uam_x86_get_cpuid(uam_cpu *cpu, uam_x86_cpuid_info *info)

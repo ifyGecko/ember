@@ -41,6 +41,8 @@
  *   -o cpus=N          processors (default 1; up to 64): one local APIC each
  *                      (APIC ID = index), the others wait for a startup IPI
  *   -o apic-hz=HZ      local APIC timer input clock
+ *   -o smm-map=MAP     SMRAM save-state map: intel64 (default) or amd64
+ *                      (uam_x86_set_smm_map), for the SMM handler's vendor
  *   -o persist=1       write flash programs/erases back to the image files
  *   -o disk=PATH       ATA disk image on AHCI port 0 (-o disk-mode=rw|ro|volatile)
  *   -o cdrom=PATH      ATAPI disc image on AHCI port 1 (read-only)
@@ -580,6 +582,14 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
 
     /* each processor's view of the platform; its APIC offers x2APIC mode and
      * the TSC-deadline timer */
+    const char *smap = uam_board_config_option(cfg, "smm-map");
+    uam_x86_smm_map smm_map = UAM_X86_SMM_MAP_INTEL64;
+    if (smap && !strcmp(smap, "amd64"))
+        smm_map = UAM_X86_SMM_MAP_AMD64;
+    else if (smap && strcmp(smap, "intel64")) {
+        uam_log(UAM_LOG_ERROR, "x86_64-ref", "smm-map must be intel64 or amd64, not '%s'", smap);
+        return UAM_ERR_INVALID;
+    }
     for (unsigned i = 0; i < b->ncpu; i++) {
         uam_cpu *cpu = uam_machine_cpu(m, i);
         uam_x86_platform plat = { .ctx = &b->pcpu[i], .inta = ref_inta, .rdmsr = ref_rdmsr,
@@ -591,6 +601,7 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
         id.logical_cpus = b->ncpu;
         id.initial_apic_id = i;
         uam_x86_set_cpuid(cpu, &id);
+        uam_x86_set_smm_map(cpu, smm_map);
     }
 
     /* Unclaimed accesses master-abort (all ones), as on a PC, unless the user

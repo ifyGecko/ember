@@ -4,7 +4,7 @@
 NASM ?= nasm
 OUT  ?= ../../build/firmware-x86
 
-all: $(OUT)/selftest.bin $(OUT)/smp.bin $(OUT)/legacy.bin $(OUT)/biosrom.bin
+all: $(OUT)/selftest.bin $(OUT)/smp.bin $(OUT)/legacy.bin $(OUT)/biosrom.bin $(OUT)/smm-amd.bin
 
 $(OUT)/selftest.bin: selftest.asm
 	@mkdir -p $(OUT)
@@ -23,3 +23,7 @@ $(OUT)/legacy.bin: legacy.asm
 $(OUT)/biosrom.bin: biosrom.asm
 	@mkdir -p $(OUT)
 	$(NASM) -f bin -l $(OUT)/biosrom.lst $< -o $@
+
+$(OUT)/smm-amd.bin: smm-amd.asm
+	@mkdir -p $(OUT)
+	$(NASM) -f bin -l $(OUT)/smm-amd.lst $< -o $@

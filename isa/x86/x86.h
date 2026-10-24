@@ -184,6 +184,7 @@ enum {
     MSR_GS_BASE          = 0xC0000101,
     MSR_KERNEL_GS_BASE   = 0xC0000102,
     MSR_TSC_AUX          = 0xC0000103,
+    MSR_AMD_SMM_BASE     = 0xC0010111,   /* with the AMD64 save-state map */
 };
 
 /* ---- exception vectors --------------------------------------------------- */
@@ -389,6 +390,7 @@ typedef struct x86_state {
 
     uam_x86_platform   plat;
     uam_x86_cpuid_info cpuid;
+    uam_x86_smm_map    smm_map;   /* the SMRAM save-state map (board-selected) */
 
     x86_tlb_ent tlb[X86_TLB_SIZE];
 } x86_state;

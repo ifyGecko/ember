@@ -313,6 +313,8 @@ x86-test: $(RUN) firmware-x86
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit --stats $(FW_X86) < /dev/null
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 $(dir $(FW_X86))legacy.bin < /dev/null
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit $(dir $(FW_X86))legacy.bin < /dev/null
+	$(RUN) -b x86_64-ref -o smm-map=amd64 --raw-base 0 --entry 0 $(dir $(FW_X86))smm-amd.bin < /dev/null
+	$(RUN) -b x86_64-ref -o smm-map=amd64 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smm-amd.bin < /dev/null
 	python3 tests/firmware-x86/bios-check.py $(RUN) $(dir $(FW_X86))biosrom.bin
 	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 $(dir $(FW_X86))smp.bin < /dev/null
 	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smp.bin < /dev/null
@@ -340,6 +342,8 @@ snapshot-test: $(RUN) firmware firmware-mips firmware-arm firmware-x86 example-t
 	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(FW_X86) 1000 5000 15000 -- --raw-base 0 --entry 0
 	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))legacy.bin 300 700 900 \
 	    -- --raw-base 0 --entry 0
+	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))smm-amd.bin 200 370 420 2000 14000 \
+	    -- -o smm-map=amd64 --raw-base 0 --entry 0
 	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))smp.bin 1 5000 20001 40000 \
 	    -- -o cpus=4 --quantum 1000 --raw-base 0 --entry 0
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(dir $(FIRMWARE))smptest.elf 3000 70001 \

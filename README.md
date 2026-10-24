@@ -261,7 +261,8 @@ isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thu
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
 isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87, MMX,
                    SSE/SSE2) and system architecture (segmentation, call gates, hardware
-                   task switching, the I/O permission bitmap, paging, SMM, A20M#, CPUID/MSRs)
+                   task switching, the I/O permission bitmap, paging, SMM with the Intel 64
+                   or AMD64 save-state map, A20M#, CPUID/MSRs)
 devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
                    virtio_net; PC architecture: i8259, i8254, mc146818, lapic, ioapic, hpet,
                    i8042, acpi_pm, pc_misc (port 92, A20 gate, POST codes), i8237 DMA, fdc

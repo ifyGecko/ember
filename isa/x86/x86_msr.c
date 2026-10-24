@@ -163,6 +163,9 @@ uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val)
     case MSR_SMBASE:
         if (!s->in_smm) break;
         *val = s->smbase; return UAM_OK;
+    case MSR_AMD_SMM_BASE:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
+        *val = s->smbase; return UAM_OK;
     case MSR_MTRRCAP:         *val = 0xD08; return UAM_OK;   /* 8 variable, fixed, WC, SMRR */
     case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
         if (!s->in_smm)
@@ -245,6 +248,9 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
     case MSR_BIOS_SIGN_ID: case MSR_PLATFORM_ID: return UAM_OK;
     case MSR_SMBASE:
         if (!s->in_smm) break;
+        s->smbase = val & 0xFFFFFFFFu; return UAM_OK;
+    case MSR_AMD_SMM_BASE:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
         s->smbase = val & 0xFFFFFFFFu; return UAM_OK;
     case MSR_MTRRCAP:         return x86_raise(cpu, X86_EXC_GP, true, 0);
     case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
