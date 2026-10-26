@@ -14,6 +14,11 @@
  * is decided when the block is lifted. Anything else (64-bit instructions,
  * AltiVec, Book E) is an illegal instruction.
  *
+ * The CPU model decides the rest: the classic MMU instructions (mfsr, mtsr,
+ * mfsrin, mtsrin, tlbie, tlbia) exist only in the classic model, and the Book E
+ * ones (rfci, rfmci, rfdi, wrtee, wrteei, tlbwe, tlbre, tlbsx, tlbivax, mfdcr,
+ * mtdcr, mfdcrx, mtdcrx, icbt) only in Book E; isel where the model has it.
+ *
  * Instruction fields are extracted with C shifts; comments use the PowerPC
  * books' bit numbering (bit 0 is the most significant).
  */
@@ -99,6 +104,8 @@ static lift_result illegal(pl *L)
     trap(L, NONE, PPC_TRAP_ILLEGAL, imm(L, L->raw));
     return LIFT_DONE;
 }
+
+static bool booke(const pl *L) { return ppc_booke(L->s); }
 
 /* True (after emitting the exception) when the instruction is privileged here. */
 static bool privileged(pl *L)
@@ -607,6 +614,16 @@ static lift_result lift_op19(pl *L, uint32_t i)
             return LIFT_DONE;
         uam_exit(L->b, NONE, helper(L, PPC_HELPER_RFI, NONE, NONE), UAM_EXIT_EXC_RETURN);
         return LIFT_DONE;
+    case 51: case 38: case 39: { /* rfci, rfmci, rfdi (Book E) */
+        const uam_ppc_booke_config *c = &L->s->cfg.booke;
+        if (!booke(L) || (xo == 38 && !c->mcheck_mcsrr) || (xo == 39 && !c->debug_dsrr))
+            return illegal(L);
+        if (privileged(L))
+            return LIFT_DONE;
+        unsigned h = xo == 51 ? PPC_HELPER_RFCI : xo == 38 ? PPC_HELPER_RFMCI : PPC_HELPER_RFDI;
+        uam_exit(L->b, NONE, helper(L, h, NONE, NONE), UAM_EXIT_EXC_RETURN);
+        return LIFT_DONE;
+    }
     case 150: /* isync: context synchronising */
         uam_fence(L->b, UAM_FENCE_INSN);
         uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP);
@@ -693,9 +710,78 @@ static lift_result lift_mtmsr(pl *L, uint32_t i)
     return LIFT_DONE;
 }
 
+/* wrtee / wrteei: MSR[EE] from a register or the instruction. */
+static lift_result lift_wrtee(pl *L, uam_ref ee)
+{
+    if (privileged(L))
+        return LIFT_DONE;
+    uam_ref msr = uam_sysrd(L->b, 32, PPC_SR_MSR, NONE);
+    uam_syswr(L->b, 32, PPC_SR_MSR, bin(L, UAM_OP_OR, bin(L, UAM_OP_AND, msr, imm(L, ~MSR_EE)),
+                                        bin(L, UAM_OP_AND, ee, imm(L, MSR_EE))), NONE);
+    uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP);
+    return LIFT_DONE;
+}
+
+/* The Book E instructions of opcode 31 (LIFT_SEQ/DONE), or -1 if xo is none of them. */
+static int lift_op31_booke(pl *L, uint32_t i, unsigned xo)
+{
+    switch (xo) {
+    case 131: return lift_wrtee(L, gpr(L, RD(i)));                       /* wrtee */
+    case 163: return lift_wrtee(L, imm(L, i & MSR_EE));                  /* wrteei */
+    case 22:  return LIFT_SEQ;                                           /* icbt */
+    case 978: case 946: case 914: case 786: {  /* tlbwe tlbre tlbsx tlbivax */
+        if (privileged(L))
+            return LIFT_DONE;
+        if (xo == 978) {
+            helper(L, PPC_HELPER_TLBWE, imm(L, i), NONE);
+        } else if (xo == 946) {
+            helper(L, PPC_HELPER_TLBRE, imm(L, i), NONE);
+            return LIFT_SEQ;
+        } else if (xo == 914) {
+            uam_helper(L->b, &L->lc->cpu->isa->helpers, PPC_HELPER_TLBSX, imm(L, i), ea_x(L, i), NONE,
+                       NONE);
+            return LIFT_SEQ;
+        } else {
+            helper(L, PPC_HELPER_TLBIVAX, ea_x(L, i), NONE);
+        }
+        uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP);   /* mappings changed */
+        return LIFT_DONE;
+    }
+    case 323: case 259: /* mfdcr, mfdcrx */
+        if (privileged(L))
+            return LIFT_DONE;
+        gpr_w(L, RD(i), helper(L, PPC_HELPER_MFDCR, xo == 323 ? imm(L, SPRN(i)) : gpr(L, RA(i)), NONE));
+        return LIFT_SEQ;
+    case 451: case 387: /* mtdcr, mtdcrx: the device may change interrupt state */
+        if (privileged(L))
+            return LIFT_DONE;
+        helper(L, PPC_HELPER_MTDCR, xo == 451 ? imm(L, SPRN(i)) : gpr(L, RA(i)), gpr(L, RD(i)));
+        uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP);
+        return LIFT_DONE;
+    default:
+        return -1;
+    }
+}
+
 static lift_result lift_op31(pl *L, uint32_t i)
 {
     unsigned xo = XO10(i);
+    if (((i >> 1) & 0x1F) == 15 && L->s->cfg.isel) {   /* isel rD,(rA|0),rB,crb */
+        uam_ref c = cr_bit(L, (i >> 6) & 31);
+        gpr_w(L, RD(i), uam_select(L->b, 32, c, gpr0(L, RA(i)), gpr(L, RB(i))));
+        return LIFT_SEQ;
+    }
+    if (booke(L)) {
+        int r = lift_op31_booke(L, i, xo);
+        if (r >= 0)
+            return (lift_result)r;
+        switch (xo) {   /* the classic MMU's instructions */
+        case 595: case 210: case 659: case 242: case 306: case 370:
+            return illegal(L);
+        default:
+            break;
+        }
+    }
     switch (XO9(i)) {   /* XO-form arithmetic (OE in bit 21) */
     case 266: case 10: case 138: case 234: case 202: case 40: case 8: case 136: case 232: case 200:
     case 104:
@@ -1017,10 +1103,11 @@ uam_status ppc_lift(uam_lift_ctx *lc)
         uam_imark(lc->b, pc, 4);
         L.pc = pc;
         L.raw = i;
-        /* Trace: armed before the instruction; an exception it raises disarms it.
-         * sc and rfi are not traced. */
+        /* Trace (Book E: the instruction-complete and branch-taken debug events):
+         * armed before the instruction; an exception it raises disarms it. sc and
+         * the returns from interrupts are not traced. */
         if (trace && ((L.priv & PPC_PRIV_SE) || is_branch(i)) && OPCD(i) != 17
-            && !(OPCD(i) == 19 && XO10(i) == 50))
+            && !(OPCD(i) == 19 && (XO10(i) == 50 || XO10(i) == 51 || XO10(i) == 38 || XO10(i) == 39)))
             helper(&L, PPC_HELPER_TRACE, NONE, NONE);
         if (lift_insn(&L, i) == LIFT_DONE)
             return UAM_OK;

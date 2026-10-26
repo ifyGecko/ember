@@ -1,7 +1,7 @@
 # UAM Firmware Emulator — Architecture
 
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
-MMU, x86-64, 32-bit PowerPC with the OEA MMU), the snapshot part of phase 3 and the JIT from
+MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU), the snapshot part of phase 3 and the JIT from
 phase 4. IR, interpreter and optimizer, an
 x86-64 JIT with block chaining, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
@@ -135,7 +135,7 @@ isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips.h (private)
 isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32) arm_system.c
                   arm.h (private)
-isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_system.c ppc.h (private)
+isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_booke.c ppc_system.c ppc.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
@@ -167,6 +167,7 @@ tests/net/            net-check.sh  (nettest.elf against real tap and tun interf
 tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
 tests/firmware-arm/   start.S selftest.c fuzztarget.c link.ld  (ARMv7: ARM and Thumb-2 builds)
 tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (32-bit PowerPC)
+                      start-booke.S link-booke.ld  (the self-test for the Book E model)
 ```
 
 Planned: more passes in `analysis/` (cmp-log, taint), an Intel HEX loader, more boards and
@@ -206,7 +207,8 @@ devices.
   (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` / `armeb-ref` (ARMv7-A,
   little-endian and BE8, with a GICv2-style interrupt controller fed by the generic timer and
   the NS16550A UART, a test finisher, RAM at 0 under the vectors), and `ppc-ref` (32-bit
-  PowerPC: RAM at 0 under the vectors, a boot ROM under the reset vector 0xfff00100, a NS16550A
+  PowerPC, classic or with `-o model=booke` Book E: RAM at 0 under the vectors, a boot ROM under
+  the reset vector (0xfff00100; Book E 0xfffffffc, in the boot page it maps at reset), a NS16550A
   UART and a test finisher). Real devices are built out of tree on the library
   (`examples/external-board/`).
 - **Multiprocessor machines** (`-o cpus=N` on every reference board): processors share the
@@ -243,20 +245,30 @@ devices.
   BE8: code is always little-endian, data follows CPSR.E (also part of `cpu->priv`, so code
   lifted for one order never runs in the other; SETEND, exception entry from SCTLR.EE and
   return from SPSR switch it), and `uam_isa_armeb` resets big-endian.
-- **PowerPC** (`isa/ppc32`, `uam/isa/ppc.h`): the 32-bit architecture as the 6xx/7xx/74xx and
-  e300/e600 cores implement it (user instruction set with the FPU, the OEA's MSR, exception
-  vectors, decrementer and time base, BATs, segment registers and the hashed page table), big-
-  endian. What differs between implementations stays outside ember: a board chooses the CPU
-  model (`uam_ppc_configure`: PVR, FPU present, 4 or 8 BAT pairs, the cache block dcbz clears,
-  the exception prefix at reset, the time base rate) and models the implementation registers
-  (HID0, L2CR, the performance monitor, ...) with `uam_ppc_set_spr_ops`; an SPR nobody claims
-  is plain storage. The external interrupt pin has eight wired-OR inputs, so a board needs no
-  OR gate in front of it; an interrupt controller (OpenPIC, a SoC's own) is the board's.
-  `cpu->priv` carries MSR[PR], MSR[FP] and the trace enables, so privileged and FP-unavailable
-  checks are made when a block is lifted. Like a hardware TLB, successful translations are kept
-  until tlbie, tlbia or a change of the segment registers, SDR1, a BAT or the MSR. MSR[POW]
-  sleeps until an interrupt the processor can take. The Book E, 40x and 8xx privileged
-  architectures, AltiVec and SPE are not modelled.
+- **PowerPC** (`isa/ppc32`, `uam/isa/ppc.h`): one 32-bit user instruction set with the FPU,
+  big-endian, and two privileged architectures the CPU model selects per hart. The classic one
+  (6xx/7xx/74xx, e300/e600): MSR with IR/DR, vectors at 0 or 0xfff00000, the decrementer, BATs,
+  segment registers and the hashed page table. Book E (Power ISA III-E: e500/e200/440 class):
+  IVPR/IVORs, the base, critical, machine-check and debug save/restore pairs (MCSRR and DSRR as
+  the model says), ESR and DEAR, TCR/TSR with the auto-reloading decrementer, the fixed-interval
+  timer and the watchdog, DBCR0 debug events (instruction complete, branch taken, trap), and
+  TLB arrays searched with the PIDs and address space, managed through the MAS registers. What
+  differs between implementations stays outside ember: a board chooses the CPU model
+  (`uam_ppc_configure`: PVR, FPU, isel, the cache block dcbz clears, the time base rate; classic:
+  4 or 8 BAT pairs, the reset prefix; Book E: the TLB arrays' geometry and page sizes, PIDs, the
+  MAS size encoding, the machine-check and debug pairs, the timer bits, the boot TLB entry) and
+  models the implementation registers with `uam_ppc_set_spr_ops` (an SPR nobody claims is plain
+  storage); on Book E also the DCR bus (`uam_ppc_set_dcr_ops`), a TLB interface other than
+  MAS (`uam_ppc_set_tlb_ops` over `uam_ppc_tlb_read/write/find`, for a 440-style tlbwe), and
+  what the watchdog's reset does (`uam_ppc_set_reset_sink`). The external interrupt pin has
+  eight wired-OR inputs; an interrupt controller (OpenPIC, a SoC's own) is the board's.
+  `cpu->priv` carries MSR[PR], MSR[FP] and the trace (Book E: debug event) enables, so
+  privileged and FP-unavailable checks are made when a block is lifted. Like a hardware TLB,
+  successful translations are kept until the guest invalidates them (tlbie/tlbivax reach every
+  processor on the bus). MSR[POW] (Book E: MSR[WE]) sleeps until an interrupt the processor can
+  take. A Book E timer has a scheduler event only while its interrupt or reset could happen.
+  Not modelled: Book E little-endian pages (E), debug address compares, the 40x and 8xx
+  privileged architectures, AltiVec and SPE.
 
 ## 6. Analysis and fuzzing
 
@@ -401,7 +413,11 @@ Implemented (`make test`):
   requires identical maps and an outcome identical to the run without coverage.
 - PowerPC board interface (`test_ppc`): the soft-reset and machine-check pins and checkstop,
   the wired-OR external inputs, the decrementer while MSR[EE] is clear, the implementation SPR
-  handlers and every CPU model option.
+  handlers and every CPU model option; on Book E the watchdog's reset sink and TSR[WRS], the
+  extended period select, the critical input, machine checks through either pair, the DCR and
+  TLB handlers and the TLB entry API. The self-test is also built for Book E
+  (`-o model=booke`: the boot page, IVORs, ESR/DEAR, the timers and watchdog, TLB0/TLB1 through
+  MAS with a software TLB reload, PIDs and address spaces, IPROT, debug events).
 - Fuzzing: `test_fuzz` runs a hand-assembled planted-bug target on RV32, MIPS32 BE/LE, ARMv7, PowerPC
   under every backend: each verdict and its detail, identical maps and results across
   backends and across restores, paired and begin-only modes, the exception-class policy,

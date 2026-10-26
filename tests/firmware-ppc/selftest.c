@@ -70,8 +70,8 @@ static void run(const char *name, void (*fn)(void))
 }
 
 /* Operands the compiler cannot fold. */
-static volatile uint32_t V0 = 0, V1 = 1, V2 = 2, V3 = 3, V5 = 5, V7 = 7, VM1 = 0xFFFFFFFFu,
-                         VMIN = 0x80000000u, VMAX = 0x7FFFFFFFu;
+static volatile uint32_t N0 = 0, N1 = 1, N2 = 2, N3 = 3, N5 = 5, N7 = 7, NM1 = 0xFFFFFFFFu,
+                         NMIN = 0x80000000u, NMAX = 0x7FFFFFFFu;
 
 /* ---- special registers --------------------------------------------------- */
 #define mfspr(n) ({ uint32_t v_; __asm__ volatile("mfspr %0, %1" : "=r"(v_) : "i"(n)); v_; })
@@ -94,6 +94,31 @@ static inline void mtxer(uint32_t v) { __asm__ volatile("mtxer %0" :: "r"(v) : "
 #define MSR_DR  0x0010u
 #define MSR_POW 0x40000u
 
+#define MSR_WE  0x40000u   /* Book E */
+#define MSR_CE  0x20000u
+#define MSR_DE  0x0200u
+#define MSR_IS  0x0020u
+#define MSR_DS  0x0010u
+
+/* Interrupt vectors (classic offsets; Book E IVOR numbers) and the program
+ * exception's reasons (classic: SRR1 bits; Book E: ESR bits). */
+#ifdef PPC_BOOKE
+enum { V_MC = 1, V_DSI = 2, V_ISI = 3, V_EXT = 4, V_ALIGN = 5, V_PROG = 6, V_FPU = 7, V_SC = 8,
+       V_DEC = 10, V_FIT = 11, V_WDT = 12, V_DTLB = 13, V_ITLB = 14, V_DEBUG = 15 };
+#define WHY_FP   0x01000000u
+#define WHY_ILL  0x08000000u
+#define WHY_PRIV 0x04000000u
+#define WHY_TRAP 0x02000000u
+#else
+enum { V_MC = 0x200, V_DSI = 0x300, V_ISI = 0x400, V_EXT = 0x500, V_ALIGN = 0x600, V_PROG = 0x700,
+       V_FPU = 0x800, V_DEC = 0x900, V_SC = 0xC00, V_DEBUG = 0xD00, V_FIT = -1, V_WDT = -2,
+       V_DTLB = -3, V_ITLB = -4 };
+#define WHY_FP   0x00100000u
+#define WHY_ILL  0x00080000u
+#define WHY_PRIV 0x00040000u
+#define WHY_TRAP 0x00020000u
+#endif
+
 #define XER_SO 0x80000000u
 #define XER_OV 0x40000000u
 #define XER_CA 0x20000000u
@@ -104,9 +129,11 @@ typedef struct frame {
     uint32_t cr, lr, ctr, xer, srr0, srr1, dar, dsisr, vec;
 } frame;
 
+/* dar/dsisr hold DEAR/ESR on Book E. */
 static volatile uint32_t trap_n, last_vec, last_srr0, last_srr1, last_dar, last_dsisr;
-static volatile uint32_t dec_n, ext_n, trace_n, user_r4;
-static volatile uint32_t trap_srr1[4];        /* SRR1 of the first traps since trap_n = 0 */
+static volatile uint32_t dec_n, ext_n, trace_n, user_r4, fit_n, wdt_n, dbsr_last;
+static volatile uint32_t trap_why[4];         /* the reason of the first traps since trap_n = 0 */
+static volatile int tlb_reload;               /* Book E: reload a missing data page from MAS */
 static volatile int user_test;
 void user_resume(void);
 void enter_user(uint32_t pc, uint32_t arg);
@@ -114,30 +141,68 @@ void enter_user(uint32_t pc, uint32_t arg);
 uint32_t trap_handler(frame *f, uint32_t vec);
 uint32_t trap_handler(frame *f, uint32_t vec)
 {
-    switch (vec) {
-    case 0x900:                 /* decrementer: count, push it far out */
+    switch ((int)vec) {
+    case V_DEC:                 /* decrementer: count, then silence it */
         dec_n++;
-        mtspr(22, 0x7FFFFFFFu);
+#ifdef PPC_BOOKE
+        mtspr(336, 0x08000000u);            /* TSR[DIS] */
+#else
+        mtspr(22, 0x7FFFFFFFu);             /* push it far out */
+#endif
         return f->srr0;
-    case 0x500:                 /* external: the UART's THRE interrupt; silence it */
+    case V_EXT:                 /* external: the UART's THRE interrupt; silence it */
         ext_n++;
         UART_IER = 0;
         return f->srr0;
-    case 0xD00:                 /* trace */
+#ifdef PPC_BOOKE
+    case V_FIT:
+        fit_n++;
+        mtspr(336, 0x04000000u);            /* TSR[FIS] */
+        return f->srr0;
+    case V_WDT:
+        wdt_n++;
+        mtspr(336, 0xC0000000u);            /* TSR[ENW WIS] */
+        return f->srr0;
+    case V_DEBUG: {
+        uint32_t dbsr = mfspr(304);
+        mtspr(304, dbsr);                   /* clear what happened */
+        dbsr_last = dbsr;
+        trace_n++;
+        return (dbsr & 0x01000000u) ? f->srr0 + 4 : f->srr0;   /* a trap: skip it */
+    }
+    case V_DTLB:
+        if (tlb_reload) {                   /* software reload from the MAS defaults */
+            tlb_reload = 0;
+            mtspr(627, 0x00502000u | 0x3Fu);    /* MAS3: RPN, all permissions */
+            __asm__ volatile("tlbwe\n isync");
+            trap_n++;
+            last_vec = vec;
+            last_dar = f->dar;
+            return f->srr0;                 /* and retry */
+        }
+        break;
+#else
+    case V_DEBUG:               /* trace */
         trace_n++;
         return f->srr0;
+#endif
     default:
         break;
     }
+#ifdef PPC_BOOKE
+    uint32_t why = f->dsisr;   /* ESR */
+#else
+    uint32_t why = f->srr1 & 0xFFFF0000u;
+#endif
     if (trap_n < 4)
-        trap_srr1[trap_n] = f->srr1;
+        trap_why[trap_n] = why;
     trap_n++;
     last_vec = vec;
     last_srr0 = f->srr0;
     last_srr1 = f->srr1;
     last_dar = f->dar;
     last_dsisr = f->dsisr;
-    if (vec == 0xC00) {         /* system call: SRR0 is already the next instruction */
+    if ((int)vec == V_SC) {     /* system call: SRR0 is already the next instruction */
         if (user_test) {
             user_test = 0;
             user_r4 = f->r[4];
@@ -146,16 +211,16 @@ uint32_t trap_handler(frame *f, uint32_t vec)
         }
         return f->srr0;
     }
-    if (vec == 0x400)           /* ISI: back to the caller that branched there */
+    if ((int)vec == V_ISI || (int)vec == V_ITLB)   /* back to the caller that branched there */
         return f->lr;
     return f->srr0 + 4;         /* skip the faulting instruction */
 }
 
 /* One synchronous exception since trap_n was cleared, at `vec`. */
-static void expect_trap(uint32_t vec, const char *what)
+static void expect_trap(int vec, const char *what)
 {
     EQ(trap_n, 1, what);
-    EQ(last_vec, vec, what);
+    EQ(last_vec, (uint32_t)vec, what);
     trap_n = 0;
 }
 
@@ -179,59 +244,59 @@ typedef struct res { uint32_t r, xer, cr0; } res;
 static void t_arith(void)
 {
     res r;
-    r = ARITH2("add", V7, V3, 0);           EQ(r.r, 10, "add");
-    r = ARITH2("addc", VM1, V1, 0);         EQ(r.r, 0, "addc"); EQ(r.xer, XER_CA, "addc ca");
-    r = ARITH2("addc", V7, V1, XER_CA);     EQ(r.xer, 0, "addc clears ca");
-    r = ARITH2("adde", VM1, V0, XER_CA);    EQ(r.r, 0, "adde"); EQ(r.xer, XER_CA, "adde ca");
-    r = ARITH2("adde", V1, V2, XER_CA);     EQ(r.r, 4, "adde +ca"); EQ(r.xer, 0, "adde no ca");
-    r = ARITH2("subf", V1, V0, 0);          EQ(r.r, 0xFFFFFFFFu, "subf");
-    r = ARITH2("subfc", V1, V0, 0);         EQ(r.r, 0xFFFFFFFFu, "subfc"); EQ(r.xer, 0, "subfc borrow");
-    r = ARITH2("subfc", V1, V5, 0);         EQ(r.r, 4, "subfc 5-1"); EQ(r.xer, XER_CA, "subfc no borrow");
-    r = ARITH2("subfe", V1, V5, 0);         EQ(r.r, 3, "subfe"); EQ(r.xer, XER_CA, "subfe ca");
-    r = ARITH1("addme", V0, 0);             EQ(r.r, 0xFFFFFFFFu, "addme"); EQ(r.xer, 0, "addme ca");
-    r = ARITH1("addme", V5, XER_CA);        EQ(r.r, 5, "addme +ca"); EQ(r.xer, XER_CA, "addme ca out");
-    r = ARITH1("addze", VM1, XER_CA);       EQ(r.r, 0, "addze"); EQ(r.xer, XER_CA, "addze ca");
-    r = ARITH1("subfme", V0, XER_CA);       EQ(r.r, 0xFFFFFFFFu, "subfme"); EQ(r.xer, XER_CA, "subfme ca");
-    r = ARITH1("subfze", V0, XER_CA);       EQ(r.r, 0, "subfze"); EQ(r.xer, XER_CA, "subfze ca");
-    r = ARITH1("neg", V5, 0);               EQ(r.r, (uint32_t)-5, "neg");
-    r = ARITH1("nego", VMIN, 0);            EQ(r.r, VMIN, "nego min"); EQ(r.xer, XER_SO | XER_OV, "nego ov");
-    r = ARITH2("addo.", VMAX, V1, 0);       EQ(r.r, VMIN, "addo."); EQ(r.xer, XER_SO | XER_OV, "addo. ov");
+    r = ARITH2("add", N7, N3, 0);           EQ(r.r, 10, "add");
+    r = ARITH2("addc", NM1, N1, 0);         EQ(r.r, 0, "addc"); EQ(r.xer, XER_CA, "addc ca");
+    r = ARITH2("addc", N7, N1, XER_CA);     EQ(r.xer, 0, "addc clears ca");
+    r = ARITH2("adde", NM1, N0, XER_CA);    EQ(r.r, 0, "adde"); EQ(r.xer, XER_CA, "adde ca");
+    r = ARITH2("adde", N1, N2, XER_CA);     EQ(r.r, 4, "adde +ca"); EQ(r.xer, 0, "adde no ca");
+    r = ARITH2("subf", N1, N0, 0);          EQ(r.r, 0xFFFFFFFFu, "subf");
+    r = ARITH2("subfc", N1, N0, 0);         EQ(r.r, 0xFFFFFFFFu, "subfc"); EQ(r.xer, 0, "subfc borrow");
+    r = ARITH2("subfc", N1, N5, 0);         EQ(r.r, 4, "subfc 5-1"); EQ(r.xer, XER_CA, "subfc no borrow");
+    r = ARITH2("subfe", N1, N5, 0);         EQ(r.r, 3, "subfe"); EQ(r.xer, XER_CA, "subfe ca");
+    r = ARITH1("addme", N0, 0);             EQ(r.r, 0xFFFFFFFFu, "addme"); EQ(r.xer, 0, "addme ca");
+    r = ARITH1("addme", N5, XER_CA);        EQ(r.r, 5, "addme +ca"); EQ(r.xer, XER_CA, "addme ca out");
+    r = ARITH1("addze", NM1, XER_CA);       EQ(r.r, 0, "addze"); EQ(r.xer, XER_CA, "addze ca");
+    r = ARITH1("subfme", N0, XER_CA);       EQ(r.r, 0xFFFFFFFFu, "subfme"); EQ(r.xer, XER_CA, "subfme ca");
+    r = ARITH1("subfze", N0, XER_CA);       EQ(r.r, 0, "subfze"); EQ(r.xer, XER_CA, "subfze ca");
+    r = ARITH1("neg", N5, 0);               EQ(r.r, (uint32_t)-5, "neg");
+    r = ARITH1("nego", NMIN, 0);            EQ(r.r, NMIN, "nego min"); EQ(r.xer, XER_SO | XER_OV, "nego ov");
+    r = ARITH2("addo.", NMAX, N1, 0);       EQ(r.r, NMIN, "addo."); EQ(r.xer, XER_SO | XER_OV, "addo. ov");
     EQ(r.cr0, 0x9, "addo. cr0 lt so");
-    r = ARITH2("addo", V1, V1, XER_SO);     EQ(r.xer, XER_SO, "so is sticky, ov cleared");
-    r = ARITH2("subfo", V1, VMIN, 0);       EQ(r.r, VMAX, "subfo"); EQ(r.xer, XER_SO | XER_OV, "subfo ov");
-    r = ARITH2("add.", V1, VM1, 0);         EQ(r.cr0, 0x2, "add. eq");
-    r = ARITH2("add.", V1, V1, XER_SO);     EQ(r.cr0, 0x5, "add. gt so");
-    r = ARITHI("addic.", VM1, 1, 0);        EQ(r.r, 0, "addic."); EQ(r.xer, XER_CA, "addic. ca");
+    r = ARITH2("addo", N1, N1, XER_SO);     EQ(r.xer, XER_SO, "so is sticky, ov cleared");
+    r = ARITH2("subfo", N1, NMIN, 0);       EQ(r.r, NMAX, "subfo"); EQ(r.xer, XER_SO | XER_OV, "subfo ov");
+    r = ARITH2("add.", N1, NM1, 0);         EQ(r.cr0, 0x2, "add. eq");
+    r = ARITH2("add.", N1, N1, XER_SO);     EQ(r.cr0, 0x5, "add. gt so");
+    r = ARITHI("addic.", NM1, 1, 0);        EQ(r.r, 0, "addic."); EQ(r.xer, XER_CA, "addic. ca");
     EQ(r.cr0, 0x2, "addic. eq");
-    r = ARITHI("subfic", V3, 5, 0);         EQ(r.r, 2, "subfic"); EQ(r.xer, XER_CA, "subfic ca");
-    r = ARITHI("subfic", V7, 5, 0);         EQ(r.r, (uint32_t)-2, "subfic neg"); EQ(r.xer, 0, "subfic borrow");
-    r = ARITHI("mulli", V7, -3, 0);         EQ(r.r, (uint32_t)-21, "mulli");
+    r = ARITHI("subfic", N3, 5, 0);         EQ(r.r, 2, "subfic"); EQ(r.xer, XER_CA, "subfic ca");
+    r = ARITHI("subfic", N7, 5, 0);         EQ(r.r, (uint32_t)-2, "subfic neg"); EQ(r.xer, 0, "subfic borrow");
+    r = ARITHI("mulli", N7, -3, 0);         EQ(r.r, (uint32_t)-21, "mulli");
 
-    r = ARITH2("mullw", V7, V3, 0);         EQ(r.r, 21, "mullw");
+    r = ARITH2("mullw", N7, N3, 0);         EQ(r.r, 21, "mullw");
     r = ARITH2("mullwo", 0x10000u, 0x10000u, 0); EQ(r.r, 0, "mullwo"); EQ(r.xer, XER_SO | XER_OV, "mullwo ov");
-    r = ARITH2("mullwo", VM1, VM1, 0);      EQ(r.xer, 0, "mullwo -1*-1 no ov");
-    r = ARITH2("mulhw", VM1, VM1, 0);       EQ(r.r, 0, "mulhw");
-    r = ARITH2("mulhwu", VM1, VM1, 0);      EQ(r.r, 0xFFFFFFFEu, "mulhwu");
-    r = ARITH2("mulhw", VMIN, V2, 0);       EQ(r.r, 0xFFFFFFFFu, "mulhw neg");
-    r = ARITH2("divw", (uint32_t)-7, V2, 0); EQ(r.r, (uint32_t)-3, "divw");
-    r = ARITH2("divwu", V7, V3, 0);         EQ(r.r, 2, "divwu");
-    r = ARITH2("divwo", V7, V0, 0);         EQ(r.xer, XER_SO | XER_OV, "divwo /0");
-    r = ARITH2("divwo", VMIN, VM1, 0);      EQ(r.xer, XER_SO | XER_OV, "divwo min/-1");
-    r = ARITH2("divwuo", V7, V0, 0);        EQ(r.xer, XER_SO | XER_OV, "divwuo /0");
-    r = ARITH2("divwo", V7, V2, 0);         EQ(r.xer, 0, "divwo ok");
+    r = ARITH2("mullwo", NM1, NM1, 0);      EQ(r.xer, 0, "mullwo -1*-1 no ov");
+    r = ARITH2("mulhw", NM1, NM1, 0);       EQ(r.r, 0, "mulhw");
+    r = ARITH2("mulhwu", NM1, NM1, 0);      EQ(r.r, 0xFFFFFFFEu, "mulhwu");
+    r = ARITH2("mulhw", NMIN, N2, 0);       EQ(r.r, 0xFFFFFFFFu, "mulhw neg");
+    r = ARITH2("divw", (uint32_t)-7, N2, 0); EQ(r.r, (uint32_t)-3, "divw");
+    r = ARITH2("divwu", N7, N3, 0);         EQ(r.r, 2, "divwu");
+    r = ARITH2("divwo", N7, N0, 0);         EQ(r.xer, XER_SO | XER_OV, "divwo /0");
+    r = ARITH2("divwo", NMIN, NM1, 0);      EQ(r.xer, XER_SO | XER_OV, "divwo min/-1");
+    r = ARITH2("divwuo", N7, N0, 0);        EQ(r.xer, XER_SO | XER_OV, "divwuo /0");
+    r = ARITH2("divwo", N7, N2, 0);         EQ(r.xer, 0, "divwo ok");
 
     /* compares */
     uint32_t cr;
-    __asm__ volatile("cmpw cr3,%1,%2\n mfcr %0" : "=r"(cr) : "r"(VM1), "r"(V1) : "cr3");
+    __asm__ volatile("cmpw cr3,%1,%2\n mfcr %0" : "=r"(cr) : "r"(NM1), "r"(N1) : "cr3");
     EQ((cr >> 16) & 0xF, 0x8, "cmpw lt");
-    __asm__ volatile("cmplw cr3,%1,%2\n mfcr %0" : "=r"(cr) : "r"(VM1), "r"(V1) : "cr3");
+    __asm__ volatile("cmplw cr3,%1,%2\n mfcr %0" : "=r"(cr) : "r"(NM1), "r"(N1) : "cr3");
     EQ((cr >> 16) & 0xF, 0x4, "cmplw gt");
-    __asm__ volatile("cmpwi cr7,%1,7\n mfcr %0" : "=r"(cr) : "r"(V7) : "cr7");
+    __asm__ volatile("cmpwi cr7,%1,7\n mfcr %0" : "=r"(cr) : "r"(N7) : "cr7");
     EQ(cr & 0xF, 0x2, "cmpwi eq");
-    __asm__ volatile("cmplwi cr1,%1,0xffff\n mfcr %0" : "=r"(cr) : "r"(V3) : "cr1");
+    __asm__ volatile("cmplwi cr1,%1,0xffff\n mfcr %0" : "=r"(cr) : "r"(N3) : "cr1");
     EQ((cr >> 24) & 0xF, 0x8, "cmplwi lt");
     mtxer(XER_SO);
-    __asm__ volatile("cmpw cr3,%1,%2\n mfcr %0" : "=r"(cr) : "r"(V1), "r"(V1) : "cr3");
+    __asm__ volatile("cmpw cr3,%1,%2\n mfcr %0" : "=r"(cr) : "r"(N1), "r"(N1) : "cr3");
     EQ((cr >> 16) & 0xF, 0x3, "cmpw eq so");
     mtxer(0);
 }
@@ -254,19 +319,19 @@ static void t_logic(void)
 #undef L2
     __asm__ volatile("extsb %0,%1" : "=r"(r) : "r"(0x1280u)); EQ(r, 0xFFFFFF80u, "extsb");
     __asm__ volatile("extsh %0,%1" : "=r"(r) : "r"(0x18000u)); EQ(r, 0xFFFF8000u, "extsh");
-    __asm__ volatile("cntlzw %0,%1" : "=r"(r) : "r"(V1)); EQ(r, 31, "cntlzw 1");
-    __asm__ volatile("cntlzw %0,%1" : "=r"(r) : "r"(V0)); EQ(r, 32, "cntlzw 0");
+    __asm__ volatile("cntlzw %0,%1" : "=r"(r) : "r"(N1)); EQ(r, 31, "cntlzw 1");
+    __asm__ volatile("cntlzw %0,%1" : "=r"(r) : "r"(N0)); EQ(r, 32, "cntlzw 0");
     uint32_t cr;
     __asm__ volatile("andi. %0,%2,0x0f0f\n mfcr %1" : "=r"(r), "=r"(cr) : "r"(0x1234u) : "cr0");
     EQ(r, 0x0204, "andi."); EQ(cr >> 28, 0x4, "andi. gt");
     __asm__ volatile("andis. %0,%2,0x00ff\n mfcr %1" : "=r"(r), "=r"(cr) : "r"(0x12345678u) : "cr0");
     EQ(r, 0x00340000u, "andis.");
-    __asm__ volatile("andi. %0,%2,0\n mfcr %1" : "=r"(r), "=r"(cr) : "r"(VM1) : "cr0");
+    __asm__ volatile("andi. %0,%2,0\n mfcr %1" : "=r"(r), "=r"(cr) : "r"(NM1) : "cr0");
     EQ(cr >> 28, 0x2, "andi. eq");
     __asm__ volatile("ori %0,%1,0x8001" : "=r"(r) : "r"(0x10000u)); EQ(r, 0x18001u, "ori");
     __asm__ volatile("oris %0,%1,0x8001" : "=r"(r) : "r"(1u)); EQ(r, 0x80010001u, "oris");
-    __asm__ volatile("xori %0,%1,0xffff" : "=r"(r) : "r"(VM1)); EQ(r, 0xFFFF0000u, "xori");
-    __asm__ volatile("xoris %0,%1,0xffff" : "=r"(r) : "r"(VM1)); EQ(r, 0x0000FFFFu, "xoris");
+    __asm__ volatile("xori %0,%1,0xffff" : "=r"(r) : "r"(NM1)); EQ(r, 0xFFFF0000u, "xori");
+    __asm__ volatile("xoris %0,%1,0xffff" : "=r"(r) : "r"(NM1)); EQ(r, 0x0000FFFFu, "xoris");
     __asm__ volatile("lis %0,0xabcd" : "=r"(r)); EQ(r, 0xABCD0000u, "lis");
     __asm__ volatile("li %0,-2" : "=r"(r)); EQ(r, 0xFFFFFFFEu, "li");
 }
@@ -278,22 +343,22 @@ static void t_rotate(void)
     __asm__ volatile("rlwinm %0,%1,8,0,31" : "=r"(r) : "r"(x)); EQ(r, 0x34567812u, "rotlwi");
     __asm__ volatile("rlwinm %0,%1,4,0,27" : "=r"(r) : "r"(x)); EQ(r, 0x23456780u, "slwi");
     __asm__ volatile("rlwinm %0,%1,28,4,31" : "=r"(r) : "r"(x)); EQ(r, 0x01234567u, "srwi");
-    __asm__ volatile("rlwinm %0,%1,0,28,3" : "=r"(r) : "r"(VM1)); EQ(r, 0xF000000Fu, "wrapped mask");
+    __asm__ volatile("rlwinm %0,%1,0,28,3" : "=r"(r) : "r"(NM1)); EQ(r, 0xF000000Fu, "wrapped mask");
     __asm__ volatile("rlwnm %0,%1,%2,0,31" : "=r"(r) : "r"(x), "r"(36u)); EQ(r, 0x23456781u, "rlwnm");
     r = 0xAAAAAAAAu;
     __asm__ volatile("rlwimi %0,%1,8,16,23" : "+r"(r) : "r"(0xFFu)); EQ(r, 0xAAAAFFAAu, "rlwimi");
-    __asm__ volatile("slw %0,%1,%2" : "=r"(r) : "r"(V1), "r"(31u)); EQ(r, 0x80000000u, "slw 31");
-    __asm__ volatile("slw %0,%1,%2" : "=r"(r) : "r"(V1), "r"(32u)); EQ(r, 0, "slw 32");
-    __asm__ volatile("srw %0,%1,%2" : "=r"(r) : "r"(VMIN), "r"(31u)); EQ(r, 1, "srw 31");
-    __asm__ volatile("srw %0,%1,%2" : "=r"(r) : "r"(VMIN), "r"(33u)); EQ(r, 0, "srw 33");
+    __asm__ volatile("slw %0,%1,%2" : "=r"(r) : "r"(N1), "r"(31u)); EQ(r, 0x80000000u, "slw 31");
+    __asm__ volatile("slw %0,%1,%2" : "=r"(r) : "r"(N1), "r"(32u)); EQ(r, 0, "slw 32");
+    __asm__ volatile("srw %0,%1,%2" : "=r"(r) : "r"(NMIN), "r"(31u)); EQ(r, 1, "srw 31");
+    __asm__ volatile("srw %0,%1,%2" : "=r"(r) : "r"(NMIN), "r"(33u)); EQ(r, 0, "srw 33");
 #define SRA(insn, a, n, wr, wx, what) do { \
         __asm__ volatile("mtxer %3\n " insn " %0,%2,%4\n mfxer %1" \
                          : "=&r"(r), "=&r"(xer) : "r"(a), "r"(0u), "r"(n) : "xer"); \
         EQ(r, wr, what); EQ(xer, wx, what " ca"); } while (0)
-    SRA("sraw", VMIN, 4u, 0xF8000000u, 0, "sraw");
+    SRA("sraw", NMIN, 4u, 0xF8000000u, 0, "sraw");
     SRA("sraw", 0x80000001u, 4u, 0xF8000000u, XER_CA, "sraw lost bits");
-    SRA("sraw", VM1, 40u, 0xFFFFFFFFu, XER_CA, "sraw 40 neg");
-    SRA("sraw", V5, 40u, 0, 0, "sraw 40 pos");
+    SRA("sraw", NM1, 40u, 0xFFFFFFFFu, XER_CA, "sraw 40 neg");
+    SRA("sraw", N5, 40u, 0, 0, "sraw 40 pos");
 #undef SRA
     __asm__ volatile("mtxer %2\n srawi %0,%3,1\n mfxer %1" : "=&r"(r), "=&r"(xer) : "r"(0u), "r"((uint32_t)-5) : "xer");
     EQ(r, (uint32_t)-3, "srawi"); EQ(xer, XER_CA, "srawi ca");
@@ -318,7 +383,7 @@ static void t_cr(void)
         : "=r"(cr) : "r"(0xA0000000u) : "cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7");
     EQ(cr, 0xA800005Au, "cr logic");
     __asm__ volatile("mtcrf 0xff,%1\n mtcrf 0x01,%2\n mfcr %0" : "=r"(cr)
-                     : "r"(0x12345678u), "r"(VM1) : "cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7");
+                     : "r"(0x12345678u), "r"(NM1) : "cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7");
     EQ(cr, 0x1234567Fu, "mtcrf");
     uint32_t xer;
     __asm__ volatile("mtxer %2\n mcrxr cr2\n mfcr %0\n mfxer %1" : "=r"(cr), "=r"(xer)
@@ -341,13 +406,13 @@ static void t_branch(void)
     EQ(n, 5, "bdnz not taken");
     /* bdnzf: decrement and branch while the condition is false */
     __asm__ volatile("li %0,0\n cmpwi cr1,%1,1\n mtctr %2\n"
-                     "1: addi %0,%0,1\n bdnzf 4*cr1+eq,1b" : "=&r"(n) : "r"(V1), "r"(4u) : "ctr", "cr1");
+                     "1: addi %0,%0,1\n bdnzf 4*cr1+eq,1b" : "=&r"(n) : "r"(N1), "r"(4u) : "ctr", "cr1");
     EQ(n, 1, "bdnzf stops on the condition");
     uint32_t pc, lbl;
     __asm__ volatile("bcl 20,31,1f\n 1: mflr %0\n lis %1,1b@ha\n addi %1,%1,1b@l"
                      : "=r"(pc), "=b"(lbl) :: "lr");
     EQ(pc, lbl, "bcl 20,31 gives the pc");
-    EQ(leaf_ptr(V7), 21, "bctrl");
+    EQ(leaf_ptr(N7), 21, "bctrl");
     __asm__ volatile("li %0,0\n mtctr %1\n bdnzlr\n li %0,9" : "=&r"(n) : "r"(1u) : "ctr");
     EQ(n, 9, "bdnzlr falls through");
     uint32_t taken = 0;
@@ -456,64 +521,77 @@ void user_priv(void);
 void user_badspr(void);
 __asm__(".text\n"
         "user_priv:   mfmsr 4\n sc\n"
-        "user_badspr: mfspr 4,256\n sc\n");
+        "user_badspr: mfspr 4,0\n sc\n");
 
 static void t_exceptions(void)
 {
     uint32_t pc;
     trap_n = 0;
     __asm__ volatile("lis %0,1f@ha\n addi %0,%0,1f@l\n 1: tw 4,%0,%0" : "=&b"(pc) :: "memory");
-    expect_trap(0x700, "tw");
-    EQ(last_srr0, pc, "tw srr0"); EQ(last_srr1 & 0xFFFF0000u, 0x00020000u, "srr1 trap");
+    expect_trap(V_PROG, "tw");
+    EQ(last_srr0, pc, "tw srr0"); EQ(trap_why[0], WHY_TRAP, "reason: trap");
+#ifdef PPC_BOOKE
+    EQ(last_srr1, mfmsr(), "srr1 holds the msr");
+#else
     EQ(last_srr1 & 0xFFFFu, mfmsr(), "srr1 holds the msr");
-    __asm__ volatile("twi 4,%0,0" :: "r"(V1));
+#endif
+    __asm__ volatile("twi 4,%0,0" :: "r"(N1));
     EQ(trap_n, 0, "twi false");
-    __asm__ volatile("twgti %0,0" :: "r"(V1));
-    expect_trap(0x700, "twgti");
+    __asm__ volatile("twgti %0,0" :: "r"(N1));
+    expect_trap(V_PROG, "twgti");
     __asm__ volatile("lis %0,1f@ha\n addi %0,%0,1f@l\n sc\n 1:" : "=&b"(pc) :: "memory");
-    expect_trap(0xC00, "sc"); EQ(last_srr0, pc, "sc srr0 is the next instruction");
+    expect_trap(V_SC, "sc"); EQ(last_srr0, pc, "sc srr0 is the next instruction");
     __asm__ volatile(".long 0");
-    expect_trap(0x700, "illegal"); EQ(last_srr1 & 0xFFFF0000u, 0x00080000u, "srr1 illegal");
+    expect_trap(V_PROG, "illegal"); EQ(trap_why[0], WHY_ILL, "reason: illegal");
     __asm__ volatile(".long 0xe8030000");   /* ld r0,0(r3): 64-bit only */
-    expect_trap(0x700, "64-bit instruction");
+    expect_trap(V_PROG, "64-bit instruction");
 
     /* machine check: a load nothing answers */
     __asm__ volatile("lis %0,1f@ha\n addi %0,%0,1f@l\n lis 9,0xe000\n 1: lwz 9,0(9)"
                      : "=&b"(pc) :: "r9", "memory");
-    expect_trap(0x200, "machine check"); EQ(last_srr0, pc, "machine check srr0");
-    EQ(mfmsr() & MSR_ME, MSR_ME, "rfi restores ME");
+    expect_trap(V_MC, "machine check"); EQ(last_srr0, pc, "machine check srr0");
+    EQ(mfmsr() & MSR_ME, MSR_ME, "the return restores ME");
 
     /* alignment */
     static volatile uint32_t al[4] __attribute__((aligned(16)));
     __asm__ volatile("lwarx 5,0,%0" :: "r"((uintptr_t)al + 1) : "r5", "memory");
-    expect_trap(0x600, "lwarx misaligned");
+    expect_trap(V_ALIGN, "lwarx misaligned");
     EQ(last_dar, (uint32_t)(uintptr_t)al + 1, "alignment dar");
+#ifdef PPC_BOOKE
+    EQ(last_dsisr, 0, "esr: a load");
+    __asm__ volatile("stwcx. 5,0,%0" :: "r"((uintptr_t)al + 2) : "cr0", "memory");
+    expect_trap(V_ALIGN, "stwcx. misaligned");
+    EQ(last_dsisr, 0x00800000u, "esr: a store");
+#else
     EQ(last_dsisr, 5u << 5, "alignment dsisr (lwarx: RT)");
+#endif
     __asm__ volatile("lmw 30,2(%0)" :: "b"(al) : "r30", "r31", "memory");
-    expect_trap(0x600, "lmw misaligned");
+    expect_trap(V_ALIGN, "lmw misaligned");
+#ifndef PPC_BOOKE
     EQ(last_dsisr & 0x3FE0u, 0x1C00u | (30u << 5), "alignment dsisr (lmw)");
+#endif
 
     /* FP unavailable */
     uint32_t m = mfmsr();
     mtmsr(m & ~MSR_FP);
     __asm__ volatile("fmr 0,0");
     mtmsr(m);
-    expect_trap(0x800, "fp unavailable");
+    expect_trap(V_FPU, "fp unavailable");
 
     /* problem state: a privileged instruction, then sc back */
     user_test = 1;
     enter_user((uint32_t)(uintptr_t)user_priv, 0);
     EQ(trap_n, 2, "user: two traps");
-    EQ(trap_srr1[0] & 0xFFFF0000u, 0x00040000u, "srr1 privileged");
-    EQ(trap_srr1[0] & MSR_PR, MSR_PR, "from problem state");
-    EQ(last_vec, 0xC00, "user: sc returns");
+    EQ(trap_why[0], WHY_PRIV, "reason: privileged");
+    EQ(last_vec, V_SC, "user: sc returns");
+    EQ(last_srr1 & MSR_PR, MSR_PR, "sc came from problem state");
     EQ(mfmsr() & MSR_PR, 0, "back in supervisor state");
     trap_n = 0;
     /* an SPR the processor does not have */
     user_test = 1;
     enter_user((uint32_t)(uintptr_t)user_badspr, 0);
     EQ(trap_n, 2, "user spr: two traps");
-    EQ(trap_srr1[0] & 0xFFFF0000u, 0x00080000u, "srr1 illegal spr");
+    EQ(trap_why[0], WHY_ILL, "reason: illegal spr");
     trap_n = 0;
 }
 
@@ -522,6 +600,7 @@ static void t_exceptions(void)
 static uint32_t mftb(void) { uint32_t v; __asm__ volatile("mftb %0" : "=r"(v)); return v; }
 static uint32_t mftbu(void) { uint32_t v; __asm__ volatile("mftbu %0" : "=r"(v)); return v; }
 
+#ifndef PPC_BOOKE
 static void t_timer(void)
 {
     uint32_t t0 = mftb();
@@ -563,6 +642,79 @@ static void t_timer(void)
     EQ(dec_n, 1, "taken when enabled");
 }
 
+#else
+static void t_timer(void)
+{
+    uint32_t t0 = mftb();
+    for (volatile int i = 0; i < 100; i++) {}
+    EQ(mftb() > t0, 1, "time base advances");
+    mtspr(284, 0);
+    mtspr(285, 0x12u);
+    EQ(mftbu(), 0x12, "tbu written");
+    uint32_t m = mfmsr();
+
+    /* the decrementer stops at 0 and sets TSR[DIS] */
+    mtspr(340, 0);
+    mtspr(336, 0xFFFFFFFFu);
+    mtspr(22, 50);
+    for (volatile int i = 0; i < 200; i++) {}
+    EQ(mfspr(22), 0, "dec stopped at 0");
+    EQ(mfspr(336) & 0x08000000u, 0x08000000u, "TSR[DIS]");
+    dec_n = 0;
+    mtspr(340, 0x04000000u);                    /* TCR[DIE]: the status is a level */
+    mtmsr(m | MSR_EE);
+    mtmsr(m);
+    EQ(dec_n, 1, "decrementer interrupt from the latched status");
+    EQ(mfspr(336) & 0x08000000u, 0, "the handler cleared DIS");
+
+    /* auto-reload from DECAR */
+    dec_n = 0;
+    mtspr(54, 300);
+    mtspr(340, 0x04400000u);                    /* DIE, ARE */
+    mtspr(22, 300);
+    mtmsr(m | MSR_EE);
+    for (volatile int i = 0; i < 100000 && dec_n < 3; i++) {}
+    mtmsr(m);
+    EQ(dec_n, 3, "auto-reload: three interrupts");
+    EQ(mfspr(22) != 0, 1, "still counting");
+    mtspr(340, 0);
+    mtspr(22, 0);
+    mtspr(336, 0x08000000u);
+
+    /* MSR[WE]: wait for the decrementer */
+    dec_n = 0;
+    mtspr(340, 0x04000000u);
+    mtspr(22, 5000);
+    __asm__ volatile("mtmsr %0\n isync" :: "r"(m | MSR_EE | MSR_WE) : "memory");
+    mtmsr(m);
+    EQ(dec_n, 1, "we wakes on the decrementer");
+    EQ(mfmsr() & MSR_WE, 0, "we cleared");
+    mtspr(340, 0);
+
+    /* the fixed-interval timer (TCR[FP] = 0: time-base bit 12) */
+    fit_n = 0;
+    mtspr(336, 0x04000000u);
+    mtspr(340, 0x00800000u);                    /* FIE */
+    __asm__ volatile("mtmsr %0\n isync" :: "r"(m | MSR_EE | MSR_WE) : "memory");
+    mtmsr(m);
+    EQ(fit_n, 1, "fixed-interval timer interrupt");
+    mtspr(340, 0);
+
+    /* the watchdog (TCR[WP] = 0: bit 16): ENW, then WIS and its critical interrupt */
+    wdt_n = 0;
+    mtspr(336, 0xC0000000u);
+    mtspr(340, 0x08000000u);                    /* WIE */
+    for (int k = 0; k < 3 && !wdt_n; k++)
+        __asm__ volatile("mtmsr %0\n isync" :: "r"(m | MSR_CE | MSR_WE) : "memory");
+    mtmsr(m);
+    EQ(wdt_n, 1, "watchdog interrupt");
+    mtspr(340, 0);
+    mtspr(336, 0xC0000000u);
+    EQ(mfspr(336) & 0xC0000000u, 0, "watchdog status clear (FIS keeps counting)");
+}
+
+#endif
+
 static void t_external(void)
 {
     ext_n = 0;
@@ -576,6 +728,15 @@ static void t_external(void)
 }
 
 /* ---- the MMU --------------------------------------------------------------- */
+
+static inline uint32_t ld(uint32_t a) { uint32_t v; __asm__ volatile("lwz %0,0(%1)" : "=r"(v) : "b"(a) : "memory"); return v; }
+static inline void st(uint32_t a, uint32_t v) { __asm__ volatile("stw %0,0(%1)" :: "r"(v), "b"(a) : "memory"); }
+#define PW(a) (*(volatile uint32_t *)(uintptr_t)(a))
+
+void user_load(void);
+__asm__(".text\n user_load: li 4,0\n lwz 4,0(3)\n sc\n");
+
+#ifndef PPC_BOOKE
 
 #define HTAB 0x00400000u
 static void pte_set(uint32_t ea, uint32_t vsid, uint32_t pa, uint32_t flags, int secondary, int slot)
@@ -597,12 +758,7 @@ static volatile uint32_t *pte_w1(uint32_t ea, uint32_t vsid, int secondary, int 
     return (volatile uint32_t *)(uintptr_t)(HTAB | ((hash & 0x3FF) << 6) | (8u * slot) | 4);
 }
 
-static inline uint32_t ld(uint32_t a) { uint32_t v; __asm__ volatile("lwz %0,0(%1)" : "=r"(v) : "b"(a) : "memory"); return v; }
-static inline void st(uint32_t a, uint32_t v) { __asm__ volatile("stw %0,0(%1)" :: "r"(v), "b"(a) : "memory"); }
-#define PW(a) (*(volatile uint32_t *)(uintptr_t)(a))
 
-void user_load(void);
-__asm__(".text\n user_load: li 4,0\n lwz 4,0(3)\n sc\n");
 
 static void t_mmu(void)
 {
@@ -690,6 +846,127 @@ static void t_mmu(void)
     mtspr(528, 0); mtspr(536, 0); mtspr(538, 0);
 }
 
+#else
+#define MAS0(tlb, esel) ((uint32_t)(tlb) << 28 | (uint32_t)(esel) << 16)
+#define MAS1_V     0x80000000u
+#define MAS1_IPROT 0x40000000u
+#define MAS1_TS    0x00001000u
+#define MAS1_TID(t) ((uint32_t)(t) << 16)
+#define TSIZE(n)   ((uint32_t)(n) << 8)          /* 4^n KiB */
+enum { P_SR = 0x01, P_UR = 0x02, P_SW = 0x04, P_UW = 0x08, P_SX = 0x10, P_UX = 0x20 };
+
+static void tlb_write(uint32_t mas0, uint32_t mas1, uint32_t mas2, uint32_t mas3)
+{
+    mtspr(624, mas0);
+    mtspr(625, mas1);
+    mtspr(626, mas2);
+    mtspr(627, mas3);
+    mtspr(944, 0);
+    __asm__ volatile("tlbwe\n isync" ::: "memory");
+}
+
+static uint32_t tlbsx_mas1(uint32_t ea)
+{
+    __asm__ volatile("tlbsx 0,%0" :: "r"(ea) : "memory");
+    return mfspr(625);
+}
+
+static void t_mmu(void)
+{
+    PW(0x00500000) = 0x11111111u;
+    PW(0x00501000) = 0x22222222u;
+    PW(0x00502000) = 0x33333333u;
+    PW(0x00502008) = 0x88888888u;
+    PW(0x00505000) = 0x3860002Au;                           /* li r3,42 */
+    PW(0x00505004) = 0x4E800020u;                           /* blr */
+    PW(0x00505FFC) = 0x01020304u;
+    PW(0x00507000) = 0x77777777u;
+    PW(0x0050F000) = 0xF0F0F0F0u;
+    mtspr(628, TSIZE(1));                                   /* MAS4: 4 KiB pages into TLB0 */
+    tlb_write(MAS0(0, 0), MAS1_V | TSIZE(1), 0x10000000u, 0x00500000u | P_SR | P_SW | P_UR | P_UW);
+    tlb_write(MAS0(0, 0), MAS1_V | TSIZE(1), 0x10001000u, 0x00501000u | P_SR | P_UR);
+    tlb_write(MAS0(0, 0), MAS1_V | TSIZE(1), 0x10005000u, 0x00505000u | P_SR | P_SX);
+    tlb_write(MAS0(0, 0), MAS1_V | TSIZE(1), 0x10006000u, 0x00505000u | P_SR);
+    tlb_write(MAS0(0, 0), MAS1_V | MAS1_TID(5) | TSIZE(1), 0x10007000u, 0x00507000u | P_SR);
+    tlb_write(MAS0(0, 0), MAS1_V | MAS1_TS | TSIZE(1), 0x10008000u, 0x00502000u | P_SR);
+    tlb_write(MAS0(1, 4), MAS1_V | TSIZE(3), 0x20000000u, 0x00500000u | P_SR);   /* 64 KiB, TLB1 */
+    trap_n = 0;
+
+    EQ(ld(0x10000000), 0x11111111u, "a TLB0 page");
+    mtspr(624, MAS0(0, 0));
+    mtspr(626, 0x10000000u);
+    __asm__ volatile("tlbre" ::: "memory");
+    EQ(mfspr(625), MAS1_V | TSIZE(1), "tlbre MAS1");
+    EQ(mfspr(626), 0x10000000u, "tlbre MAS2");
+    EQ(mfspr(627), 0x00500000u | P_SR | P_SW | P_UR | P_UW, "tlbre MAS3");
+    mtspr(630, 0);                                          /* MAS6: PID 0, space 0 */
+    EQ(tlbsx_mas1(0x10000010u) & MAS1_V, MAS1_V, "tlbsx finds it");
+    EQ(mfspr(624) & 0x30000000u, 0, "in TLB0");
+    EQ(tlbsx_mas1(0x10003000u) & MAS1_V, 0, "tlbsx misses");
+    EQ(mfspr(626) & 0xFFFFF000u, 0x10003000u, "miss: MAS2 has the page");
+    EQ(ld(0x2000F000), 0xF0F0F0F0u, "a 64 KiB TLB1 page");
+
+    EQ(ld(0x10001000), 0x22222222u, "read-only page reads");
+    EQ(trap_n, 0, "no faults so far");
+    st(0x10001000, 1);
+    expect_trap(V_DSI, "store to a read-only page");
+    EQ(last_dsisr, 0x00800000u, "esr: store"); EQ(last_dar, 0x10001000u, "dear");
+    (void)ld(0x10003008);
+    expect_trap(V_DTLB, "data TLB error");
+    EQ(last_dar, 0x10003008u, "dear");
+    EQ(mfspr(626) & 0xFFFFF000u, 0x10003000u, "MAS2 EPN"); EQ(mfspr(625), MAS1_V | TSIZE(1), "MAS1 defaults");
+    tlb_reload = 1;
+    EQ(ld(0x10003008), 0x88888888u, "reloaded from the MAS registers");
+    EQ(trap_n, 1, "one TLB error");
+    trap_n = 0;
+    EQ(ld(0x10005FFE), 0x03043860u, "misaligned across pages");
+
+    uint32_t (*fn)(void) = (uint32_t (*)(void))0x10005000u;
+    EQ(fn(), 42, "code through a page");
+    fn = (uint32_t (*)(void))0x10006000u;
+    (void)fn();
+    expect_trap(V_ISI, "no execute permission"); EQ(last_srr0, 0x10006000u, "isi srr0");
+    fn = (uint32_t (*)(void))0x10004000u;
+    (void)fn();
+    expect_trap(V_ITLB, "instruction TLB error");
+
+    (void)ld(0x10007000);
+    expect_trap(V_DTLB, "TID 5 does not match PID 0");
+    mtspr(48, 5);
+    EQ(ld(0x10007000), 0x77777777u, "PID 5");
+    mtspr(48, 0);
+    uint32_t v, m = mfmsr();
+    __asm__ volatile("mtmsr %1\n isync\n lwz %0,0(%2)\n mtmsr %3\n isync"
+                     : "=&r"(v) : "r"(m | MSR_DS), "b"(0x10008000u), "r"(m) : "memory");
+    EQ(v, 0x33333333u, "address space 1 with MSR[DS]");
+    (void)ld(0x10008000);
+    expect_trap(V_DTLB, "not in address space 0");
+
+    user_test = 1;
+    enter_user((uint32_t)(uintptr_t)user_load, 0x10001000u);
+    EQ(trap_n, 1, "user: readable page");
+    EQ(user_r4, 0x22222222u, "user load");
+    trap_n = 0;
+    user_test = 1;
+    enter_user((uint32_t)(uintptr_t)user_load, 0x10006000u);
+    EQ(trap_n, 2, "user: supervisor-only page, then sc");
+    EQ(user_r4, 0, "the load did not happen");
+    trap_n = 0;
+
+    __asm__ volatile("tlbivax 0,%0\n tlbsync\n msync" :: "r"(0x10000000u) : "memory");
+    (void)ld(0x10000000);
+    expect_trap(V_DTLB, "gone after tlbivax");
+    __asm__ volatile("tlbivax 0,%0\n tlbsync\n msync" :: "r"(0xAu) : "memory");   /* TLB1, all */
+    (void)ld(0x2000F000);
+    expect_trap(V_DTLB, "TLB1 invalidated");
+    EQ(ld(0x00500000), 0x11111111u, "but IPROT entries stay");
+    mtspr(1012, 0x4);                                       /* MMUCSR0: flash TLB0 */
+    (void)ld(0x10001000);
+    expect_trap(V_DTLB, "TLB0 flash invalidated");
+}
+
+#endif
+
 /* ---- floating point ------------------------------------------------------- */
 
 static inline uint64_t dbits(double d) { union { double d; uint64_t u; } x = { .d = d }; return x.u; }
@@ -703,7 +980,7 @@ static inline uint32_t sbits(double d) { uint32_t v; __asm__ volatile("stfs %1,0
 static inline uint32_t iwbits(double d) { uint32_t v; __asm__ volatile("stfiwx %1,0,%0" :: "r"(&v), "f"(d) : "memory"); return v; }
 
 static volatile double D1 = 1.0, D2 = 2.0, D3 = 3.0, D4 = 4.0, D10 = 10.0, DH = 0.25, D15 = 1.5,
-                       D225 = 2.25, DZ = 0.0, DM1 = -1.0, D27 = 2.7, D25 = 2.5, D35 = 3.5;
+                       D225 = 2.25, DZ = 0.0, DNEG1 = -1.0, D27 = 2.7, D25 = 2.5, D35 = 3.5;
 
 static void t_fpu(void)
 {
@@ -723,11 +1000,11 @@ static void t_fpu(void)
     EQ(iwbits(F1("fctiwz", -D27)), 0xFFFFFFFEu, "fctiwz");
     EQ(iwbits(F1("fctiw", D25)), 2, "fctiw ties to even");
     EQ(iwbits(F1("fctiw", D35)), 4, "fctiw 3.5");
-    EQ64(dbits(F1("fabs", DM1)), 0x3FF0000000000000ull, "fabs");
+    EQ64(dbits(F1("fabs", DNEG1)), 0x3FF0000000000000ull, "fabs");
     EQ64(dbits(F1("fneg", D1)), 0xBFF0000000000000ull, "fneg");
     EQ64(dbits(F1("fnabs", D1)), 0xBFF0000000000000ull, "fnabs");
     EQ64(dbits(F1("fmr", D2)), 0x4000000000000000ull, "fmr");
-    EQ64(dbits(F3("fsel", DM1, D2, D3)), 0x4008000000000000ull, "fsel negative");
+    EQ64(dbits(F3("fsel", DNEG1, D2, D3)), 0x4008000000000000ull, "fsel negative");
     EQ64(dbits(F3("fsel", DZ, D2, D3)), 0x4000000000000000ull, "fsel zero");
     EQ64(dbits(F1("fres", D4)), 0x3FD0000000000000ull, "fres");
     EQ64(dbits(F1("frsqrte", D4)), 0x3FE0000000000000ull, "frsqrte");
@@ -799,8 +1076,8 @@ static void t_fpu(void)
     mtmsr(m | MSR_FE0 | MSR_FE1);
     __asm__ volatile("fsub %0,%1,%1" : "+f"(t) : "f"(inf));
     mtmsr(m);
-    expect_trap(0x700, "fp enabled exception");
-    EQ(last_srr1 & 0xFFFF0000u, 0x00100000u, "srr1 fp");
+    expect_trap(V_PROG, "fp enabled exception");
+    EQ(trap_why[0], WHY_FP, "reason: fp enabled");
     __asm__ volatile("mtfsb0 24\n mtfsb1 31");
     EQ(fpscr() & 0xFFu, 0x01u, "mtfsb0/1");
     fpscr_set(0);
@@ -813,6 +1090,7 @@ static void t_fpu(void)
     fpscr_set(0);
 }
 
+#ifndef PPC_BOOKE
 /* ---- trace ---------------------------------------------------------------- */
 
 static void t_trace(void)
@@ -846,10 +1124,73 @@ static void t_ident(void)
     EQ(mfspr(26) + mfspr(27), 0x3100u, "srr0/srr1");
 }
 
+#else
+/* ---- debug events ------------------------------------------------------------- */
+
+static void t_trace(void)
+{
+    uint32_t m = mfmsr();
+    trace_n = 0;
+    mtspr(308, 0x48000000u);                    /* DBCR0: IDM, ICMP */
+    __asm__ volatile("mtmsr %0\n nop\n nop\n nop\n mtmsr %1" :: "r"(m | MSR_DE), "r"(m) : "memory");
+    EQ(trace_n, 3, "instruction complete");
+    EQ(dbsr_last & 0x08000000u, 0x08000000u, "DBSR[ICMP]");
+    trace_n = 0;
+    mtspr(308, 0x44000000u);                    /* IDM, BRT */
+    __asm__ volatile("mtmsr %0\n nop\n b 1f\n 1: nop\n mtmsr %1" :: "r"(m | MSR_DE), "r"(m) : "memory");
+    EQ(trace_n, 1, "branch taken");
+    trace_n = 0;
+    trap_n = 0;
+    mtspr(308, 0x41000000u);                    /* IDM, TRAP */
+    __asm__ volatile("mtmsr %0\n tw 31,0,0\n mtmsr %1" :: "r"(m | MSR_DE), "r"(m) : "memory");
+    EQ(trace_n, 1, "trap debug event"); EQ(trap_n, 0, "not a program interrupt");
+    EQ(dbsr_last & 0x01000000u, 0x01000000u, "DBSR[TRAP]");
+    mtspr(308, 0);
+}
+
+/* ---- identification and plain SPRs ---------------------------------------- */
+
+static void t_ident(void)
+{
+    EQ(mfspr(287), 0x00FE0000u, "pvr: Book E reference identity");
+    EQ(mfspr(286), 0, "pir");
+    mtspr(272, 0x100u); mtspr(273, 0x101u); mtspr(274, 0x102u); mtspr(275, 0x103u);
+    EQ(mfspr(272) + mfspr(273) + mfspr(274) + mfspr(275), 0x406u, "sprg0-3");
+    mtspr(276, 4u); mtspr(277, 5u); mtspr(278, 6u); mtspr(279, 7u);
+    EQ(mfspr(260) + mfspr(261) * 10 + mfspr(262) * 100 + mfspr(263) * 1000, 7654, "sprg4-7, user view");
+    mtspr(256, 0xABCDu); EQ(mfspr(256), 0xABCDu, "usprg0");
+    mtspr(1008, 0x8000C000u); EQ(mfspr(1008), 0x8000C000u, "hid0 storage");
+    mtspr(61, 0x1234u); EQ(mfspr(61), 0x1234u, "dear");
+    mtspr(62, 0x00800000u); EQ(mfspr(62), 0x00800000u, "esr");
+    EQ(mfspr(415), 0x1000u, "ivor15");
+    EQ(mfspr(1015), 0x00480B44u, "mmucfg");
+    EQ(mfspr(688), 0x04110200u, "tlb0cfg");
+    EQ(mfspr(689), 0x101AC010u, "tlb1cfg");
+
+    trap_n = 0;
+    uint32_t v;
+    __asm__ volatile("mfdcr %0,0x10" : "=r"(v));
+    expect_trap(V_PROG, "no DCRs on this board"); EQ(trap_why[0], WHY_ILL, "illegal");
+    __asm__ volatile("cmpw %1,%1\n isel %0,%1,%2,2" : "=r"(v) : "r"(7u), "r"(9u) : "cr0");
+    EQ(v, 7, "isel taken");
+    __asm__ volatile("cmpw %1,%2\n isel %0,%1,%2,2" : "=r"(v) : "r"(7u), "r"(9u) : "cr0");
+    EQ(v, 9, "isel not taken");
+    __asm__ volatile("wrteei 1");
+    EQ(mfmsr() & MSR_EE, MSR_EE, "wrteei 1");
+    __asm__ volatile("wrtee %0" :: "r"(0u));
+    EQ(mfmsr() & MSR_EE, 0, "wrtee 0");
+}
+
+#endif
+
 int main(void);
 int main(void)
 {
+#ifdef PPC_BOOKE
+    puts_("UAM self-test (ppc32 Book E, ppc-ref -o model=booke)\n");
+#else
     puts_("UAM self-test (ppc32, ppc-ref)\n");
+#endif
     run("arith", t_arith);
     run("logic", t_logic);
     run("rotate", t_rotate);

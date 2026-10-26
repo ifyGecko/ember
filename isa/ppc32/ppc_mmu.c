@@ -13,6 +13,8 @@
  * translation sets the PTE's referenced bit, and its changed bit on a store,
  * in memory.
  *
+ * (Book E translation is in ppc_booke.c.)
+ *
  * Like a hardware TLB, successful translations are kept (the software TLB below)
  * until tlbie, tlbia, or a change of the segment registers, SDR1, a BAT or the
  * MSR's translation and privilege bits; software that edits a PTE invalidates it
@@ -138,7 +140,8 @@ static uam_status xlate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store, bool 
         }
         out->paddr = pa;
         if (te)
-            *te = (ppc_tlb_entry){ .vpage = ea >> 12, .ppage = pa >> 12, .write_ok = acc == 2 };
+            *te = (ppc_tlb_entry){ .vpage = ea >> 12, .ppage = pa >> 12, .read_ok = true,
+                                   .write_ok = acc == 2 };
         return UAM_OK;
     }
 
@@ -175,13 +178,16 @@ static uam_status xlate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store, bool 
     uint32_t nw1 = w1 | 0x100 | (store ? 0x80 : 0);
     if (nw1 != w1)
         uam_bus_write(cpu->bus, pte_pa + 4, 4, UAM_ACC_BE | UAM_ACC_PHYS, nw1);
-    *te = (ppc_tlb_entry){ .vpage = ea >> 12, .ppage = w1 >> 12,
+    *te = (ppc_tlb_entry){ .vpage = ea >> 12, .ppage = w1 >> 12, .read_ok = true,
                            .write_ok = acc == 2 && (nw1 & 0x80) };
     return UAM_OK;
 }
 
 uam_status ppc_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_xlate *out)
 {
+    if (ppc_booke(ppc_st(cpu)))
+        return ppc_booke_translate(cpu, (uint32_t)vaddr, kind == UAM_XLATE_FETCH,
+                                   kind == UAM_XLATE_STORE, kind == UAM_XLATE_DEBUG, out);
     return xlate(cpu, (uint32_t)vaddr, kind == UAM_XLATE_FETCH, kind == UAM_XLATE_STORE,
                  kind == UAM_XLATE_DEBUG, out);
 }
@@ -189,7 +195,9 @@ uam_status ppc_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_
 bool ppc_peek_insn(uam_cpu *cpu, uint32_t pc, uint32_t *insn)
 {
     uam_xlate xl = { 0 };
-    return xlate(cpu, pc, true, false, true, &xl) == UAM_OK && pa_read32(cpu, (uint32_t)xl.paddr, insn);
+    uam_status st = ppc_booke(ppc_st(cpu)) ? ppc_booke_translate(cpu, pc, true, false, true, &xl)
+                                           : xlate(cpu, pc, true, false, true, &xl);
+    return st == UAM_OK && pa_read32(cpu, (uint32_t)xl.paddr, insn);
 }
 
 /*

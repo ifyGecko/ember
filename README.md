@@ -14,9 +14,11 @@ MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
 boards with a GIC, x86-64 (real, protected, virtual-8086 and long mode, SMM, x87/MMX/
 SSE2) on the `x86_64-ref` board, which also boots UEFI firmware and legacy BIOS images, and 32-bit
-PowerPC (the user instruction set with the FPU; the operating environment of the 6xx/7xx/74xx
-class: MSR, exceptions, decrementer and time base, BATs, segments and the hashed page table;
-configurable CPU model and implementation SPRs) on the `ppc-ref` board - run by a
+PowerPC (the user instruction set with the FPU, and either privileged architecture as the CPU
+model selects: the classic one of the 6xx/7xx/74xx - BATs, segments and the hashed page table -
+or Book E - IVORs, critical and machine-check classes, TCR/TSR timers and watchdog, TLB arrays
+with the MAS interface; implementation SPRs, DCRs and TLB interfaces left to the board) on the
+`ppc-ref` board - run by a
 reference interpreter or, with `--jit`, a native x86-64 JIT
 with block chaining (a block optimizer feeds both). Every reference board takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
@@ -57,6 +59,7 @@ build/uam-run --raw-base 0x80000000 path/to/image.bin
 build/uam-run -b arm-ref build/firmware-arm/selftest-thumb.elf   # ARMv7, Thumb-2 code
 build/uam-run -b armeb-ref build/firmware-arm/selftest-arm-be.elf # big-endian (BE8)
 build/uam-run -b ppc-ref build/firmware-ppc/selftest.elf        # 32-bit PowerPC
+build/uam-run -b ppc-ref -o model=booke build/firmware-ppc/selftest-booke.elf  # Book E
 build/uam-run -b ppc-ref --raw-base 0xfff00000 --entry 0xfff00100 boot.bin   # a PowerPC boot ROM
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
@@ -276,8 +279,9 @@ isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
 isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_fpu.c), MMU
-                   (ppc_mmu.c: BATs, segments, hashed page table) and operating environment
-                   (ppc_system.c: MSR, SPRs, exceptions, decrementer, time base)
+                   (ppc_mmu.c: BATs, segments, hashed page table), operating environment
+                   (ppc_system.c: MSR, SPRs, exceptions, decrementer, time base) and the Book E
+                   model (ppc_booke.c: interrupts, timers, TLB arrays, MAS registers)
 isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87, MMX,
                    SSE/SSE2) and system architecture (segmentation, call gates, hardware
                    task switching, the I/O permission bitmap, paging, SMM with the Intel 64
@@ -298,7 +302,8 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, ABI), host s
 tests/firmware/    bare-metal RV32 self-test and network-test images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
 tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
-tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test, multiprocessor test and fuzz target
+tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E builds), multiprocessor
+                   test and fuzz target
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

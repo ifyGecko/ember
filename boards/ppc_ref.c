@@ -18,8 +18,14 @@
  * reads its number in PIR (SPR 1023), and they interrupt each other through the
  * doorbells, processor n's on its external interrupt input. The UART interrupts
  * processor 0.
+ *
+ * -o model=booke makes the processors Book E (uam_ppc_booke_ref): the reset
+ * address is 0xfffffffc, inside the boot page the reference identity maps at reset
+ * (TLB1 entry 0, 0xfffff000), and a watchdog reset resets the machine (a core
+ * reset, TCR[WRC] = 1, only the processors). -o model=classic is the default.
  */
 #include <stdlib.h>
+#include <string.h>
 
 #include "uam/boards.h"
 #include "uam/dev/ipi.h"
@@ -40,6 +46,13 @@
 #define PPC_IPI_IRQ    UAM_PPC_IRQ_INT(1)
 #define PPC_MAX_CPUS   8u
 
+/* The watchdog's reset: WRC 1 resets the processors, 2 and 3 the whole machine. */
+static void watchdog_reset(void *ctx, uam_cpu *cpu, unsigned kind)
+{
+    (void)cpu;
+    uam_machine_reset_sink(ctx, kind == 1 ? UAM_RESET_CPU : UAM_RESET_SYSTEM, 1);
+}
+
 static uam_status ppc_ref_build(uam_machine *m, const uam_board_config *cfg)
 {
     uam_status st = uam_machine_init(m, &uam_isa_ppc32);
@@ -55,6 +68,21 @@ static uam_status ppc_ref_build(uam_machine *m, const uam_board_config *cfg)
     }
     if ((st = uam_machine_add_cpus(m, ncpu - 1)) != UAM_OK)
         return st;
+    const char *model = uam_board_config_option(cfg, "model");
+    bool booke = model && !strcmp(model, "booke");
+    if (model && !booke && strcmp(model, "classic")) {
+        uam_log(UAM_LOG_ERROR, m->board_name, "model=%s: classic or booke", model);
+        return UAM_ERR_INVALID;
+    }
+    if (booke) {
+        m->reset_pc = 0xfffffffcu;
+        for (unsigned i = 0; i < ncpu; i++) {
+            uam_cpu *cpu = uam_machine_cpu(m, i);
+            if ((st = uam_ppc_configure(cpu, &uam_ppc_booke_ref)) != UAM_OK
+                || (st = uam_ppc_set_reset_sink(cpu, watchdog_reset, m)) != UAM_OK)
+                return st;
+        }
+    }
 
     if ((st = uam_bus_map_ram(&m->bus, "ram", PPC_RAM_BASE,
                               cfg->ram_size ? cfg->ram_size : PPC_RAM_SIZE)) != UAM_OK
@@ -106,6 +134,6 @@ static uam_status ppc_ref_build(uam_machine *m, const uam_board_config *cfg)
 const uam_board uam_board_ppc_ref = {
     .name = "ppc-ref",
     .description = "32-bit PowerPC reference board (NS16550A UART, test finisher, boot ROM; "
-                   "-o cpus=N)",
+                   "-o cpus=N, -o model=classic|booke)",
     .build = ppc_ref_build,
 };

@@ -65,6 +65,7 @@ static const uam_regdesc ppc_regs[] = {
 
 const uam_ppc_config uam_ppc_ref = {
     .name        = "ppc32-ref",
+    .model       = UAM_PPC_MODEL_OEA,
     .pvr         = 0x00FF0000u,   /* version 0x00FF: no implementation, revision 0 */
     .fpu         = true,
     .bat_pairs   = 4,
@@ -73,10 +74,42 @@ const uam_ppc_config uam_ppc_ref = {
     .tb_div      = 1,
 };
 
+/* Book E page sizes of the MAS v1 interface: 4^n KiB, 4 KiB .. 1 GiB. */
+#define SIZES_4N_4K_1G 0x0000000055555000ull
+
+const uam_ppc_config uam_ppc_booke_ref = {
+    .name        = "ppc32-booke-ref",
+    .model       = UAM_PPC_MODEL_BOOKE,
+    .pvr         = 0x00FE0000u,   /* version 0x00FE: no implementation, revision 0 */
+    .fpu         = true,
+    .isel        = true,
+    .cache_block = 32,
+    .tb_div      = 1,
+    .booke = {
+        .tlb = {
+            { .entries = 512, .ways = 4, .page_sizes = UINT64_C(1) << 12 },
+            { .entries = 16, .ways = 16, .page_sizes = SIZES_4N_4K_1G, .iprot = true },
+        },
+        .pids         = 1,
+        .mcheck_mcsrr = true,
+        .fit_bit      = { 12, 16, 20, 24 },
+        .wdt_bit      = { 16, 20, 24, 28 },
+        .boot = {
+            .valid = true, .iprot = true, .size_log2 = 12, .epn = 0xFFFFF000u,
+            .rpn = 0xFFFFF000u, .wimge = 0x0A,   /* I, G */
+            .perm = UAM_PPC_TLB_SR | UAM_PPC_TLB_SW | UAM_PPC_TLB_SX,
+        },
+    },
+};
+
 static bool valid_config(const uam_ppc_config *c)
 {
-    return (c->bat_pairs == 4 || c->bat_pairs == 8) && c->cache_block >= 16
-        && c->cache_block <= 128 && !(c->cache_block & (c->cache_block - 1)) && c->tb_div >= 1;
+    if (c->cache_block < 16 || c->cache_block > 128 || (c->cache_block & (c->cache_block - 1))
+        || c->tb_div < 1)
+        return false;
+    if (c->model == UAM_PPC_MODEL_BOOKE)
+        return ppc_booke_config_ok(c);
+    return c->model == UAM_PPC_MODEL_OEA && (c->bat_pairs == 4 || c->bat_pairs == 8);
 }
 
 uam_status uam_ppc_configure(uam_cpu *cpu, const uam_ppc_config *cfg)
@@ -99,6 +132,8 @@ uam_status uam_ppc_set_spr_ops(uam_cpu *cpu, const uam_ppc_spr_ops *ops, void *c
 /* Every PowerPC hart, for the tlbie broadcast (harts share a bus within a machine). */
 static ppc_state *all_harts;
 
+ppc_state *ppc_harts(void) { return all_harts; }
+
 /* ------------------------------------------------------------------------ */
 /* MSR                                                                       */
 /* ------------------------------------------------------------------------ */
@@ -116,6 +151,10 @@ static void dec_timer_update(uam_cpu *cpu);
 void ppc_msr_write(uam_cpu *cpu, uint32_t v)
 {
     ppc_state *s = ppc_st(cpu);
+    if (ppc_booke(s)) {
+        ppc_booke_msr_write(cpu, v);
+        return;
+    }
     uint32_t mask = MSR_POW | MSR_EE | MSR_PR | MSR_ME | MSR_FE0 | MSR_SE | MSR_BE | MSR_FE1
                   | MSR_IP | MSR_IR | MSR_DR | MSR_RI | (s->cfg.fpu ? MSR_FP : 0);
     uint32_t old = s->s.msr;
@@ -134,12 +173,18 @@ void ppc_msr_write(uam_cpu *cpu, uint32_t v)
 /* Time base and decrementer                                                 */
 /* ------------------------------------------------------------------------ */
 
-static uint64_t ticks_now(uam_cpu *cpu)
+uint64_t ppc_ticks_now(uam_cpu *cpu)
 {
     return uam_sched_now(cpu->sched) / ppc_st(cpu)->cfg.tb_div;
 }
 
-static uint64_t tb_now(uam_cpu *cpu) { return ticks_now(cpu) + ppc_st(cpu)->s.tb_bias; }
+#define ticks_now ppc_ticks_now
+
+uint64_t ppc_tb_now(uam_cpu *cpu) { return ticks_now(cpu) + ppc_st(cpu)->s.tb_bias; }
+
+#define tb_now ppc_tb_now
+
+void ppc_tb_set(uam_cpu *cpu, uint64_t tb) { ppc_st(cpu)->s.tb_bias = tb - ticks_now(cpu); }
 
 static uint32_t dec_now(uam_cpu *cpu)
 {
@@ -181,6 +226,10 @@ static void dec_timer_update(uam_cpu *cpu)
 static void dec_fire(void *ctx)
 {
     uam_cpu *cpu = ctx;
+    if (ppc_booke(ppc_st(cpu))) {
+        ppc_booke_timer_fire(ctx);
+        return;
+    }
     dec_timer_update(cpu);
     uam_cpu_request_exit(cpu);
 }
@@ -219,20 +268,29 @@ static void enter(uam_cpu *cpu, uint32_t vec, uint32_t srr0, uint32_t extra)
     ppc_msr_write(cpu, msr & keep);
 }
 
+/* The processor stops for good: a machine check while MSR[ME] is clear. */
+void ppc_checkstop(uam_cpu *cpu, uint32_t pc)
+{
+    ppc_state *s = ppc_st(cpu);
+    uam_log(UAM_LOG_ERROR, "ppc32", "cpu %u: checkstop (machine check with MSR[ME] = 0) at 0x%08x",
+            cpu->hartid, pc);
+    s->s.checkstop = true;
+    cpu->pc = pc;                /* stopped at the instruction (or boundary) concerned */
+    cpu->waiting = true;
+    if (cpu->sched) {
+        uam_timer_cancel(cpu->sched, &s->dec_timer);
+        uam_timer_cancel(cpu->sched, &s->fit_timer);
+        uam_timer_cancel(cpu->sched, &s->wdt_timer);
+    }
+}
+
 /* A machine check: taken with MSR[ME] set, else the processor checkstops. */
 static void machine_check(uam_cpu *cpu, uint32_t srr0)
 {
-    ppc_state *s = ppc_st(cpu);
-    if (s->s.msr & MSR_ME) {
+    if (ppc_st(cpu)->s.msr & MSR_ME)
         enter(cpu, VEC_MCHECK, srr0, 0);
-        return;
-    }
-    uam_log(UAM_LOG_ERROR, "ppc32", "cpu %u: checkstop (machine check with MSR[ME] = 0) at 0x%08x",
-            cpu->hartid, srr0);
-    s->s.checkstop = true;
-    cpu->pc = srr0;              /* stopped at the instruction (or boundary) concerned */
-    cpu->waiting = true;
-    dec_timer_update(cpu);
+    else
+        ppc_checkstop(cpu, srr0);
 }
 
 /* DSISR of an alignment exception: the instruction's opcode and register fields. */
@@ -266,6 +324,10 @@ static void alignment(uam_cpu *cpu, uint32_t pc, uint32_t ea)
 static void ppc_take_exception(uam_cpu *cpu, const uam_exception *e)
 {
     ppc_state *s = ppc_st(cpu);
+    if (ppc_booke(s)) {
+        ppc_booke_take_exception(cpu, e);
+        return;
+    }
     const uint32_t pc = (uint32_t)e->pc, va = (uint32_t)e->tval;
     switch (e->kind) {
     case UAM_EXC_TRAP:
@@ -315,6 +377,8 @@ static bool ext_pending(const ppc_state *s) { return s->intlines != 0; }
 static bool ppc_irq_take(uam_cpu *cpu)
 {
     ppc_state *s = ppc_st(cpu);
+    if (ppc_booke(s))
+        return ppc_booke_irq_take(cpu);
     const uint32_t pc = (uint32_t)cpu->pc;
     if (s->s.checkstop)
         return false;
@@ -358,6 +422,8 @@ static uint64_t ppc_irq_lines(uam_cpu *cpu) { return ppc_st(cpu)->taken_lines; }
 static bool ppc_irq_wakeup(uam_cpu *cpu)
 {
     const ppc_state *s = ppc_st(cpu);
+    if (ppc_booke(s))
+        return ppc_booke_irq_wakeup(cpu);
     if (s->s.checkstop)
         return false;
     if (s->s.sreset_pending || s->s.mcp_pending)
@@ -381,6 +447,8 @@ static void ppc_irq_input(uam_cpu *cpu, unsigned line, int level)
         if (level && !s->mcp_level)
             s->s.mcp_pending = true;
         s->mcp_level = level;
+    } else if (line == UAM_PPC_IRQ_CINT) {
+        s->cint_level = level;
     }
 }
 
@@ -405,7 +473,7 @@ static uint32_t *bat_reg(ppc_state *s, unsigned spr)
 
 /* An SPR the architecture does not define: the board's, else plain storage
  * (supervisor) or illegal (problem state). */
-static uam_status impl_read(uam_cpu *cpu, unsigned spr, uint64_t *val)
+uam_status ppc_impl_read(uam_cpu *cpu, unsigned spr, uint64_t *val)
 {
     ppc_state *s = ppc_st(cpu);
     if (s->spr_ops && s->spr_ops->read) {
@@ -422,7 +490,7 @@ static uam_status impl_read(uam_cpu *cpu, unsigned spr, uint64_t *val)
     return UAM_OK;
 }
 
-static uam_status impl_write(uam_cpu *cpu, unsigned spr, uint32_t v)
+uam_status ppc_impl_write(uam_cpu *cpu, unsigned spr, uint32_t v)
 {
     ppc_state *s = ppc_st(cpu);
     if (s->spr_ops && s->spr_ops->write) {
@@ -442,6 +510,20 @@ static uam_status ppc_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     if (id == PPC_SR_MSR) {
         *val = s->s.msr;
         return UAM_OK;
+    }
+    if (ppc_booke(s)) {
+        uam_status st = ppc_booke_sysreg_read(cpu, id, val);
+        if (st != UAM_ERR_INVALID)
+            return st;
+        switch (id) {   /* what Book E shares with the classic architecture */
+        case SPR_SRR0:  *val = s->s.srr0; return UAM_OK;
+        case SPR_SRR1:  *val = s->s.srr1; return UAM_OK;
+        case SPR_SPRG0: case SPR_SPRG0 + 1: case SPR_SPRG0 + 2: case SPR_SPRG3:
+            *val = s->s.sprg[id - SPR_SPRG0];
+            return UAM_OK;
+        case SPR_PVR:   *val = s->cfg.pvr; return UAM_OK;
+        default:        return ppc_impl_read(cpu, id, val);
+        }
     }
     if (id >= PPC_SR_SR0 && id < PPC_SR_SR0 + 16) {
         *val = s->s.sr[id - PPC_SR_SR0];
@@ -467,7 +549,7 @@ static uam_status ppc_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     case SPR_TBU_R: case SPR_TBU_W: *val = (uint32_t)(tb_now(cpu) >> 32); break;
     case SPR_PVR:   *val = s->cfg.pvr; break;
     case SPR_PIR:   *val = cpu->hartid; break;
-    default:        return impl_read(cpu, id, val);
+    default:        return ppc_impl_read(cpu, id, val);
     }
     return UAM_OK;
 }
@@ -479,6 +561,20 @@ static uam_status ppc_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     if (id == PPC_SR_MSR) {
         ppc_msr_write(cpu, v);
         return UAM_OK;
+    }
+    if (ppc_booke(s)) {
+        uam_status st = ppc_booke_sysreg_write(cpu, id, v);
+        if (st != UAM_ERR_INVALID)
+            return st;
+        switch (id) {
+        case SPR_SRR0:  s->s.srr0 = v; return UAM_OK;
+        case SPR_SRR1:  s->s.srr1 = v; return UAM_OK;
+        case SPR_SPRG0: case SPR_SPRG0 + 1: case SPR_SPRG0 + 2: case SPR_SPRG3:
+            s->s.sprg[id - SPR_SPRG0] = v;
+            return UAM_OK;
+        case SPR_PVR:   return UAM_OK;
+        default:        return ppc_impl_write(cpu, id, v);
+        }
     }
     if (id >= PPC_SR_SR0 && id < PPC_SR_SR0 + 16) {
         s->s.sr[id - PPC_SR_SR0] = v;
@@ -523,7 +619,7 @@ static uam_status ppc_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     case SPR_PVR: case SPR_PIR:
         break;                       /* read only */
     default:
-        return impl_write(cpu, id, v);
+        return ppc_impl_write(cpu, id, v);
     }
     return UAM_OK;
 }
@@ -537,7 +633,10 @@ static uint64_t helper_rfi(void *env, uint64_t a, uint64_t b, uint64_t c, uam_st
     (void)a; (void)b; (void)c; (void)st;
     uam_cpu *cpu = env;
     ppc_state *s = ppc_st(cpu);
-    ppc_msr_write(cpu, (s->s.msr & ~MSR_SRR1_MASK) | (s->s.srr1 & MSR_SRR1_MASK));
+    if (ppc_booke(s))   /* Book E: SRR1 is the whole MSR */
+        ppc_msr_write(cpu, s->s.srr1);
+    else
+        ppc_msr_write(cpu, (s->s.msr & ~MSR_SRR1_MASK) | (s->s.srr1 & MSR_SRR1_MASK));
     return s->s.srr0 & ~3u;
 }
 
@@ -658,6 +757,24 @@ const uam_helper_desc ppc_helpers[PPC_HELPER__COUNT] = {
                             .effect = RW | UAM_HELPER_MAY_FAULT, .fn = helper_stswx },
     [PPC_HELPER_TRACE]  = { .name = "ppc_trace", .n_args = 0, .result_width = 0, .effect = RW,
                             .fn = helper_trace },
+    [PPC_HELPER_RFCI]   = { .name = "ppc_rfci", .n_args = 0, .result_width = 32, .effect = RW,
+                            .fn = ppc_helper_rfci },
+    [PPC_HELPER_RFMCI]  = { .name = "ppc_rfmci", .n_args = 0, .result_width = 32, .effect = RW,
+                            .fn = ppc_helper_rfmci },
+    [PPC_HELPER_RFDI]   = { .name = "ppc_rfdi", .n_args = 0, .result_width = 32, .effect = RW,
+                            .fn = ppc_helper_rfdi },
+    [PPC_HELPER_TLBWE]  = { .name = "ppc_tlbwe", .n_args = 1, .arg_width = { 32 }, .result_width = 0,
+                            .effect = RW | UAM_HELPER_MAY_FAULT, .fn = ppc_helper_tlbwe },
+    [PPC_HELPER_TLBRE]  = { .name = "ppc_tlbre", .n_args = 1, .arg_width = { 32 }, .result_width = 0,
+                            .effect = RW | UAM_HELPER_MAY_FAULT, .fn = ppc_helper_tlbre },
+    [PPC_HELPER_TLBSX]  = { .name = "ppc_tlbsx", .n_args = 2, .arg_width = { 32, 32 }, .result_width = 0,
+                            .effect = RW | UAM_HELPER_MAY_FAULT, .fn = ppc_helper_tlbsx },
+    [PPC_HELPER_TLBIVAX] = { .name = "ppc_tlbivax", .n_args = 1, .arg_width = { 32 }, .result_width = 0,
+                             .effect = RW, .fn = ppc_helper_tlbivax },
+    [PPC_HELPER_MFDCR]  = { .name = "ppc_mfdcr", .n_args = 1, .arg_width = { 32 }, .result_width = 32,
+                            .effect = RW | UAM_HELPER_MAY_FAULT, .fn = ppc_helper_mfdcr },
+    [PPC_HELPER_MTDCR]  = { .name = "ppc_mtdcr", .n_args = 2, .arg_width = { 32, 32 }, .result_width = 0,
+                            .effect = RW | UAM_HELPER_MAY_FAULT, .fn = ppc_helper_mtdcr },
 };
 
 /* ------------------------------------------------------------------------ */
@@ -673,6 +790,8 @@ static uam_status ppc_init(uam_cpu *cpu)
     s->cfg = uam_ppc_ref;
     s->cpu = cpu;
     uam_timer_init(&s->dec_timer, dec_fire, cpu);
+    uam_timer_init(&s->fit_timer, ppc_booke_timer_fire, cpu);
+    uam_timer_init(&s->wdt_timer, ppc_booke_timer_fire, cpu);
     ppc_tlb_flush(s);
     s->next = all_harts;
     all_harts = s;
@@ -682,8 +801,11 @@ static uam_status ppc_init(uam_cpu *cpu)
 static void ppc_fini(uam_cpu *cpu)
 {
     ppc_state *s = ppc_st(cpu);
-    if (cpu->sched)
+    if (cpu->sched) {
         uam_timer_cancel(cpu->sched, &s->dec_timer);
+        uam_timer_cancel(cpu->sched, &s->fit_timer);
+        uam_timer_cancel(cpu->sched, &s->wdt_timer);
+    }
     for (ppc_state **pp = &all_harts; *pp; pp = &(*pp)->next) {
         if (*pp == s) {
             *pp = s->next;
@@ -709,10 +831,19 @@ static void ppc_reset(uam_cpu *cpu, uint64_t entry)
      * nothing until software writes it. */
     if (cpu->sched)
         s->s.tb_bias = (uint64_t)0 - ticks_now(cpu);
-    s->s.msr = s->cfg.reset_ip ? MSR_IP : 0;
-    s->s.dec_next = UINT64_MAX;     /* nothing to catch up on */
-    dec_write(cpu, 0xFFFFFFFFu);
-    cpu->priv = priv_of(s->s.msr);
+    if (ppc_booke(s)) {
+        ppc_booke_reset(cpu);       /* MSR 0, the boot page mapped, timers stopped */
+        cpu->priv = ppc_booke_priv(s);
+    } else {
+        if (cpu->sched) {
+            uam_timer_cancel(cpu->sched, &s->fit_timer);
+            uam_timer_cancel(cpu->sched, &s->wdt_timer);
+        }
+        s->s.msr = s->cfg.reset_ip ? MSR_IP : 0;
+        s->s.dec_next = UINT64_MAX;     /* nothing to catch up on */
+        dec_write(cpu, 0xFFFFFFFFu);
+        cpu->priv = priv_of(s->s.msr);
+    }
     uam_cpu_xlate_changed(cpu);
     cpu->pc = entry;
     cpu->waiting = false;
@@ -749,6 +880,10 @@ static void ppc_dump_state(uam_cpu *cpu, FILE *out)
             (unsigned long long)uam_cpu_reg_read(cpu, PPC_LR_OFF, 32),
             (unsigned long long)uam_cpu_reg_read(cpu, PPC_CTR_OFF, 32), xer_value(cpu),
             (unsigned long long)uam_cpu_reg_read(cpu, PPC_FPSCR_OFF, 32));
+    if (ppc_booke(s)) {
+        ppc_booke_dump(cpu, out);
+        return;
+    }
     fprintf(out, "srr0=%08x srr1=%08x dar=%08x dsisr=%08x dec=%08x tb=%016llx sdr1=%08x\n",
             s->s.srr0, s->s.srr1, s->s.dar, s->s.dsisr, dec_now(cpu),
             (unsigned long long)tb_now(cpu), s->s.sdr1);
@@ -763,6 +898,7 @@ static void ppc_save(uam_cpu *cpu, uam_state_writer *w)
     const ppc_state *s = ppc_st(cpu);
     const ppc_sys *y = &s->s;
     uam_state_put_u32(w, s->cfg.pvr);
+    uam_state_put_u32(w, s->cfg.model);
     uam_state_put_u32(w, s->cfg.bat_pairs);
     uam_state_put_u8(w, s->intlines);
     uam_state_put_bool(w, s->sreset_level);
@@ -789,6 +925,7 @@ static void ppc_save(uam_cpu *cpu, uam_state_writer *w)
     for (unsigned n = 0; n < 1024; n++)
         uam_state_put_u32(w, s->impl_spr[n]);
     uam_state_put_timer(w, &s->dec_timer);
+    ppc_booke_save(cpu, w);
 }
 
 static void ppc_restore(uam_cpu *cpu, uam_state_reader *r)
@@ -796,6 +933,7 @@ static void ppc_restore(uam_cpu *cpu, uam_state_reader *r)
     ppc_state *s = ppc_st(cpu);
     ppc_sys *y = &s->s;
     uam_state_expect_u32(r, s->cfg.pvr, "PowerPC PVR");
+    uam_state_expect_u32(r, s->cfg.model, "PowerPC model");
     uam_state_expect_u32(r, s->cfg.bat_pairs, "PowerPC BAT pairs");
     s->intlines = uam_state_get_u8(r);
     s->sreset_level = uam_state_get_bool(r);
@@ -822,9 +960,10 @@ static void ppc_restore(uam_cpu *cpu, uam_state_reader *r)
     for (unsigned n = 0; n < 1024; n++)
         s->impl_spr[n] = uam_state_get_u32(r);
     uam_state_get_timer(r, &s->dec_timer);
+    ppc_booke_restore(cpu, r);
     s->hfault = PPC_HF_NONE;
     ppc_tlb_flush(s);
-    cpu->priv = priv_of(y->msr);
+    cpu->priv = ppc_booke(s) ? ppc_booke_priv(s) : priv_of(y->msr);
 }
 
 /* ------------------------------------------------------------------------ */

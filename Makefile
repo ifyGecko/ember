@@ -87,7 +87,8 @@ MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c
-PPC_SRC     := isa/ppc32/ppc_lift.c isa/ppc32/ppc_fpu.c isa/ppc32/ppc_mmu.c isa/ppc32/ppc_system.c
+PPC_SRC     := isa/ppc32/ppc_lift.c isa/ppc32/ppc_fpu.c isa/ppc32/ppc_mmu.c isa/ppc32/ppc_booke.c \
+               isa/ppc32/ppc_system.c
 X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
                isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
@@ -139,6 +140,7 @@ FW_ARM_BE := $(BUILD)/firmware-arm/selftest-arm-be.elf
 FW_THUMB_BE := $(BUILD)/firmware-arm/selftest-thumb-be.elf
 FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 FW_PPC    := $(BUILD)/firmware-ppc/selftest.elf
+FW_PPC_BOOKE := $(BUILD)/firmware-ppc/selftest-booke.elf
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
@@ -336,6 +338,8 @@ ppc-test: $(RUN) firmware-ppc
 	$(RUN) -b ppc-ref --jit --stats $(FW_PPC) < /dev/null
 	$(RUN) -b ppc-ref -o cpus=4 $(dir $(FW_PPC))smptest.elf < /dev/null
 	$(RUN) -b ppc-ref -o cpus=4 --jit $(dir $(FW_PPC))smptest.elf < /dev/null
+	$(RUN) -b ppc-ref -o model=booke --stats $(FW_PPC_BOOKE) < /dev/null
+	$(RUN) -b ppc-ref -o model=booke --jit --stats $(FW_PPC_BOOKE) < /dev/null
 
 # The gdb stub over the remote protocol, on a four-processor machine.
 gdb-test: $(RUN) firmware-x86
@@ -373,6 +377,8 @@ snapshot-test: $(RUN) firmware firmware-mips firmware-arm firmware-x86 firmware-
 	sh tests/snapshot/snapshot-check.sh $(RUN) ppc-ref $(FW_PPC) 777 7300 21000 39800 40400 41000
 	sh tests/snapshot/snapshot-check.sh $(RUN) ppc-ref $(dir $(FW_PPC))smptest.elf 50000 120001 \
 	    -- -o cpus=4 --quantum 97
+	sh tests/snapshot/snapshot-check.sh $(RUN) ppc-ref $(FW_PPC_BOOKE) 1 8000 8400 9500 11900 13000 14850 \
+	    -- -o model=booke
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
@@ -384,6 +390,7 @@ cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
 	sh tests/cov/cov-check.sh $(RUN) arm-ref $(FW_THUMB)
 	sh tests/cov/cov-check.sh $(RUN) armeb-ref $(FW_ARM_BE)
 	sh tests/cov/cov-check.sh $(RUN) ppc-ref $(FW_PPC)
+	sh tests/cov/cov-check.sh $(RUN) ppc-ref $(FW_PPC_BOOKE) -- -o model=booke
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.

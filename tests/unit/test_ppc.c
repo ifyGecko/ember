@@ -4,7 +4,10 @@
  * checkstop), the wired-OR external interrupt sources, the decrementer while
  * MSR[EE] is clear, the implementation SPR handlers (uam_ppc_set_spr_ops), and the
  * CPU model (uam_ppc_configure: no FPU, eight BAT pairs, the cache block size, the
- * time base rate, the exception prefix at reset, the PVR).
+ * time base rate, the exception prefix at reset, the PVR), and for the Book E model:
+ * the watchdog's reset sink and TSR[WRS], the extended timer period select, the
+ * critical input, machine checks through CSRR0/1, the DCR and TLB handlers and the
+ * TLB entry API.
  *
  * Each test runs tiny hand-encoded programs on a bare machine (RAM at 0).
  */
@@ -351,6 +354,207 @@ static void test_config(void)
     uam_machine_fini(&m);
 }
 
+/* ---- Book E -------------------------------------------------------------------- */
+
+#define IVPR 63u
+#define IVOR(n) (400u + (n))
+#define TCR 340u
+#define TSR 336u
+#define CSRR0 58u
+#define MSR_CE 0x20000u
+
+/* A Book E hart (cfg, else the reference identity) with RAM mapped by TLB1 entry 1
+ * (1 MiB at 0, every permission), IVOR n at 0x100 * (n + 1) (each a spin), and the
+ * program at 0x2000. */
+static void booke_machine(uam_machine *m, const uam_ppc_config *cfg, uint32_t msr)
+{
+    CHECK(uam_machine_init(m, &uam_isa_ppc32) == UAM_OK, "machine init");
+    CHECK(uam_bus_map_ram(&m->bus, "ram", 0, 1 << 20) == UAM_OK, "map ram");
+    CHECK(uam_ppc_configure(&m->cpu, cfg ? cfg : &uam_ppc_booke_ref) == UAM_OK, "configure");
+    for (uint32_t v = 0x100; v <= 0x1000; v += 0x100)
+        put32(m, v, B_SELF);
+    put32(m, 0x2000, B_SELF);
+    uam_machine_reset(m, 0x2000);
+    const uam_ppc_tlbe ram = { .valid = true, .size_log2 = 20, .epn = 0, .rpn = 0, .perm = 0x3F };
+    CHECK(uam_ppc_tlb_write(&m->cpu, 1, 1, &ram) == UAM_OK, "map RAM");
+    sysw(m, IVPR, 0);
+    for (unsigned n = 0; n < 16; n++)
+        sysw(m, IVOR(n), 0x100 * (n + 1));
+    sysw(m, SR_MSR, msr);
+}
+
+typedef struct resets { unsigned n, kind; uam_machine *m; } resets;
+
+static void on_reset(void *ctx, uam_cpu *cpu, unsigned kind)
+{
+    (void)cpu;
+    resets *r = ctx;
+    r->n++;
+    r->kind = kind;
+}
+
+static void test_booke_timers(void)
+{
+    uam_machine m;
+    resets r = { 0 };
+    booke_machine(&m, NULL, MSR_ME);
+    CHECK(uam_ppc_set_reset_sink(&m.cpu, on_reset, &r) == UAM_OK, "reset sink");
+    sysw(&m, TCR, 2u << 28);                 /* WRC = 2, WP = 0: time-base bit 16 */
+    EQ64(uam_sched_count(&m.sched), 1, "a reset can happen: the watchdog is timed");
+    run(&m, 1u << 16);
+    EQ64(r.n, 0, "first time-out: not yet");
+    EQ64(sysr(&m, TSR) >> 30, 0x2, "TSR[ENW]");
+    run(&m, 1u << 17);
+    EQ64(sysr(&m, TSR) >> 30, 0x3, "second: WIS");
+    run(&m, (1u << 17) + 100);
+    EQ64(r.n, 1, "third: the reset");
+    EQ64(r.kind, 2, "of the kind WRC says");
+    EQ64((sysr(&m, TSR) >> 28) & 3, 2, "TSR[WRS]");
+    sysw(&m, TCR, 0);
+    EQ64((sysr(&m, TCR) >> 28) & 3, 2, "WRC stays set until reset");
+    uam_machine_reset(&m, 0x2000);
+    EQ64((sysr(&m, TSR) >> 28) & 3, 2, "WRS survives the reset");
+    EQ64((sysr(&m, TCR) >> 28) & 3, 0, "WRC does not");
+    uam_machine_fini(&m);
+
+    /* The extended period select: time-base bit 63 - (WPEXT || WP). */
+    uam_ppc_config c = uam_ppc_booke_ref;
+    c.booke.period_ext = true;
+    booke_machine(&m, &c, MSR_ME | MSR_CE);
+    unsigned sel = 63 - 9;                   /* bit 9: a rise every 1024 ticks */
+    sysw(&m, TSR, 0xFFFFFFFFu);
+    sysw(&m, TCR, (sel & 3) << 30 | (sel >> 2) << 17 | 1u << 27);   /* WP, WPEXT, WIE */
+    run(&m, 3000);
+    EQ64(m.cpu.pc, 0xD00, "watchdog interrupt (IVOR12) after two rises");
+    EQ64(sysr(&m, CSRR0), 0x2000, "critical class: CSRR0");
+    uam_machine_fini(&m);
+}
+
+static void test_booke_inputs(void)
+{
+    uam_machine m;
+    booke_machine(&m, NULL, MSR_ME);
+    uam_cpu_irq_sink(&m.cpu, UAM_PPC_IRQ_CINT, 1);
+    run(&m, 10);
+    EQ64(m.cpu.pc, 0x2000, "critical input masked by CE");
+    sysw(&m, SR_MSR, MSR_ME | MSR_CE);
+    run(&m, 10);
+    EQ64(m.cpu.pc, 0x100, "critical input (IVOR0)");
+    EQ64(sysr(&m, CSRR0), 0x2000, "CSRR0");
+    EQ64(sysr(&m, SR_MSR) & (MSR_CE | MSR_ME), MSR_ME, "CE cleared, ME kept");
+    uam_cpu_irq_sink(&m.cpu, UAM_PPC_IRQ_CINT, 0);
+    uam_cpu_irq_sink(&m.cpu, UAM_PPC_IRQ_SRESET, 1);
+    m.cpu.pc = 0x2000;
+    run(&m, 10);
+    EQ64(m.cpu.pc, 0x2000, "no soft-reset interrupt in Book E");
+    uam_machine_fini(&m);
+
+    /* Machine checks through MCSRR0/1 (reference) or the critical pair. */
+    for (int mcsrr = 1; mcsrr >= 0; mcsrr--) {
+        uam_ppc_config c = uam_ppc_booke_ref;
+        c.booke.mcheck_mcsrr = mcsrr;
+        booke_machine(&m, &c, MSR_ME);
+        uam_cpu_irq_sink(&m.cpu, UAM_PPC_IRQ_MCP, 1);
+        run(&m, 10);
+        EQ64(m.cpu.pc, 0x200, "machine check (IVOR1)");
+        EQ64(sysr(&m, mcsrr ? 570u : CSRR0), 0x2000, mcsrr ? "MCSRR0" : "CSRR0");
+        uint64_t v = 0;
+        EQ64(m.cpu.isa->sysreg_read(&m.cpu, 570, &v) == UAM_OK && v == 0x2000, mcsrr,
+             "MCSRR0 only with mcheck_mcsrr");
+        uam_machine_fini(&m);
+    }
+}
+
+static uam_status dcr_read(void *ctx, uam_cpu *cpu, unsigned dcrn, uint32_t *val)
+{
+    (void)ctx; (void)cpu;
+    if (dcrn != 0x10)
+        return UAM_ERR_ILLEGAL;
+    *val = 0xD0D0;
+    return UAM_OK;
+}
+
+static uam_status dcr_write(void *ctx, uam_cpu *cpu, unsigned dcrn, uint32_t val)
+{
+    (void)cpu;
+    *(uint32_t *)ctx = dcrn << 16 | (val & 0xFFFF);
+    return UAM_OK;
+}
+
+static const uam_ppc_dcr_ops dcr_ops = { .read = dcr_read, .write = dcr_write };
+
+/* A board's own tlbwe: rS holds an EPN, rA an index into TLB1 (the API underneath). */
+static uam_status my_tlbwe(void *ctx, uam_cpu *cpu, uint32_t insn)
+{
+    (void)ctx;
+    uam_ppc_tlbe e = { .valid = true, .size_log2 = 12, .epn = uam_ppc_gpr(cpu, (insn >> 21) & 31),
+                       .rpn = 0x3000, .perm = UAM_PPC_TLB_SR };
+    return uam_ppc_tlb_write(cpu, 1, uam_ppc_gpr(cpu, (insn >> 16) & 31), &e);
+}
+
+static const uam_ppc_tlb_ops tlb_ops = { .tlbwe = my_tlbwe };
+
+static void test_booke_board(void)
+{
+    uam_machine m;
+    uint32_t written = 0;
+    booke_machine(&m, NULL, MSR_ME);
+    CHECK(uam_ppc_set_dcr_ops(&m.cpu, &dcr_ops, &written) == UAM_OK, "dcr ops");
+    uam_cpu_reg_write(&m.cpu, 4 * 4, 32, 0x1234);
+    put32(&m, 0x2000, 0x7C700286u);   /* mfdcr r3,0x10 */
+    put32(&m, 0x2004, 0x7C900386u);   /* mtdcr 0x10,r4 */
+    put32(&m, 0x2008, 0x7CB10286u);   /* mfdcr r5,0x11: refused */
+    put32(&m, 0x200C, B_SELF);
+    run(&m, 10);
+    EQ64(gpr(&m, 3), 0xD0D0, "mfdcr");
+    EQ64(written, 0x101234, "mtdcr");
+    EQ64(m.cpu.pc, 0x700, "a refused DCR: program interrupt");
+    uam_machine_fini(&m);
+
+    booke_machine(&m, NULL, MSR_ME);
+    CHECK(uam_ppc_set_tlb_ops(&m.cpu, &tlb_ops, NULL) == UAM_OK, "tlb ops");
+    put32(&m, 0x3000, 0xCAFEF00Du);
+    uam_cpu_reg_write(&m.cpu, 5 * 4, 32, 0x40000000u);   /* EPN */
+    uam_cpu_reg_write(&m.cpu, 6 * 4, 32, 7);             /* index */
+    uam_cpu_reg_write(&m.cpu, 4 * 4, 32, 0x40000000u);
+    put32(&m, 0x2000, 0x7CA607A4u);   /* tlbwe r5,r6 (the board's form) */
+    put32(&m, 0x2004, 0x80640000u);   /* lwz r3,0(r4) */
+    put32(&m, 0x2008, B_SELF);
+    run(&m, 10);
+    EQ64(gpr(&m, 3), 0xCAFEF00Du, "the board's tlbwe mapped the page");
+    unsigned a = 9, k = 9;
+    CHECK(uam_ppc_tlb_find(&m.cpu, 0x40000123u, 0, 0, &a, &k) == UAM_OK && a == 1 && k == 7,
+          "tlb_find: TLB1 entry 7");
+    uam_ppc_tlbe e;
+    CHECK(uam_ppc_tlb_read(&m.cpu, 1, 7, &e) == UAM_OK && e.epn == 0x40000000u && e.rpn == 0x3000,
+          "tlb_read");
+    CHECK(uam_ppc_tlb_find(&m.cpu, 0x50000000u, 0, 0, &a, &k) == UAM_ERR_XLATE, "nothing there");
+    CHECK(uam_ppc_tlb_read(&m.cpu, 1, 16, &e) == UAM_ERR_INVALID, "past TLB1");
+    CHECK(uam_ppc_tlb_read(&m.cpu, 0, 0, &e) == UAM_OK, "TLB0 entry 0");
+    uam_machine_fini(&m);
+
+    /* Without an override, tlbwe is the MAS registers' (and a classic hart has no TLB API). */
+    ppc_machine(&m, NULL, MSR_ME);
+    CHECK(uam_ppc_tlb_read(&m.cpu, 0, 0, &e) == UAM_ERR_INVALID, "classic: no TLB arrays");
+    uam_machine_fini(&m);
+
+    /* Book E configurations that make no sense. */
+    CHECK(uam_machine_init(&m, &uam_isa_ppc32) == UAM_OK, "init");
+    uam_ppc_config c = uam_ppc_booke_ref;
+    c.booke.tlb[0].ways = 3;
+    CHECK(uam_ppc_configure(&m.cpu, &c) == UAM_ERR_INVALID, "512 entries in 3 ways");
+    c = uam_ppc_booke_ref;
+    c.booke.pids = 2;
+    CHECK(uam_ppc_configure(&m.cpu, &c) == UAM_ERR_INVALID, "2 PIDs");
+    c = uam_ppc_booke_ref;
+    c.booke.tlb[1].page_sizes = 1u << 10;
+    CHECK(uam_ppc_configure(&m.cpu, &c) == UAM_ERR_INVALID, "1 KiB pages");
+    c = uam_ppc_booke_ref;
+    c.model = (uam_ppc_model)7;
+    CHECK(uam_ppc_configure(&m.cpu, &c) == UAM_ERR_INVALID, "unknown model");
+    uam_machine_fini(&m);
+}
+
 int main(void)
 {
     test_pins();
@@ -358,6 +562,9 @@ int main(void)
     test_decrementer();
     test_spr_ops();
     test_config();
+    test_booke_timers();
+    test_booke_inputs();
+    test_booke_board();
     printf("test_ppc: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

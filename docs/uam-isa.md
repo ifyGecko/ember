@@ -498,8 +498,10 @@ PowerPC needed no new IR either; these are conventions of its lifter (`isa/ppc32
 - **The MSR bits code depends on are in `cpu->priv`.** Problem state, floating point
   available and the trace enables tag translated code, so a privileged instruction in
   problem state, or an FP instruction with MSR[FP] = 0, lifts to its exception
-  directly, and with MSR[SE] or MSR[BE] a block holds one instruction and arms the trace
-  exception before it.
+  directly, and with MSR[SE] or MSR[BE] (Book E: MSR[DE] with DBCR0's instruction-complete
+  or branch-taken event) a block holds one instruction and arms the trace exception
+  before it. Which privileged instructions exist (classic or Book E) is the CPU model's,
+  fixed per hart.
 - **Floating point is one helper.** FP arithmetic, rounding, conversions, compares and
   the FPSCR instructions call one `HELPER` with the instruction word, which reads and
   writes FPRs, the FPSCR and CR1 itself; FP loads, stores and the sign moves stay IR.

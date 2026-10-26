@@ -142,8 +142,8 @@ watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: o
 `mcause` interrupt code (7 machine timer, 11 machine external), on MIPS32 the Cause.IP bit
 (0..7) that was pending and enabled, on ARMv7 0 for IRQ and 1 for FIQ (on `arm-ref` every
 device interrupt arrives as IRQ, through the GIC), on PowerPC the external interrupt sources
-0..7 that were high (on `ppc-ref`: 0 the UART, 1 the IPI doorbell), 8 soft reset and 9 machine
-check; the decrementer has no line. The interrupt is reported once the CPU has taken it
+0..7 that were high (on `ppc-ref`: 0 the UART, 1 the IPI doorbell), 8 soft reset, 9 machine
+check and 10 the Book E critical input; the timers have no line. The interrupt is reported once the CPU has taken it
 (`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
 detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
 

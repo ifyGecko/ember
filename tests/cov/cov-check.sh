@@ -1,5 +1,6 @@
 #!/bin/sh
-# cov-check.sh RUN BOARD FIRMWARE - block coverage must not depend on the backend.
+# cov-check.sh RUN BOARD FIRMWARE [-- EXTRA RUNNER ARGS] - block coverage must not depend on
+# the backend.
 #
 # Runs FIRMWARE on BOARD without coverage, then with --cov-blocks under the
 # interpreter, the JIT and the JIT without chaining. Every coverage run must end
@@ -11,6 +12,8 @@ set -eu
 run=$1
 board=$2
 fw=$3
+shift 3
+[ "${1:-}" = "--" ] && shift
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -19,7 +22,7 @@ outcome() {
     grep -v '^stats:' "$1"
 }
 
-"$run" -b "$board" "$fw" < /dev/null > "$tmp/base.out" 2>&1 || true
+"$run" -b "$board" "$@" "$fw" < /dev/null > "$tmp/base.out" 2>&1 || true
 outcome "$tmp/base.out" > "$tmp/base.txt"
 
 fail=0
@@ -30,7 +33,7 @@ for mode in interp jit jit-nochain; do
         jit-nochain) flags="--jit --no-chain" ;;
     esac
     # shellcheck disable=SC2086
-    "$run" -b "$board" $flags --cov-blocks --cov-out "$tmp/$mode.map" "$fw" \
+    "$run" -b "$board" $flags "$@" --cov-blocks --cov-out "$tmp/$mode.map" "$fw" \
         < /dev/null > "$tmp/$mode.out" 2>&1 || true
     outcome "$tmp/$mode.out" > "$tmp/$mode.txt"
     if ! cmp -s "$tmp/base.txt" "$tmp/$mode.txt"; then
