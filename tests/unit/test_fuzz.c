@@ -1,8 +1,8 @@
 /*
  * test_fuzz.c - The fuzz harness (uam/fuzz.h) and the replay frontend.
  *
- * A small target with planted bugs, hand-assembled for RV32, MIPS32 BE and LE and ARMv7
- * (little-endian and BE8):
+ * A small target with planted bugs, hand-assembled for RV32, MIPS32 BE and LE, ARMv7
+ * (little-endian and BE8) and 32-bit PowerPC:
  * after a short boot loop it reaches BEGIN, reads the input from guest memory (the
  * "mem:" route) and dispatches on its first byte:
  *   'B' a load from an unmapped address (bus fault)   'H' a tight loop (timeout)
@@ -20,6 +20,7 @@
 #include "uam/fuzz.h"
 #include "uam/isa/arm.h"
 #include "uam/isa/mips32.h"
+#include "uam/isa/ppc.h"
 #include "uam/isa/riscv.h"
 
 static int n_checks, n_failed;
@@ -217,6 +218,63 @@ static target arm_target(bool be8)
     w[i++] = 0xE7F000F0u;                         /* b+20 ILL: udf #0 */
     w[i++] = 0xE320F003u;                         /* b+21 WAIT: wfi */
     w[i] = ARM_B(0xEA000000u, i, i - 1); i++;
+    t.n = i;
+    return t;
+}
+
+/* 32-bit PowerPC (big-endian, real addressing after reset) */
+#define PPC_D(op, rt, ra, imm) ((uint32_t)(op) << 26 | (uint32_t)(rt) << 21 | (uint32_t)(ra) << 16 \
+                                | ((uint32_t)(imm) & 0xFFFF))
+#define PPC_BC(bo, bi, i, to) (0x40000000u | (bo) << 21 | (bi) << 16 \
+                               | ((uint32_t)(4 * ((int)(to) - (int)(i))) & 0xFFFC))
+#define PPC_B(i, to) (0x48000000u | ((uint32_t)(4 * ((int)(to) - (int)(i))) & 0x03FFFFFCu))
+
+static target ppc_target(void)
+{
+    enum { R3 = 3, R6 = 6, R7 = 7, R9 = 9, R10 = 10, R11 = 11, R14 = 14, R15 = 15 };
+    target t = { .name = "ppc32", .isa = &uam_isa_ppc32, .be = true, .base = 0x1000, .phys = 0x1000,
+                 .route = "mem:0x8000,len=0x7ffc,max=64", .s0 = R14 * 4 };
+    uint32_t *w = t.w;
+    unsigned i = 0;
+    w[i++] = PPC_D(14, R14, 0, 0);                /* li r14,0 (iterations) */
+    w[i++] = PPC_D(14, R15, 0, 5);                /* li r15,5 */
+    w[i++] = PPC_D(13, R15, R15, -1);             /* boot loop: addic. r15,r15,-1 */
+    w[i] = PPC_BC(4, 2, i, 2); i++;               /* bne */
+    unsigned b = i;
+    t.begin = t.base + 4 * b;
+    w[i++] = PPC_D(14, R3, 0, 0x4000);            /* li r3,0x4000 */
+    w[i++] = PPC_D(14, R3, R3, 0x4000);           /* addi r3,r3,0x4000: 0x8000 */
+    w[i++] = PPC_D(32, R6, R3, -4);               /* lwz r6,-4(r3) (len) */
+    w[i++] = PPC_D(34, R7, R3, 0);                /* lbz r7,0(r3) */
+    static const char keys[5] = { 'B', 'H', 'O', 'I', 'W' };
+    unsigned br[5];
+    for (unsigned k = 0; k < 5; k++) {
+        w[i++] = PPC_D(11, 0, R7, keys[k]);       /* cmpwi r7,key */
+        br[k] = i++;                              /* beq (patched below) */
+    }
+    w[i++] = PPC_D(14, R14, R14, 1);              /* addi r14,r14,1 */
+    t.end = t.base + 4 * i;
+    w[i] = PPC_B(i, b); i++;                      /* END: b BEGIN */
+    unsigned crash = i;
+    w[i++] = PPC_D(15, R9, 0, 0x4000);            /* CRASH: lis r9,0x4000 */
+    t.fault_pc = t.base + 4 * i;
+    w[i++] = PPC_D(32, R10, R9, 0);               /* lwz r10,0(r9): bus error */
+    w[i] = PPC_B(i, i); i++;
+    unsigned hang = i;
+    w[i] = PPC_B(i, i); i++;                      /* HANG: b . */
+    unsigned oracle = i;
+    t.oracle = t.base + 4 * i;
+    w[i] = PPC_B(i, i); i++;                      /* ORACLE */
+    unsigned ill = i;
+    t.illegal = t.base + 4 * i;
+    w[i++] = 0;                                   /* ILL */
+    unsigned wait = i;
+    w[i++] = PPC_D(15, R11, 0, 4);                /* WAIT: lis r11,4 (MSR[POW]) */
+    w[i++] = 0x7C000124u | R11 << 21;             /* mtmsr r11: sleep */
+    w[i] = PPC_B(i, i - 1); i++;
+    const unsigned dest[5] = { crash, hang, oracle, ill, wait };
+    for (unsigned k = 0; k < 5; k++)
+        w[br[k]] = PPC_BC(12, 2, br[k], dest[k]);
     t.n = i;
     return t;
 }
@@ -882,6 +940,12 @@ static void enable_irqs(uam_machine *m, const target *t, unsigned *line, uint64_
         /* the vector's code is little-endian on both harts (BE8) */
         const uint8_t spin[4] = { 0xfe, 0xff, 0xff, 0xea };              /* b . */
         uam_bus_load_bytes(&m->bus, 0x18, spin, 4);
+    } else if (uam_ppc_is(t->isa)) {
+        *line = UAM_PPC_IRQ_INT(0);
+        *handler = 0x500;                                                /* MSR[IP] = 0 */
+        m->cpu.isa->sysreg_write(&m->cpu, 0x1000, 0x8000);               /* MSR: EE only */
+        const uint8_t spin[4] = { 0x48, 0, 0, 0 };                       /* b . */
+        uam_bus_load_bytes(&m->bus, 0x500, spin, 4);
     } else {
         *line = UAM_MIPS_IRQ_HW0;
         *handler = 0x80000180u;                                          /* BEV=0, EBase 0x80000000 */
@@ -1108,7 +1172,7 @@ int main(void)
     test_misc();
     test_nested();
     const target ts[] = { rv_target(), mips_target(true), mips_target(false), arm_target(false),
-                          arm_target(true) };
+                          arm_target(true), ppc_target() };
     for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {
         test_verdicts(&ts[i]);
         test_modes(&ts[i]);

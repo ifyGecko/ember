@@ -141,7 +141,9 @@ usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that 
 watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the
 `mcause` interrupt code (7 machine timer, 11 machine external), on MIPS32 the Cause.IP bit
 (0..7) that was pending and enabled, on ARMv7 0 for IRQ and 1 for FIQ (on `arm-ref` every
-device interrupt arrives as IRQ, through the GIC). The interrupt is reported once the CPU has taken it
+device interrupt arrives as IRQ, through the GIC), on PowerPC the external interrupt sources
+0..7 that were high (on `ppc-ref`: 0 the UART, 1 the IPI doorbell), 8 soft reset and 9 machine
+check; the decrementer has no line. The interrupt is reported once the CPU has taken it
 (`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
 detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
 
@@ -265,7 +267,7 @@ suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
-`mips32le`, `armv7` or `armv7be`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+`mips32le`, `armv7`, `armv7be` or `ppc32`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|

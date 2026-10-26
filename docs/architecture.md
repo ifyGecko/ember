@@ -1,11 +1,12 @@
 # UAM Firmware Emulator — Architecture
 
-Status: phases 1 and 2 implemented, plus two more ISAs (MIPS32 with a TLB, ARMv7-A with an
-MMU), the snapshot part of phase 3 and the JIT from phase 4. IR, interpreter and optimizer, an
+Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
+MMU, x86-64, 32-bit PowerPC with the OEA MMU), the snapshot part of phase 3 and the JIT from
+phase 4. IR, interpreter and optimizer, an
 x86-64 JIT with block chaining, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
-(`mips-ref` / `mipsel-ref` boards) and ARMv7-A, ARM and Thumb-2, little-endian and BE8
-(`arm-ref` / `armeb-ref` boards), host
+(`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
+(`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -44,7 +45,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -72,7 +73,8 @@ Arrows point to what a module may include. Anything not listed is forbidden.
 
 ```
 ir            ← nothing (pure data + algorithms over it)
-isa/*         → ir, isa.h, state.h
+isa/*         → ir, isa.h, state.h      (x86 and PowerPC page-table walks also bus.h:
+                                         physical reads and accessed/referenced/changed bits)
 exec/*        → ir, isa.h, bus.h, sched.h, pass.h, cov.h (it wires passes in)
 analysis/*    → ir, pass.h, cov.h        (never an ISA or a device)
 core (bus, sched, signal, chardev, netdev, state) → their own headers only
@@ -119,7 +121,7 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
                   mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
                   i8237.h ide.h fdc.h vga.h lpt.h
-include/uam/isa/  riscv.h mips32.h arm.h x86.h
+include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit_x86.c coverage.c jit.h execops.h
@@ -133,6 +135,7 @@ isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips.h (private)
 isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32) arm_system.c
                   arm.h (private)
+isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_system.c ppc.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
@@ -140,7 +143,7 @@ devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.
                   mmio_stub.c virtio_net.c i8259.c i8254.c mc146818.c lapic.c ioapic.c hpet.c
                   i8042.c acpi_pm.c pc_misc.c pci.c ata_core.c ahci.c ide.c nvme.c cfi_flash.c
                   ipi.c i8237.c fdc.c vga.c lpt.c
-boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
@@ -151,7 +154,7 @@ tools/            uam-run.c fetch-suzzer.sh (`make suzzer`: clone suzzer into ./
                   by git)
 examples/         external-board/ (an out-of-tree board built against `make lib`)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_mmio.c test_cov.c
-                  test_fuzz.c test_suzzer.c
+                  test_fuzz.c test_suzzer.c test_smp.c test_ppc.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -163,6 +166,7 @@ tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
 tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
 tests/firmware-arm/   start.S selftest.c fuzztarget.c link.ld  (ARMv7: ARM and Thumb-2 builds)
+tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (32-bit PowerPC)
 ```
 
 Planned: more passes in `analysis/` (cmp-log, taint), an Intel HEX loader, more boards and
@@ -201,16 +205,20 @@ devices.
   test finisher, virtio-net ports, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
   (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` / `armeb-ref` (ARMv7-A,
   little-endian and BE8, with a GICv2-style interrupt controller fed by the generic timer and
-  the NS16550A UART, a test finisher, RAM at 0 under the vectors). Real devices are built out of tree on the library
+  the NS16550A UART, a test finisher, RAM at 0 under the vectors), and `ppc-ref` (32-bit
+  PowerPC: RAM at 0 under the vectors, a boot ROM under the reset vector 0xfff00100, a NS16550A
+  UART and a test finisher). Real devices are built out of tree on the library
   (`examples/external-board/`).
 - **Multiprocessor machines** (`-o cpus=N` on every reference board): processors share the
   bus and the clock and run in deterministic instruction slices (`--quantum`). Every processor
   starts at the reset address and firmware tells them apart by its architectural number:
-  `mhartid`; EBase.CPUNum; MPIDR.Aff0; the x86 initial APIC ID, where the others wait for
-  INIT/SIPI. Per-processor interrupts come from generic parts that know several CPUs: the
+  `mhartid`; EBase.CPUNum; MPIDR.Aff0; PIR on PowerPC; the x86 initial APIC ID, where the
+  others wait for INIT/SIPI. Per-processor interrupts come from generic parts that know several CPUs: the
   CLINT (a msip and mtimecmp per hart) and PLIC contexts on RISC-V, IPI doorbells
   (`devices/ipi.c`) on MIPS, the GIC on ARM (banked SGIs/PPIs, SGI sources, ITARGETSR-routed
-  SPIs, a CPU interface per processor), local APICs on an APIC bus on x86.
+  SPIs, a CPU interface per processor), local APICs on an APIC bus on x86, the decrementer and
+  IPI doorbells on the external interrupt input on PowerPC (whose `tlbie` reaches every
+  processor on the bus).
   `tests/smp/smp_test.h` is one self-test for all four: per-processor timer and IPI interrupts
   and a shared log written with atomics, whose hash depends on the interleaving.
 - **Legacy PC** (for emulators of real boards that run their BIOS image): the x86 core has
@@ -235,6 +243,20 @@ devices.
   BE8: code is always little-endian, data follows CPSR.E (also part of `cpu->priv`, so code
   lifted for one order never runs in the other; SETEND, exception entry from SCTLR.EE and
   return from SPSR switch it), and `uam_isa_armeb` resets big-endian.
+- **PowerPC** (`isa/ppc32`, `uam/isa/ppc.h`): the 32-bit architecture as the 6xx/7xx/74xx and
+  e300/e600 cores implement it (user instruction set with the FPU, the OEA's MSR, exception
+  vectors, decrementer and time base, BATs, segment registers and the hashed page table), big-
+  endian. What differs between implementations stays outside ember: a board chooses the CPU
+  model (`uam_ppc_configure`: PVR, FPU present, 4 or 8 BAT pairs, the cache block dcbz clears,
+  the exception prefix at reset, the time base rate) and models the implementation registers
+  (HID0, L2CR, the performance monitor, ...) with `uam_ppc_set_spr_ops`; an SPR nobody claims
+  is plain storage. The external interrupt pin has eight wired-OR inputs, so a board needs no
+  OR gate in front of it; an interrupt controller (OpenPIC, a SoC's own) is the board's.
+  `cpu->priv` carries MSR[PR], MSR[FP] and the trace enables, so privileged and FP-unavailable
+  checks are made when a block is lifted. Like a hardware TLB, successful translations are kept
+  until tlbie, tlbia or a change of the segment registers, SDR1, a BAT or the MSR. MSR[POW]
+  sleeps until an interrupt the processor can take. The Book E, 40x and 8xx privileged
+  architectures, AltiVec and SPE are not modelled.
 
 ## 6. Analysis and fuzzing
 
@@ -333,7 +355,8 @@ devices.
 4. Board description format, more peripherals, ARMv7-M, JIT (*done*: x86-64 host, with block chaining; every IR op compiles, so no block falls back to the interpreter).
 
 Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
-short-descriptor MMU, generic timer, a GIC, little-endian and BE8), host networking, a gdb stub, the library build with
+short-descriptor MMU, generic timer, a GIC, little-endian and BE8), x86-64, 32-bit PowerPC (FPU,
+OEA MMU, decrementer), host networking, a gdb stub, the library build with
 an ABI handshake. ARMv7-M (the M-profile NVIC exception model) is still planned.
 
 ## 8. Verification
@@ -345,8 +368,10 @@ Implemented (`make test`):
   holding (`test_host`); state streams and snapshots under both backends (`test_snapshot`).
 - The IR verifier runs on every translated block (on by default; `--no-verify` skips it), before
   and after the optimizer.
-- Firmware self-tests: bare-metal RV32, MIPS32 (both byte orders) and ARMv7 (built as ARM and
-  as Thumb-2 code, little-endian and BE8) programs that check themselves and report through the test finisher, run
+- Firmware self-tests: bare-metal RV32, MIPS32 (both byte orders), ARMv7 (built as ARM and
+  as Thumb-2 code, little-endian and BE8) and 32-bit PowerPC (integer, CR, branches, every
+  load/store form, exceptions, problem state, decrementer, the MMU, the FPU and its FPSCR,
+  trace) programs that check themselves and report through the test finisher, run
   on the interpreter and on the JIT; and a multiprocessor self-test on four processors of each
   architecture (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
   `tests/firmware-x86/legacy.asm` (task switches, gates, the I/O bitmap, virtual-8086 mode,
@@ -369,12 +394,15 @@ Implemented (`make test`):
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
   the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and
-  ARMv7 (ARM and Thumb-2)
+  ARMv7 (ARM and Thumb-2) and 32-bit PowerPC
   under the interpreter and the JIT with and without chaining, block mode, rejected sites,
   coverage off, and the exception observer on an illegal instruction on each ISA.
   `tests/cov/cov-check.sh` runs the self-tests with block coverage on every backend and
   requires identical maps and an outcome identical to the run without coverage.
-- Fuzzing: `test_fuzz` runs a hand-assembled planted-bug target on RV32, MIPS32 BE/LE and ARMv7
+- PowerPC board interface (`test_ppc`): the soft-reset and machine-check pins and checkstop,
+  the wired-OR external inputs, the decrementer while MSR[EE] is clear, the implementation SPR
+  handlers and every CPU model option.
+- Fuzzing: `test_fuzz` runs a hand-assembled planted-bug target on RV32, MIPS32 BE/LE, ARMv7, PowerPC
   under every backend: each verdict and its detail, identical maps and results across
   backends and across restores, paired and begin-only modes, the exception-class policy,
   routes, resets, the frontend protocol, abort, and the replay frontend.

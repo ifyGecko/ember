@@ -8,12 +8,15 @@ with one module per concern.
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: four guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
+Status: five guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
-boards with a GIC, and x86-64 (real, protected, virtual-8086 and long mode, SMM, x87/MMX/
-SSE2) on the `x86_64-ref` board, which also boots UEFI firmware and legacy BIOS images - run by a
+boards with a GIC, x86-64 (real, protected, virtual-8086 and long mode, SMM, x87/MMX/
+SSE2) on the `x86_64-ref` board, which also boots UEFI firmware and legacy BIOS images, and 32-bit
+PowerPC (the user instruction set with the FPU; the operating environment of the 6xx/7xx/74xx
+class: MSR, exceptions, decrementer and time base, BATs, segments and the hashed page table;
+configurable CPU model and implementation SPRs) on the `ppc-ref` board - run by a
 reference interpreter or, with `--jit`, a native x86-64 JIT
 with block chaining (a block optimizer feeds both). Every reference board takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
@@ -26,7 +29,7 @@ dependencies beyond libc.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS and ARM firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86 and PowerPC firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT)
 make net-check       # ARP/ping between an rv32-ref guest and the host kernel over a real tap and tun
 make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
@@ -41,6 +44,10 @@ The ARM self-test (built as ARM and as Thumb-2 code, little-endian and BE8) need
 The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
 `riscv64-unknown-elf-gcc` both work).
 
+The PowerPC self-test needs a GCC for PowerPC: by default `powerpc64le-linux-gnu-gcc`, which
+builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works too
+(`make CROSS=powerpc-linux-gnu- ppc-test`).
+
 ## Run firmware
 
 ```bash
@@ -49,6 +56,8 @@ build/uam-run --stats --trace exc --unknown-mmio zero path/to/firmware.elf
 build/uam-run --raw-base 0x80000000 path/to/image.bin
 build/uam-run -b arm-ref build/firmware-arm/selftest-thumb.elf   # ARMv7, Thumb-2 code
 build/uam-run -b armeb-ref build/firmware-arm/selftest-arm-be.elf # big-endian (BE8)
+build/uam-run -b ppc-ref build/firmware-ppc/selftest.elf        # 32-bit PowerPC
+build/uam-run -b ppc-ref --raw-base 0xfff00000 --entry 0xfff00100 boot.bin   # a PowerPC boot ROM
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
@@ -253,7 +262,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
                    cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h host.h
                    gdbstub.h runner.h boards.h
 include/uam/dev/   one header per device model
-include/uam/isa/   one header per ISA module
+include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, x86-64 JIT (jit_x86.c)
@@ -266,6 +275,9 @@ isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_sys
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
+isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_fpu.c), MMU
+                   (ppc_mmu.c: BATs, segments, hashed page table) and operating environment
+                   (ppc_system.c: MSR, SPRs, exceptions, decrementer, time base)
 isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87, MMX,
                    SSE/SSE2) and system architecture (segmentation, call gates, hardware
                    task switching, the I/O permission bitmap, paging, SMM with the Intel 64
@@ -276,15 +288,17 @@ devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, uni
                    (82077), ide (PIO + bus master), lpt, vga; pci (bridges, MSI/MSI-X,
                    expansion ROMs), ahci, nvme, cfi_flash; ipi
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
-                   x86_64_ref.c (x86-64): reference boards of generic parts, the only files that
-                   pair an ISA with devices; mmio_rules.c: per-register rules for any board
+                   x86_64_ref.c (x86-64), ppc_ref.c (PowerPC): reference boards of generic
+                   parts, the only files that pair an ISA with devices; mmio_rules.c:
+                   per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 examples/          external-board: an out-of-tree board using the library
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, ABI), host side, snapshots,
-                   JIT chaining, MMIO rules
+                   JIT chaining, MMIO rules, the PowerPC board interface (test_ppc)
 tests/firmware/    bare-metal RV32 self-test and network-test images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
 tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
+tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test, multiprocessor test and fuzz target
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

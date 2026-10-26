@@ -486,6 +486,26 @@ ARM needed no new IR; these are conventions of its lifter (`isa/arm`).
   IT state goes into `cpu->priv`, which tags translated code: the next block is
   lifted for it, one instruction at a time, until the IT block ends.
 
+## 10c. Condition register fields and lift-time privilege (32-bit PowerPC)
+
+PowerPC needed no new IR either; these are conventions of its lifter (`isa/ppc32`).
+
+- **Flags as bytes.** Each CR field is one byte of the register file (LT GT EQ SO in
+  bits 3..0), and XER's SO, OV and CA one byte each, so a compare is one `PUT` of a
+  `SELECT`, a conditional branch tests one byte, and `mfcr`/`mtcrf`/`mfxer` assemble
+  or scatter the bytes. Carry and overflow of three-operand sums (`adde`, `subfe`,
+  ...) are `CARRY` of each addition and the sign rule on the result.
+- **The MSR bits code depends on are in `cpu->priv`.** Problem state, floating point
+  available and the trace enables tag translated code, so a privileged instruction in
+  problem state, or an FP instruction with MSR[FP] = 0, lifts to its exception
+  directly, and with MSR[SE] or MSR[BE] a block holds one instruction and arms the trace
+  exception before it.
+- **Floating point is one helper.** FP arithmetic, rounding, conversions, compares and
+  the FPSCR instructions call one `HELPER` with the instruction word, which reads and
+  writes FPRs, the FPSCR and CR1 itself; FP loads, stores and the sign moves stay IR.
+- **No delay slots, no IT state**: every branch ends its block with guarded `EXIT`s;
+  `bc` decrements CTR with a `PUT` before them.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |
