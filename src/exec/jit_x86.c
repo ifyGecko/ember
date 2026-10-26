@@ -138,10 +138,11 @@ static void dtlb_fill(uam_cpu *cpu, uint64_t addr, uint32_t flags, unsigned size
 static int jit_br_load(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, uint32_t size)
 {
     uint32_t xf = 0;
-    uam_status st = uam_execops_load(jc->cpu, addr, flags, size, &jc->scratch, &xf);
+    uint64_t fva;
+    uam_status st = uam_execops_load(jc->cpu, addr, flags, size, &jc->scratch, &xf, &fva);
     chain_check(jc);
     if (st != UAM_OK)
-        return jit_fault(jc, st, addr, xf, false);
+        return jit_fault(jc, st, fva, xf, false);
     if (!(flags & UAM_ACC_X))
         dtlb_fill(jc->cpu, addr, flags, size, false);
     return 0;
@@ -150,10 +151,11 @@ static int jit_br_load(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, uint32_t 
 static int jit_br_store(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t flags, uint32_t size)
 {
     uint32_t xf = 0;
-    uam_status st = uam_execops_store(jc->cpu, addr, val, flags, size, &xf);
+    uint64_t fva;
+    uam_status st = uam_execops_store(jc->cpu, addr, val, flags, size, &xf, &fva);
     chain_check(jc);
     if (st != UAM_OK)
-        return jit_fault(jc, st, addr, xf, true);
+        return jit_fault(jc, st, fva, xf, true);
     dtlb_fill(jc->cpu, addr, flags, size, true);
     return 0;
 }
@@ -163,10 +165,11 @@ static int jit_br_store_x(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t
 {
     uint32_t xf = 0;
     bool ok = false;
-    uam_status st = uam_execops_store_x(jc->cpu, addr, val, flags, size, &ok, &xf);
+    uint64_t fva;
+    uam_status st = uam_execops_store_x(jc->cpu, addr, val, flags, size, &ok, &xf, &fva);
     chain_check(jc);
     if (st != UAM_OK)
-        return jit_fault(jc, st, addr, xf, true);
+        return jit_fault(jc, st, fva, xf, true);
     jc->scratch = ok;
     return 0;
 }

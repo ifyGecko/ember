@@ -54,14 +54,75 @@ static inline uam_status uam_execops_xlate(uam_cpu *cpu, uint64_t vaddr, uam_xla
     return st;
 }
 
-/* LD (section 6.2). On success sets *out and, for an exclusive load, the reservation. */
+/*
+ * An access that crosses a page boundary under address translation: the two pages may
+ * map to unrelated physical pages, so both ends are translated and, unless they turn out
+ * contiguous, the bytes are moved one at a time (in the access's byte order). A
+ * translation fault on the second page reports that page's first byte (*fault_va), the
+ * address a fault handler must make accessible.
+ */
+static inline bool uam_execops_crosses(const uam_cpu *cpu, uint64_t addr, unsigned size,
+                                       unsigned flags)
+{
+    return size > 1 && cpu->isa->translate && !(flags & UAM_ACC_PHYS)
+        && ((addr ^ (addr + size - 1)) & UAM_PAGE_MASK);
+}
+
+/* Translate the bytes of a page-crossing access: pa[0] for its first byte, pa[1] for the
+ * first byte of the second page; n0 bytes lie on the first page. */
+static inline uam_status uam_execops_xlate2(uam_cpu *cpu, uint64_t addr, uam_xlate_kind kind,
+                                            unsigned flags, unsigned size, uint64_t pa[2],
+                                            unsigned *n0, uint32_t *xfault, uint64_t *fault_va)
+{
+    uint64_t second = (addr + size - 1) & UAM_PAGE_MASK;
+    *n0 = (unsigned)(second - addr);
+    uam_status st = uam_execops_xlate(cpu, addr, kind, flags, size, &pa[0], xfault);
+    if (st == UAM_OK) {
+        st = uam_execops_xlate(cpu, second, kind, flags & ~UAM_ACC_ALIGNED, 1, &pa[1], xfault);
+        if (st != UAM_OK)
+            *fault_va = second;
+    }
+    return st;
+}
+
+/* Byte k of a size-byte value in the access's byte order (k = 0: lowest address). */
+static inline unsigned uam_execops_byte_shift(unsigned flags, unsigned size, unsigned k)
+{
+    return 8 * ((flags & UAM_ACC_BE) ? size - 1 - k : k);
+}
+
+/* LD (section 6.2). On success sets *out and, for an exclusive load, the reservation.
+ * On failure *fault_va is the faulting address (addr, except as above). */
 static inline uam_status uam_execops_load(uam_cpu *cpu, uint64_t addr, unsigned flags,
-                                          unsigned size, uint64_t *out, uint32_t *xfault)
+                                          unsigned size, uint64_t *out, uint32_t *xfault,
+                                          uint64_t *fault_va)
 {
     uint64_t pa;
-    uam_status st = uam_execops_xlate(cpu, addr, UAM_XLATE_LOAD, flags, size, &pa, xfault);
-    if (st == UAM_OK)
-        st = uam_bus_read(cpu->bus, pa, size, flags, out);
+    uam_status st;
+    *fault_va = addr;
+    if (uam_execops_crosses(cpu, addr, size, flags)) {
+        uint64_t p[2];
+        unsigned n0;
+        st = uam_execops_xlate2(cpu, addr, UAM_XLATE_LOAD, flags, size, p, &n0, xfault, fault_va);
+        if (st != UAM_OK)
+            return st;
+        if (p[1] == p[0] + n0) {
+            pa = p[0];
+            st = uam_bus_read(cpu->bus, pa, size, flags, out);
+        } else {
+            uint64_t v = 0;
+            for (unsigned k = 0; k < size && st == UAM_OK; k++) {
+                uint64_t b = 0;
+                st = uam_bus_read(cpu->bus, k < n0 ? p[0] + k : p[1] + (k - n0), 1, flags, &b);
+                v |= b << uam_execops_byte_shift(flags, size, k);
+            }
+            *out = v;
+        }
+    } else {
+        st = uam_execops_xlate(cpu, addr, UAM_XLATE_LOAD, flags, size, &pa, xfault);
+        if (st == UAM_OK)
+            st = uam_bus_read(cpu->bus, pa, size, flags, out);
+    }
     if (st != UAM_OK)
         return st;
     if (flags & UAM_ACC_X)
@@ -71,9 +132,23 @@ static inline uam_status uam_execops_load(uam_cpu *cpu, uint64_t addr, unsigned 
 
 /* Plain ST (section 6.2). */
 static inline uam_status uam_execops_store(uam_cpu *cpu, uint64_t addr, uint64_t val,
-                                           unsigned flags, unsigned size, uint32_t *xfault)
+                                           unsigned flags, unsigned size, uint32_t *xfault,
+                                           uint64_t *fault_va)
 {
     uint64_t pa;
+    *fault_va = addr;
+    if (uam_execops_crosses(cpu, addr, size, flags)) {
+        uint64_t p[2];
+        unsigned n0;
+        uam_status st = uam_execops_xlate2(cpu, addr, UAM_XLATE_STORE, flags, size, p, &n0,
+                                           xfault, fault_va);
+        if (st != UAM_OK || p[1] == p[0] + n0)
+            return st != UAM_OK ? st : uam_bus_write(cpu->bus, p[0], size, flags, val);
+        for (unsigned k = 0; k < size && st == UAM_OK; k++)
+            st = uam_bus_write(cpu->bus, k < n0 ? p[0] + k : p[1] + (k - n0), 1, flags,
+                               (val >> uam_execops_byte_shift(flags, size, k)) & 0xFF);
+        return st;
+    }
     uam_status st = uam_execops_xlate(cpu, addr, UAM_XLATE_STORE, flags, size, &pa, xfault);
     if (st == UAM_OK)
         st = uam_bus_write(cpu->bus, pa, size, flags, val);
@@ -87,8 +162,9 @@ static inline uam_status uam_execops_store(uam_cpu *cpu, uint64_t addr, uint64_t
  */
 static inline uam_status uam_execops_store_x(uam_cpu *cpu, uint64_t addr, uint64_t val,
                                              unsigned flags, unsigned size, bool *ok,
-                                             uint32_t *xfault)
+                                             uint32_t *xfault, uint64_t *fault_va)
 {
+    *fault_va = addr;
     if ((flags & UAM_ACC_ALIGNED) && (addr & (size - 1)))
         return UAM_ERR_MISALIGNED;
     bool held = uam_execops_resv_covers(&cpu->resv, addr, size);
@@ -96,7 +172,7 @@ static inline uam_status uam_execops_store_x(uam_cpu *cpu, uint64_t addr, uint64
     *ok = held;
     if (!held)
         return UAM_OK;
-    return uam_execops_store(cpu, addr, val, flags, size, xfault);
+    return uam_execops_store(cpu, addr, val, flags, size, xfault, fault_va);
 }
 
 /* The new value an AMO stores, given the old memory value and the operand. */

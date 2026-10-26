@@ -449,7 +449,10 @@ all are ISA-neutral and unused by ISAs that do not need them.
   valid while the hart runs at the same `cpu->priv` and, for code fetched
   through a mapping the ISA did not mark `fixed`, while `cpu->xlate_gen` is
   unchanged; the ISA bumps it with `uam_cpu_xlate_changed()` on TLB writes and
-  address-space switches.
+  address-space switches. A data access that crosses a page boundary is translated at
+  both ends (its pages may map to unrelated frames); unless they turn out physically
+  contiguous the executor moves its bytes one at a time, in the access's byte order, and
+  a translation fault on the second page reports that page's first byte as `tval`.
 
 - **Executor stop marks (`UAM_IMARK_BREAK`).** The executor (never a lifter)
   may set this flag on an `IMARK` of a translated block so the block ends

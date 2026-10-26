@@ -107,27 +107,27 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
             break;
 
         case UAM_OP_LD: {
-            uint64_t addr = opnd(blk, t, in->a, aw), v = 0;
-            uam_status st = uam_execops_load(cpu, addr, in->flags, size, &v, &xf);
+            uint64_t addr = opnd(blk, t, in->a, aw), v = 0, fva;
+            uam_status st = uam_execops_load(cpu, addr, in->flags, size, &v, &xf, &fva);
             if (st != UAM_OK)
-                return fault(mem_fault_kind(st, false), &pos, addr, xf);
+                return fault(mem_fault_kind(st, false), &pos, fva, xf);
             t[in->dst] = v;
             break;
         }
         case UAM_OP_ST: {
-            uint64_t addr = opnd(blk, t, in->a, aw);
+            uint64_t addr = opnd(blk, t, in->a, aw), fva;
             uint64_t v = opnd(blk, t, in->b, W);
             if (in->flags & UAM_ACC_X) {
                 bool ok = false;
-                uam_status st = uam_execops_store_x(cpu, addr, v, in->flags, size, &ok, &xf);
+                uam_status st = uam_execops_store_x(cpu, addr, v, in->flags, size, &ok, &xf, &fva);
                 if (st != UAM_OK)
-                    return fault(mem_fault_kind(st, true), &pos, addr, xf);
+                    return fault(mem_fault_kind(st, true), &pos, fva, xf);
                 t[in->dst] = ok;
                 break;
             }
-            uam_status st = uam_execops_store(cpu, addr, v, in->flags, size, &xf);
+            uam_status st = uam_execops_store(cpu, addr, v, in->flags, size, &xf, &fva);
             if (st != UAM_OK)
-                return fault(mem_fault_kind(st, true), &pos, addr, xf);
+                return fault(mem_fault_kind(st, true), &pos, fva, xf);
             break;
         }
         case UAM_OP_AMO:
