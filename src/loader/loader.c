@@ -52,7 +52,12 @@ static uint64_t rd(const uint8_t *p, unsigned size, bool be)
 
 #define PT_LOAD 1
 
-/* Translate a guest load address to physical through the ISA, if any. */
+/*
+ * Translate a guest load address to physical through the ISA, if any. An address the
+ * reset state cannot translate is taken as physical: a processor whose MMU is always
+ * on (Book E) maps little more than its boot page at reset, and an ELF segment's load
+ * address is a physical address.
+ */
 static uam_status load_bytes_xlated(uam_bus *bus, uam_cpu *cpu, uint64_t vaddr,
                                     const void *data, size_t len)
 {
@@ -63,18 +68,17 @@ static uam_status load_bytes_xlated(uam_bus *bus, uam_cpu *cpu, uint64_t vaddr,
     const uint8_t *p = data;
     while (len) {
         uam_xlate xl = { 0 };
-        uam_status st = cpu->isa->translate(cpu, vaddr, UAM_XLATE_DEBUG, &xl);
-        if (st != UAM_OK) {
-            uam_log(UAM_LOG_ERROR, "loader", "load address 0x%llx has no translation",
+        uint64_t pa = vaddr;
+        if (cpu->isa->translate(cpu, vaddr, UAM_XLATE_DEBUG, &xl) == UAM_OK)
+            pa = xl.paddr;
+        else
+            uam_log(UAM_LOG_DEBUG, "loader", "load address 0x%llx has no translation: physical",
                     (unsigned long long)vaddr);
-            return st;
-        }
-        uint64_t pa = xl.paddr;
         uint64_t page_end = (vaddr | (UAM_PAGE_SIZE - 1)) + 1;
         size_t chunk = (size_t)(page_end - vaddr);
         if (chunk > len)
             chunk = len;
-        st = uam_bus_load_bytes(bus, pa, p, chunk);
+        uam_status st = uam_bus_load_bytes(bus, pa, p, chunk);
         if (st != UAM_OK)
             return st;
         vaddr += chunk;
