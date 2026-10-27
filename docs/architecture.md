@@ -162,6 +162,8 @@ tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats t
 tests/szr/        szr-check.sh fake_brain.py  (the SZR1 executor against a scripted brain)
                   brain-check.sh  (a session with suzzer's own brain)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
+tests/bench/      bench.c x86-start.S x86.ld  (one C benchmark for every guest ISA; make
+                  bench-test checks it, tools/xbench.sh times it)
 tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
 tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
@@ -438,6 +440,10 @@ Implemented (`make test`):
   strict flags, and `test_suzzer` reads the checkout's own conformance vectors. Without one,
   the suzzer tests are skipped.
 - The external-board example is built and run against the library.
+- Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
+  board (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64) and natively, and
+  requires each guest's checksums, under the interpreter and the JIT, to equal the host
+  build's (docs/jit-perf.md, "Parity across ISAs").
 - `test_jitdiff` checks the JIT against the interpreter block by block: every pure op at
   every width with temp and immediate operands, then random verified blocks (guards,
   CONT/BREAK imarks, faulting, page-crossing, MMIO and exclusive accesses, helpers,

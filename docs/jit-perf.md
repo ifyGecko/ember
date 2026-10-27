@@ -163,6 +163,64 @@ Correctness, end to end:
 **VxWorks profile.** Its idle loop is now one constant-address load, a fused compare
 and branch, and the chain path back to itself.
 
+## Parity across ISAs
+
+The reference workloads say little about how the guests compare. `tests/bench/bench.c`
+is one C benchmark built for every reference board and natively: CRC-32, heapsort,
+matrix multiply, string search, a switch-dispatch bytecode interpreter, pointer
+chasing, 64-bit arithmetic and number formatting, about 5e8 guest instructions in all.
+It uses fixed-width types only, so every build prints the same checksums.
+- `make bench-test` (part of `make test`) runs two rounds on every guest, under the
+  interpreter and the JIT, and requires the host build's checksums.
+- `tools/xbench.sh` (`make xbench`) times the full run on every guest. Each does the
+  same work, so wall time is the number to compare; `vs_best` divides it by the fastest
+  guest's. `--per-kernel` times each kernel on its own and prints the ratio matrix with
+  a geometric mean per guest; `--interp` uses the interpreter.
+
+Whole run, JIT, medians of 5 (main at a352e5b):
+
+| Guest | Guest instructions | Time | MIPS | vs best |
+|---|---:|---:|---:|---:|
+| RV32 | 519M | 0.384 s | 1351 | 1.00 |
+| MIPS32 BE / LE | 540M | 0.407 / 0.409 s | 1327 / 1320 | 1.06 / 1.07 |
+| ARM | 451M | 0.465 s | 971 | 1.21 |
+| Thumb-2 LE / BE8 | 450M | 0.467 / 0.464 s | 965 / 971 | 1.22 / 1.21 |
+| PowerPC | 502M | 0.474 s | 1058 | 1.23 |
+| x86-64 | 454M | 0.657 s | 692 | 1.71 |
+
+Each kernel on its own (`--per-kernel --rounds 1600`, medians of 3): time over the
+fastest guest's on that kernel.
+
+| Kernel | RV32 | MIPS | MIPSel | ARM | Thumb | Thumb BE8 | PPC | x86 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| crc | 1.00 | 1.17 | 1.18 | 1.31 | 1.44 | 1.45 | 1.07 | 2.84 |
+| sort | 1.00 | 1.20 | 1.20 | 1.37 | 1.34 | 1.35 | 1.38 | 1.58 |
+| matmul | 1.00 | 1.12 | 1.10 | 1.35 | 1.68 | 1.70 | 1.01 | 3.73 |
+| string | 1.00 | 1.06 | 1.09 | 1.36 | 1.51 | 1.55 | 1.37 | 2.11 |
+| interp | 1.40 | 1.02 | 1.38 | 1.00 | 1.42 | 1.05 | 1.41 | 1.38 |
+| list | 1.00 | 1.16 | 1.13 | 1.38 | 1.47 | 1.47 | 1.30 | 1.95 |
+| u64 | 1.00 | 1.11 | 1.09 | 1.20 | 1.56 | 1.55 | 1.33 | 1.55 |
+| fmt | 1.00 | 1.14 | 1.15 | 1.25 | 1.57 | 1.55 | 1.30 | 3.28 |
+| **geomean** | 1.04 | 1.12 | 1.16 | 1.27 | 1.50 | 1.45 | 1.26 | 2.17 |
+
+Under the interpreter (one run) the order is the same and the spread wider: MIPS 1.00,
+RV32 1.08, PPC 1.30, ARM 1.40, Thumb 1.58, x86 2.79.
+
+What it shows:
+- **x86 is the outlier, and flags are why.** On the ALU kernels (crc, matmul, fmt,
+  string) x86 runs 2.1-3.7x the time of RV32 for about the same instruction count. The
+  matmul inner loop (`mov; imul; add; add; add; cmp; jne`) is about 90 IR ops, three
+  quarters of them CF/OF/AF/ZF/SF/PF computations that the next instruction overwrites
+  before `jne` reads ZF. That is what step 9 removes.
+- **Thumb trails ARM by ~15%** on the same instruction counts: nearly every 16-bit
+  Thumb ALU op sets NZCV, again dead flag work.
+- **The interpreter kernel is bimodal** (1.0 or 1.4 by guest, varying between runs):
+  its switch is an indirect jump, and a computed exit links only its last target, so
+  about 30% of its block exits return to the run loop (3.8M of 12.6M on MIPS). A
+  multi-target cache for computed exits would help every ISA alike.
+- RV32, MIPS and PPC are within 1.3x of each other everywhere; endianness costs nothing
+  measurable (MIPS BE/LE, Thumb LE/BE8).
+
 Not done yet:
 - **Dead flag stores across instructions (step 9 of the plan).** This defers PUTs that
   a later instruction overwrites, and replays them at interrupt exits and on memory

@@ -147,7 +147,8 @@ EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test firmware-ppc ppc-test \
         example-test \
-        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak install \
+        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
+        bench-test xbench install \
         clean FORCE
 
 all: $(RUN) lib
@@ -459,7 +460,16 @@ endif
 
 test: unit-test firmware-test mips-test arm-test x86-test ppc-test example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
-      gdb-test runner-test
+      gdb-test runner-test bench-test
+
+# The cross-ISA benchmark (tests/bench): bench-test checks every guest build, with the
+# interpreter and the JIT, against the host build in two rounds; xbench times them
+# (tools/xbench.sh; XBENCH_ARGS="--per-kernel" for each kernel on its own).
+bench-test: $(RUN)
+	sh tools/xbench.sh --check --run $(RUN) --out $(abspath $(BUILD))/firmware-bench
+
+xbench: $(RUN)
+	sh tools/xbench.sh --run $(RUN) --out $(abspath $(BUILD))/firmware-bench $(XBENCH_ARGS)
 
 # uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit)
 runner-test: $(RUN) firmware-x86
