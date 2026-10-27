@@ -149,14 +149,17 @@ bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_w
 void sz_bounds_free(sz_bounds *bd);
 
 /*
- * ARM code addresses carry the instruction set in bit 0 (uam/isa/arm.h), while suzzer
- * marks a Thumb site by its length (2, at the instruction's even address). For an ARM
- * hart: set bit 0 of every Thumb site's pc, and of each boundary pc whose closest site
- * at or below it is a Thumb site (a marker in a Thumb function; with no sites, markers
- * stay ARM). Call before sz_namer_init.
+ * On an ISA whose code addresses carry instruction-set state bits
+ * (uam_isa_pc_state_bits: ARM's Thumb bit 0), suzzer marks a site in the alternate
+ * state by its length (2, at the instruction's address without the bits). For such
+ * a hart, with `state` its pc state bits: set them in every such site's pc, and in
+ * each boundary pc whose closest site at or below it has them (a marker in a Thumb
+ * function; with no sites, markers stay in the base state). Call before
+ * sz_namer_init. Nothing to do when `state` is 0.
  */
-void sz_arm_thumb_sites(const sz_patchlist *p, uam_cov_site *sites);
-void sz_arm_thumb_bounds(const sz_patchlist *p, const uam_cov_site *sites, sz_bounds *bd);
+void sz_state_sites(const sz_patchlist *p, uam_cov_site *sites, uint64_t state);
+void sz_state_bounds(const sz_patchlist *p, const uam_cov_site *sites, uint64_t state,
+                     sz_bounds *bd);
 
 /* Compare each site's bytes in guest memory (through the ISA's translation, debug
  * reads) with orig[]. Prints a summary and the first `max_report` mismatches to `log`;

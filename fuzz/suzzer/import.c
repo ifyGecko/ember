@@ -343,37 +343,41 @@ void sz_namer_describe(void *ctx, uint64_t pc, char *buf, size_t len)
     }
 }
 
-void sz_arm_thumb_sites(const sz_patchlist *p, uam_cov_site *sites)
+void sz_state_sites(const sz_patchlist *p, uam_cov_site *sites, uint64_t state)
 {
+    if (!state)
+        return;
     for (uint32_t i = 0; i < p->count; i++)
         if (p->rec[i].len == 2)
-            sites[i].pc |= 1;
+            sites[i].pc |= state;
 }
 
-static uint64_t thumb_pc(const sz_patchlist *p, const uam_cov_site *sites, uint64_t pc)
+static uint64_t state_pc(const sz_patchlist *p, const uam_cov_site *sites, uint64_t state,
+                         uint64_t pc)
 {
-    uint64_t best = 0;
-    bool found = false, thumb = false;
+    uint64_t best = 0, bits = 0;
+    bool found = false;
     for (uint32_t i = 0; i < p->count; i++) {
-        uint64_t at = sites[i].pc & ~UINT64_C(1);
+        uint64_t at = sites[i].pc & ~state;
         if (at <= pc && (!found || at >= best)) {
             best = at;
             found = true;
-            thumb = sites[i].pc & 1;
+            bits = sites[i].pc & state;
         }
     }
-    return thumb ? pc | 1 : pc;
+    return pc | bits;
 }
 
-void sz_arm_thumb_bounds(const sz_patchlist *p, const uam_cov_site *sites, sz_bounds *bd)
+void sz_state_bounds(const sz_patchlist *p, const uam_cov_site *sites, uint64_t state,
+                     sz_bounds *bd)
 {
-    if (!p || !sites)
+    if (!p || !sites || !state)
         return;
-    bd->begin_pc = thumb_pc(p, sites, bd->begin_pc);
+    bd->begin_pc = state_pc(p, sites, state, bd->begin_pc);
     for (size_t i = 0; i < bd->n_more_begin_pcs; i++)
-        bd->more_begin_pcs[i] = thumb_pc(p, sites, bd->more_begin_pcs[i]);
+        bd->more_begin_pcs[i] = state_pc(p, sites, state, bd->more_begin_pcs[i]);
     for (size_t i = 0; i < bd->n_end_pcs; i++)
-        bd->end_pcs[i] = thumb_pc(p, sites, bd->end_pcs[i]);
+        bd->end_pcs[i] = state_pc(p, sites, state, bd->end_pcs[i]);
 }
 
 bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_width,
@@ -435,8 +439,8 @@ size_t sz_check_sites(uam_machine *m, const sz_patchlist *p, const uam_cov_site 
         const sz_record *r = &p->rec[i];
         uint8_t got[LIBCOV_PATCH_ORIG_MAX] = { 0 };
         bool ok = true;
-        /* a Thumb site's pc carries bit 0 (sz_arm_thumb_sites); its bytes start below */
-        const uint64_t at = r->len == 2 ? sites[i].pc & ~UINT64_C(1) : sites[i].pc;
+        /* a pc may carry state bits (sz_state_sites); the bytes start without them */
+        const uint64_t at = sites[i].pc & ~uam_isa_pc_state_bits(cpu->isa);
         for (unsigned k = 0; k < r->len && ok; k++) {
             uint64_t va = at + k, pa = va, v = 0;
             if (cpu->isa->translate) {
