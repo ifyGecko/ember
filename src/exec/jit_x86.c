@@ -15,7 +15,10 @@
  * Host register use (System V AMD64, all callee-saved so they survive bridge calls):
  *   rbx = jc    rbp = jc->temps    r14 = jc->cpu    r15 = jc->cpu->regfile
  *   r13 = icount (flushed to cpu->icount before bridges and at the epilogue)
- *   r12 = cpu->icount_deadline (fixed while native code runs)
+ *   r12 = unused (saved; free for values)
+ * Every IMARK that may stop compares r13 with cpu->icount_stop (exit_request ? 0 :
+ * icount_deadline, set on entry and zeroed by uam_cpu_request_exit) and leaves through
+ * an out-of-line stub, so the common path is one compare and an untaken branch.
  * rax/rcx/rdx/rsi/rdi/r8 are scratch. Guest temporaries live in jc->temps[], 64-bit,
  * masked to their width (the interpreter's invariant). Immediates are materialized.
  *
@@ -63,16 +66,23 @@ typedef struct jit_slot {
 
 #define LINK_NONE UINT64_MAX
 
+/* Where a bridge call happens, for a precise fault: stored with the block's code, and
+ * pointed to by jc->site just before a call that may fault (so the common path pays
+ * nothing per instruction). */
+typedef struct jit_site {
+    uint64_t pc;          /* the guest instruction */
+    uint64_t parent_pc;   /* its parent, if a continuation (else pc) */
+    uint64_t cont;        /* 1 if it is a continuation */
+} jit_site;
+
 typedef struct uam_jit_ctx {
     uam_cpu                *cpu;
     uint64_t               *temps;
     uint8_t                *regfile;
     const uam_block        *blk;
     const uam_helper_table *helpers;
-    uint64_t                cur_pc;      /* current guest instruction (for faults) */
-    uint64_t                parent_pc;   /* its parent, if a continuation */
+    const jit_site         *site;        /* the faulting call's instruction */
     uint64_t                scratch;     /* bridge load destination */
-    uint64_t                cont;        /* 1 if the current instruction is a continuation */
     uam_block_result        res;
     /* chaining */
     uint64_t                epoch;       /* links made in another epoch are dead */
@@ -98,11 +108,11 @@ static int jit_fault(uam_jit_ctx *jc, uam_status st, uint64_t addr, uint32_t xf,
 {
     uam_block_result *r = &jc->res;
     r->kind = UAM_BR_FAULT;
-    r->pc = jc->cur_pc;
+    r->pc = jc->site->pc;
     r->exc.kind = uam_execops_fault_kind(st, store);
-    r->exc.flags = jc->cont ? UAM_EXC_F_CONT : 0;
-    r->exc.pc = jc->cur_pc;
-    r->exc.parent_pc = jc->parent_pc;
+    r->exc.flags = jc->site->cont ? UAM_EXC_F_CONT : 0;
+    r->exc.pc = jc->site->pc;
+    r->exc.parent_pc = jc->site->parent_pc;
     r->exc.cause = xf;
     r->exc.tval = addr;
     return 1;
@@ -195,11 +205,11 @@ static int jit_fault_simple(uam_jit_ctx *jc, uam_exc_kind kind, uint64_t tval)
 {
     uam_block_result *r = &jc->res;
     r->kind = UAM_BR_FAULT;
-    r->pc = jc->cur_pc;
+    r->pc = jc->site->pc;
     r->exc.kind = kind;
-    r->exc.flags = jc->cont ? UAM_EXC_F_CONT : 0;
-    r->exc.pc = jc->cur_pc;
-    r->exc.parent_pc = jc->parent_pc;
+    r->exc.flags = jc->site->cont ? UAM_EXC_F_CONT : 0;
+    r->exc.pc = jc->site->pc;
+    r->exc.parent_pc = jc->site->parent_pc;
     r->exc.cause = 0;
     r->exc.tval = tval;
     return 1;
@@ -258,8 +268,8 @@ static uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64
 #define MAX_SLOTS  64u           /* EXITs per block that get a link (more just return) */
 
 /* Code-region kinds recorded for the op map (UAM_JIT_OPMAP; docs/jit-perf.md). */
-enum { MK_PROLOGUE, MK_OP, MK_IMARK_PC, MK_SLOW, MK_CHAIN, MK_EPILOGUE, MK_SLOTS };
-static const char *const mark_name[] = { "prologue", "op", "imark-pc", "slow", "chain",
+enum { MK_PROLOGUE, MK_OP, MK_IMARK_PC, MK_SLOW, MK_CHAIN, MK_STUB, MK_EPILOGUE, MK_SLOTS };
+static const char *const mark_name[] = { "prologue", "op", "imark-pc", "slow", "chain", "stub",
                                          "epilogue", "slots" };
 typedef struct jit_mark { uint32_t off, idx; uint8_t kind; } jit_mark;
 
@@ -289,6 +299,14 @@ struct uam_jit {
     bool         overflow;
     struct { size_t lea; uint64_t pc; } slot[MAX_SLOTS];  /* lea rel32 position, target */
     unsigned     n_slots;
+    jit_site     cur;        /* the guest instruction being compiled */
+    bool         cur_emitted;/* cur has a site record (sites[n_sites - 1]) */
+    jit_site    *sites;      /* site records, emitted after the slots */
+    uint32_t     n_sites, cap_sites;
+    struct { size_t lea; uint32_t site; } *site_refs;   /* lea rel32 positions to patch */
+    uint32_t     n_site_refs, cap_site_refs;
+    struct { size_t jcc; uint64_t pc; } *stubs;        /* out-of-line IMARK stops */
+    uint32_t     n_stubs, cap_stubs;
     /* profiling output, from the environment at creation (docs/jit-perf.md) */
     FILE        *perf_map;   /* UAM_PERF_MAP: /tmp/perf-<pid>.map, one line per block */
     FILE        *opmap;      /* UAM_JIT_OPMAP=FILE: code offset -> IR instruction */
@@ -375,13 +393,6 @@ static void ld_mem(uam_jit *j, int reg, int base, int32_t disp)
 static void st_mem(uam_jit *j, int reg, int base, int32_t disp)
 {
     rex(j, 1, reg >= 8, 0, base >= 8);
-    g8(j, 0x89);
-    modrm_mem(j, reg, base, disp);
-}
-/* mov [base + disp], reg32 (low 32 bits) */
-static void st_mem32(uam_jit *j, int reg, int base, int32_t disp)
-{
-    rex(j, 0, reg >= 8, 0, base >= 8);
     g8(j, 0x89);
     modrm_mem(j, reg, base, disp);
 }
@@ -637,6 +648,45 @@ static void patch(uam_jit *j, size_t pos)
         memcpy(&j->cb[pos], &rel, 4);
 }
 
+/* Make room for `need` elements of `size` bytes in *p; on failure the block is not
+ * compiled (j->overflow). */
+static bool grow(uam_jit *j, void *p, uint32_t *cap, uint32_t need, size_t size)
+{
+    if (need <= *cap)
+        return true;
+    uint32_t ncap = *cap ? 2 * *cap : 16;
+    while (ncap < need)
+        ncap *= 2;
+    void *n = realloc(*(void **)p, size * ncap);
+    if (!n) {
+        j->overflow = true;
+        return false;
+    }
+    *(void **)p = n;
+    *cap = ncap;
+    return true;
+}
+
+/* Before a bridge call that may fault: jc->site = the current instruction's site
+ * record (one per instruction, emitted after the code). Clobbers rax. */
+static void emit_site(uam_jit *j)
+{
+    if (!j->cur_emitted) {
+        if (!grow(j, &j->sites, &j->cap_sites, j->n_sites + 1, sizeof(jit_site)))
+            return;
+        j->sites[j->n_sites++] = j->cur;
+        j->cur_emitted = true;
+    }
+    if (!grow(j, &j->site_refs, &j->cap_site_refs, j->n_site_refs + 1, sizeof(*j->site_refs)))
+        return;
+    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x05);              /* lea rax, [rip + site] */
+    j->site_refs[j->n_site_refs].lea = j->n;
+    j->site_refs[j->n_site_refs].site = j->n_sites - 1;
+    j->n_site_refs++;
+    g32(j, 0);
+    st_mem(j, RAX, RBX, OFF(site));
+}
+
 /*
  * UAM_OP_COV A, B (docs/uam-isa.md section 7.5; uam_cov_count in cpu.h is the
  * reference), inline: no bridge, so chained blocks count too. cpu->cov is read at run
@@ -722,11 +772,8 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t 
                        unsigned *n_epi)
 {
     bool fixed = uam_ref_is_imm(target);
-    /* if (exit_request || icount >= deadline || !chain_left) goto epilogue */
-    g8(j, 0x41); g8(j, 0x0F); g8(j, 0xB6); modrm_mem(j, RAX, R14, CPU(exit_request));
-    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX);       /* test rax, rax */
-    epi[(*n_epi)++] = jcc_fwd(j, 0x85);                             /* jnz */
-    g8(j, 0x4D); g8(j, 0x39); modrm_reg(j, R12, R13);               /* cmp r13, r12 */
+    /* if (icount >= icount_stop (exit request or deadline) || !chain_left) goto epilogue */
+    rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop)); /* cmp r13, [stop] */
     epi[(*n_epi)++] = jcc_fwd(j, 0x83);                             /* jae */
     g8(j, 0x83); modrm_mem(j, 7, RBX, OFF(chain_left)); g8(j, 0);   /* cmp dword [chain_left], 0 */
     epi[(*n_epi)++] = jcc_fwd(j, 0x84);                             /* je */
@@ -1092,6 +1139,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     j->overflow = false;
     j->n_slots = 0;
     j->n_marks = 0;
+    j->n_sites = j->n_site_refs = j->n_stubs = 0;
+    j->cur = (jit_site){ blk->guest_pc, blk->guest_pc, 0 };
+    j->cur_emitted = false;
 
     for (uint32_t i = 0; i < blk->n_insn; i++) {
         uam_opcode op = (uam_opcode)blk->insn[i].op;
@@ -1113,7 +1163,6 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     ld_mem(j, R14, RBX, OFF(cpu));
     ld_mem(j, R15, RBX, OFF(regfile));
     ld_mem(j, R13, R14, CPU(icount));              /* r13 = icount (kept in a register) */
-    ld_mem(j, R12, R14, CPU(icount_deadline));     /* r12 = deadline (constant per block) */
     j->body_off = j->n;                            /* chained jumps enter here */
 
     /* epilogue jumps: up to 4 per EXIT (chain checks), 1 per other op */
@@ -1156,51 +1205,21 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 if (in->flags & UAM_IMARK_BREAK) {
                     set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
                     epi[n_epi++] = jmp_fwd(j);
-                } else {
-                    /* if (exit_request) goto INT  (exit_request can be set async by a device) */
-                    g8(j, 0x41); g8(j, 0x0F); g8(j, 0xB6); modrm_mem(j, RAX, R14, CPU(exit_request));
-                    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX);
-                    size_t to_int = jcc_fwd(j, 0x85);                 /* jnz INT */
-                    /* if (icount < deadline) goto AFTER  (both in registers) */
-                    g8(j, 0x4D); g8(j, 0x39); modrm_reg(j, R12, R13); /* cmp r13, r12 */
-                    size_t to_after = jcc_fwd(j, 0x82);               /* jb AFTER */
-                    patch(j, to_int);
-                    set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
-                    epi[n_epi++] = jmp_fwd(j);
-                    patch(j, to_after);
+                } else if (grow(j, &j->stubs, &j->cap_stubs, j->n_stubs + 1, sizeof(*j->stubs))) {
+                    /* if (icount >= icount_stop) stop here: an out-of-line stub */
+                    rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop));
+                    j->stubs[j->n_stubs].jcc = jcc_fwd(j, 0x83);                 /* jae */
+                    j->stubs[j->n_stubs].pc = pc;
+                    j->n_stubs++;
                 }
             }
             first = false;
-            /* cur_pc/parent_pc/cont are read only when an op in this guest instruction can
-             * fault or traps (jit_fault / TRAP). Store them only then, so arithmetic and
-             * branch instructions - the common case - pay nothing here. */
-            bool needs_pc = false;
-            for (uint32_t k = i + 1; k < blk->n_insn; k++) {
-                uam_opcode o2 = (uam_opcode)blk->insn[k].op;
-                if (o2 == UAM_OP_IMARK) {
-                    /* A group leader covers its continuation instructions (delay slots): a
-                     * fault there needs this instruction's pc as the parent. Keep scanning
-                     * across CONT imarks; stop at the next independent instruction. */
-                    if (cont || !(blk->insn[k].flags & UAM_IMARK_CONT))
-                        break;
-                    continue;
-                }
-                /* a helper may fault (its descriptor says; any one is assumed to) */
-                if ((uam_opinfo_table[o2].props & UAM_P_FAULT) || o2 == UAM_OP_TRAP ||
-                    o2 == UAM_OP_HELPER) {
-                    needs_pc = true;
-                    break;
-                }
-            }
+            /* A continuation keeps the parent of the instruction it continues. */
+            j->cur.parent_pc = cont ? j->cur.parent_pc : pc;
+            j->cur.pc = pc;
+            j->cur.cont = cont;
+            j->cur_emitted = false;
             mark(j, MK_IMARK_PC, i);
-            if (needs_pc) {
-                mov_imm(j, RAX, pc);
-                st_mem(j, RAX, RBX, OFF(cur_pc));
-                if (!cont)
-                    st_mem(j, RAX, RBX, OFF(parent_pc));
-                mov_imm(j, RAX, cont ? 1 : 0);
-                st_mem(j, RAX, RBX, OFF(cont));
-            }
             g8(j, 0x49); g8(j, 0xFF); modrm_reg(j, 0, R13); /* inc r13 (icount) */
             break;
         }
@@ -1252,6 +1271,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
+            emit_site(j);
             mov_rr(j, RDI, RBX);                        /* miss / slow path: the bridge */
             mov_imm(j, RDX, in->flags);
             mov_imm(j, RCX, size);
@@ -1268,6 +1288,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         case UAM_OP_ST:
             if (in->flags & UAM_ACC_X) {               /* store-conditional: always the bridge */
                 st_mem(j, R13, R14, CPU(icount));
+                emit_site(j);
                 mov_rr(j, RDI, RBX);
                 load_operand(j, RSI, blk, in->a, aw);
                 load_operand(j, RDX, blk, in->b, W);
@@ -1300,6 +1321,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));
+            emit_site(j);
             mov_rr(j, RDI, RBX);
             load_operand(j, RDX, blk, in->b, W);        /* reload: the bridge call needs it in rdx */
             mov_imm(j, RCX, in->flags);
@@ -1316,6 +1338,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         case UAM_OP_CAS: {
             const bool cas = op == UAM_OP_CAS;
             st_mem(j, R13, R14, CPU(icount));
+            emit_site(j);
             mov_rr(j, RDI, RBX);
             load_operand(j, RSI, blk, in->a, aw);       /* addr */
             load_operand(j, RDX, blk, in->b, W);        /* operand / expected */
@@ -1350,6 +1373,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             break;
         case UAM_OP_SYSRD:
             st_mem(j, R13, R14, CPU(icount));
+            emit_site(j);
             mov_rr(j, RDI, RBX);
             mov_imm(j, RSI, in->aux);
             mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_sysrd);
@@ -1362,6 +1386,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             break;
         case UAM_OP_SYSWR:
             st_mem(j, R13, R14, CPU(icount));
+            emit_site(j);
             mov_rr(j, RDI, RBX);
             mov_imm(j, RSI, in->aux);
             load_operand(j, RDX, blk, in->a, W);
@@ -1374,6 +1399,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             const uam_ref args[3] = { in->a, in->b, in->c };
             const int regs[3] = { RDX, RCX, R8 };
             st_mem(j, R13, R14, CPU(icount));
+            emit_site(j);
             for (unsigned k = 0; k < 3; k++) {
                 if (uam_ref_is_none(args[k]))
                     mov_imm(j, regs[k], 0);
@@ -1394,10 +1420,10 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         }
         case UAM_OP_TRAP:
             /* res = { TRAP, class, exc{TRAP, flags=cont, pc, parent_pc, cause, tval} } */
-            ld_mem(j, RAX, RBX, OFF(cur_pc));   st_mem(j, RAX, RBX, RES(pc));
+            mov_imm(j, RAX, j->cur.pc);         st_mem(j, RAX, RBX, RES(pc));
             st_mem(j, RAX, RBX, REXC(pc));
-            ld_mem(j, RAX, RBX, OFF(parent_pc)); st_mem(j, RAX, RBX, REXC(parent_pc));
-            ld_mem(j, RAX, RBX, OFF(cont));      st_mem32(j, RAX, RBX, REXC(flags));
+            mov_imm(j, RAX, j->cur.parent_pc);  st_mem(j, RAX, RBX, REXC(parent_pc));
+            g8(j, 0xC7); modrm_mem(j, 0, RBX, REXC(flags)); g32(j, j->cur.cont ? UAM_EXC_F_CONT : 0);
             load_operand(j, RAX, blk, in->a, aw); st_mem(j, RAX, RBX, REXC(cause));
             load_operand(j, RAX, blk, in->b, aw); st_mem(j, RAX, RBX, REXC(tval));
             g8(j, 0xC7); modrm_mem(j, 0, RBX, REXC(kind)); g32(j, UAM_EXC_TRAP);
@@ -1432,6 +1458,14 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         }
     }
 
+    /* out-of-line stops at IMARKs */
+    mark(j, MK_STUB, 0);
+    for (uint32_t k = 0; k < j->n_stubs; k++) {
+        patch(j, j->stubs[k].jcc);
+        set_res_pc_imm(j, UAM_BR_INTERRUPTED, j->stubs[k].pc);
+        epi[n_epi++] = jmp_fwd(j);
+    }
+
     /* epilogue */
     for (unsigned k = 0; k < n_epi; k++)
         patch(j, epi[k]);
@@ -1458,6 +1492,19 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         g64(j, 0);                                       /* entry */
         g64(j, LINK_NONE);                               /* epoch: never linked */
         g64(j, j->slot[k].pc);                           /* pc */
+    }
+    /* fault sites (8-aligned too: slots are 24 bytes) */
+    size_t sites_at = j->n;
+    for (uint32_t k = 0; k < j->n_sites; k++) {
+        g64(j, j->sites[k].pc);
+        g64(j, j->sites[k].parent_pc);
+        g64(j, j->sites[k].cont);
+    }
+    for (uint32_t k = 0; k < j->n_site_refs; k++) {
+        int32_t rel = (int32_t)(sites_at + sizeof(jit_site) * j->site_refs[k].site
+                                - (j->site_refs[k].lea + 4));
+        if (j->site_refs[k].lea + 4 <= CBUF_MAX)
+            memcpy(&j->cb[j->site_refs[k].lea], &rel, 4);
     }
 
     return !j->overflow;
@@ -1539,6 +1586,9 @@ void uam_jit_destroy(uam_jit *j)
     if (j->opmap)
         fclose(j->opmap);
     free(j->marks);
+    free(j->sites);
+    free(j->site_refs);
+    free(j->stubs);
     free(j);
 }
 
@@ -1602,6 +1652,7 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
     jc->link_slot = NULL;
     jc->dgen = cpu->bus->direct_gen;
     jc->next_when = uam_sched_next(x->sched);
+    cpu->icount_stop = cpu->exit_request ? 0 : cpu->icount_deadline;
     ((void (*)(uam_jit_ctx *))blk->backend)(jc);
     *res = jc->res;
     chain->hops = jc->hops;
