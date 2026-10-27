@@ -836,11 +836,27 @@ static void emit_fast_store(uam_jit *j, unsigned size, bool be)
  * `tag_off`/`base_off` select the read or write set. Returns miss-jump positions in
  * miss[] (up to 3) and their count in *n_miss. */
 static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag_off,
-                            int32_t base_off, size_t *miss, unsigned *n_miss)
+                            int32_t base_off, const opnd *addr, size_t *miss, unsigned *n_miss)
 {
     /* Uses only rax and rcx as scratch; rdx (addr) and r11 (store value) are preserved,
      * and so is every register that holds a temp. rcx ends holding the host base. */
     *n_miss = 0;
+    if (addr->kind == O_IMM) {
+        /* A constant address: its entry, page and alignment are known, so the probe
+         * is one compare with that entry's tag (the caller sends a page-crossing or
+         * misaligned constant access straight to the bridge). */
+        const uint64_t vpage = addr->imm >> UAM_PAGE_SHIFT;
+        const int32_t e = 8 * (int32_t)(vpage & (UAM_DTLB_SIZE - 1));
+        if (fits_s32(vpage)) {
+            rex(j, 1, 0, 0, 1); g8(j, 0x81); modrm_mem(j, 7, R14, tag_off + e); g32(j, (uint32_t)vpage);
+        } else {                                           /* cmp qword [tag], vpage */
+            movabs(j, RAX, vpage);
+            rex(j, 1, 0, 0, 1); g8(j, 0x3B); modrm_mem(j, RAX, R14, tag_off + e);
+        }
+        miss[(*n_miss)++] = jcc_fwd(j, 0x85);              /* jne miss */
+        ld_mem(j, RCX, R14, base_off + e);                 /* rcx = host base */
+        return;
+    }
     mov_rr(j, RAX, RDX);                                   /* rax = addr */
     rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 5, RAX); g8(j, UAM_PAGE_SHIFT); /* shr rax,12 (vpage) */
     g8(j, 0x89); modrm_reg(j, RAX, RCX);                   /* mov ecx, eax */
@@ -858,6 +874,14 @@ static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag
         }
     }
     rex(j, 1, 0, 0, 1); g8(j, 0x8B); modrm_sib(j, RCX, R14, RCX, 3, base_off);  /* mov rcx,[r14+rcx*8+base] */
+}
+
+/* A constant access the inline path can never take: it crosses a page, or it is
+ * misaligned and must fault (ACC_ALIGNED). */
+static bool const_slow(uint64_t addr, unsigned size, unsigned flags)
+{
+    return (size > 1 && (addr & (UAM_PAGE_SIZE - 1)) > UAM_PAGE_SIZE - size)
+        || ((flags & UAM_ACC_ALIGNED) && (addr & (size - 1)));
 }
 
 /* Forward jump: emit opcode(s) + rel32 placeholder; returns the patch position. */
@@ -1532,11 +1556,13 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             unsigned size = W / 8;
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
-            load_operand(j, RDX, blk, in->a, aw);       /* rdx = addr */
+            const opnd ao = opnd_of(j, blk, in->a, aw);
+            load(j, RDX, ao, aw);                       /* rdx = addr */
+            fast = fast && !(ao.kind == O_IMM && const_slow(ao.imm, size, in->flags));
             size_t done = 0, miss[3]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_rt), CPU(dtlb_rb),
-                                miss, &n_miss);
+                                &ao, miss, &n_miss);
                 emit_fast_load(j, size, be);            /* rax = value */
                 done = jmp_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
@@ -1584,11 +1610,13 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
             load_operand(j, R11, blk, in->b, W);        /* r11 = value */
-            load_operand(j, RDX, blk, in->a, aw);       /* rdx = addr */
+            const opnd ao = opnd_of(j, blk, in->a, aw);
+            load(j, RDX, ao, aw);                       /* rdx = addr */
+            fast = fast && !(ao.kind == O_IMM && const_slow(ao.imm, size, in->flags));
             size_t done = 0, miss[3]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_wt), CPU(dtlb_wb),
-                                miss, &n_miss);
+                                &ao, miss, &n_miss);
                 emit_fast_store(j, size, be);
                 done = jmp_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
