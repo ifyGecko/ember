@@ -805,6 +805,70 @@ static void test_pci(void)
     uam_bus_fini(&bus);
 }
 
+/* Configuration mechanism #1: only a dword access to CONFIG_ADDRESS is one; others go
+ * to the pass-through (here: a byte register at offset 1, like a PC's 0xCF9). */
+static unsigned through_writes;
+static uint64_t through_off, through_val;
+static uam_status through_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
+{
+    (void)d; (void)size;
+    *val = 0xA0 + off;
+    return UAM_OK;
+}
+static uam_status through_write(uam_device *d, uint64_t off, unsigned size, uint64_t val)
+{
+    (void)d; (void)size;
+    through_writes++;
+    through_off = off;
+    through_val = val;
+    return UAM_OK;
+}
+static unsigned cf9_calls;
+static uint8_t  cf9_val;
+static void cf9_hook(void *ctx, uint8_t val) { (void)ctx; cf9_calls++; cf9_val = val; }
+
+static void test_pci_cam(void)
+{
+    uam_bus bus;
+    uam_bus_init(&bus);
+    uam_pci_bus *pb = uam_pci_bus_create("pci", &bus, 0);
+    uam_pci_func f;
+    uam_pci_func_init(&f, "f", 0x1234, 0x0005, 0x01060100, NULL, NULL);
+    CHECK(uam_pci_register(pb, &f, 2, 0) == UAM_OK, "register function");
+    CHECK(uam_bus_map_mmio(&bus, "cam", 0xCF8, 8, uam_pci_cam(pb)) == UAM_OK, "map CAM");
+    const unsigned L = UAM_ACC_LE;
+
+    wr(&bus, 0xCF8, 4, L, 0x80001000);
+    EQ64(rd(&bus, 0xCFC, 4, L), 0x00051234, "dword address selects device 2");
+    wr(&bus, 0xCF9, 1, L, 0x06);
+    EQ64(rd(&bus, 0xCF8, 4, L), 0x80001000, "byte write alone is not an address write");
+    EQ64(rd(&bus, 0xCF9, 1, L), 0x10, "byte read of the address without a pass-through");
+
+    static const uam_device_ops through_ops = {
+        .type = "test,cam-through", .read = through_read, .write = through_write,
+        .flags = UAM_DEVICE_STATELESS,
+    };
+    uam_device through;
+    uam_device_init(&through, &through_ops, "through");
+    uam_pci_cam_passthrough(pb, &through);
+    wr(&bus, 0xCF9, 1, L, 0x06);
+    CHECK(through_writes == 1 && through_off == 1 && through_val == 0x06, "byte write passed through");
+    EQ64(rd(&bus, 0xCF9, 1, L), 0xA1, "byte read passed through");
+    wr(&bus, 0xCF8, 4, L, 0x80000000);
+    EQ64(through_writes, 1, "dword address write not passed through");
+    EQ64(rd(&bus, 0xCF8, 4, L), 0x80000000, "dword address read");
+
+    uam_pci_set_cf9_hook(pb, cf9_hook, NULL);
+    wr(&bus, 0xCF9, 1, L, 0x0E);
+    CHECK(cf9_calls == 1 && cf9_val == 0x0E, "CF9 hook");
+    wr(&bus, 0xCFA, 1, L, 0x0E);
+    EQ64(cf9_calls, 1, "other bytes are not the hook");
+    EQ64(rd(&bus, 0xCF8, 4, L), 0x80000000, "address untouched");
+
+    uam_pci_bus_device(pb)->ops->destroy(uam_pci_bus_device(pb));
+    uam_bus_fini(&bus);
+}
+
 /* A 64 KiB disk image whose every byte is its sector number. */
 static uam_blockdev *test_disk(char *path, uint32_t ss)
 {
@@ -1741,6 +1805,7 @@ int main(void)
     test_region_remap();
     test_cfi_flash();
     test_pci();
+    test_pci_cam();
     test_nvme();
     test_ahci();
     test_pci_rom();

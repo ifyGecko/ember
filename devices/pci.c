@@ -16,8 +16,10 @@ struct uam_pci_bus {
     uam_device    ecam;
     uam_bus      *sys;
     uint64_t      io_base;
-    uint32_t      addr;         /* 0xCF8 */
+    uint32_t      addr;         /* CONFIG_ADDRESS */
+    uam_device   *cam_through;  /* other accesses to CONFIG_ADDRESS (uam_pci_cam_passthrough) */
     uam_pci_func *funcs;
+    uam_device    cf9_dev;      /* uam_pci_set_cf9_hook's pass-through device */
     void        (*cf9)(void *ctx, uint8_t val);
     void         *cf9_ctx;
     uam_pci_intx_fn intx;
@@ -659,11 +661,20 @@ void uam_pci_cfg_write(uam_pci_bus *pb, unsigned bus, unsigned devfn, unsigned o
         uam_pci_update_bars(f);
 }
 
-/* ---- 0xCF8 / 0xCFC ------------------------------------------------------- */
+/* ---- configuration mechanism #1 (CONFIG_ADDRESS / CONFIG_DATA) ------------ */
+
+/* Only a dword access to CONFIG_ADDRESS is a configuration access (PCI Local Bus
+ * spec, configuration mechanism #1); the bridge passes any other one through. */
+static bool cam_through(const uam_pci_bus *pb, uint64_t off, unsigned size)
+{
+    return off < 4 && !(off == 0 && size == 4) && pb->cam_through;
+}
 
 static uam_status cam_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
 {
     uam_pci_bus *pb = from_cam(d);
+    if (cam_through(pb, off, size))
+        return pb->cam_through->ops->read(pb->cam_through, off, size, val);
     if (off < 4) {
         *val = (pb->addr >> (8 * off)) & (uint32_t)((1ull << (8 * size)) - 1);
         return UAM_OK;
@@ -680,11 +691,8 @@ static uam_status cam_read(uam_device *d, uint64_t off, unsigned size, uint64_t 
 static uam_status cam_write(uam_device *d, uint64_t off, unsigned size, uint64_t v)
 {
     uam_pci_bus *pb = from_cam(d);
-    if (off == 1 && size == 1) {           /* 0xCF9: reset control, not the address */
-        if (pb->cf9)
-            pb->cf9(pb->cf9_ctx, (uint8_t)v);
-        return UAM_OK;
-    }
+    if (cam_through(pb, off, size))
+        return pb->cam_through->ops->write(pb->cam_through, off, size, v);
     if (off < 4) {
         if (off == 0 && size == 4)
             pb->addr = (uint32_t)v & 0x80FFFFFCu;
@@ -810,8 +818,36 @@ uam_device *uam_pci_bus_device(uam_pci_bus *pb) { return &pb->cam; }
 uam_device *uam_pci_cam(uam_pci_bus *pb)        { return &pb->cam; }
 uam_device *uam_pci_ecam(uam_pci_bus *pb)       { return &pb->ecam; }
 
+void uam_pci_cam_passthrough(uam_pci_bus *pb, uam_device *dev)
+{
+    pb->cam_through = dev;
+}
+
+/* uam_pci_set_cf9_hook: a pass-through whose byte 1 written alone is the hook; reads
+ * see CONFIG_ADDRESS, as they do without a pass-through. */
+static uam_status cf9_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
+{
+    uam_pci_bus *pb = UAM_CONTAINER_OF(d, uam_pci_bus, cf9_dev);
+    *val = (pb->addr >> (8 * off)) & (uint32_t)((1ull << (8 * size)) - 1);
+    return UAM_OK;
+}
+
+static uam_status cf9_write(uam_device *d, uint64_t off, unsigned size, uint64_t v)
+{
+    uam_pci_bus *pb = UAM_CONTAINER_OF(d, uam_pci_bus, cf9_dev);
+    if (off == 1 && size == 1)
+        pb->cf9(pb->cf9_ctx, (uint8_t)v);
+    return UAM_OK;
+}
+
+static const uam_device_ops cf9_ops = {
+    .type = "pci,cam-cf9", .read = cf9_read, .write = cf9_write, .flags = UAM_DEVICE_STATELESS,
+};
+
 void uam_pci_set_cf9_hook(uam_pci_bus *pb, void (*fn)(void *ctx, uint8_t val), void *ctx)
 {
     pb->cf9 = fn;
     pb->cf9_ctx = ctx;
+    uam_device_init(&pb->cf9_dev, &cf9_ops, "cf9");
+    uam_pci_cam_passthrough(pb, fn ? &pb->cf9_dev : NULL);
 }

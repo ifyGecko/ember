@@ -10,10 +10,12 @@
  * `io_base + port`.
  *
  * Configuration access:
- *   uam_pci_cam(bus)   8 bytes at the PC's 0xCF8 (address) / 0xCFC (data).
- *                      A byte write to 0xCF9 is not a configuration access:
- *                      it goes to the hook set with uam_pci_set_cf9_hook
- *                      (the PC reset-control register).
+ *   uam_pci_cam(bus)   configuration mechanism #1: 8 bytes, CONFIG_ADDRESS
+ *                      then CONFIG_DATA (0xCF8 / 0xCFC on a PC). Only a dword
+ *                      access to CONFIG_ADDRESS is a configuration access;
+ *                      the bridge passes narrower ones to the device set with
+ *                      uam_pci_cam_passthrough (a PC chipset's reset-control
+ *                      register at 0xCF9, for one), else ignores the writes.
  *   uam_pci_ecam(bus)  enhanced configuration window: bus << 20 |
  *                      device << 15 | function << 12 | register.
  *
@@ -148,6 +150,12 @@ uam_pci_bus *uam_pci_bus_create(const char *name, uam_bus *sys, uint64_t io_base
 uam_device  *uam_pci_bus_device(uam_pci_bus *pb);   /* = uam_pci_cam */
 uam_device  *uam_pci_cam(uam_pci_bus *pb);
 uam_device  *uam_pci_ecam(uam_pci_bus *pb);
+/* The device that sees accesses to CONFIG_ADDRESS other than a dword (offsets 0-3,
+ * little-endian), or NULL. Reads go to it too: without one they return
+ * CONFIG_ADDRESS's bytes. */
+void         uam_pci_cam_passthrough(uam_pci_bus *pb, uam_device *dev);
+/* Compatibility: a pass-through calling fn for a byte written at offset 1 (the PC's
+ * 0xCF9 reset control); reads return CONFIG_ADDRESS's bytes. */
 void         uam_pci_set_cf9_hook(uam_pci_bus *pb, void (*fn)(void *ctx, uint8_t val), void *ctx);
 
 /*
