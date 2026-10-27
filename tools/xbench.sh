@@ -1,7 +1,7 @@
 #!/bin/sh
 # xbench.sh - run the cross-ISA benchmark (tests/bench) on every guest and compare
 #
-#   tools/xbench.sh [--runs N] [--interp] [--rounds N] [--only K] [--per-kernel]
+#   tools/xbench.sh [--runs N] [--interp] [--rounds N] [--only K] [--per-kernel [--times]]
 #                   [--check] [--run UAM_RUN] [--out DIR] [--variants LIST]
 #
 # Builds tests/bench (ROUNDS and ONLY passed through), runs each guest build on its
@@ -14,7 +14,9 @@
 #
 # --per-kernel instead runs each kernel on its own and prints, for each kernel, every
 # guest's time divided by the fastest guest's on that kernel, and last the geometric
-# mean of those ratios per guest (1.00 everywhere would be perfect parity).
+# mean of those ratios per guest (1.00 everywhere would be perfect parity). --times also
+# prints each kernel's time_s per guest, and their geometric mean: the table to compare two
+# builds by, as the ratios hide a change that speeds up every guest alike.
 #
 # --check is the quick correctness run of make bench-test: 2 rounds, one run each,
 # with the interpreter and with the JIT.
@@ -25,7 +27,7 @@
 set -eu
 
 here=$(cd "$(dirname "$0")/.." && pwd)
-runs=5 mode=--jit rounds= only= per_kernel=0 check=0 run=$here/build/uam-run
+runs=5 mode=--jit rounds= only= per_kernel=0 times=0 check=0 run=$here/build/uam-run
 base=$here/build/firmware-bench
 variants="rv32 mips mipsel arm thumb thumb-be ppc x86"
 while [ $# -gt 0 ]; do
@@ -35,6 +37,7 @@ while [ $# -gt 0 ]; do
     --rounds) rounds=$2; shift 2;;
     --only) only=$2; shift 2;;
     --per-kernel) per_kernel=1; shift;;
+    --times) times=1; shift;;
     --check) check=1 rounds=2 runs=1; shift;;
     --run) run=$2; shift 2;;
     --out) base=$2; shift 2;;
@@ -103,7 +106,7 @@ else
         k=$((k + 1))
     done
     # columns now: 1 kernel, 2 board, 3 label, 5 time_s, 15 ok
-    awk -F'\t' '
+    awk -F'\t' -v times=$times '
         { if (!($1 in seen)) { seen[$1] = 1; ks[++nk] = $1 }
           if (!($3 in vseen)) { vseen[$3] = 1; vs[++nv] = $3 }
           t[$1, $3] = $5; if (!(($1) in best) || $5 < best[$1]) best[$1] = $5
@@ -120,6 +123,14 @@ else
                 printf "\n"
             }
             printf "geomean"; for (j = 1; j <= nv; j++) printf "\t%.2f", exp(lg[j] / nk); printf "\n"
+            if (!times) exit
+            printf "\ntime_s"; for (j = 1; j <= nv; j++) printf "\t%s", vs[j]; printf "\n"
+            for (i = 1; i <= nk; i++) {
+                printf "%s", ks[i]
+                for (j = 1; j <= nv; j++) { printf "\t%.4f", t[ks[i], vs[j]]; lt[j] += log(t[ks[i], vs[j]]) }
+                printf "\n"
+            }
+            printf "geomean"; for (j = 1; j <= nv; j++) printf "\t%.4f", exp(lt[j] / nk); printf "\n"
         }' "$tmp/rows"
 fi
 ! grep -q 'WRONG$' "$tmp/rows"

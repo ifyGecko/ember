@@ -14,6 +14,8 @@
  * Level A runs every pure op at every valid width with temp and immediate operands
  * over edge and random values. Level C runs fixed shapes the optimizer rewrites
  * (overwritten register writes, flags read back, CSE) over random register files.
+ * Level D runs shapes of register writes the JIT defers across instructions (replayed
+ * where the block may stop) under every stop condition below.
  * Level B runs random verified blocks: guards, CONT and
  * BREAK imarks, loads/stores (LE/BE, aligned, exclusive, page-crossing, faulting,
  * MMIO), AMO/CAS, helpers, sysregs, traps, and exits to constant and computed pcs.
@@ -686,6 +688,177 @@ static void level_c(void)
     printf("test_jitdiff: level C: %u pattern runs\n", n);
 }
 
+/* ---- level D: register writes deferred across instructions ----------------------- */
+
+static void random_start(void);
+
+/* A load whose address picks the path: RAM, ROM, the observer device (its events hash
+ * the register file), a page-crossing RAM word, or the hole (a fault). */
+static uam_ref d_load(uam_builder *b, unsigned which)
+{
+    static const uint64_t at[] = { RAM_BASE + 0x40, ROM_BASE + 0x80, DEV_BASE + 4,
+                                   RAM_BASE + 0xFFE, HOLE };
+    return uam_ld(b, 32, UAM_ACC_LE, uam_imm(b, at[which % 5]), NONE);
+}
+
+/* Flag-like bytes 64..69 from two operands, as an ALU instruction sets them. */
+static void d_flags(uam_builder *b, uam_ref x, uam_ref y, uam_ref g)
+{
+    static const uam_opcode cmp[] = { UAM_OP_EQ, UAM_OP_ULT, UAM_OP_SLT, UAM_OP_CARRY,
+                                      UAM_OP_SBORROW, UAM_OP_SLE };
+    for (unsigned k = 0; k < 6; k++)
+        uam_put(b, 8, 64 + k, uam_unop(b, UAM_OP_ZEXT, 8, uam_binop(b, cmp[k], 32, x, y)),
+                k == 3 ? g : NONE);
+}
+
+/* Each pattern spans several instructions with a soft point (a stop check, a load's
+ * slow path) between a write and the write that overwrites it. */
+static void d_pattern(uam_builder *b, unsigned p)
+{
+    const uam_ref N = NONE;
+    uint64_t pc = 0x4000;
+    uam_builder_begin(b, pc);
+    uam_imark(b, pc, 4);
+#define NEXT() uam_imark(b, pc += 4, 4)
+    switch (p) {
+    case 0:   /* a write done in place that partly overlaps a pending one (overlap rule) */
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        NEXT();
+        uam_put(b, 16, 0, uam_get(b, 16, 16), N);
+        NEXT();
+        uam_put(b, 32, 44, d_load(b, rn(5)), N);
+        NEXT();
+        uam_put(b, 16, 2, uam_get(b, 16, 24), N);
+        break;
+    case 1: { /* a guarded write done in place over a pending one */
+        uam_ref g = uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 72));
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        NEXT();
+        uam_put(b, 64, 0, uam_get(b, 64, 16), g);
+        NEXT();
+        uam_put(b, 32, 44, d_load(b, rn(5)), N);
+        NEXT();
+        uam_put(b, 32, 0, uam_get(b, 32, 24), N);
+        break;
+    }
+    case 2:   /* pieces overwritten one at a time, replayed in order */
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        NEXT();
+        uam_put(b, 16, 0, uam_get(b, 16, 16), N);
+        NEXT();
+        uam_put(b, 32, 44, d_load(b, rn(5)), N);
+        uam_put(b, 16, 2, uam_get(b, 16, 24), N);
+        NEXT();
+        uam_put(b, 32, 48, d_load(b, rn(5)), N);
+        uam_put(b, 16, 0, uam_get(b, 16, 32), N);
+        break;
+    case 3: { /* a read between a write and the one that overwrites it */
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        NEXT();
+        uam_ref t = uam_get(b, 8, 1);
+        NEXT();
+        uam_put(b, 32, 44, d_load(b, rn(5)), N);
+        uam_put(b, 32, 0, uam_get(b, 32, 16), N);
+        uam_put(b, 8, 40, t, N);
+        break;
+    }
+    case 4:   /* continuation imarks (no stop) and plain ones between the writes */
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        uam_imark_cont(b, pc, 4);
+        uam_put(b, 32, 0, uam_get(b, 32, 12), N);
+        NEXT();
+        uam_put(b, 32, 4, uam_get(b, 32, 16), N);
+        uam_imark_cont(b, pc, 4);
+        uam_put(b, 32, 44, d_load(b, rn(5)), N);
+        uam_put(b, 32, 0, uam_get(b, 32, 20), N);
+        uam_put(b, 32, 4, uam_get(b, 32, 24), N);
+        break;
+    case 5: { /* immediates of every width, guarded and not, with a store in between */
+        uam_ref g = uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 72));
+        uam_put(b, 64, 0, uam_imm(b, 0x8000000012345678ull), N);
+        uam_put(b, 64, 8, uam_imm(b, 0xFFFFFFFFFFFFFF80ull), g);
+        uam_put(b, 16, 16, uam_imm(b, 0xBEEF), N);
+        uam_put(b, 8, 18, uam_imm(b, 0x5A), g);
+        NEXT();
+        uam_st(b, 32, UAM_ACC_LE, uam_imm(b, rn(2) ? DEV_BASE + 8 : RAM_BASE + 0x80),
+               uam_get(b, 32, 24), N);
+        uam_put(b, 64, 0, uam_get(b, 64, 32), N);
+        uam_put(b, 64, 8, uam_get(b, 64, 40), N);
+        uam_put(b, 32, 16, uam_get(b, 32, 48), N);
+        break;
+    }
+    default: { /* flag-setting instructions, each with a memory access first */
+        uam_ref g = uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 72));
+        uam_ref x = uam_get(b, 32, 0), y = uam_get(b, 32, 8);
+        uam_ref s = uam_binop(b, UAM_OP_ADD, 32, x, y);
+        uam_put(b, 32, 0, s, N);
+        d_flags(b, x, y, g);
+        for (unsigned k = 0; k < 4; k++) {
+            NEXT();
+            uam_ref v = d_load(b, rn(8));   /* mostly RAM and ROM */
+            uam_ref r = uam_binop(b, UAM_OP_SUB, 32, s, v);
+            uam_put(b, 32, 0, r, N);
+            d_flags(b, s, v, chance(50) ? g : N);
+            s = r;
+        }
+        NEXT();
+        d_flags(b, s, uam_get(b, 32, 16), N);
+        break;
+    }
+    }
+#undef NEXT
+    uam_exit(b, NONE, uam_imm(b, pc + 4), UAM_EXIT_JUMP);
+}
+
+static void level_d(void)
+{
+    uam_builder b;
+    uam_builder_init(&b, 32);
+    with_mem = true;
+    unsigned n = 0;
+    for (unsigned p = 0; p < 7 && failures < 5; p++) {
+        for (unsigned it = 0; it < 150; it++) {
+            d_pattern(&b, p);
+            uam_block *blk = uam_builder_finish(&b);
+            char err[256];
+            if (!verify_block(blk, err, sizeof(err))) {
+                fprintf(stderr, "FAIL level D: pattern %u does not verify: %s\n", p, err);
+                failures++;
+                uam_block_free(blk);
+                break;
+            }
+            random_start();
+            bool bad = false;
+            /* stop conditions as in level B */
+            for (unsigned s = 0; s < blk->n_guest + 5 && !bad; s++) {
+                start.deadline = UINT64_MAX;
+                start.exit_request = false;
+                dev_exit_at = 0;
+                if (s >= 1 && s <= blk->n_guest + 1)
+                    start.deadline = ICOUNT0 + s - 1;
+                else if (s == blk->n_guest + 2)
+                    start.exit_request = true;
+                else if (s >= blk->n_guest + 3)
+                    dev_exit_at = s - blk->n_guest - 2;
+                checks++;
+                n++;
+                if (diff_block(blk, false)) {
+                    char what[64];
+                    snprintf(what, sizeof(what), "level D: pattern %u (stop case %u)", p, s);
+                    report(blk, what);
+                    bad = true;
+                }
+            }
+            if (bad)
+                break;
+            uam_block_free(blk);
+        }
+    }
+    dev_exit_at = 0;
+    uam_builder_free(&b);
+    printf("test_jitdiff: level D: %u pattern runs\n", n);
+}
+
 /* ---- level B: random blocks ------------------------------------------------------ */
 
 typedef struct gen {
@@ -1101,6 +1274,7 @@ int main(int argc, char **argv)
     rng_state = seed;
     level_a();
     level_c();
+    level_d();
     level_priv();
     level_b(n, seed);
     uam_exec_fini(&ex);

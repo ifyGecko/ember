@@ -278,9 +278,10 @@ static uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64
 #define MAX_SLOTS  64u           /* EXITs per block that get a link (more just return) */
 
 /* Code-region kinds recorded for the op map (UAM_JIT_OPMAP; docs/jit-perf.md). */
-enum { MK_PROLOGUE, MK_OP, MK_IMARK_PC, MK_SLOW, MK_CHAIN, MK_STUB, MK_EPILOGUE, MK_SLOTS };
+enum { MK_PROLOGUE, MK_OP, MK_IMARK_PC, MK_SLOW, MK_CHAIN, MK_STUB, MK_EPILOGUE, MK_SLOTS,
+       MK_REPLAY };
 static const char *const mark_name[] = { "prologue", "op", "imark-pc", "slow", "chain", "stub",
-                                         "epilogue", "slots" };
+                                         "epilogue", "slots", "replay" };
 typedef struct jit_mark { uint32_t off, idx; uint8_t kind; } jit_mark;
 
 /* Host registers. */
@@ -295,6 +296,8 @@ enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, RDI = 7, R
 #define RA_POOL_MAX 6
 static const int ra_regs[RA_POOL_MAX] = { R12, RSI, RDI, R8, R9, R10 };
 #define NO_TEMP UINT32_MAX
+
+typedef struct jit_rep jit_rep;   /* a replay in an IMARK stop stub (defer_analyze) */
 
 struct uam_jit {
     uam_exec    *x;
@@ -325,8 +328,21 @@ struct uam_jit {
     uint32_t     n_sites, cap_sites;
     struct { size_t lea; uint32_t site; } *site_refs;   /* lea rel32 positions to patch */
     uint32_t     n_site_refs, cap_site_refs;
-    struct { size_t jcc; uint64_t pc; } *stubs;        /* out-of-line IMARK stops */
+    struct { size_t jcc; uint64_t pc; uint32_t rep, n_rep; } *stubs;  /* out-of-line IMARK
+                                                                       * stops, their replays */
     uint32_t     n_stubs, cap_stubs;
+    /* deferred register writes (defer_analyze; docs/jit-dead-puts-design.md) */
+    bool         defer;      /* on unless UAM_JIT_NODEFER */
+    uint8_t     *okind;      /* per insn: what it is to the analysis (OK_*) */
+    uint8_t     *dfr;        /* per insn: a PUT done only on the cold paths */
+    uint32_t    *obs_start;  /* per insn + 1: the writes to replay at insn i (a soft point) */
+    uint32_t    *obs_list;   /*   are obs_list[obs_start[i] .. obs_start[i + 1]), in order */
+    uint32_t    *pend;       /* scratch: pending writes and their live bytes */
+    uint8_t     *pend_live;
+    uint8_t     *kbytes;     /* scratch: register file bytes overwritten later (backward) */
+    uint32_t     cap_ins, cap_obs, cap_kb;
+    jit_rep     *reps;       /* replays of the IMARK stubs */
+    uint32_t     n_reps, cap_reps;
     /* register allocation, per temp of the block being compiled */
     int8_t      *reg_of;     /* host register holding it, or -1 */
     uint8_t     *in_mem;     /* its jc->temps slot holds its value */
@@ -451,6 +467,15 @@ static void st_temp(uam_jit *j, uint32_t idx, int reg) { st_mem(j, reg, RBP, (in
  * jc->temps (a temp not allocated a register, or spilled). */
 enum { O_IMM, O_MEM, O_REG };
 typedef struct opnd { int kind; uint64_t imm; int32_t disp; int reg; } opnd;
+
+/* A deferred register write replayed in an IMARK stop stub: where its value and guard
+ * were when the stub's jump was taken. */
+struct jit_rep {
+    uint32_t aux;          /* register file offset */
+    uint8_t  w;            /* width */
+    bool     guarded;
+    opnd     v, g;
+};
 
 static opnd opnd_of(const uam_jit *j, const uam_block *blk, uam_ref r, unsigned w)
 {
@@ -637,7 +662,38 @@ static void   patch(uam_jit *j, size_t pos);
  * a register is freed after its temp's last read. A temp once stored is never stored
  * again (SSA), so a spilled temp is simply read from memory from then on. Guarded
  * ops define their result after the guard's paths join, and calls save and restore
- * the live caller-saved registers, so the allocation is the same on every path. */
+ * the live caller-saved registers, so the allocation is the same on every path.
+ * A deferred PUT (defer_analyze) reads nothing where it stands; instead its value and
+ * guard are read at every soft point that replays it, so they stay live up to the last. */
+
+/* The temps insn i reads: its operands (none for a deferred PUT), then the value and
+ * guard of each write its replay list holds. Returns how many, into out[]. */
+static unsigned insn_reads(const uam_jit *j, const uam_block *blk, uint32_t i, uam_ref *out,
+                           unsigned max)
+{
+    unsigned n = 0;
+    const uam_insn *in = &blk->insn[i];
+    if (!j->dfr[i]) {
+        const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
+        for (unsigned k = 0; k < 4; k++)
+            if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]) && n < max)
+                out[n++] = refs[k];
+    }
+    for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
+        const uam_insn *d = &blk->insn[j->obs_list[e]];
+        if (!uam_ref_is_imm(d->a) && n < max)
+            out[n++] = d->a;
+        if (!uam_ref_is_none(d->guard) && !uam_ref_is_imm(d->guard) && n < max)
+            out[n++] = d->guard;
+    }
+    return n;
+}
+
+/* Reads of one insn at most: 4 operands, 2 per replayed write. */
+static unsigned max_reads(const uam_jit *j, uint32_t i)
+{
+    return 4 + 2 * (j->obs_start[i + 1] - j->obs_start[i]);
+}
 
 static bool ra_begin(uam_jit *j, const uam_block *blk)
 {
@@ -658,21 +714,26 @@ static bool ra_begin(uam_jit *j, const uam_block *blk)
             return false;
         j->cap_temp = cap;
     }
-    uint32_t n_use = 0;
+    uint32_t n_use = 0, max = 4;
+    for (uint32_t i = 0; i < blk->n_insn; i++)
+        if (max_reads(j, i) > max)
+            max = max_reads(j, i);
+    uam_ref *rd = malloc(sizeof(uam_ref) * max);
+    if (!rd)
+        return false;
     memset(j->use_start, 0, sizeof(uint32_t) * (nt + 1));
     for (uint32_t i = 0; i < blk->n_insn; i++) {
-        const uam_insn *in = &blk->insn[i];
-        const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
-        for (unsigned k = 0; k < 4; k++)
-            if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k])) {
-                j->use_start[refs[k] + 1]++;
-                n_use++;
-            }
+        unsigned n = insn_reads(j, blk, i, rd, max);
+        for (unsigned k = 0; k < n; k++)
+            j->use_start[rd[k] + 1]++;
+        n_use += n;
     }
     if (n_use > j->cap_use) {
         uint32_t *u = realloc(j->use_pos, sizeof(uint32_t) * n_use);
-        if (!u)
+        if (!u) {
+            free(rd);
             return false;
+        }
         j->use_pos = u;
         j->cap_use = n_use;
     }
@@ -680,12 +741,11 @@ static bool ra_begin(uam_jit *j, const uam_block *blk)
         j->use_start[t + 1] += j->use_start[t];
     memcpy(j->use_cur, j->use_start, sizeof(uint32_t) * nt);
     for (uint32_t i = 0; i < blk->n_insn; i++) {   /* fill in insn order: sorted */
-        const uam_insn *in = &blk->insn[i];
-        const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
-        for (unsigned k = 0; k < 4; k++)
-            if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]))
-                j->use_pos[j->use_cur[refs[k]]++] = i;
+        unsigned n = insn_reads(j, blk, i, rd, max);
+        for (unsigned k = 0; k < n; k++)
+            j->use_pos[j->use_cur[rd[k]]++] = i;
     }
+    free(rd);
     for (uint32_t t = 0; t < nt; t++) {
         j->use_cur[t] = j->use_start[t];
         j->last_use[t] = j->use_start[t + 1] > j->use_start[t] ? j->use_pos[j->use_start[t + 1] - 1]
@@ -707,13 +767,24 @@ static uint32_t next_use(uam_jit *j, uint32_t t)
 }
 
 /* After an insn: free the registers of the temps it read for the last time. */
-static void ra_free_dead(uam_jit *j, const uam_insn *in)
+static void ra_free_dead(uam_jit *j, const uam_block *blk)
 {
-    const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
-    for (unsigned k = 0; k < 4; k++) {
-        uam_ref t = refs[k];
-        if (uam_ref_is_none(t) || uam_ref_is_imm(t) || j->reg_of[t] < 0
-            || j->last_use[t] > j->cur_i)
+    uam_ref rd[4 + 2 * 64];
+    const uint32_t i = j->cur_i;
+    unsigned n = 0;
+    if (max_reads(j, i) <= sizeof(rd) / sizeof(rd[0])) {
+        n = insn_reads(j, blk, i, rd, (unsigned)(sizeof(rd) / sizeof(rd[0])));
+    } else {   /* a long replay list: one at a time */
+        for (uint32_t t = 0; t < blk->n_temp; t++)
+            if (j->reg_of[t] >= 0 && j->last_use[t] == i) {
+                j->holder[j->reg_of[t]] = NO_TEMP;
+                j->reg_of[t] = -1;
+            }
+        return;
+    }
+    for (unsigned k = 0; k < n; k++) {
+        uam_ref t = rd[k];
+        if (j->reg_of[t] < 0 || j->last_use[t] > i)
             continue;
         j->holder[j->reg_of[t]] = NO_TEMP;
         j->reg_of[t] = -1;
@@ -1403,10 +1474,265 @@ static bool fusable(const uam_jit *j, const uam_block *blk, uint32_t i)
     uint32_t k = i + 1;
     if (k < blk->n_insn && blk->insn[k].op == UAM_OP_IMARK && (blk->insn[k].flags & UAM_IMARK_CONT))
         k++;
-    if (k >= blk->n_insn)
+    if (k >= blk->n_insn || j->dfr[k])   /* a deferred PUT tests its guard elsewhere */
         return false;
     const uam_insn *c = &blk->insn[k];
     return c->guard == t || (c->op == UAM_OP_SELECT && c->a == t && c->b != t && c->c != t);
+}
+
+/* ---- deferred register writes (docs/jit-dead-puts-design.md) ----------------------
+ *
+ * A PUT that a later unguarded PUT of the same block overwrites before anything reads
+ * it is not done where it stands. Between the two the block can still stop at a soft
+ * point - an IMARK's interrupt/deadline check, a load or store's slow path - and there
+ * the register file must be exact, so the writes still pending are replayed on that
+ * point's cold path (the IMARK stop stub, before the bridge call), in program order.
+ * The inline data-TLB path cannot observe the register file, so it skips them. At a hard
+ * point (an exit, a C call that may read the register file, a breakpoint) nothing is
+ * pending. Only ISA helpers write the register file behind the block's back, and they
+ * are hard points, so a replay never undoes a write made since. The interpreter does
+ * every write in place; where the difference could be seen, the two agree. */
+
+enum { OK_NONE, OK_PUT, OK_GET, OK_SOFT, OK_HARD };
+
+static bool guard_false(const uam_block *blk, const uam_insn *in)
+{
+    return !uam_ref_is_none(in->guard) && uam_ref_is_imm(in->guard)
+        && !(blk->imm[uam_ref_index(in->guard)] & 1);
+}
+static bool guard_temp(const uam_insn *in)
+{
+    return !uam_ref_is_none(in->guard) && !uam_ref_is_imm(in->guard);
+}
+
+/* A load or store that compile_block gives the inline data-TLB path. */
+static bool mem_fast(const uam_block *blk, const uam_insn *in)
+{
+    if (in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV))
+        return false;
+    return !(uam_ref_is_imm(in->a)
+             && const_slow(blk->imm[uam_ref_index(in->a)] & uam_mask(blk->addr_width), in->width / 8,
+                           in->flags));
+}
+
+/* What insn i is to the analysis. */
+static uint8_t obs_kind(const uam_block *blk, const uam_insn *in, bool *first)
+{
+    if (guard_false(blk, in))
+        return OK_NONE;   /* not emitted */
+    switch ((uam_opcode)in->op) {
+    case UAM_OP_PUT:
+        return in->width >= 8 ? OK_PUT : OK_HARD;
+    case UAM_OP_GET:
+        return OK_GET;
+    case UAM_OP_IMARK: {
+        bool f = *first;
+        *first = false;
+        if (in->flags & UAM_IMARK_BREAK)
+            return f ? OK_NONE : OK_HARD;
+        return f || (in->flags & UAM_IMARK_CONT) ? OK_NONE : OK_SOFT;
+    }
+    case UAM_OP_LD:
+    case UAM_OP_ST:
+        return mem_fast(blk, in) ? OK_SOFT : OK_HARD;
+    case UAM_OP_EXIT: case UAM_OP_TRAP: case UAM_OP_WAIT: case UAM_OP_SYSRD: case UAM_OP_SYSWR:
+    case UAM_OP_HELPER: case UAM_OP_AMO: case UAM_OP_CAS:
+        return OK_HARD;
+    default:
+        return OK_NONE;   /* pure ops, COV, FENCE */
+    }
+}
+
+/* Bits of the bytes [daux, daux + dlen) that [aux, aux + len) covers. */
+static uint8_t cover(uint32_t daux, unsigned dlen, uint32_t aux, unsigned len)
+{
+    uint8_t m = 0;
+    for (unsigned k = 0; k < dlen; k++)
+        if (daux + k >= aux && daux + k < aux + len)
+            m |= (uint8_t)(1u << k);
+    return m;
+}
+
+/* Decide which PUTs of blk are deferred (j->dfr) and what each soft point replays
+ * (j->obs_start / obs_list). Returns false on allocation failure. */
+static bool defer_analyze(uam_jit *j, const uam_block *blk)
+{
+    const uint32_t n = blk->n_insn;
+    if (n + 1 > j->cap_ins) {
+        const uint32_t cap = n + 1;
+        uint8_t *ok = realloc(j->okind, cap);
+        if (ok) j->okind = ok;
+        uint8_t *df = realloc(j->dfr, cap);
+        if (df) j->dfr = df;
+        uint32_t *os = realloc(j->obs_start, sizeof(uint32_t) * cap);
+        if (os) j->obs_start = os;
+        uint32_t *pe = realloc(j->pend, sizeof(uint32_t) * cap);
+        if (pe) j->pend = pe;
+        uint8_t *pl = realloc(j->pend_live, cap);
+        if (pl) j->pend_live = pl;
+        if (!ok || !df || !os || !pe || !pl)
+            return false;
+        j->cap_ins = cap;
+    }
+    memset(j->dfr, 0, n);
+    memset(j->obs_start, 0, sizeof(uint32_t) * (n + 1));
+    if (!j->defer)
+        return true;
+
+    /* classify, and size the byte map */
+    bool first = true;
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uam_insn *in = &blk->insn[i];
+        j->okind[i] = obs_kind(blk, in, &first);
+        if ((j->okind[i] == OK_PUT || j->okind[i] == OK_GET) && in->aux + in->width / 8u > nb)
+            nb = in->aux + in->width / 8u;
+    }
+    if (!grow(j, &j->kbytes, &j->cap_kb, nb + 1, 1))
+        return false;
+
+    /* backward: kbytes = the bytes a later unguarded PUT overwrites before any read */
+    memset(j->kbytes, 0, nb);
+    for (uint32_t i = n; i-- > 0;) {
+        const uam_insn *in = &blk->insn[i];
+        const unsigned len = in->width / 8u;
+        switch (j->okind[i]) {
+        case OK_PUT: {
+            bool all = true;
+            for (unsigned b = 0; b < len; b++)
+                all = all && j->kbytes[in->aux + b];
+            j->dfr[i] = all;
+            if (!guard_temp(in))
+                memset(j->kbytes + in->aux, 1, len);
+            break;
+        }
+        case OK_GET:
+            memset(j->kbytes + in->aux, 0, len);
+            break;
+        case OK_HARD:
+            memset(j->kbytes, 0, nb);
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* forward: the pending writes at each soft point. A write still pending where a PUT
+     * done in place overlaps it would undo that PUT when replayed later: it is done in
+     * place too (un-deferred), and the pass starts over until nothing changes. */
+    for (;;) {
+        bool changed = false;
+        uint32_t np = 0, no = 0;
+        for (uint32_t i = 0; i <= n; i++) {
+            j->obs_start[i] = no;
+            const uint8_t k = i < n ? j->okind[i] : OK_HARD;   /* the block's end */
+            const uam_insn *in = i < n ? &blk->insn[i] : NULL;
+            if (k == OK_PUT) {
+                const unsigned len = in->width / 8u;
+                const bool g = guard_temp(in);
+                uint32_t keep = 0;
+                for (uint32_t p = 0; p < np; p++) {
+                    const uam_insn *d = &blk->insn[j->pend[p]];
+                    const uint8_t m = cover(d->aux, d->width / 8u, in->aux, len);
+                    if (m && j->dfr[i]) {
+                        if (!g)
+                            j->pend_live[p] &= (uint8_t)~m;   /* replayed after: it wins */
+                    } else if (m) {
+                        if (g || (j->pend_live[p] & (uint8_t)~m)) {
+                            j->dfr[j->pend[p]] = 0;          /* the overlap rule */
+                            changed = true;
+                        }
+                        j->pend_live[p] = 0;
+                    }
+                    if (j->pend_live[p]) {
+                        j->pend[keep] = j->pend[p];
+                        j->pend_live[keep++] = j->pend_live[p];
+                    }
+                }
+                np = keep;
+                if (j->dfr[i]) {
+                    j->pend[np] = i;
+                    j->pend_live[np++] = (uint8_t)((1u << len) - 1);
+                }
+            } else if (k == OK_SOFT && np) {
+                if (!grow(j, &j->obs_list, &j->cap_obs, no + np, sizeof(uint32_t)))
+                    return false;
+                memcpy(j->obs_list + no, j->pend, sizeof(uint32_t) * np);
+                no += np;
+            } else if (k == OK_HARD) {
+                for (uint32_t p = 0; p < np; p++) {   /* none by construction; to be safe */
+                    j->dfr[j->pend[p]] = 0;
+                    changed = true;
+                }
+                np = 0;
+            }
+        }
+        if (!changed)
+            break;
+    }
+    return true;
+}
+
+/* mov [r15 + aux], v (width w) */
+static void emit_put(uam_jit *j, uint32_t aux, unsigned w, opnd v)
+{
+    if (v.kind == O_IMM && (w < 64 || fits_s32(v.imm))) {
+        if (w == 16) g8(j, 0x66);
+        rex(j, w == 64, 0, 0, 1);
+        g8(j, w == 8 ? 0xC6 : 0xC7);                     /* mov [r15+off], imm */
+        modrm_mem(j, 0, R15, (int32_t)aux);
+        if (w == 8) g8(j, (uint8_t)v.imm);
+        else if (w == 16) { g8(j, (uint8_t)v.imm); g8(j, (uint8_t)(v.imm >> 8)); }
+        else g32(j, (uint32_t)v.imm);
+        return;
+    }
+    /* store straight from the temp's register (the REX prefix r15 needs also makes
+     * sil/dil addressable as bytes) */
+    int src = RAX;
+    if (v.kind == O_REG)
+        src = v.reg;
+    else
+        load(j, RAX, v, w);
+    if (w == 16) g8(j, 0x66);
+    rex(j, w == 64, src >= 8, 0, 1);
+    g8(j, w == 8 ? 0x88 : 0x89);                         /* mov [r15+off], src */
+    modrm_mem(j, src, R15, (int32_t)aux);
+}
+
+/* The replay record of deferred PUT d, with its operands where they are now. */
+static jit_rep rep_of(const uam_jit *j, const uam_block *blk, uint32_t d)
+{
+    const uam_insn *in = &blk->insn[d];
+    jit_rep r = { in->aux, in->width, guard_temp(in), opnd_of(j, blk, in->a, in->width), { 0 } };
+    if (r.guarded)
+        r.g = opnd_of(j, blk, in->guard, 1);
+    return r;
+}
+
+/* Replay one write. Uses rax only (and the flags). */
+static void emit_rep(uam_jit *j, const jit_rep *r)
+{
+    size_t skip = 0;
+    if (r->guarded) {
+        test_bool(j, r->g);
+        skip = jcc_fwd(j, 0x84);                         /* je: guard false */
+    }
+    emit_put(j, r->aux, r->w, r->v);
+    if (r->guarded)
+        patch(j, skip);
+}
+
+/* Replay, here, the writes pending at soft point i (a load or store's slow path). */
+static void emit_replays(uam_jit *j, const uam_block *blk, uint32_t i)
+{
+    if (j->obs_start[i] == j->obs_start[i + 1])
+        return;
+    mark(j, MK_REPLAY, i);
+    for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
+        const jit_rep r = rep_of(j, blk, j->obs_list[e]);
+        emit_rep(j, &r);
+    }
+    mark(j, MK_SLOW, i);
 }
 
 /* Compile the whole block into j->cb. Returns false if it must be interpreted. */
@@ -1417,7 +1743,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     j->overflow = false;
     j->n_slots = 0;
     j->n_marks = 0;
-    j->n_sites = j->n_site_refs = j->n_stubs = 0;
+    j->n_sites = j->n_site_refs = j->n_stubs = j->n_reps = 0;
     j->flag_temp = UAM_REF_NONE;
     j->cur = (jit_site){ blk->guest_pc, blk->guest_pc, 0 };
     j->cur_emitted = false;
@@ -1446,7 +1772,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
 
     /* epilogue jumps: up to 4 per EXIT (chain checks), 1 per other op */
     size_t *epi = malloc(sizeof(size_t) * (4 * blk->n_insn + 1));
-    if (!epi || !ra_begin(j, blk)) {
+    if (!epi || !defer_analyze(j, blk) || !ra_begin(j, blk)) {
         free(epi);
         return false;
     }
@@ -1460,6 +1786,8 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         const unsigned W = in->width;
         const bool has_dst = !uam_ref_is_none(in->dst);
         j->cur_i = i;
+        if (j->dfr[i])
+            continue;                          /* replayed on the cold paths, if at all */
         j->fuse = fusable(j, blk, i);
         mark(j, MK_OP, i);
 
@@ -1469,7 +1797,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         if (!uam_ref_is_none(in->guard)) {
             if (uam_ref_is_imm(in->guard)) {
                 if (!(blk->imm[uam_ref_index(in->guard)] & 1)) {
-                    ra_free_dead(j, in);   /* guard false: op does nothing, dst = 0 */
+                    ra_free_dead(j, blk);  /* guard false: op does nothing, dst = 0 */
                     if (has_dst) {
                         mov_imm(j, RAX, 0);
                         ra_def(j, in->dst, blk->temp_width[in->dst]);
@@ -1499,10 +1827,17 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                     set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
                     epi[n_epi++] = jmp_fwd(j);
                 } else if (grow(j, &j->stubs, &j->cap_stubs, j->n_stubs + 1, sizeof(*j->stubs))) {
-                    /* if (icount >= icount_stop) stop here: an out-of-line stub */
+                    /* if (icount >= icount_stop) stop here: an out-of-line stub, which
+                     * first replays the deferred writes still pending */
                     rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop));
                     j->stubs[j->n_stubs].jcc = jcc_fwd(j, 0x83);                 /* jae */
                     j->stubs[j->n_stubs].pc = pc;
+                    j->stubs[j->n_stubs].rep = j->n_reps;
+                    const uint32_t nr = j->obs_start[i + 1] - j->obs_start[i];
+                    if (nr && grow(j, &j->reps, &j->cap_reps, j->n_reps + nr, sizeof(jit_rep)))
+                        for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++)
+                            j->reps[j->n_reps++] = rep_of(j, blk, j->obs_list[e]);
+                    j->stubs[j->n_stubs].n_rep = j->n_reps - j->stubs[j->n_stubs].rep;
                     j->n_stubs++;
                 }
             }
@@ -1532,29 +1867,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             break;
         case UAM_OP_PUT:
-            if (uam_ref_is_imm(in->a) && (W < 64 || fits_s32(blk->imm[uam_ref_index(in->a)]))) {
-                const uint64_t v = blk->imm[uam_ref_index(in->a)] & uam_mask(W);
-                if (W == 16) g8(j, 0x66);
-                rex(j, W == 64, 0, 0, 1);
-                g8(j, W == 8 ? 0xC6 : 0xC7);                     /* mov [r15+off], imm */
-                modrm_mem(j, 0, R15, (int32_t)in->aux);
-                if (W == 8) g8(j, (uint8_t)v);
-                else if (W == 16) { g8(j, (uint8_t)v); g8(j, (uint8_t)(v >> 8)); }
-                else g32(j, (uint32_t)v);
-            } else {
-                /* store straight from the temp's register (the REX prefix r15 needs also
-                 * makes sil/dil addressable as bytes) */
-                const opnd v = opnd_of(j, blk, in->a, W);
-                int src = RAX;
-                if (v.kind == O_REG)
-                    src = v.reg;
-                else
-                    load(j, RAX, v, W);
-                if (W == 16) g8(j, 0x66);
-                rex(j, W == 64, src >= 8, 0, 1);
-                g8(j, W == 8 ? 0x88 : 0x89);                     /* mov [r15+off], src */
-                modrm_mem(j, src, R15, (int32_t)in->aux);
-            }
+            emit_put(j, in->aux, W, opnd_of(j, blk, in->a, W));
             break;
         case UAM_OP_LD: {
             unsigned size = W / 8;
@@ -1574,6 +1887,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
+            emit_replays(j, blk, i);                    /* rdx (addr) is kept */
             emit_site(j);
             ra_save(j, false);
             mov_rr(j, RSI, RDX);                        /* miss / slow path: the bridge */
@@ -1628,6 +1942,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));
+            emit_replays(j, blk, i);                    /* rdx (addr) and r11 are kept */
             emit_site(j);
             ra_save(j, false);
             mov_rr(j, RSI, RDX);                        /* r11 still holds the unswapped value */
@@ -1767,7 +2082,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
         }
         /* the paths have joined: free what this insn read last, define its result */
-        ra_free_dead(j, in);
+        ra_free_dead(j, blk);
         if (j->fuse)
             j->flag_temp = in->dst;              /* in the flags, not in a register */
         else if (has_dst)
@@ -1778,6 +2093,12 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     mark(j, MK_STUB, 0);
     for (uint32_t k = 0; k < j->n_stubs; k++) {
         patch(j, j->stubs[k].jcc);
+        if (j->stubs[k].n_rep) {
+            mark(j, MK_REPLAY, 0);
+            for (uint32_t e = 0; e < j->stubs[k].n_rep; e++)
+                emit_rep(j, &j->reps[j->stubs[k].rep + e]);
+            mark(j, MK_STUB, 0);
+        }
         set_res_pc_imm(j, UAM_BR_INTERRUPTED, j->stubs[k].pc);
         epi[n_epi++] = jmp_fwd(j);
     }
@@ -1855,6 +2176,9 @@ uam_jit *uam_jit_create(uam_exec *x)
     j->n_pool = RA_POOL_MAX;
     if (nr && *nr && strtoul(nr, NULL, 0) < RA_POOL_MAX)
         j->n_pool = (unsigned)strtoul(nr, NULL, 0);
+    /* UAM_JIT_NODEFER=1 does every register write in place (no deferral to cold paths). */
+    const char *nd = getenv("UAM_JIT_NODEFER");
+    j->defer = !(nd && *nd && strcmp(nd, "0") != 0);
     /* Profiling output. Every JIT of the process appends to the same files. */
     const char *pm = getenv("UAM_PERF_MAP");
     if (pm && *pm && strcmp(pm, "0") != 0) {
@@ -1910,6 +2234,14 @@ void uam_jit_destroy(uam_jit *j)
     free(j->sites);
     free(j->site_refs);
     free(j->stubs);
+    free(j->okind);
+    free(j->dfr);
+    free(j->obs_start);
+    free(j->obs_list);
+    free(j->pend);
+    free(j->pend_live);
+    free(j->kbytes);
+    free(j->reps);
     free(j->reg_of);
     free(j->in_mem);
     free(j->last_use);
