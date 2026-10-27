@@ -441,7 +441,8 @@ Implemented (`make test`):
 - `test_jitdiff` checks the JIT against the interpreter block by block: every pure op at
   every width with temp and immediate operands, then random verified blocks (guards,
   CONT/BREAK imarks, faulting, page-crossing, MMIO and exclusive accesses, helpers,
-  sysregs, traps) under every deadline and exit request. Each run must agree on the result,
+  sysregs, traps) under every deadline and exit request, and fixed shapes the optimizer
+  rewrites (overwritten register writes, flags read back, common subexpressions). Each run must agree on the result,
   registers, memory, icount and on the register file seen at every device, sysreg and helper
   access. `make jitdiff-soak` runs it at length; docs/jit-perf.md has the performance side.
 

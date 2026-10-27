@@ -12,7 +12,9 @@
  * state must also agree at every point where something outside the block can see it.
  *
  * Level A runs every pure op at every valid width with temp and immediate operands
- * over edge and random values. Level B runs random verified blocks: guards, CONT and
+ * over edge and random values. Level C runs fixed shapes the optimizer rewrites
+ * (overwritten register writes, flags read back, CSE) over random register files.
+ * Level B runs random verified blocks: guards, CONT and
  * BREAK imarks, loads/stores (LE/BE, aligned, exclusive, page-crossing, faulting,
  * MMIO), AMO/CAS, helpers, sysregs, traps, and exits to constant and computed pcs.
  * Each one runs with every instruction deadline, with an exit already requested, and
@@ -547,6 +549,129 @@ static void level_a(void)
     printf("test_jitdiff: level A: %u op blocks\n", n_blocks);
 }
 
+/* ---- level C: shapes the optimizer rewrites ------------------------------------- */
+
+/* Each pattern is built from registers 0..72 of a random register file and must
+ * behave the same however the optimizer rewrites it. */
+static void pattern(uam_builder *b, unsigned p)
+{
+    const uam_ref N = NONE;
+    uam_builder_begin(b, 0x3000);
+    uam_imark(b, 0x3000, 4);
+    switch (p) {
+    case 0: {   /* a used GET between a PUT and the PUT that overwrites it */
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        uam_ref t = uam_get(b, 8, 1);
+        uam_put(b, 32, 0, uam_get(b, 32, 16), N);
+        uam_put(b, 8, 40, t, N);
+        break;
+    }
+    case 1: {   /* a guarded exit between two writes of a flag */
+        uam_ref c = uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 64));
+        uam_put(b, 8, 65, uam_unop(b, UAM_OP_ZEXT, 8, c), N);
+        uam_exit(b, uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 66)), uam_imm(b, 0x3100), UAM_EXIT_JUMP);
+        uam_put(b, 8, 65, uam_imm(b, 7), N);
+        break;
+    }
+    case 2: {   /* the same conversion to two widths */
+        uam_ref t = uam_get(b, 8, 1);
+        uam_put(b, 16, 40, uam_unop(b, UAM_OP_SEXT, 16, t), N);
+        uam_put(b, 32, 48, uam_unop(b, UAM_OP_SEXT, 32, t), N);
+        uam_put(b, 32, 56, uam_unop(b, UAM_OP_ZEXT, 32, t), N);
+        break;
+    }
+    case 3: {   /* a flag written, then read back the ways lifters do */
+        uam_ref c = uam_binop(b, UAM_OP_ULT, 32, uam_get(b, 32, 0), uam_get(b, 32, 8));
+        uam_put(b, 8, 64, uam_unop(b, UAM_OP_ZEXT, 8, c), N);
+        uam_imark(b, 0x3004, 4);
+        uam_ref f = uam_get(b, 8, 64);
+        uam_ref ne = uam_binop(b, UAM_OP_NE, 8, f, uam_imm(b, 0));
+        uam_ref eq = uam_binop(b, UAM_OP_EQ, 8, f, uam_imm(b, 0));
+        uam_ref e1 = uam_binop(b, UAM_OP_EQ, 8, f, uam_imm(b, 1));
+        uam_ref nn = uam_binop(b, UAM_OP_XOR, 1, ne, uam_imm(b, 1));
+        uam_ref tr = uam_unop(b, UAM_OP_TRUNC, 1, f);
+        uam_put(b, 32, 32, uam_select(b, 32, nn, uam_get(b, 32, 16), uam_get(b, 32, 24)), N);
+        uam_put(b, 8, 68, uam_unop(b, UAM_OP_ZEXT, 8, eq), N);
+        uam_put(b, 8, 69, uam_unop(b, UAM_OP_ZEXT, 8, e1), N);
+        uam_put(b, 8, 70, uam_unop(b, UAM_OP_ZEXT, 8, uam_select(b, 1, tr, uam_imm(b, 0), uam_imm(b, 1))), N);
+        uam_put(b, 8, 71, uam_unop(b, UAM_OP_ZEXT, 8, uam_binop(b, UAM_OP_XOR, 1, nn, uam_imm(b, 1))), N);
+        break;
+    }
+    case 4: {   /* guarded and unguarded writes of one register */
+        uam_ref g = uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 64));
+        uam_put(b, 32, 0, uam_get(b, 32, 8), g);
+        uam_put(b, 32, 0, uam_get(b, 32, 16), N);
+        uam_put(b, 32, 4, uam_get(b, 32, 24), N);
+        uam_put(b, 32, 4, uam_get(b, 32, 32), g);
+        break;
+    }
+    case 5: {   /* a state-reading helper between two writes */
+        uam_put(b, 32, 0, uam_get(b, 32, 8), N);
+        uam_ref h = uam_helper(b, &test_isa.helpers, 1, uam_get(b, 64, 16), N, N, N);
+        uam_put(b, 32, 0, h, N);
+        break;
+    }
+    case 6: {   /* overlapping widths */
+        uam_put(b, 64, 0, uam_get(b, 64, 8), N);
+        uam_put(b, 32, 0, uam_get(b, 32, 16), N);
+        uam_put(b, 32, 24, uam_get(b, 32, 32), N);
+        uam_put(b, 64, 24, uam_get(b, 64, 40), N);
+        break;
+    }
+    default: {  /* commutative operands and repeated subexpressions */
+        uam_ref x = uam_get(b, 32, 0), y = uam_get(b, 32, 8);
+        uam_ref s1 = uam_binop(b, UAM_OP_ADD, 32, x, y), s2 = uam_binop(b, UAM_OP_ADD, 32, y, x);
+        uam_ref c1 = uam_binop(b, UAM_OP_CARRY, 32, x, y), c2 = uam_binop(b, UAM_OP_CARRY, 32, y, x);
+        uam_ref k1 = uam_binop(b, UAM_OP_AND, 32, uam_imm(b, 0xFF), x);
+        uam_ref k2 = uam_binop(b, UAM_OP_AND, 32, x, uam_imm(b, 0xFF));
+        uam_put(b, 32, 16, uam_binop(b, UAM_OP_XOR, 32, s1, s2), N);
+        uam_put(b, 8, 20, uam_unop(b, UAM_OP_ZEXT, 8, uam_binop(b, UAM_OP_XOR, 1, c1, c2)), N);
+        uam_put(b, 32, 24, uam_binop(b, UAM_OP_SUB, 32, k1, k2), N);
+        uam_put(b, 32, 28, s2, N);
+        break;
+    }
+    }
+    uam_exit(b, NONE, uam_imm(b, 0x3008), UAM_EXIT_JUMP);
+}
+
+static void level_c(void)
+{
+    uam_builder b;
+    uam_builder_init(&b, 32);
+    with_mem = false;
+    dev_exit_at = 0;
+    unsigned n = 0;
+    for (unsigned p = 0; p < 8; p++) {
+        for (unsigned it = 0; it < 400; it++) {
+            pattern(&b, p);
+            uam_block *blk = uam_builder_finish(&b);
+            char err[256];
+            if (!verify_block(blk, err, sizeof(err))) {
+                fprintf(stderr, "FAIL level C: pattern %u does not verify: %s\n", p, err);
+                failures++;
+                uam_block_free(blk);
+                break;
+            }
+            for (unsigned i = 0; i < ADDR_SLOTS; i++)
+                start.regfile[i] = chance(40) ? (uint8_t)rn(2) : (uint8_t)val(8);
+            start.icount = ICOUNT0;
+            start.deadline = UINT64_MAX;
+            start.exit_request = false;
+            checks++;
+            n++;
+            if (diff_block(blk, false)) {
+                char what[64];
+                snprintf(what, sizeof(what), "level C: pattern %u", p);
+                report(blk, what);
+                break;
+            }
+            uam_block_free(blk);
+        }
+    }
+    uam_builder_free(&b);
+    printf("test_jitdiff: level C: %u pattern runs\n", n);
+}
+
 /* ---- level B: random blocks ------------------------------------------------------ */
 
 typedef struct gen {
@@ -570,6 +695,19 @@ static void add_temp(gen *g, unsigned w, uam_ref r)
 }
 
 static uam_ref new_value(gen *g, unsigned w);
+
+/* A register offset for a w-bit access: often one of a few hot ones (so writes and
+ * reads of the same register meet: forwarding, overwritten PUTs), else anywhere. */
+static uint32_t reg_off(unsigned w)
+{
+    static const uint32_t hot[] = { 0, 8, 16, 24, 64, 65, 66, 67, 68, 72 };
+    if (chance(50)) {
+        uint32_t o = hot[rn(UAM_ARRAY_LEN(hot))];
+        if (o + w / 8 <= ADDR_SLOTS)
+            return o;
+    }
+    return rn(ADDR_SLOTS - w / 8 + 1);
+}
 
 /* An operand of width w: an immediate, an existing temp, or a new one. */
 static uam_ref operand(gen *g, unsigned w)
@@ -599,7 +737,7 @@ static uam_ref new_value(gen *g, unsigned w)
         unsigned cw = widths[1 + rn(4)];
         r = uam_binop(g->b, cmp[rn(UAM_ARRAY_LEN(cmp))], cw, temp_of(g, cw), operand(g, cw));
     } else {
-        r = uam_get(g->b, w, rn(ADDR_SLOTS - w / 8 + 1));
+        r = uam_get(g->b, w, reg_off(w));
     }
     add_temp(g, w, r);
     return r;
@@ -744,10 +882,21 @@ static void gen_safe(gen *g)
         gen_pure(g);
     } else if (r < 11) {
         new_value(g, widths[1 + rn(4)]);
-    } else if (r < 16) {
+    } else if (r < 14) {
         unsigned w = widths[1 + rn(4)];
-        uam_put(g->b, w, rn(ADDR_SLOTS - w / 8 + 1), operand(g, w), guard(g, 25));
+        uam_put(g->b, w, reg_off(w), operand(g, w), guard(g, 25));
         g->put_seen = true;
+    } else if (r < 15) {   /* a flag byte written as a zero-extended boolean */
+        uam_put(g->b, 8, 64 + rn(4), uam_unop(g->b, UAM_OP_ZEXT, 8, temp_of(g, 1)), guard(g, 10));
+        g->put_seen = true;
+    } else if (r < 16) {   /* a flag byte read back as a boolean, the ways lifters do */
+        uam_ref f = uam_get(g->b, 8, 64 + rn(4));
+        static const uam_opcode cmp[] = { UAM_OP_NE, UAM_OP_EQ };
+        uam_ref v = rn(3) == 0 ? uam_unop(g->b, UAM_OP_TRUNC, 1, f)
+                  : uam_binop(g->b, cmp[rn(2)], 8, f, uam_imm(g->b, rn(2)));
+        if (chance(30))
+            v = uam_binop(g->b, UAM_OP_XOR, 1, v, uam_imm(g->b, 1));
+        add_temp(g, 1, v);
     } else if (r < 17) {
         uam_exit(g->b, temp_of(g, 1), exit_target(g), UAM_EXIT_JUMP);
     } else if (r < 18) {
@@ -874,6 +1023,7 @@ int main(int argc, char **argv)
     setup();
     rng_state = seed;
     level_a();
+    level_c();
     level_b(n, seed);
     uam_exec_fini(&ex);
     printf("test_jitdiff: %d/%d checks passed\n", checks - failures, checks);

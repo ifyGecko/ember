@@ -351,10 +351,12 @@ uam_ref uam_helper(uam_builder *b, const uam_helper_table *ht, uint32_t id,
 
 /*
  * Local, semantics-preserving optimization of a verified block, in place: constant
- * and copy propagation, constant folding, algebraic identities, register forwarding
- * (GET after GET/PUT of the same register), constant guards, unreachable-code and
- * dead-code removal. Side effects, IMARKs and PUT order are kept, so the result
- * still verifies and behaves identically. Returns false on allocation failure (the
+ * and copy propagation, constant folding, algebraic identities and peepholes,
+ * common-subexpression elimination, register forwarding (GET after GET/PUT of the
+ * same register), constant guards, unreachable-code and dead-code removal, and
+ * removal of a PUT that a later PUT of the same guest instruction overwrites before
+ * anything can observe it. Other side effects, IMARKs and the order of the remaining
+ * PUTs are kept, so the result still verifies and behaves identically. Returns false on allocation failure (the
  * block is then unusable).
  */
 bool uam_optimize(uam_block *blk);
