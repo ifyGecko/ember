@@ -140,3 +140,34 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 8a: dispatch | 2.38 s | 2.12 s | a block's code pages are rechecked only when bus->code_gen moved (a code write or a map change); a direct-mapped cache of recent tcache entries; buckets double as blocks accumulate (ABI 15) |
 | 8b: bus sub-page cache | 2.07 s | 2.10 s | regions smaller than a page (I/O ports, register blocks) were resolved by a linear scan of every region on each access; a 64-entry cache keyed by 8-byte granule now serves them (ABI 16) |
 | 8c: constant-address probes | 2.07 s | 1.86 s | a load/store to a constant address compares one known data-TLB entry with its page (a constant access that crosses a page or is misaligned goes straight to the bridge) |
+
+## Where it stands (after step 8c)
+
+Against the baseline: OVMF 3.91 s -> 2.06 s (256 -> 485 MIPS, 1.9x), VxWorks
+3.07 s -> 1.87 s (1302 -> 2143 MIPS, 1.6x).
+
+Correctness, end to end:
+- The guest console is identical to the baseline's on both workloads.
+- The interpreter and the JIT end with the same console and `-d` state: OVMF at 1e9
+  instructions, VxWorks at 2e9.
+- The OVMF board's own `ovmf-check` and `secureboot-check` pass on this build.
+
+**OVMF profile.**
+- 64% of samples are now in native code.
+- Compares take 14%, zero-extensions 4.6%, `put.8` 1.8%, and part of the ALU ops
+  build the x86 flags (CF/OF/AF/ZF/SF/PF). Roughly 15-20% of the run is flag work.
+  Most of it is overwritten by the next instruction and never read, which is what
+  removing dead flag stores across instructions would recover.
+- The remaining C costs are small: port I/O 3.5%, libc 6%, translation 4%.
+
+**VxWorks profile.** Its idle loop is now one constant-address load, a fused compare
+and branch, and the chain path back to itself.
+
+Not done yet:
+- **Dead flag stores across instructions (step 9 of the plan).** This defers PUTs that
+  a later instruction overwrites, and replays them at interrupt exits and on memory
+  slow paths. Its gate (flag work at least 10% of OVMF time) is met, but it needs a
+  design review first.
+- **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
+  once at block entry. It changes how stopping at a deadline is implemented, so it
+  needs sign-off.
