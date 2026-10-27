@@ -238,6 +238,21 @@ static void test_priority(void)
     EQ64(uam_unimp_accesses(un), 2, "catch-all sees the gaps");
     EQ64(uam_unimp_offsets(un), 2, "offsets relative to the window");
 
+    /* More offsets than the table holds: every access still counts, and the untracked
+     * ones (probed a bounded number of slots) stay RAZ/WI. */
+    uam_device *big = uam_unimp_create("big", 0x30000);
+    CHECK(uam_bus_map_mmio_ex(&bus, "big", 0x30000, 0x2000, big,
+                              &(uam_map_attrs){ .prio = UAM_PRIO_BACKGROUND }) == UAM_OK, "map big unimp");
+    uam_log_level saved = uam_log_threshold;
+    uam_log_threshold = UAM_LOG_ERROR;   /* one warning per new offset */
+    for (uint64_t a = 0x30000; a < 0x32000; a += 4)
+        EQ64(rd(&bus, a, 4, L), 0, "window reads as zero");
+    for (int i = 0; i < 1000; i++)
+        wr(&bus, 0x31ffc, 4, L, (uint64_t)i);
+    uam_log_threshold = saved;
+    EQ64(uam_unimp_accesses(big), 2048 + 1000, "a full table still counts accesses");
+    CHECK(uam_unimp_offsets(big) > 0 && uam_unimp_offsets(big) <= 1024, "at most 1024 offsets tracked");
+
     FILE *f = tmpfile();
     uam_bus_dump_map(&bus, f);
     rewind(f);
@@ -249,6 +264,9 @@ static void test_priority(void)
 
     uam_bus_fini(&bus);
     un->ops->destroy(un);
+    uam_log_threshold = UAM_LOG_ERROR;   /* its hot list */
+    big->ops->destroy(big);
+    uam_log_threshold = saved;
     free(reg);
     free(dev);
 }
