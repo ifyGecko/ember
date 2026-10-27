@@ -297,7 +297,8 @@ enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, RDI = 7, R
 static const int ra_regs[RA_POOL_MAX] = { R12, RSI, RDI, R8, R9, R10 };
 #define NO_TEMP UINT32_MAX
 
-typedef struct jit_rep jit_rep;   /* a replay in an IMARK stop stub (defer_analyze) */
+/* An IMARK stop stub's view of a temp it reads: the register holding it there. */
+typedef struct jit_snap { uint32_t t; int8_t reg; } jit_snap;
 
 struct uam_jit {
     uam_exec    *x;
@@ -328,8 +329,8 @@ struct uam_jit {
     uint32_t     n_sites, cap_sites;
     struct { size_t lea; uint32_t site; } *site_refs;   /* lea rel32 positions to patch */
     uint32_t     n_site_refs, cap_site_refs;
-    struct { size_t jcc; uint64_t pc; uint32_t rep, n_rep; } *stubs;  /* out-of-line IMARK
-                                                                       * stops, their replays */
+    struct { size_t jcc; uint64_t pc; uint32_t i, snap, n_snap; } *stubs;  /* out-of-line
+                                        * IMARK stops: the imark, its temps' registers there */
     uint32_t     n_stubs, cap_stubs;
     /* deferred register writes (defer_analyze; docs/jit-dead-puts-design.md) */
     bool         defer;      /* on unless UAM_JIT_NODEFER */
@@ -340,9 +341,19 @@ struct uam_jit {
     uint32_t    *pend;       /* scratch: pending writes and their live bytes */
     uint8_t     *pend_live;
     uint8_t     *kbytes;     /* scratch: register file bytes overwritten later (backward) */
-    uint32_t     cap_ins, cap_obs, cap_kb;
-    jit_rep     *reps;       /* replays of the IMARK stubs */
-    uint32_t     n_reps, cap_reps;
+    uint8_t     *cold;       /* per insn: a pure op only deferred writes need (not emitted) */
+    uint8_t     *forced;     /* per insn: kept hot (its replays would be too long) */
+    uint32_t    *clo_start;  /* per insn + 1: the cold ops soft point i recomputes are */
+    uint32_t    *clo_list;   /*   clo_list[clo_start[i] .. clo_start[i + 1]), in order */
+    uint32_t    *stamp;      /* scratch per insn */
+    uint32_t    *def_of;     /* per temp: the insn defining it */
+    uint32_t    *bad;        /* scratch per temp: reads by insns that are emitted */
+    uint32_t    *nread;      /* scratch per temp: all reads */
+    uint32_t     cap_ins, cap_obs, cap_kb, cap_clo, cap_tmp;
+    jit_snap    *snaps;      /* the IMARK stubs' snapshots */
+    uint32_t     n_snaps, cap_snaps;
+    uam_ref     *rd;         /* scratch: one insn's reads (insn_reads) */
+    uint32_t     cap_rd;
     /* register allocation, per temp of the block being compiled */
     int8_t      *reg_of;     /* host register holding it, or -1 */
     uint8_t     *in_mem;     /* its jc->temps slot holds its value */
@@ -467,15 +478,6 @@ static void st_temp(uam_jit *j, uint32_t idx, int reg) { st_mem(j, reg, RBP, (in
  * jc->temps (a temp not allocated a register, or spilled). */
 enum { O_IMM, O_MEM, O_REG };
 typedef struct opnd { int kind; uint64_t imm; int32_t disp; int reg; } opnd;
-
-/* A deferred register write replayed in an IMARK stop stub: where its value and guard
- * were when the stub's jump was taken. */
-struct jit_rep {
-    uint32_t aux;          /* register file offset */
-    uint8_t  w;            /* width */
-    bool     guarded;
-    opnd     v, g;
-};
 
 static opnd opnd_of(const uam_jit *j, const uam_block *blk, uam_ref r, unsigned w)
 {
@@ -663,36 +665,49 @@ static void   patch(uam_jit *j, size_t pos);
  * again (SSA), so a spilled temp is simply read from memory from then on. Guarded
  * ops define their result after the guard's paths join, and calls save and restore
  * the live caller-saved registers, so the allocation is the same on every path.
- * A deferred PUT (defer_analyze) reads nothing where it stands; instead its value and
- * guard are read at every soft point that replays it, so they stay live up to the last. */
+ * A deferred PUT or a cold op (defer_analyze) reads nothing where it stands; instead
+ * the values a replay needs - the writes' values and guards, the operands of the cold
+ * ops it recomputes - are read at every soft point that replays them, so they stay
+ * live up to the last. Cold temps are never in a register: a replay computes them into
+ * their slots. */
 
-/* The temps insn i reads: its operands (none for a deferred PUT), then the value and
- * guard of each write its replay list holds. Returns how many, into out[]. */
-static unsigned insn_reads(const uam_jit *j, const uam_block *blk, uint32_t i, uam_ref *out,
-                           unsigned max)
+/* A temp only cold ops and deferred PUTs read, computed by the replays that need it. */
+static bool cold_temp(const uam_jit *j, uam_ref t)
 {
-    unsigned n = 0;
-    const uam_insn *in = &blk->insn[i];
-    if (!j->dfr[i]) {
-        const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
-        for (unsigned k = 0; k < 4; k++)
-            if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]) && n < max)
-                out[n++] = refs[k];
-    }
-    for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
-        const uam_insn *d = &blk->insn[j->obs_list[e]];
-        if (!uam_ref_is_imm(d->a) && n < max)
-            out[n++] = d->a;
-        if (!uam_ref_is_none(d->guard) && !uam_ref_is_imm(d->guard) && n < max)
-            out[n++] = d->guard;
-    }
+    return j->def_of[t] != NO_TEMP && j->cold[j->def_of[t]];
+}
+
+/* Append the temp operands of `in` that are not cold to out[]. */
+static unsigned push_reads(const uam_jit *j, const uam_insn *in, bool guard_and_a_only,
+                           uam_ref *out, unsigned n)
+{
+    const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
+    for (unsigned k = 0; k < (guard_and_a_only ? 2u : 4u); k++)
+        if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]) && !cold_temp(j, refs[k]))
+            out[n++] = refs[k];
     return n;
 }
 
-/* Reads of one insn at most: 4 operands, 2 per replayed write. */
+/* The temps insn i reads: its operands (none for a deferred PUT or a cold op), then
+ * those of each cold op and write its replay recomputes and replays. Returns how many,
+ * into out[] (room for max_reads(j, i)). */
+static unsigned insn_reads(const uam_jit *j, const uam_block *blk, uint32_t i, uam_ref *out)
+{
+    unsigned n = 0;
+    if (!j->dfr[i] && !j->cold[i])
+        n = push_reads(j, &blk->insn[i], false, out, n);
+    for (uint32_t e = j->clo_start[i]; e < j->clo_start[i + 1]; e++)
+        n = push_reads(j, &blk->insn[j->clo_list[e]], false, out, n);
+    for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++)
+        n = push_reads(j, &blk->insn[j->obs_list[e]], true, out, n);
+    return n;
+}
+
+/* Reads of one insn at most: 4 operands, 4 per recomputed cold op, 2 per write. */
 static unsigned max_reads(const uam_jit *j, uint32_t i)
 {
-    return 4 + 2 * (j->obs_start[i + 1] - j->obs_start[i]);
+    return 4 + 4 * (j->clo_start[i + 1] - j->clo_start[i])
+             + 2 * (j->obs_start[i + 1] - j->obs_start[i]);
 }
 
 static bool ra_begin(uam_jit *j, const uam_block *blk)
@@ -718,22 +733,25 @@ static bool ra_begin(uam_jit *j, const uam_block *blk)
     for (uint32_t i = 0; i < blk->n_insn; i++)
         if (max_reads(j, i) > max)
             max = max_reads(j, i);
-    uam_ref *rd = malloc(sizeof(uam_ref) * max);
-    if (!rd)
-        return false;
+    if (max > j->cap_rd) {
+        uam_ref *r2 = realloc(j->rd, sizeof(uam_ref) * max);
+        if (!r2)
+            return false;
+        j->rd = r2;
+        j->cap_rd = max;
+    }
+    uam_ref *rd = j->rd;
     memset(j->use_start, 0, sizeof(uint32_t) * (nt + 1));
     for (uint32_t i = 0; i < blk->n_insn; i++) {
-        unsigned n = insn_reads(j, blk, i, rd, max);
+        unsigned n = insn_reads(j, blk, i, rd);
         for (unsigned k = 0; k < n; k++)
             j->use_start[rd[k] + 1]++;
         n_use += n;
     }
     if (n_use > j->cap_use) {
         uint32_t *u = realloc(j->use_pos, sizeof(uint32_t) * n_use);
-        if (!u) {
-            free(rd);
+        if (!u)
             return false;
-        }
         j->use_pos = u;
         j->cap_use = n_use;
     }
@@ -741,11 +759,10 @@ static bool ra_begin(uam_jit *j, const uam_block *blk)
         j->use_start[t + 1] += j->use_start[t];
     memcpy(j->use_cur, j->use_start, sizeof(uint32_t) * nt);
     for (uint32_t i = 0; i < blk->n_insn; i++) {   /* fill in insn order: sorted */
-        unsigned n = insn_reads(j, blk, i, rd, max);
+        unsigned n = insn_reads(j, blk, i, rd);
         for (unsigned k = 0; k < n; k++)
             j->use_pos[j->use_cur[rd[k]]++] = i;
     }
-    free(rd);
     for (uint32_t t = 0; t < nt; t++) {
         j->use_cur[t] = j->use_start[t];
         j->last_use[t] = j->use_start[t + 1] > j->use_start[t] ? j->use_pos[j->use_start[t + 1] - 1]
@@ -769,21 +786,10 @@ static uint32_t next_use(uam_jit *j, uint32_t t)
 /* After an insn: free the registers of the temps it read for the last time. */
 static void ra_free_dead(uam_jit *j, const uam_block *blk)
 {
-    uam_ref rd[4 + 2 * 64];
     const uint32_t i = j->cur_i;
-    unsigned n = 0;
-    if (max_reads(j, i) <= sizeof(rd) / sizeof(rd[0])) {
-        n = insn_reads(j, blk, i, rd, (unsigned)(sizeof(rd) / sizeof(rd[0])));
-    } else {   /* a long replay list: one at a time */
-        for (uint32_t t = 0; t < blk->n_temp; t++)
-            if (j->reg_of[t] >= 0 && j->last_use[t] == i) {
-                j->holder[j->reg_of[t]] = NO_TEMP;
-                j->reg_of[t] = -1;
-            }
-        return;
-    }
+    const unsigned n = insn_reads(j, blk, i, j->rd);
     for (unsigned k = 0; k < n; k++) {
-        uam_ref t = rd[k];
+        uam_ref t = j->rd[k];
         if (j->reg_of[t] < 0 || j->last_use[t] > i)
             continue;
         j->holder[j->reg_of[t]] = NO_TEMP;
@@ -1474,7 +1480,7 @@ static bool fusable(const uam_jit *j, const uam_block *blk, uint32_t i)
     uint32_t k = i + 1;
     if (k < blk->n_insn && blk->insn[k].op == UAM_OP_IMARK && (blk->insn[k].flags & UAM_IMARK_CONT))
         k++;
-    if (k >= blk->n_insn || j->dfr[k])   /* a deferred PUT tests its guard elsewhere */
+    if (k >= blk->n_insn || j->dfr[k] || j->cold[k])   /* not emitted here */
         return false;
     const uam_insn *c = &blk->insn[k];
     return c->guard == t || (c->op == UAM_OP_SELECT && c->a == t && c->b != t && c->c != t);
@@ -1553,8 +1559,112 @@ static uint8_t cover(uint32_t daux, unsigned dlen, uint32_t aux, unsigned len)
     return m;
 }
 
+#define CLO_MAX 32u   /* cold ops one replay may recompute (more: they stay on the fast path) */
+
+/* A pure op that can be left out of the fast path and recomputed by a replay: inline
+ * (no C call), unguarded, with a result. */
+static bool cold_eligible(const uam_jit *j, const uam_block *blk, uint32_t i)
+{
+    const uam_insn *in = &blk->insn[i];
+    const uam_opcode op = (uam_opcode)in->op;
+    const uam_opinfo *oi = &uam_opinfo_table[op];
+    return !j->forced[i] && op != UAM_OP_GET && oi->result != UAM_RK_NONE
+        && !(oi->props & (UAM_P_EFFECT | UAM_P_GUARD | UAM_P_FAULT)) && pure_inline(j, op)
+        && uam_ref_is_none(in->guard) && !uam_ref_is_none(in->dst) && !uam_ref_is_imm(in->dst);
+}
+
+/* Append insn c to soft point i's cold list, unless it is there already. */
+static bool clo_add(uam_jit *j, uint32_t c, uint32_t tag, uint32_t *nc)
+{
+    if (j->stamp[c] == tag)
+        return true;
+    j->stamp[c] = tag;
+    if (!grow(j, &j->clo_list, &j->cap_clo, *nc + 1, sizeof(uint32_t)))
+        return false;
+    j->clo_list[(*nc)++] = c;
+    return true;
+}
+
+/* The cold ops of the deferred writes (j->dfr): a pure op is cold if every reader is a
+ * deferred PUT or another cold op, so the fast path never needs its value. Each soft
+ * point recomputes, before its replays and in program order, the cold ops its pending
+ * writes depend on (j->clo_start / clo_list). A soft point that would recompute more
+ * than CLO_MAX of them keeps them all on the fast path instead, and the pass starts over
+ * (keeping ops hot only shrinks the other lists). */
+static bool cold_analyze(uam_jit *j, const uam_block *blk)
+{
+    const uint32_t n = blk->n_insn, nt = blk->n_temp;
+    for (;;) {
+        memset(j->bad, 0, sizeof(uint32_t) * nt);
+        memset(j->nread, 0, sizeof(uint32_t) * nt);
+        for (uint32_t i = 0; i < n; i++) {
+            const uam_insn *in = &blk->insn[i];
+            const uam_ref refs[4] = { in->guard, in->a, in->b, in->c };
+            for (unsigned k = 0; k < 4; k++)
+                if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k])) {
+                    j->nread[refs[k]]++;
+                    if (!j->dfr[i])
+                        j->bad[refs[k]]++;
+                }
+        }
+        for (uint32_t i = n; i-- > 0;) {   /* readers come after: decided already */
+            j->cold[i] = 0;
+            if (!cold_eligible(j, blk, i))
+                continue;
+            const uam_insn *in = &blk->insn[i];
+            if (!j->nread[in->dst] || j->bad[in->dst])
+                continue;
+            j->cold[i] = 1;
+            const uam_ref refs[3] = { in->a, in->b, in->c };
+            for (unsigned k = 0; k < 3; k++)
+                if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]))
+                    j->bad[refs[k]]--;
+        }
+
+        bool over = false;
+        uint32_t nc = 0;
+        memset(j->stamp, 0, sizeof(uint32_t) * n);
+        for (uint32_t i = 0; i < n; i++) {
+            j->clo_start[i] = nc;
+            const uint32_t first = nc, tag = i + 1;
+            for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
+                const uam_insn *d = &blk->insn[j->obs_list[e]];
+                const uam_ref refs[2] = { d->a, d->guard };
+                for (unsigned k = 0; k < 2; k++)
+                    if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]) && cold_temp(j, refs[k])
+                        && !clo_add(j, j->def_of[refs[k]], tag, &nc))
+                        return false;
+            }
+            for (uint32_t w = first; w < nc; w++) {   /* nc grows: the transitive closure */
+                const uam_insn *c = &blk->insn[j->clo_list[w]];
+                const uam_ref refs[3] = { c->a, c->b, c->c };
+                for (unsigned k = 0; k < 3; k++)
+                    if (!uam_ref_is_none(refs[k]) && !uam_ref_is_imm(refs[k]) && cold_temp(j, refs[k])
+                        && !clo_add(j, j->def_of[refs[k]], tag, &nc))
+                        return false;
+            }
+            for (uint32_t a = first + 1; a < nc; a++) {   /* program order (insertion sort) */
+                const uint32_t v = j->clo_list[a];
+                uint32_t b = a;
+                for (; b > first && j->clo_list[b - 1] > v; b--)
+                    j->clo_list[b] = j->clo_list[b - 1];
+                j->clo_list[b] = v;
+            }
+            if (nc - first > CLO_MAX) {
+                for (uint32_t w = first; w < nc; w++)
+                    j->forced[j->clo_list[w]] = 1;
+                over = true;
+            }
+        }
+        j->clo_start[n] = nc;
+        if (!over)
+            return true;
+    }
+}
+
 /* Decide which PUTs of blk are deferred (j->dfr) and what each soft point replays
- * (j->obs_start / obs_list). Returns false on allocation failure. */
+ * (j->obs_start / obs_list), then which pure ops only those writes need (j->cold).
+ * Returns false on allocation failure. */
 static bool defer_analyze(uam_jit *j, const uam_block *blk)
 {
     const uint32_t n = blk->n_insn;
@@ -1570,12 +1680,41 @@ static bool defer_analyze(uam_jit *j, const uam_block *blk)
         if (pe) j->pend = pe;
         uint8_t *pl = realloc(j->pend_live, cap);
         if (pl) j->pend_live = pl;
-        if (!ok || !df || !os || !pe || !pl)
+        uint8_t *co = realloc(j->cold, cap);
+        if (co) j->cold = co;
+        uint8_t *fo = realloc(j->forced, cap);
+        if (fo) j->forced = fo;
+        uint32_t *cs = realloc(j->clo_start, sizeof(uint32_t) * cap);
+        if (cs) j->clo_start = cs;
+        uint32_t *st = realloc(j->stamp, sizeof(uint32_t) * cap);
+        if (st) j->stamp = st;
+        if (!ok || !df || !os || !pe || !pl || !co || !fo || !cs || !st)
             return false;
         j->cap_ins = cap;
     }
+    const uint32_t nt = blk->n_temp;
+    if (nt + 1 > j->cap_tmp) {
+        const uint32_t cap = nt + 1;
+        uint32_t *de = realloc(j->def_of, sizeof(uint32_t) * cap);
+        if (de) j->def_of = de;
+        uint32_t *ba = realloc(j->bad, sizeof(uint32_t) * cap);
+        if (ba) j->bad = ba;
+        uint32_t *nr = realloc(j->nread, sizeof(uint32_t) * cap);
+        if (nr) j->nread = nr;
+        if (!de || !ba || !nr)
+            return false;
+        j->cap_tmp = cap;
+    }
     memset(j->dfr, 0, n);
+    memset(j->cold, 0, n);
+    memset(j->forced, 0, n);
     memset(j->obs_start, 0, sizeof(uint32_t) * (n + 1));
+    memset(j->clo_start, 0, sizeof(uint32_t) * (n + 1));
+    for (uint32_t t = 0; t < nt; t++)
+        j->def_of[t] = NO_TEMP;
+    for (uint32_t i = 0; i < n; i++)
+        if (!uam_ref_is_none(blk->insn[i].dst) && !uam_ref_is_imm(blk->insn[i].dst))
+            j->def_of[blk->insn[i].dst] = i;
     if (!j->defer)
         return true;
 
@@ -1670,7 +1809,7 @@ static bool defer_analyze(uam_jit *j, const uam_block *blk)
         if (!changed)
             break;
     }
-    return true;
+    return cold_analyze(j, blk);
 }
 
 /* mov [r15 + aux], v (width w) */
@@ -1699,40 +1838,40 @@ static void emit_put(uam_jit *j, uint32_t aux, unsigned w, opnd v)
     modrm_mem(j, src, R15, (int32_t)aux);
 }
 
-/* The replay record of deferred PUT d, with its operands where they are now. */
-static jit_rep rep_of(const uam_jit *j, const uam_block *blk, uint32_t d)
-{
-    const uam_insn *in = &blk->insn[d];
-    jit_rep r = { in->aux, in->width, guard_temp(in), opnd_of(j, blk, in->a, in->width), { 0 } };
-    if (r.guarded)
-        r.g = opnd_of(j, blk, in->guard, 1);
-    return r;
-}
-
-/* Replay one write. Uses rax only (and the flags). */
-static void emit_rep(uam_jit *j, const jit_rep *r)
-{
-    size_t skip = 0;
-    if (r->guarded) {
-        test_bool(j, r->g);
-        skip = jcc_fwd(j, 0x84);                         /* je: guard false */
-    }
-    emit_put(j, r->aux, r->w, r->v);
-    if (r->guarded)
-        patch(j, skip);
-}
-
-/* Replay, here, the writes pending at soft point i (a load or store's slow path). */
-static void emit_replays(uam_jit *j, const uam_block *blk, uint32_t i)
+/* Replay, here, what soft point i needs: compute its cold ops into their slots (in
+ * program order, so each finds its cold operands there), then do its pending writes,
+ * each under its guard. The temps it reads are where opnd_of says (an IMARK stub sets
+ * that up). Uses rax, rcx and rdx (the cold ops) and the flags; returns whether rcx and
+ * rdx were touched. `back` is the region kind to resume in the op map. */
+static bool emit_replays(uam_jit *j, const uam_block *blk, uint32_t i, unsigned back)
 {
     if (j->obs_start[i] == j->obs_start[i + 1])
-        return;
+        return false;
     mark(j, MK_REPLAY, i);
-    for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
-        const jit_rep r = rep_of(j, blk, j->obs_list[e]);
-        emit_rep(j, &r);
+    const bool fuse = j->fuse;
+    const uam_ref ft = j->flag_temp;
+    j->fuse = false;                   /* every result to rax, nothing held in the flags */
+    j->flag_temp = UAM_REF_NONE;
+    for (uint32_t e = j->clo_start[i]; e < j->clo_start[i + 1]; e++) {
+        const uam_insn *c = &blk->insn[j->clo_list[e]];
+        emit_pure(j, blk, c);
+        st_temp(j, c->dst, RAX);
     }
-    mark(j, MK_SLOW, i);
+    j->fuse = fuse;
+    j->flag_temp = ft;
+    for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
+        const uam_insn *d = &blk->insn[j->obs_list[e]];
+        size_t skip = 0;
+        if (guard_temp(d)) {
+            test_bool(j, opnd_of(j, blk, d->guard, 1));
+            skip = jcc_fwd(j, 0x84);                         /* je: guard false */
+        }
+        emit_put(j, d->aux, d->width, opnd_of(j, blk, d->a, d->width));
+        if (skip)
+            patch(j, skip);
+    }
+    mark(j, back, i);
+    return j->clo_start[i] != j->clo_start[i + 1];
 }
 
 /* Compile the whole block into j->cb. Returns false if it must be interpreted. */
@@ -1743,7 +1882,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     j->overflow = false;
     j->n_slots = 0;
     j->n_marks = 0;
-    j->n_sites = j->n_site_refs = j->n_stubs = j->n_reps = 0;
+    j->n_sites = j->n_site_refs = j->n_stubs = j->n_snaps = 0;
     j->flag_temp = UAM_REF_NONE;
     j->cur = (jit_site){ blk->guest_pc, blk->guest_pc, 0 };
     j->cur_emitted = false;
@@ -1786,7 +1925,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         const unsigned W = in->width;
         const bool has_dst = !uam_ref_is_none(in->dst);
         j->cur_i = i;
-        if (j->dfr[i])
+        if (j->dfr[i] || j->cold[i])
             continue;                          /* replayed on the cold paths, if at all */
         j->fuse = fusable(j, blk, i);
         mark(j, MK_OP, i);
@@ -1832,12 +1971,13 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                     rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop));
                     j->stubs[j->n_stubs].jcc = jcc_fwd(j, 0x83);                 /* jae */
                     j->stubs[j->n_stubs].pc = pc;
-                    j->stubs[j->n_stubs].rep = j->n_reps;
-                    const uint32_t nr = j->obs_start[i + 1] - j->obs_start[i];
-                    if (nr && grow(j, &j->reps, &j->cap_reps, j->n_reps + nr, sizeof(jit_rep)))
-                        for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++)
-                            j->reps[j->n_reps++] = rep_of(j, blk, j->obs_list[e]);
-                    j->stubs[j->n_stubs].n_rep = j->n_reps - j->stubs[j->n_stubs].rep;
+                    j->stubs[j->n_stubs].i = i;
+                    j->stubs[j->n_stubs].snap = j->n_snaps;
+                    const unsigned nr = insn_reads(j, blk, i, j->rd);   /* the replay's reads */
+                    if (nr && grow(j, &j->snaps, &j->cap_snaps, j->n_snaps + nr, sizeof(jit_snap)))
+                        for (unsigned e = 0; e < nr; e++)
+                            j->snaps[j->n_snaps++] = (jit_snap){ j->rd[e], j->reg_of[j->rd[e]] };
+                    j->stubs[j->n_stubs].n_snap = j->n_snaps - j->stubs[j->n_stubs].snap;
                     j->n_stubs++;
                 }
             }
@@ -1887,7 +2027,8 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
-            emit_replays(j, blk, i);                    /* rdx (addr) is kept */
+            if (emit_replays(j, blk, i, MK_SLOW))
+                load(j, RDX, ao, aw);                   /* rdx = addr again */
             emit_site(j);
             ra_save(j, false);
             mov_rr(j, RSI, RDX);                        /* miss / slow path: the bridge */
@@ -1942,7 +2083,8 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));
-            emit_replays(j, blk, i);                    /* rdx (addr) and r11 are kept */
+            if (emit_replays(j, blk, i, MK_SLOW))       /* r11 (the value) is kept */
+                load(j, RDX, ao, aw);                   /* rdx = addr again */
             emit_site(j);
             ra_save(j, false);
             mov_rr(j, RSI, RDX);                        /* r11 still holds the unswapped value */
@@ -2093,11 +2235,19 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     mark(j, MK_STUB, 0);
     for (uint32_t k = 0; k < j->n_stubs; k++) {
         patch(j, j->stubs[k].jcc);
-        if (j->stubs[k].n_rep) {
-            mark(j, MK_REPLAY, 0);
-            for (uint32_t e = 0; e < j->stubs[k].n_rep; e++)
-                emit_rep(j, &j->reps[j->stubs[k].rep + e]);
-            mark(j, MK_STUB, 0);
+        /* the replay, with the temps it reads where they were at the IMARK (a replay of
+         * immediates reads none) */
+        const jit_snap *sn = &j->snaps[j->stubs[k].snap];
+        for (uint32_t e = 0; e < j->stubs[k].n_snap; e++) {
+            const int8_t r = j->reg_of[sn[e].t];
+            j->reg_of[sn[e].t] = sn[e].reg;
+            j->snaps[j->stubs[k].snap + e].reg = r;               /* swap: restored below */
+        }
+        emit_replays(j, blk, j->stubs[k].i, MK_STUB);
+        for (uint32_t e = j->stubs[k].n_snap; e-- > 0;) {       /* reversed: a temp may repeat */
+            const int8_t r = j->reg_of[sn[e].t];
+            j->reg_of[sn[e].t] = sn[e].reg;
+            j->snaps[j->stubs[k].snap + e].reg = r;
         }
         set_res_pc_imm(j, UAM_BR_INTERRUPTED, j->stubs[k].pc);
         epi[n_epi++] = jmp_fwd(j);
@@ -2241,7 +2391,16 @@ void uam_jit_destroy(uam_jit *j)
     free(j->pend);
     free(j->pend_live);
     free(j->kbytes);
-    free(j->reps);
+    free(j->cold);
+    free(j->forced);
+    free(j->clo_start);
+    free(j->clo_list);
+    free(j->stamp);
+    free(j->def_of);
+    free(j->bad);
+    free(j->nread);
+    free(j->snaps);
+    free(j->rd);
     free(j->reg_of);
     free(j->in_mem);
     free(j->last_use);

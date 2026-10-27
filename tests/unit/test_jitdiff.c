@@ -787,6 +787,40 @@ static void d_pattern(uam_builder *b, unsigned p)
         uam_put(b, 32, 16, uam_get(b, 32, 48), N);
         break;
     }
+    case 7: { /* values only replays need, computed with rcx/rdx (variable shift, divide,
+               * high multiply, a wide immediate), recomputed on a slow path */
+        uam_ref x = uam_get(b, 32, 0), y = uam_get(b, 32, 8);
+        uam_ref u = uam_get(b, 64, 32), v = uam_get(b, 64, 40);
+        uam_put(b, 32, 16, uam_binop(b, UAM_OP_LSHR, 32, x, y), N);
+        uam_put(b, 32, 20, uam_binop(b, UAM_OP_UDIV, 32, x, y), N);
+        uam_put(b, 64, 24, uam_binop(b, UAM_OP_MULHU, 64, u, v), N);
+        uam_put(b, 8, 64, uam_unop(b, UAM_OP_ZEXT, 8,
+                                   uam_binop(b, UAM_OP_ULT, 64, u, uam_imm(b, 0x123456789ull))), N);
+        NEXT();
+        uam_ref at = chance(50) ? uam_imm(b, rn(2) ? DEV_BASE + 4 : RAM_BASE + 0x40)
+                                : uam_get(b, 32, ADDR_SLOTS + 8 * rn(8));
+        if (chance(50))
+            uam_put(b, 32, 44, uam_ld(b, 32, UAM_ACC_LE, at, N), N);
+        else
+            uam_st(b, 32, UAM_ACC_LE, at, uam_get(b, 32, 48), N);
+        NEXT();
+        uam_put(b, 32, 16, uam_get(b, 32, 52), N);
+        uam_put(b, 32, 20, uam_get(b, 32, 56), N);
+        uam_put(b, 64, 24, uam_get(b, 64, 8), N);
+        uam_put(b, 8, 64, uam_get(b, 8, 60), N);
+        break;
+    }
+    case 8:   /* only immediates pending at a stop check: a constant overwritten in the
+               * delay slot of a branch (MIPS `li v0, 0x3d; beq ...; li v0, 0x40`) */
+        uam_put(b, 32, 0, uam_imm(b, 0x3d), N);
+        uam_put(b, 8, 4, uam_imm(b, rn(256)), N);
+        NEXT();
+        uam_ref c = uam_binop(b, UAM_OP_EQ, 32, uam_get(b, 32, 8), uam_imm(b, 0x3d));
+        uam_imark_cont(b, pc, 4);
+        uam_put(b, 32, 0, uam_imm(b, 0x40), N);
+        uam_put(b, 8, 4, uam_get(b, 8, 12), N);
+        uam_exit(b, c, uam_imm(b, 0x4100), UAM_EXIT_JUMP);
+        break;
     default: { /* flag-setting instructions, each with a memory access first */
         uam_ref g = uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 72));
         uam_ref x = uam_get(b, 32, 0), y = uam_get(b, 32, 8);
@@ -816,7 +850,7 @@ static void level_d(void)
     uam_builder_init(&b, 32);
     with_mem = true;
     unsigned n = 0;
-    for (unsigned p = 0; p < 7 && failures < 5; p++) {
+    for (unsigned p = 0; p < 9 && failures < 5; p++) {
         for (unsigned it = 0; it < 150; it++) {
             d_pattern(&b, p);
             uam_block *blk = uam_builder_finish(&b);

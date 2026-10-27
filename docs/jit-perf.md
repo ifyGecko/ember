@@ -144,6 +144,7 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 8a: dispatch | 2.38 s | 2.12 s | a block's code pages are rechecked only when bus->code_gen moved (a code write or a map change); a direct-mapped cache of recent tcache entries; buckets double as blocks accumulate (ABI 15) |
 | 8b: bus sub-page cache | 2.07 s | 2.10 s | regions smaller than a page (I/O ports, register blocks) were resolved by a linear scan of every region on each access; a 64-entry cache keyed by 8-byte granule now serves them (ABI 16) |
 | 8c: constant-address probes | 2.07 s | 1.86 s | a load/store to a constant address compares one known data-TLB entry with its page (a constant access that crosses a page or is misaligned goes straight to the bridge) |
+| 9: deferred register writes | 1.70 s | 1.81 s | a register write that a later instruction of the block overwrites unread is replayed only where the block can stop (IMARK stop stubs, load/store slow paths), and the pure ops only those writes need are recomputed there (docs/jit-dead-puts-design.md). Measured against 2.04 s / 1.87 s for the build before it in the same session; code +20% / +2%, translation 0.17 -> 0.23 s / 0.048 -> 0.061 s. Consoles and the interpreter-vs-JIT state identical on both |
 
 ## Where it stands (after step 8c)
 
@@ -225,11 +226,40 @@ What it shows:
 - RV32, MIPS and PPC are within 1.3x of each other everywhere; endianness costs nothing
   measurable (MIPS BE/LE, Thumb LE/BE8).
 
+### After step 9
+
+Step 9 defers register writes that a later instruction overwrites unread, and the
+arithmetic that only feeds them (docs/jit-dead-puts-design.md). Each kernel's time
+before over after (`--per-kernel --times --rounds 1600`, medians of 5; above 1 is
+faster):
+
+| Kernel | RV32 | MIPS | MIPSel | ARM | Thumb | Thumb BE8 | PPC | x86 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| crc | 1.03 | 1.01 | 1.03 | 1.01 | 1.08 | 1.09 | 1.01 | 1.58 |
+| sort | 0.99 | 1.00 | 1.03 | 1.01 | 1.02 | 1.01 | 1.01 | 1.02 |
+| matmul | 0.99 | 1.00 | 1.00 | 1.02 | 1.20 | 1.22 | 1.00 | 2.11 |
+| string | 1.01 | 1.02 | 1.03 | 1.03 | 1.04 | 1.04 | 1.02 | 1.34 |
+| list | 1.03 | 1.03 | 1.03 | 1.01 | 1.04 | 1.05 | 1.01 | 1.29 |
+| u64 | 1.10 | 1.13 | 1.15 | 1.28 | 1.64 | 1.60 | 1.13 | 3.32 |
+| fmt | 1.04 | 1.08 | 1.03 | 1.04 | 1.26 | 1.22 | 1.04 | 1.93 |
+| **geomean** | 1.03 | 1.04 | 1.04 | 1.05 | 1.17 | 1.16 | 1.03 | 1.68 |
+
+The interp kernel is left out: it is bimodal between runs on every build (above).
+Parity, as each guest's geometric-mean kernel time over RV32's (interp left out; the
+ratio matrix overstates the others now that x86, with native 64-bit arithmetic, is the
+fastest guest on u64):
+
+| | MIPS BE / LE | PPC | ARM | Thumb LE / BE8 | x86 |
+|---|---:|---:|---:|---:|---:|
+| before step 9 | 1.12 / 1.12 | 1.23 | 1.30 | 1.48 / 1.50 | 2.27 |
+| after | 1.11 / 1.10 | 1.23 | 1.27 | 1.31 / 1.33 | 1.39 |
+
+x86 is still the slowest guest on most kernels (crc 1.78x, matmul 1.71x, fmt 1.74x of
+RV32; not yet profiled after this step). Thumb's gap to ARM is down to 3-4%.
+
 Not done yet:
-- **Dead flag stores across instructions (step 9 of the plan).** This defers PUTs that
-  a later instruction overwrites, and replays them at interrupt exits and on memory
-  slow paths. Its gate (flag work at least 10% of OVMF time) is met, but it needs a
-  design review first.
+- **A multi-target cache for computed exits** (the interp kernel above): generic, helps
+  every ISA alike.
 - **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
   once at block entry. It changes how stopping at a deadline is implemented, so it
   needs sign-off.

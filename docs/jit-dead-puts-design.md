@@ -1,6 +1,6 @@
-# Step 9 design: dead register writes across instructions (for review)
+# Step 9 design: dead register writes across instructions
 
-Status: **draft for review, nothing implemented.** It builds on the work in docs/jit-perf.md (steps 0–8).
+Status: **approved and implemented** (2026-10-27): stage D1 in 72bc0af, stage D2 in the commit after it; results in docs/jit-perf.md. It builds on the work in docs/jit-perf.md (steps 0–8). Where the implementation differs from the text below, §9 says how.
 
 ## 1. What it is, in one paragraph
 
@@ -159,6 +159,16 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
 
 - **Lazy flags in the lifters.** Keep the last operation and operands, and compute flags when they are read. This is architecture-specific work (x86 differently from ARM differently from PPC), and it changes the register-file layout: ABI, snapshots, gdb, every C reader of RFLAGS/CPSR. It is the opposite of keeping ember generic.
 - **An IMARK flag meaning "no stop here".** This would let deferral cross instruction boundaries trivially, but it changes when interrupts and deadlines are taken. That is visible to the guest and differs from the interpreter.
+
+## 9. As implemented
+
+- **Where:** `defer_analyze` and `cold_analyze` in `src/exec/jit_x86.c`, run on each block before register allocation; the replays are emitted by `emit_replays`.
+- **IMARK stop stubs** stay at the end of the block. Each records, at its IMARK, which register holds each temp its replay reads, and the stub is emitted with those locations, so stubs and load/store slow paths share one replay emitter.
+- **Hard points** also include loads and stores that never take the inline path (exclusive, physical, unprivileged, or a constant address that crosses a page or is misaligned): they always call C, so a replay there would run every time.
+- **Recomputed ops** use rax, rcx and rdx. On a load/store slow path the address in rdx is loaded again after them; the store value in r11 is untouched. Only inline pure ops are sunk: one that needs the C evaluator stays on the fast path.
+- **D2 stub cap:** a soft point that would recompute more than 32 ops keeps all of them on the fast path (the writes stay deferred), and the analysis repeats until no list is over the cap. Keeping ops on the fast path only shortens the other lists.
+- **No `--stats` counters:** they would change `uam_exec_stats`, and with it the library ABI, for a debugging aid. The op map (`UAM_JIT_OPMAP`, `tools/jitprof.py`) labels replay code as its own region kind, `replay`; `UAM_JIT_NODEFER=1` still turns the step off for bisecting.
+- **Tests:** test_jitdiff level D (deferral shapes under every stop condition) and the mutation checks listed in the D1 and D2 commits. The end-to-end runs earned their place: the first D2 build skipped a stop stub's replay when it read no temps (only constants pending, as in a MIPS `li` overwritten in a branch delay slot), which VxWorks hit within 1e7 instructions while every unit test passed; level D's pattern 8 now covers it.
 
 ---
 
