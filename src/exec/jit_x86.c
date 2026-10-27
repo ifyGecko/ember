@@ -92,7 +92,7 @@ typedef struct uam_jit_ctx {
     uint64_t                epoch;       /* links made in another epoch are dead */
     jit_slot               *link_slot;   /* out: the EXIT slot that missed (to be linked) */
     uint32_t                chain_left;  /* chained jumps still allowed */
-    uint32_t                hops;        /* chained jumps taken */
+    uint32_t                chain_budget;/* hops taken = chain_budget - chain_left */
     uint32_t                dgen;        /* bus->direct_gen at entry */
     uam_sched              *sched;
     uint64_t                next_when;   /* next timer at entry */
@@ -104,8 +104,10 @@ typedef struct uam_jit_ctx {
  * timer armed earlier usually requests an exit too (the machine's scheduler kick). */
 static void chain_check(uam_jit_ctx *jc)
 {
-    if (jc->cpu->bus->direct_gen != jc->dgen || uam_sched_next(jc->sched) != jc->next_when)
+    if (jc->cpu->bus->direct_gen != jc->dgen || uam_sched_next(jc->sched) != jc->next_when) {
+        jc->chain_budget -= jc->chain_left;   /* keeps the hop count */
         jc->chain_left = 0;
+    }
 }
 
 static int jit_fault(uam_jit_ctx *jc, uam_status st, uint64_t addr, uint32_t xf, bool store)
@@ -331,6 +333,11 @@ struct uam_jit {
     uint32_t     cap_temp, cap_use;
     uint32_t     holder[16]; /* temp held by each host register, or NO_TEMP */
     uint32_t     cur_i;      /* the insn being compiled */
+    /* flag fusion: a compare whose only reader is the next guard or select condition
+     * leaves its result in the host flags instead of a register */
+    bool         fuse;       /* the insn being compiled is such a compare */
+    uam_ref      flag_temp;  /* the temp now held in the flags, or NONE */
+    uint8_t      flag_cc;    /* its x86 condition code (true when the cc holds) */
     /* profiling output, from the environment at creation (docs/jit-perf.md) */
     FILE        *perf_map;   /* UAM_PERF_MAP: /tmp/perf-<pid>.map, one line per block */
     FILE        *opmap;      /* UAM_JIT_OPMAP=FILE: code offset -> IR instruction */
@@ -1010,7 +1017,6 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t 
     rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(epoch));    /* cmp rcx, [slot.epoch] */
     size_t miss = jcc_fwd(j, 0x85);
     g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));             /* dec dword [chain_left] */
-    g8(j, 0xFF); modrm_mem(j, 0, RBX, OFF(hops));                   /* inc dword [hops] */
     g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));                 /* jmp [slot.entry] */
     patch(j, miss);
     if (!fixed)
@@ -1103,9 +1109,13 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
         /* compare at width W itself: the signed conditions then see W-bit values */
         load_operand(j, RAX, blk, in->a, W);
         alu(j, ALU_CMP, W == 1 ? 8 : W, RAX, opnd_of(j, blk, in->b, W));
-        uint8_t cc = op == UAM_OP_EQ ? 0x94 : op == UAM_OP_NE ? 0x95 : op == UAM_OP_ULT ? 0x92
-                   : op == UAM_OP_ULE ? 0x96 : op == UAM_OP_SLT ? 0x9C : 0x9E;
-        g8(j, 0x0F); g8(j, cc); modrm_reg(j, 0, RAX);              /* setcc al */
+        uint8_t cc = op == UAM_OP_EQ ? 0x4 : op == UAM_OP_NE ? 0x5 : op == UAM_OP_ULT ? 0x2
+                   : op == UAM_OP_ULE ? 0x6 : op == UAM_OP_SLT ? 0xC : 0xE;
+        if (j->fuse) {
+            j->flag_cc = cc;                                       /* the reader tests the flags */
+            break;
+        }
+        g8(j, 0x0F); g8(j, 0x90 | cc); modrm_reg(j, 0, RAX);       /* setcc al */
         g8(j, 0x0F); g8(j, 0xB6); modrm_reg(j, RAX, RAX);          /* movzx eax, al */
         break;
     }
@@ -1143,9 +1153,15 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
                 mov_imm(j, RCX, x.imm);
                 x = (opnd){ O_REG, 0, 0, RCX };
             }
-            test_bool(j, c);
+            uint8_t cc = 0x5;                                        /* ne: cond != 0 */
+            if (in->a == j->flag_temp) {
+                cc = j->flag_cc;                                     /* cond is in the flags */
+                j->flag_temp = UAM_REF_NONE;
+            } else {
+                test_bool(j, c);
+            }
             rex(j, 1, 0, 0, x.kind == O_REG && x.reg >= 8);
-            g8(j, 0x0F); g8(j, 0x45);                                /* cmovne rax, b */
+            g8(j, 0x0F); g8(j, 0x40 | cc);                           /* cmovcc rax, b */
             if (x.kind == O_REG) modrm_reg(j, RAX, x.reg);
             else                 modrm_mem(j, RAX, RBP, x.disp);
         }
@@ -1212,7 +1228,12 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
         if (W == 64) g8(j, 0x48);
         g8(j, (uint8_t)((sub ? 0x28 : 0x00) | (W == 8 ? 0 : 1)));    /* add/sub al|ax|eax|rax, cl.. */
         modrm_reg(j, RCX, RAX);
-        g8(j, 0x0F); g8(j, op == UAM_OP_CARRY ? 0x92 : 0x90); modrm_reg(j, 0, RAX); /* setc/seto al */
+        const uint8_t cc = op == UAM_OP_CARRY ? 0x2 : 0x0;             /* c / o */
+        if (j->fuse) {
+            j->flag_cc = cc;
+            break;
+        }
+        g8(j, 0x0F); g8(j, 0x90 | cc); modrm_reg(j, 0, RAX);           /* setc/seto al */
         g8(j, 0x0F); g8(j, 0xB6); modrm_reg(j, RAX, RAX);              /* movzx eax, al */
         break;
     }
@@ -1334,6 +1355,32 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
     }
 }
 
+/* Can insn i, a compare, leave its result in the host flags? Only if its one reader
+ * is the guard or the select condition of the next insn (past a continuation IMARK,
+ * which emits no check and increments icount with lea), so that nothing in between
+ * changes the flags. */
+static bool fusable(const uam_jit *j, const uam_block *blk, uint32_t i)
+{
+    const uam_insn *in = &blk->insn[i];
+    switch (in->op) {
+    case UAM_OP_EQ: case UAM_OP_NE: case UAM_OP_ULT: case UAM_OP_ULE: case UAM_OP_SLT:
+    case UAM_OP_SLE: case UAM_OP_CARRY: case UAM_OP_SCARRY: case UAM_OP_SBORROW:
+        break;
+    default:
+        return false;
+    }
+    const uam_ref t = in->dst;
+    if (j->use_start[t + 1] - j->use_start[t] != 1)
+        return false;
+    uint32_t k = i + 1;
+    if (k < blk->n_insn && blk->insn[k].op == UAM_OP_IMARK && (blk->insn[k].flags & UAM_IMARK_CONT))
+        k++;
+    if (k >= blk->n_insn)
+        return false;
+    const uam_insn *c = &blk->insn[k];
+    return c->guard == t || (c->op == UAM_OP_SELECT && c->a == t && c->b != t && c->c != t);
+}
+
 /* Compile the whole block into j->cb. Returns false if it must be interpreted. */
 static bool compile_block(uam_jit *j, const uam_block *blk)
 {
@@ -1343,6 +1390,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     j->n_slots = 0;
     j->n_marks = 0;
     j->n_sites = j->n_site_refs = j->n_stubs = 0;
+    j->flag_temp = UAM_REF_NONE;
     j->cur = (jit_site){ blk->guest_pc, blk->guest_pc, 0 };
     j->cur_emitted = false;
 
@@ -1384,6 +1432,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         const unsigned W = in->width;
         const bool has_dst = !uam_ref_is_none(in->dst);
         j->cur_i = i;
+        j->fuse = fusable(j, blk, i);
         mark(j, MK_OP, i);
 
         /* Guard on an effectful op. */
@@ -1401,8 +1450,13 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 }
                 /* guard true: fall through unguarded */
             } else {
-                test_bool(j, opnd_of(j, blk, in->guard, 1));
-                guard_skip = jcc_fwd(j, 0x84);    /* je skip */
+                if (in->guard == j->flag_temp) {  /* the guard is in the flags */
+                    guard_skip = jcc_fwd(j, (uint8_t)(0x80 | (j->flag_cc ^ 1)));   /* j!cc skip */
+                    j->flag_temp = UAM_REF_NONE;
+                } else {
+                    test_bool(j, opnd_of(j, blk, in->guard, 1));
+                    guard_skip = jcc_fwd(j, 0x84);    /* je skip */
+                }
                 guarded = true;
             }
         }
@@ -1431,7 +1485,11 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             j->cur.cont = cont;
             j->cur_emitted = false;
             mark(j, MK_IMARK_PC, i);
-            g8(j, 0x49); g8(j, 0xFF); modrm_reg(j, 0, R13); /* inc r13 (icount) */
+            if (j->flag_temp != UAM_REF_NONE) {   /* keep the flags (a CONT imark: no check) */
+                g8(j, 0x4D); g8(j, 0x8D); g8(j, 0x6D); g8(j, 0x01);  /* lea r13, [r13+1] */
+            } else {
+                g8(j, 0x49); g8(j, 0xFF); modrm_reg(j, 0, R13);      /* inc r13 (icount) */
+            }
             break;
         }
         case UAM_OP_GET:
@@ -1678,7 +1736,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         }
         /* the paths have joined: free what this insn read last, define its result */
         ra_free_dead(j, in);
-        if (has_dst)
+        if (j->fuse)
+            j->flag_temp = in->dst;              /* in the flags, not in a register */
+        else if (has_dst)
             ra_def(j, in->dst, blk->temp_width[in->dst]);
     }
 
@@ -1882,15 +1942,14 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
     }
 
     jc->temps = temps;   /* the executor may grow it between runs */
-    jc->chain_left = chain->budget;
-    jc->hops = 0;
+    jc->chain_left = jc->chain_budget = chain->budget;
     jc->link_slot = NULL;
     jc->dgen = cpu->bus->direct_gen;
     jc->next_when = uam_sched_next(x->sched);
     cpu->icount_stop = cpu->exit_request ? 0 : cpu->icount_deadline;
     ((void (*)(uam_jit_ctx *))blk->backend)(jc);
     *res = jc->res;
-    chain->hops = jc->hops;
+    chain->hops = jc->chain_budget - jc->chain_left;
     if (jc->link_slot && res->kind == UAM_BR_NEXT) {
         j->pend_slot = jc->link_slot;
         j->pend_pc = res->pc;

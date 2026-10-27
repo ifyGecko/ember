@@ -618,6 +618,20 @@ static void pattern(uam_builder *b, unsigned p)
         uam_put(b, 64, 24, uam_get(b, 64, 40), N);
         break;
     }
+    case 8: {   /* compares read once, as a guard or select condition (fused into the
+                 * host flags), across a continuation imark */
+        static const uam_opcode cmp[] = { UAM_OP_EQ, UAM_OP_NE, UAM_OP_ULT, UAM_OP_ULE,
+                                          UAM_OP_SLT, UAM_OP_SLE, UAM_OP_CARRY, UAM_OP_SBORROW };
+        uam_ref c = uam_binop(b, cmp[rn(8)], 32, uam_get(b, 32, 0), uam_get(b, 32, 8));
+        uam_imark_cont(b, 0x3004, 4);
+        uam_put(b, 32, 16, uam_get(b, 32, 24), c);
+        uam_ref d = uam_binop(b, cmp[rn(8)], 8, uam_get(b, 8, 1), uam_get(b, 8, 9));
+        uam_put(b, 32, 32, uam_select(b, 32, d, uam_get(b, 32, 40), uam_imm(b, 0x1234)), N);
+        uam_ref e = uam_binop(b, cmp[rn(8)], 16, uam_get(b, 16, 2), uam_imm(b, 0x8000));
+        uam_imark_cont(b, 0x3008, 4);
+        uam_exit(b, e, uam_imm(b, 0x3200), UAM_EXIT_JUMP);
+        break;
+    }
     default: {  /* commutative operands and repeated subexpressions */
         uam_ref x = uam_get(b, 32, 0), y = uam_get(b, 32, 8);
         uam_ref s1 = uam_binop(b, UAM_OP_ADD, 32, x, y), s2 = uam_binop(b, UAM_OP_ADD, 32, y, x);
@@ -641,7 +655,7 @@ static void level_c(void)
     with_mem = false;
     dev_exit_at = 0;
     unsigned n = 0;
-    for (unsigned p = 0; p < 8; p++) {
+    for (unsigned p = 0; p < 9; p++) {
         for (unsigned it = 0; it < 400; it++) {
             pattern(&b, p);
             uam_block *blk = uam_builder_finish(&b);
