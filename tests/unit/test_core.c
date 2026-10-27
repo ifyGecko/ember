@@ -869,6 +869,30 @@ static void test_pci_cam(void)
     uam_bus_fini(&bus);
 }
 
+/* Without an MSI sink, a message is a little-endian dword write to memory. */
+static void test_pci_msi_mem(void)
+{
+    uam_bus bus;
+    uam_bus_init(&bus);
+    CHECK(uam_bus_map_ram(&bus, "ram", 0, 0x10000) == UAM_OK, "map ram");
+    uam_pci_bus *pb = uam_pci_bus_create("pci", &bus, 0);
+    uam_pci_func f;
+    uam_pci_func_init(&f, "f", 0x1234, 0x0006, 0x01060100, NULL, NULL);
+    unsigned msi = uam_pci_msi_init(&f, 0, true, true);
+    CHECK(uam_pci_register(pb, &f, 1, 0) == UAM_OK, "register function");
+    unsigned d = 1 << 3;
+    uam_pci_cfg_write(pb, 0, d, UAM_PCI_COMMAND, 2, UAM_PCI_CMD_MASTER);
+    uam_pci_cfg_write(pb, 0, d, msi + 4, 4, 0x8000);
+    uam_pci_cfg_write(pb, 0, d, msi + 8, 4, 0);
+    uam_pci_cfg_write(pb, 0, d, msi + 0x0C, 2, 0x1234);
+    uam_pci_cfg_write(pb, 0, d, msi + 2, 2, 1);
+    uam_pci_msi_notify(&f, 0);
+    EQ64(rd(&bus, 0x8000, 1, UAM_ACC_LE), 0x34, "message byte 0");
+    EQ64(rd(&bus, 0x8001, 1, UAM_ACC_LE), 0x12, "message byte 1");
+    uam_pci_bus_device(pb)->ops->destroy(uam_pci_bus_device(pb));
+    uam_bus_fini(&bus);
+}
+
 /* A 64 KiB disk image whose every byte is its sector number. */
 static uam_blockdev *test_disk(char *path, uint32_t ss)
 {
@@ -1806,6 +1830,7 @@ int main(void)
     test_cfi_flash();
     test_pci();
     test_pci_cam();
+    test_pci_msi_mem();
     test_nvme();
     test_ahci();
     test_pci_rom();

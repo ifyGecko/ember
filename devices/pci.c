@@ -32,9 +32,30 @@ struct uam_pci_msix {
     unsigned  n;
     unsigned  table_bar, pba_bar;
     uint32_t  table_off, pba_off;
-    uint32_t *table;          /* 4 dwords per entry */
-    uint64_t *pba;
+    uint8_t  *table;          /* 16 bytes per entry, as the function's BAR shows them (LE) */
+    uint8_t  *pba;            /* the pending bits, bit v in byte v / 8 (LE qwords) */
 };
+
+/* Little-endian values of 1-8 bytes (MSI-X structures take qword accesses). */
+static uint64_t get_le(const uint8_t *p, unsigned size)
+{
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size; i++)
+        v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+static void put_le(uint8_t *p, unsigned size, uint64_t v)
+{
+    for (unsigned i = 0; i < size; i++)
+        p[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* The MSI-X table's dwords: entry v's dword k. */
+static uint32_t tab_get(const uam_pci_msix *x, unsigned v, unsigned k)
+{
+    return (uint32_t)get_le(x->table + v * 16 + k * 4, 4);
+}
 
 static uam_pci_bus *from_cam(uam_device *d)  { return UAM_CONTAINER_OF(d, uam_pci_bus, cam); }
 static uam_pci_bus *from_ecam(uam_device *d) { return UAM_CONTAINER_OF(d, uam_pci_bus, ecam); }
@@ -241,10 +262,13 @@ static void send_msg(uam_pci_func *f, uint64_t addr, uint32_t data)
     if (!mastering(f))
         return;
     uam_pci_bus *pb = f->bus;
-    if (pb->msi)
+    if (pb->msi) {
         pb->msi(pb->msi_ctx, addr, data);
-    else
-        (void)uam_bus_dma_write(pb->sys, addr, &data, 4);
+    } else {
+        uint8_t b[4];                /* PCI is little-endian */
+        put_le(b, 4, data);
+        (void)uam_bus_dma_write(pb->sys, addr, b, 4);
+    }
 }
 
 static void msi_send(uam_pci_func *f, unsigned vec)
@@ -298,7 +322,7 @@ unsigned uam_pci_msix_init(uam_pci_func *f, unsigned n, unsigned table_bar, uint
     x->table_bar = table_bar; x->table_off = table_off;
     x->pba_bar = pba_bar; x->pba_off = pba_off;
     for (unsigned i = 0; i < n; i++)
-        x->table[i * 4 + 3] = 1;             /* vector control: masked */
+        x->table[i * 16 + 12] = 1;           /* vector control: masked */
     f->msix = x;
     f->msix_cap = o;
     uam_pci_set(f->cfg, o + 2, 2, n - 1);
@@ -310,7 +334,7 @@ unsigned uam_pci_msix_init(uam_pci_func *f, unsigned n, unsigned table_bar, uint
 
 static bool msix_masked(const uam_pci_func *f, unsigned v)
 {
-    return (uam_pci_get(f->cfg, f->msix_cap + 2, 2) & 0x4000) || (f->msix->table[v * 4 + 3] & 1);
+    return (uam_pci_get(f->cfg, f->msix_cap + 2, 2) & 0x4000) || (tab_get(f->msix, v, 3) & 1);
 }
 
 static void msix_retry(uam_pci_func *f)
@@ -319,9 +343,9 @@ static void msix_retry(uam_pci_func *f)
     if (!x || !msix_on(f))
         return;
     for (unsigned v = 0; v < x->n; v++)
-        if ((x->pba[v / 64] >> (v % 64) & 1) && !msix_masked(f, v)) {
-            x->pba[v / 64] &= ~(1ull << (v % 64));
-            send_msg(f, x->table[v * 4] | (uint64_t)x->table[v * 4 + 1] << 32, x->table[v * 4 + 2]);
+        if ((x->pba[v / 8] >> (v % 8) & 1) && !msix_masked(f, v)) {
+            x->pba[v / 8] &= (uint8_t)~(1u << (v % 8));
+            send_msg(f, tab_get(x, v, 0) | (uint64_t)tab_get(x, v, 1) << 32, tab_get(x, v, 2));
         }
 }
 
@@ -333,25 +357,20 @@ bool uam_pci_msix_access(uam_pci_func *f, unsigned bar, uint64_t off, unsigned s
         return false;
     if (bar == x->table_bar && off >= x->table_off && off + size <= x->table_off + x->n * 16ull) {
         uint64_t o = off - x->table_off;
-        uint8_t *t = (uint8_t *)x->table;
         if (!write) {
-            uint64_t v = 0;
-            memcpy(&v, t + o, size);
-            *val = v;
+            *val = get_le(x->table + o, size);
             return true;
         }
-        memcpy(t + o, val, size);
-        x->table[(o / 16) * 4 + 3] &= 1;     /* only the mask bit is defined */
+        put_le(x->table + o, size, *val);
+        unsigned v = (unsigned)(o / 16);
+        put_le(x->table + v * 16 + 12, 4, tab_get(x, v, 3) & 1);   /* only the mask bit is defined */
         msix_retry(f);
         return true;
     }
     uint64_t pba_len = ((x->n + 63) / 64) * 8ull;
     if (bar == x->pba_bar && off >= x->pba_off && off + size <= x->pba_off + pba_len) {
-        if (!write) {
-            uint64_t v = 0;
-            memcpy(&v, (uint8_t *)x->pba + (off - x->pba_off), size);
-            *val = v;
-        }
+        if (!write)
+            *val = get_le(x->pba + (off - x->pba_off), size);
         return true;                         /* the PBA is read-only */
     }
     return false;
@@ -364,11 +383,11 @@ void uam_pci_msi_notify(uam_pci_func *f, unsigned vector)
         if (vector >= x->n)
             return;
         if (msix_masked(f, vector)) {
-            x->pba[vector / 64] |= 1ull << (vector % 64);
+            x->pba[vector / 8] |= (uint8_t)(1u << (vector % 8));
             return;
         }
-        send_msg(f, x->table[vector * 4] | (uint64_t)x->table[vector * 4 + 1] << 32,
-                 x->table[vector * 4 + 2]);
+        send_msg(f, tab_get(x, vector, 0) | (uint64_t)tab_get(x, vector, 1) << 32,
+                 tab_get(x, vector, 2));
         return;
     }
     if (!msi_on(f) || vector >= (1u << ((msi_ctl(f) >> 4) & 7)) || vector >= 32)
@@ -736,7 +755,7 @@ static void bus_reset(uam_device *d)
         if (f->msix) {
             memset(f->msix->table, 0, f->msix->n * 16ull);
             for (unsigned i = 0; i < f->msix->n; i++)
-                f->msix->table[i * 4 + 3] = 1;
+                f->msix->table[i * 16 + 12] = 1;
             memset(f->msix->pba, 0, (f->msix->n + 63) / 64 * 8ull);
         }
         if (f->ops && f->ops->reset)
