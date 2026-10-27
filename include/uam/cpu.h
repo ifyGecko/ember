@@ -28,7 +28,8 @@ typedef struct uam_reservation {
 /* Data-TLB for the JIT's inline load/store fast path: guest virtual page -> host
  * address of RAM/ROM backing it. Read and write sets are separate (the write set
  * excludes read-only and code pages). Flushed whenever a mapping or translation
- * changes (uam_cpu_dtlb_flush); a miss falls back to the bus. */
+ * changes (uam_cpu_dtlb_flush), and by the JIT whenever cpu->priv differs from the
+ * level its entries were filled at; a miss falls back to the bus. */
 #define UAM_DTLB_BITS 10u
 #define UAM_DTLB_SIZE (1u << UAM_DTLB_BITS)
 #define UAM_DTLB_NONE UINT64_MAX   /* a tag no guest page number can equal */

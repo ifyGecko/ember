@@ -1030,6 +1030,69 @@ static void level_b(unsigned n, uint64_t seed)
            (unsigned long long)seed);
 }
 
+/* ---- privilege: data-TLB entries belong to one privilege level ----------------- */
+
+/* test_isa with a translation that depends on cpu->priv: at level 1 the first RAM
+ * page is read-only. */
+static uam_status xlate_priv(uam_cpu *c, uint64_t va, uam_xlate_kind kind, uam_xlate *out)
+{
+    if (c->priv == 1 && kind == UAM_XLATE_STORE && (va >> UAM_PAGE_SHIFT) == (RAM_BASE >> UAM_PAGE_SHIFT)) {
+        out->fault = 1;
+        return UAM_ERR_XLATE;
+    }
+    out->paddr = va;
+    out->fixed = true;
+    return UAM_OK;
+}
+
+/* A store that succeeds at level 0 (filling the data-TLB) must fault at level 1, in
+ * the JIT as in the interpreter. Both address forms: the constant-address probe and
+ * the computed one. */
+static void level_priv(void)
+{
+    uam_isa isa = test_isa;
+    isa.translate = xlate_priv;
+    cpu.isa = &isa;
+    with_mem = true;
+    dev_exit_at = 0;
+    uam_builder b;
+    uam_builder_init(&b, 32);
+    for (int computed = 0; computed < 2; computed++) {
+        uam_imark(&b, 0x3000, 4);
+        uam_ref addr = computed ? uam_get(&b, 32, ADDR_SLOTS) : uam_imm(&b, RAM_BASE + 0x100);
+        uam_st(&b, 32, UAM_ACC_LE, addr, uam_get(&b, 32, 0), NONE);
+        uam_exit(&b, NONE, uam_imm(&b, 0x3004), UAM_EXIT_JUMP);
+        uam_block *blk = uam_builder_finish(&b);
+        uam_jit_compile(ex.jit, blk);
+        memset(&start, 0, sizeof(start));
+        for (unsigned i = 0; i < 4; i++)
+            start.regfile[ADDR_SLOTS + i] = (uint8_t)((RAM_BASE + 0x100) >> (8 * i));
+        start.icount = ICOUNT0;
+        start.deadline = UINT64_MAX;
+        static outcome o;
+        for (unsigned priv = 0; priv < 2; priv++) {
+            cpu.priv = priv;
+            for (int jit = 0; jit < 2; jit++) {
+                run_one(blk, jit, false, &o);   /* warm: the level-0 run filled the TLB */
+                bool fault = o.r.kind == UAM_BR_FAULT && o.r.exc.kind == UAM_EXC_STORE_XLATE;
+                checks++;
+                if (fault != (priv == 1)) {
+                    fprintf(stderr, "FAIL privilege: %s store (%s address) at level %u: %s\n",
+                            jit ? "JIT" : "interpreter", computed ? "computed" : "constant", priv,
+                            fault ? "faulted" : "did not fault");
+                    failures++;
+                }
+            }
+        }
+        uam_block_free(blk);
+    }
+    uam_builder_free(&b);
+    cpu.priv = 0;
+    cpu.isa = &test_isa;
+    uam_cpu_dtlb_flush(&cpu);
+    printf("test_jitdiff: privilege: data-TLB per level checked\n");
+}
+
 int main(int argc, char **argv)
 {
     unsigned n = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 0) : 3000;
@@ -1038,6 +1101,7 @@ int main(int argc, char **argv)
     rng_state = seed;
     level_a();
     level_c();
+    level_priv();
     level_b(n, seed);
     uam_exec_fini(&ex);
     printf("test_jitdiff: %d/%d checks passed\n", checks - failures, checks);

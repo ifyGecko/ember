@@ -106,16 +106,12 @@ static uint32_t reg_r(uam_cpu *cpu, unsigned r) { return (uint32_t)uam_cpu_reg_r
 static void reg_w(uam_cpu *cpu, unsigned r, uint32_t v) { uam_cpu_reg_write(cpu, ARM_REG_OFF(r), 32, v); }
 
 /* Keep cpu->priv's User bit (it tags translated code and decides translation
- * permissions; the JIT data-TLB caches permissions of the old mode) and its BE bit
- * (CPSR.E, the data byte order lifted code uses) current. */
+ * permissions) and its BE bit (CPSR.E, the data byte order lifted code uses) current. */
 static void priv_update(uam_cpu *cpu)
 {
     const arm_state *a = arm_st(cpu);
     unsigned user = cur_mode(a) == ARM_MODE_USR ? ARM_PRIV_USER : 0;
-    if ((cpu->priv & ARM_PRIV_USER) != user) {
-        cpu->priv = (cpu->priv & ~ARM_PRIV_USER) | user;
-        uam_cpu_dtlb_flush(cpu);
-    }
+    cpu->priv = (cpu->priv & ~ARM_PRIV_USER) | user;
     unsigned be = (a->s.cpsr & CPSR_E) ? ARM_PRIV_BE : 0;
     cpu->priv = (cpu->priv & ~ARM_PRIV_BE) | be;
     uam_cpu_request_exit(cpu);

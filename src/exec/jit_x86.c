@@ -94,17 +94,21 @@ typedef struct uam_jit_ctx {
     uint32_t                chain_left;  /* chained jumps still allowed */
     uint32_t                chain_budget;/* hops taken = chain_budget - chain_left */
     uint32_t                dgen;        /* bus->direct_gen at entry */
+    unsigned                priv;        /* cpu->priv at entry */
     uam_sched              *sched;
     uint64_t                next_when;   /* next timer at entry */
     uam_exec_stats         *stats;       /* slow-path counters (jit_*_calls) */
 } uam_jit_ctx;
 
-/* After a bridge: if the bus mapping or the timer queue changed, the run loop has work
- * to do (data-TLB flush, a new deadline) before the next block, so stop chaining. A
- * timer armed earlier usually requests an exit too (the machine's scheduler kick). */
+/* After a bridge: if the bus mapping, the timer queue or the privilege level changed,
+ * the run loop has work to do (data-TLB flush, a new deadline, blocks translated at the
+ * new level) before the next block, so stop chaining. A helper may change cpu->priv
+ * without an exit request (an exception return); a timer armed earlier usually
+ * requests an exit too (the machine's scheduler kick). */
 static void chain_check(uam_jit_ctx *jc)
 {
-    if (jc->cpu->bus->direct_gen != jc->dgen || uam_sched_next(jc->sched) != jc->next_when) {
+    if (jc->cpu->bus->direct_gen != jc->dgen || jc->cpu->priv != jc->priv
+        || uam_sched_next(jc->sched) != jc->next_when) {
         jc->chain_budget -= jc->chain_left;   /* keeps the hop count */
         jc->chain_left = 0;
     }
@@ -1948,6 +1952,10 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
     uam_exec *x = j->x;
     uam_cpu *cpu = x->cpu;
 
+    /* The data-TLB holds translations made at one privilege level: translation
+     * permissions depend on it (a user-mode access to a kernel page must fault). */
+    if (cpu->priv != j->key_priv)
+        uam_cpu_dtlb_flush(cpu);
     /* A linked block may have become invalid since the epoch was set: kill all links. */
     if (!j->key_valid || x->tc.gen != j->key_tc || cpu->xlate_gen != j->key_xgen
         || cpu->priv != j->key_priv) {
@@ -1973,6 +1981,7 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
     jc->chain_left = jc->chain_budget = chain->budget;
     jc->link_slot = NULL;
     jc->dgen = cpu->bus->direct_gen;
+    jc->priv = cpu->priv;
     jc->next_when = uam_sched_next(x->sched);
     cpu->icount_stop = cpu->exit_request ? 0 : cpu->icount_deadline;
     ((void (*)(uam_jit_ctx *))blk->backend)(jc);
