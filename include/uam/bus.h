@@ -116,6 +116,9 @@ typedef struct uam_bus {
     uint32_t           n_watches, cap_watches;
     int                next_watch_id;
     uint32_t           direct_gen;         /* bumped when uam_bus_page_host answers may change */
+    uint32_t           code_gen;           /* bumped when the generation of a page holding code,
+                                            * or the map, may have changed: while it holds,
+                                            * translations need not recheck their pages */
     uint32_t           gen_seq;            /* source of page generations (unique bus-wide) */
     bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
 } uam_bus;

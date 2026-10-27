@@ -79,7 +79,8 @@ struct uam_tc_entry;
 typedef bool (*uam_tcache_remap_fn)(void *ctx, const uam_block *blk);
 typedef struct uam_tcache {
     struct uam_tc_entry **buckets;  /* chained hash on guest pc */
-    uint32_t              n_buckets;/* power of two */
+    uint32_t              n_buckets;/* power of two; doubles as blocks are added */
+    struct uam_tc_entry **recent;   /* direct-mapped by pc: entries found lately */
     uint32_t              n_blocks;
     uint32_t              gen;      /* bumped whenever a block is freed or may have gone
                                      * stale (code write); JIT block links depend on it */

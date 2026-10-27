@@ -40,6 +40,7 @@ void uam_bus_fini(uam_bus *bus)
 static void tlb_flush(uam_bus *bus)
 {
     bus->direct_gen++;
+    bus->code_gen++;
     memset(bus->tlb, 0, sizeof(bus->tlb));
 }
 
@@ -509,6 +510,7 @@ static void note_write(uam_bus *bus, uam_region *r, uint64_t off, uint64_t len)
             r->page_gen[pidx] = ++bus->gen_seq;
         } else if (r->code_lines[pidx] & line_mask(off, n)) {
             r->page_gen[pidx] = ++bus->gen_seq;
+            bus->code_gen++;
             r->code_page[pidx] = 0;
             r->code_lines[pidx] = 0;
             r->n_code_pages--;
@@ -791,6 +793,7 @@ void uam_bus_romd_set_mode(uam_bus *bus, uam_region *r, bool rom)
         return;
     r->rom_mode = rom;
     bus->direct_gen++;
+    bus->code_gen++;
     /* Code fetched in ROM mode is no longer what a fetch would see. */
     if (!rom && r->n_code_pages) {
         uint64_t npages = (r->size + UAM_PAGE_SIZE - 1) >> UAM_PAGE_SHIFT;
