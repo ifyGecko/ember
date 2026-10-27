@@ -72,7 +72,7 @@ build/uam-run --help
 
 With `--jit`, compiled blocks jump straight into each other (block chaining) instead of
 returning to the run loop after every block, which pays off most on firmware with short
-blocks: a VxWorks boot on a MIPS board ran 7.5x faster (19.8 s to 2.6 s for 3e9 instructions).
+blocks: an RTOS boot on a MIPS32 board ran 7.5x faster (19.8 s to 2.6 s for 3e9 instructions).
 Results are bit-identical with and without it, and to the interpreter. `--stats` reports how
 many blocks were entered by chaining.
 

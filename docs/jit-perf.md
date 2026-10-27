@@ -1,7 +1,9 @@
 # JIT performance: measuring it, and where it stands
 
 This note is about the x86-64 backend (`src/exec/jit_x86.c`). It covers the tools for
-measuring the JIT, the reference workloads, and a log of what each change bought.
+measuring the JIT, a log of what each change bought, and how the guest ISAs compare.
+Ember's own reference measure is the cross-ISA benchmark in `tests/bench` ("Parity
+across ISAs" below): every change is judged on all guests at once with it.
 
 ## Measuring
 
@@ -83,14 +85,16 @@ prints one tab-separated row:
 
 On a VM without a PMU the host-instruction column is `-`; use the median time there.
 
-## Reference workloads
+## External workloads used for the log below
 
-Two firmware images, each run on a board kept outside this repository and built
-against the tree under test. Both runs use a fixed instruction budget and no input.
-- **x86-64 UEFI boot.** An installed OVMF booted on a Q35-class board to the UEFI shell,
+The log of steps 0-8 was measured on two firmware images run by boards that are not
+part of ember (separate projects built against the tree under test, nothing of them in
+this repository). They are kept here only as the record of those measurements. Both
+runs use a fixed instruction budget and no input.
+- **x86-64 UEFI boot.** An installed OVMF booted to the UEFI shell,
   1e9 instructions, 512 MiB RAM. This exercises SEC/PEI decompression, DXE drivers,
   I/O-port polling, and x86 flag computation.
-- **MIPS32 BE VxWorks 5.5.1.** A router OS image, 4e9 instructions. The boot banner
+- **MIPS32 BE VxWorks 5.5.1.** An RTOS image, 4e9 instructions. The boot banner
   comes at about 6e7 instructions; after that it is mostly the idle task spinning on a
   memory word, so this measures the tight-loop costs: load fast path, per-instruction
   checks, chaining.
@@ -150,7 +154,7 @@ Correctness, end to end:
 - The guest console is identical to the baseline's on both workloads.
 - The interpreter and the JIT end with the same console and `-d` state: OVMF at 1e9
   instructions, VxWorks at 2e9.
-- The OVMF board's own `ovmf-check` and `secureboot-check` pass on this build.
+- The external x86 board's own UEFI boot and secure-boot checks pass on this build.
 
 **OVMF profile.**
 - 64% of samples are now in native code.

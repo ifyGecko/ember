@@ -154,9 +154,6 @@ uam_device  *uam_pci_ecam(uam_pci_bus *pb);
  * little-endian), or NULL. Reads go to it too: without one they return
  * CONFIG_ADDRESS's bytes. */
 void         uam_pci_cam_passthrough(uam_pci_bus *pb, uam_device *dev);
-/* Compatibility: a pass-through calling fn for a byte written at offset 1 (the PC's
- * 0xCF9 reset control); reads return CONFIG_ADDRESS's bytes. */
-void         uam_pci_set_cf9_hook(uam_pci_bus *pb, void (*fn)(void *ctx, uint8_t val), void *ctx);
 
 /*
  * Set up a function: zeroed configuration space with the IDs, class and

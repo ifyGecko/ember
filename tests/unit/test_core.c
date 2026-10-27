@@ -823,10 +823,6 @@ static uam_status through_write(uam_device *d, uint64_t off, unsigned size, uint
     through_val = val;
     return UAM_OK;
 }
-static unsigned cf9_calls;
-static uint8_t  cf9_val;
-static void cf9_hook(void *ctx, uint8_t val) { (void)ctx; cf9_calls++; cf9_val = val; }
-
 static void test_pci_cam(void)
 {
     uam_bus bus;
@@ -857,12 +853,11 @@ static void test_pci_cam(void)
     wr(&bus, 0xCF8, 4, L, 0x80000000);
     EQ64(through_writes, 1, "dword address write not passed through");
     EQ64(rd(&bus, 0xCF8, 4, L), 0x80000000, "dword address read");
-
-    uam_pci_set_cf9_hook(pb, cf9_hook, NULL);
-    wr(&bus, 0xCF9, 1, L, 0x0E);
-    CHECK(cf9_calls == 1 && cf9_val == 0x0E, "CF9 hook");
-    wr(&bus, 0xCFA, 1, L, 0x0E);
-    EQ64(cf9_calls, 1, "other bytes are not the hook");
+    wr(&bus, 0xCFA, 2, L, 0x1234);
+    CHECK(through_writes == 2 && through_off == 2 && through_val == 0x1234, "word write passed through");
+    uam_pci_cam_passthrough(pb, NULL);
+    wr(&bus, 0xCF9, 1, L, 0x06);
+    EQ64(through_writes, 2, "no pass-through once removed");
     EQ64(rd(&bus, 0xCF8, 4, L), 0x80000000, "address untouched");
 
     uam_pci_bus_device(pb)->ops->destroy(uam_pci_bus_device(pb));
