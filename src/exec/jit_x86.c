@@ -397,15 +397,137 @@ static void mov_rr(uam_jit *j, int dst, int src)   /* mov dst64, src64 */
     g8(j, 0x89);
     modrm_reg(j, src, dst);
 }
-static void ld_temp(uam_jit *j, int reg, uint32_t idx) { ld_mem(j, reg, RBP, (int32_t)(8 * idx)); }
 static void st_temp(uam_jit *j, uint32_t idx, int reg) { st_mem(j, reg, RBP, (int32_t)(8 * idx)); }
+
+/* ---- operands ------------------------------------------------------------------- */
+
+/* Where an IR operand lives: an immediate, or a temp's slot in jc->temps. */
+enum { O_IMM, O_MEM };
+typedef struct opnd { int kind; uint64_t imm; int32_t disp; } opnd;
+
+static opnd opnd_of(const uam_block *blk, uam_ref r, unsigned w)
+{
+    if (uam_ref_is_imm(r))
+        return (opnd){ O_IMM, blk->imm[uam_ref_index(r)] & uam_mask(w), 0 };
+    return (opnd){ O_MEM, 0, (int32_t)(8 * r) };
+}
+
+static bool fits_s32(uint64_t v) { return (int64_t)v == (int32_t)v; }
+static bool fits_s8(int64_t v) { return v >= -128 && v <= 127; }
+
+/* reg = v without touching the host flags (no xor-zeroing): the shortest of
+ * mov r32,imm32 (zero-extends), mov r64,simm32 and movabs. */
+static void mov_imm(uam_jit *j, int reg, uint64_t v)
+{
+    if (v <= 0xFFFFFFFFu) {
+        rex(j, 0, 0, 0, reg >= 8);
+        g8(j, (uint8_t)(0xB8 + (reg & 7)));
+        g32(j, (uint32_t)v);
+    } else if (fits_s32(v)) {
+        rex(j, 1, 0, 0, reg >= 8);
+        g8(j, 0xC7); modrm_reg(j, 0, reg);
+        g32(j, (uint32_t)v);
+    } else {
+        movabs(j, reg, v);
+    }
+}
+
+/* reg = the operand, a value of width w (temps are kept zero-extended, so a 32-bit
+ * load of a narrow one is enough). */
+static void load(uam_jit *j, int reg, opnd o, unsigned w)
+{
+    if (o.kind == O_IMM) {
+        mov_imm(j, reg, o.imm);
+    } else if (w <= 32) {
+        rex(j, 0, reg >= 8, 0, 0);
+        g8(j, 0x8B); modrm_mem(j, reg, RBP, o.disp);           /* mov r32, [rbp+d] */
+    } else {
+        ld_mem(j, reg, RBP, o.disp);
+    }
+}
 
 static void load_operand(uam_jit *j, int reg, const uam_block *blk, uam_ref r, unsigned w)
 {
-    if (uam_ref_is_imm(r))
-        movabs(j, reg, blk->imm[uam_ref_index(r)] & uam_mask(w));
-    else
-        ld_temp(j, reg, r);
+    load(j, reg, opnd_of(blk, r, w), w);
+}
+
+/* Prefixes for an instruction at operand size os (8/16/32/64) with ModRM reg `r` and
+ * rm `rm` (a register if rm_reg, else a memory base). Byte access to rsp..rdi as
+ * registers needs a REX prefix. */
+static void opsize(uam_jit *j, unsigned os, int r, int rm, bool rm_reg)
+{
+    if (os == 16)
+        g8(j, 0x66);
+    int w = os == 64, R = r >= 8, B = rm >= 8;
+    bool byte_rex = os == 8 && ((r >= 4 && r < 8) || (rm_reg && rm >= 4 && rm < 8));
+    if (w || R || B || byte_rex)
+        g8(j, (uint8_t)(0x40 | (w << 3) | (R << 2) | B));
+}
+
+/* x86 group-1 ALU operations (the /digit of opcodes 0x80..0x83). */
+enum { ALU_ADD = 0, ALU_OR = 1, ALU_AND = 4, ALU_SUB = 5, ALU_XOR = 6, ALU_CMP = 7 };
+
+static void alu_rr(uam_jit *j, int op, unsigned os, int dst, int src)
+{
+    opsize(j, os, src, dst, true);
+    g8(j, (uint8_t)((op << 3) | (os == 8 ? 0 : 1)));        /* op r/m, r */
+    modrm_reg(j, src, dst);
+}
+
+/* reg = reg OP operand, at operand size os. */
+static void alu(uam_jit *j, int op, unsigned os, int reg, opnd o)
+{
+    if (o.kind == O_MEM) {
+        opsize(j, os, reg, RBP, false);
+        g8(j, (uint8_t)((op << 3) | (os == 8 ? 2 : 3)));    /* op r, [rbp+d] */
+        modrm_mem(j, reg, RBP, o.disp);
+        return;
+    }
+    if (os == 64 && !fits_s32(o.imm)) {
+        int s = reg == RCX ? RDX : RCX;
+        movabs(j, s, o.imm);
+        alu_rr(j, op, os, reg, s);
+        return;
+    }
+    opsize(j, os, 0, reg, true);
+    if (os == 8) {
+        g8(j, 0x80); modrm_reg(j, op, reg); g8(j, (uint8_t)o.imm);
+        return;
+    }
+    int64_t sv = uam_sext(o.imm, os);
+    if (fits_s8(sv)) {
+        g8(j, 0x83); modrm_reg(j, op, reg); g8(j, (uint8_t)sv);
+    } else {
+        g8(j, 0x81); modrm_reg(j, op, reg);
+        if (os == 16) { g8(j, (uint8_t)o.imm); g8(j, (uint8_t)(o.imm >> 8)); }
+        else g32(j, (uint32_t)o.imm);
+    }
+}
+
+/* reg = reg * operand (imul), at operand size 32 or 64. */
+static void imul(uam_jit *j, unsigned os, int reg, opnd o)
+{
+    if (o.kind == O_MEM) {
+        opsize(j, os, reg, RBP, false);
+        g8(j, 0x0F); g8(j, 0xAF); modrm_mem(j, reg, RBP, o.disp);
+    } else if (os == 64 && !fits_s32(o.imm)) {
+        movabs(j, RCX, o.imm);
+        opsize(j, os, reg, RCX, true);
+        g8(j, 0x0F); g8(j, 0xAF); modrm_reg(j, reg, RCX);
+    } else {
+        int64_t sv = uam_sext(o.imm, os);
+        opsize(j, os, reg, reg, true);
+        if (fits_s8(sv)) { g8(j, 0x6B); modrm_reg(j, reg, reg); g8(j, (uint8_t)sv); }
+        else { g8(j, 0x69); modrm_reg(j, reg, reg); g32(j, (uint32_t)o.imm); }
+    }
+}
+
+/* Shift group (C1 /digit ib) by an immediate, at operand size os. */
+enum { SH_ROR = 1, SH_SHL = 4, SH_SHR = 5, SH_SAR = 7 };
+static void shift_imm(uam_jit *j, int op, unsigned os, int reg, unsigned n)
+{
+    opsize(j, os, 0, reg, true);
+    g8(j, os == 8 ? 0xC0 : 0xC1); modrm_reg(j, op, reg); g8(j, (uint8_t)n);
 }
 
 /* Zero-extend the low `w` bits of rax to 64 bits (mask to width). */
@@ -534,7 +656,7 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
     size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
     size_t rep = 0;
     if (cs && cs->skip_repeat) {
-        movabs(j, RAX, pc);                                /* rax = pc */
+        mov_imm(j, RAX, pc);                                /* rax = pc */
         rex(j, 1, 0, 0, 0); g8(j, 0x39); modrm_mem(j, RAX, RCX, COV(last_pc)); /* cmp last_pc, rax */
         rep = jcc_fwd(j, 0x84);                            /* je skip: the same site again */
         st_mem(j, RAX, RCX, COV(last_pc));                 /* last_pc = pc */
@@ -580,8 +702,12 @@ static void set_res_pc(uam_jit *j, uint32_t kind, const uam_block *blk, uam_ref 
 }
 static void set_res_pc_imm(uam_jit *j, uint32_t kind, uint64_t pc)
 {
-    movabs(j, RAX, pc);
-    st_mem(j, RAX, RBX, RES(pc));
+    if (fits_s32(pc)) {
+        g8(j, 0x48); g8(j, 0xC7); modrm_mem(j, 0, RBX, RES(pc)); g32(j, (uint32_t)pc); /* mov qword */
+    } else {
+        mov_imm(j, RAX, pc);
+        st_mem(j, RAX, RBX, RES(pc));
+    }
     g8(j, 0xC7); modrm_mem(j, 0, RBX, RES(kind)); g32(j, kind);
 }
 
@@ -676,41 +802,45 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
     if (!pure_inline(j, op)) {
         /* call jit_br_eval(jc, packed, a, b, c) */
         load_operand(j, RDX, blk, in->a, op == UAM_OP_SELECT ? 1 : src_w);
-        if (n_src > 1) load_operand(j, RCX, blk, in->b, W); else movabs(j, RCX, 0);
-        if (n_src > 2) load_operand(j, R8, blk, in->c, W); else movabs(j, R8, 0);
+        if (n_src > 1) load_operand(j, RCX, blk, in->b, W); else mov_imm(j, RCX, 0);
+        if (n_src > 2) load_operand(j, R8, blk, in->c, W); else mov_imm(j, R8, 0);
         mov_rr(j, RDI, RBX);
-        movabs(j, RSI, (uint32_t)op | (W << 8) | (src_w << 16));
-        movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_eval);
+        mov_imm(j, RSI, (uint32_t)op | (W << 8) | (src_w << 16));
+        mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_eval);
         g8(j, 0xFF); modrm_reg(j, 2, RAX);      /* call rax */
         mask_rax(j, W);
         st_temp(j, in->dst, RAX);
         return;
     }
 
+    /* Natural operand size: 32-bit operations zero-extend their result, so only
+     * narrower widths need masking after an add, sub or multiply. AND/OR/XOR of
+     * zero-extended values never need it. */
+    const unsigned os = W == 64 ? 64 : 32;
     switch (op) {
-    case UAM_OP_ADD: case UAM_OP_SUB: case UAM_OP_AND: case UAM_OP_OR:
-    case UAM_OP_XOR: case UAM_OP_MUL: {
+    case UAM_OP_ADD: case UAM_OP_SUB: case UAM_OP_AND: case UAM_OP_OR: case UAM_OP_XOR: {
+        static const int alu_op[] = { [UAM_OP_ADD] = ALU_ADD, [UAM_OP_SUB] = ALU_SUB,
+                                      [UAM_OP_AND] = ALU_AND, [UAM_OP_OR] = ALU_OR,
+                                      [UAM_OP_XOR] = ALU_XOR };
         load_operand(j, RAX, blk, in->a, W);
-        load_operand(j, RCX, blk, in->b, W);
-        rex(j, 1, 0, 0, 0);
-        switch (op) {
-        case UAM_OP_ADD: g8(j, 0x01); modrm_reg(j, RCX, RAX); break;
-        case UAM_OP_SUB: g8(j, 0x29); modrm_reg(j, RCX, RAX); break;
-        case UAM_OP_AND: g8(j, 0x21); modrm_reg(j, RCX, RAX); break;
-        case UAM_OP_OR:  g8(j, 0x09); modrm_reg(j, RCX, RAX); break;
-        case UAM_OP_XOR: g8(j, 0x31); modrm_reg(j, RCX, RAX); break;
-        default:         g8(j, 0x0F); g8(j, 0xAF); modrm_reg(j, RAX, RCX); break; /* imul rax,rcx */
-        }
-        mask_rax(j, W);
+        alu(j, alu_op[op], os, RAX, opnd_of(blk, in->b, W));
+        if ((op == UAM_OP_ADD || op == UAM_OP_SUB) && W < 32)
+            mask_rax(j, W);
         st_temp(j, in->dst, RAX);
         break;
     }
+    case UAM_OP_MUL:
+        load_operand(j, RAX, blk, in->a, W);
+        imul(j, os, RAX, opnd_of(blk, in->b, W));
+        if (W < 32)
+            mask_rax(j, W);
+        st_temp(j, in->dst, RAX);
+        break;
     case UAM_OP_EQ: case UAM_OP_NE: case UAM_OP_ULT: case UAM_OP_ULE:
     case UAM_OP_SLT: case UAM_OP_SLE: {
+        /* compare at width W itself: the signed conditions then see W-bit values */
         load_operand(j, RAX, blk, in->a, W);
-        load_operand(j, RCX, blk, in->b, W);
-        if (op == UAM_OP_SLT || op == UAM_OP_SLE) { sext_reg(j, RAX, W); sext_reg(j, RCX, W); }
-        rex(j, 1, 0, 0, 0); g8(j, 0x39); modrm_reg(j, RCX, RAX);   /* cmp rax, rcx */
+        alu(j, ALU_CMP, W == 1 ? 8 : W, RAX, opnd_of(blk, in->b, W));
         uint8_t cc = op == UAM_OP_EQ ? 0x94 : op == UAM_OP_NE ? 0x95 : op == UAM_OP_ULT ? 0x92
                    : op == UAM_OP_ULE ? 0x96 : op == UAM_OP_SLT ? 0x9C : 0x9E;
         g8(j, 0x0F); g8(j, cc); modrm_reg(j, 0, RAX);              /* setcc al */
@@ -718,9 +848,8 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
         st_temp(j, in->dst, RAX);
         break;
     }
-    case UAM_OP_ZEXT:
+    case UAM_OP_ZEXT:   /* the source temp is already zero-extended */
         load_operand(j, RAX, blk, in->a, src_w);
-        mask_rax(j, W);
         st_temp(j, in->dst, RAX);
         break;
     case UAM_OP_TRUNC:
@@ -728,19 +857,36 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
         mask_rax(j, W);
         st_temp(j, in->dst, RAX);
         break;
-    case UAM_OP_SEXT:
-        load_operand(j, RAX, blk, in->a, src_w);
-        sext_reg(j, RAX, src_w);
+    case UAM_OP_SEXT: {
+        const opnd a = opnd_of(blk, in->a, src_w);
+        if (src_w == 1 || a.kind == O_IMM) {
+            load(j, RAX, a, src_w);
+            sext_reg(j, RAX, src_w);
+        } else {                                       /* movsx/movsxd rax, [rbp+d] */
+            g8(j, 0x48);
+            if (src_w == 32) g8(j, 0x63);
+            else { g8(j, 0x0F); g8(j, src_w == 8 ? 0xBE : 0xBF); }
+            modrm_mem(j, RAX, RBP, a.disp);
+        }
         mask_rax(j, W);
         st_temp(j, in->dst, RAX);
         break;
+    }
     case UAM_OP_SELECT: {
-        load_operand(j, RAX, blk, in->c, W);          /* default = c */
-        load_operand(j, RCX, blk, in->b, W);          /* b */
-        load_operand(j, RDX, blk, in->a, 1);          /* cond */
-        g8(j, 0x84); modrm_reg(j, RDX, RDX);          /* test dl, dl */
-        rex(j, 1, 0, 0, 0); g8(j, 0x0F); g8(j, 0x45); modrm_reg(j, RAX, RCX); /* cmovne rax, rcx */
-        mask_rax(j, W);
+        const opnd c = opnd_of(blk, in->a, 1), x = opnd_of(blk, in->b, W);
+        const opnd y = opnd_of(blk, in->c, W);
+        if (c.kind == O_IMM) {
+            load(j, RAX, c.imm ? x : y, W);
+        } else {
+            load(j, RAX, y, W);                                      /* default: c */
+            g8(j, 0x80); modrm_mem(j, 7, RBP, c.disp); g8(j, 0);     /* cmp byte [cond], 0 */
+            if (x.kind == O_IMM) {
+                mov_imm(j, RCX, x.imm);
+                g8(j, 0x48); g8(j, 0x0F); g8(j, 0x45); modrm_reg(j, RAX, RCX);  /* cmovne rax, rcx */
+            } else {
+                g8(j, 0x48); g8(j, 0x0F); g8(j, 0x45); modrm_mem(j, RAX, RBP, x.disp); /* cmovne rax, [b] */
+            }
+        }
         st_temp(j, in->dst, RAX);
         break;
     }
@@ -773,21 +919,28 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
             if (op == UAM_OP_ASHR) {
                 load_operand(j, RAX, blk, in->a, W);
                 sext_reg(j, RAX, W);
-                rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 7, RAX); g8(j, 63); /* sar rax, 63 */
+                shift_imm(j, SH_SAR, 64, RAX, 63);
                 mask_rax(j, W);
             } else {
-                movabs(j, RAX, 0);
+                mov_imm(j, RAX, 0);
             }
             st_temp(j, in->dst, RAX);
             break;
         }
         load_operand(j, RAX, blk, in->a, W);
-        if (op == UAM_OP_ASHR)
-            sext_reg(j, RAX, W);
-        rex(j, 1, 0, 0, 0); g8(j, 0xC1);
-        modrm_reg(j, op == UAM_OP_SHL ? 4 : op == UAM_OP_LSHR ? 5 : 7, RAX);
-        g8(j, (uint8_t)n);
-        mask_rax(j, W);
+        if (op == UAM_OP_SHL) {
+            shift_imm(j, SH_SHL, os, RAX, (unsigned)n);
+            if (W < 32)
+                mask_rax(j, W);
+        } else if (op == UAM_OP_LSHR) {
+            shift_imm(j, SH_SHR, os, RAX, (unsigned)n);     /* zero-extended: nothing to mask */
+        } else if (W >= 32) {
+            shift_imm(j, SH_SAR, os, RAX, (unsigned)n);     /* sar eax zero-extends the result */
+        } else {
+            g8(j, 0x0F); g8(j, W == 8 ? 0xBE : 0xBF); modrm_reg(j, RAX, RAX); /* movsx eax, al/ax */
+            shift_imm(j, SH_SAR, 32, RAX, (unsigned)n);
+            mask_rax(j, W);
+        }
         st_temp(j, in->dst, RAX);
         break;
     }
@@ -911,7 +1064,7 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
         size_t done = jmp_fwd(j);
         patch(j, by_zero);
         if (!rem)
-            movabs(j, RAX, uam_mask(W));                                      /* x / 0 */
+            mov_imm(j, RAX, uam_mask(W));                                      /* x / 0 */
         size_t done0 = rem ? 0 : jmp_fwd(j);                                  /* x % 0 = x: rax */
         if (by_m1) {
             if (rem) { done0 = jmp_fwd(j); }
@@ -983,14 +1136,13 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         if (!uam_ref_is_none(in->guard)) {
             if (uam_ref_is_imm(in->guard)) {
                 if (!(blk->imm[uam_ref_index(in->guard)] & 1)) {
-                    if (!uam_ref_is_none(in->dst)) { movabs(j, RAX, 0); st_temp(j, in->dst, RAX); }
+                    if (!uam_ref_is_none(in->dst)) { mov_imm(j, RAX, 0); st_temp(j, in->dst, RAX); }
                     continue;   /* guard false: op does nothing */
                 }
                 /* guard true: fall through unguarded */
             } else {
-                ld_temp(j, RAX, in->guard);
-                rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX);  /* test rax, rax */
-                guard_skip = jcc_fwd(j, 0x84);    /* jz skip */
+                g8(j, 0x80); modrm_mem(j, 7, RBP, (int32_t)(8 * in->guard)); g8(j, 0); /* cmp byte [g], 0 */
+                guard_skip = jcc_fwd(j, 0x84);    /* je skip */
                 guarded = true;
             }
         }
@@ -1042,11 +1194,11 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             }
             mark(j, MK_IMARK_PC, i);
             if (needs_pc) {
-                movabs(j, RAX, pc);
+                mov_imm(j, RAX, pc);
                 st_mem(j, RAX, RBX, OFF(cur_pc));
                 if (!cont)
                     st_mem(j, RAX, RBX, OFF(parent_pc));
-                movabs(j, RAX, cont ? 1 : 0);
+                mov_imm(j, RAX, cont ? 1 : 0);
                 st_mem(j, RAX, RBX, OFF(cont));
             }
             g8(j, 0x49); g8(j, 0xFF); modrm_reg(j, 0, R13); /* inc r13 (icount) */
@@ -1054,7 +1206,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         }
         case UAM_OP_GET:
             if (W == 1) {
-                movabs(j, RAX, 0);
+                mov_imm(j, RAX, 0);
             } else {
                 int b = R15;
                 if (W == 8) { rex(j, 0, 0, 0, 1); g8(j, 0x0F); g8(j, 0xB6); modrm_mem(j, RAX, b, (int32_t)in->aux); }
@@ -1065,7 +1217,16 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             st_temp(j, in->dst, RAX);
             break;
         case UAM_OP_PUT:
-            if (W != 1) {
+            if (uam_ref_is_imm(in->a) && (W < 64 || fits_s32(blk->imm[uam_ref_index(in->a)]))) {
+                const uint64_t v = blk->imm[uam_ref_index(in->a)] & uam_mask(W);
+                if (W == 16) g8(j, 0x66);
+                rex(j, W == 64, 0, 0, 1);
+                g8(j, W == 8 ? 0xC6 : 0xC7);                     /* mov [r15+off], imm */
+                modrm_mem(j, 0, R15, (int32_t)in->aux);
+                if (W == 8) g8(j, (uint8_t)v);
+                else if (W == 16) { g8(j, (uint8_t)v); g8(j, (uint8_t)(v >> 8)); }
+                else g32(j, (uint32_t)v);
+            } else if (W != 1) {
                 load_operand(j, RAX, blk, in->a, W);
                 int b = R15;
                 if (W == 8) { rex(j, 0, 0, 0, 1); g8(j, 0x88); modrm_mem(j, RAX, b, (int32_t)in->aux); }
@@ -1092,9 +1253,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
             mov_rr(j, RDI, RBX);                        /* miss / slow path: the bridge */
-            movabs(j, RDX, in->flags);
-            movabs(j, RCX, size);
-            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_load);
+            mov_imm(j, RDX, in->flags);
+            mov_imm(j, RCX, size);
+            mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_load);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);            /* jnz epilogue (fault) */
@@ -1110,9 +1271,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 mov_rr(j, RDI, RBX);
                 load_operand(j, RSI, blk, in->a, aw);
                 load_operand(j, RDX, blk, in->b, W);
-                movabs(j, RCX, in->flags);
-                movabs(j, R8, W / 8);
-                movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_store_x);
+                mov_imm(j, RCX, in->flags);
+                mov_imm(j, R8, W / 8);
+                mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_store_x);
                 g8(j, 0xFF); modrm_reg(j, 2, RAX);
                 g8(j, 0x85); modrm_reg(j, RAX, RAX);
                 epi[n_epi++] = jcc_fwd(j, 0x85);
@@ -1141,9 +1302,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             st_mem(j, R13, R14, CPU(icount));
             mov_rr(j, RDI, RBX);
             load_operand(j, RDX, blk, in->b, W);        /* reload: the bridge call needs it in rdx */
-            movabs(j, RCX, in->flags);
-            movabs(j, R8, size);
-            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_store);
+            mov_imm(j, RCX, in->flags);
+            mov_imm(j, R8, size);
+            mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_store);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
@@ -1161,10 +1322,10 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             if (cas)
                 load_operand(j, RCX, blk, in->c, W);    /* new value */
             else
-                movabs(j, RCX, 0);
-            movabs(j, R8, in->flags);
-            movabs(j, R9, (uint32_t)op | (cas ? 0 : (uint32_t)in->aux << 8) | (uint32_t)W << 16);
-            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_rmw);
+                mov_imm(j, RCX, 0);
+            mov_imm(j, R8, in->flags);
+            mov_imm(j, R9, (uint32_t)op | (cas ? 0 : (uint32_t)in->aux << 8) | (uint32_t)W << 16);
+            mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_rmw);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
@@ -1190,8 +1351,8 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         case UAM_OP_SYSRD:
             st_mem(j, R13, R14, CPU(icount));
             mov_rr(j, RDI, RBX);
-            movabs(j, RSI, in->aux);
-            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_sysrd);
+            mov_imm(j, RSI, in->aux);
+            mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_sysrd);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
@@ -1202,9 +1363,9 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         case UAM_OP_SYSWR:
             st_mem(j, R13, R14, CPU(icount));
             mov_rr(j, RDI, RBX);
-            movabs(j, RSI, in->aux);
+            mov_imm(j, RSI, in->aux);
             load_operand(j, RDX, blk, in->a, W);
-            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_syswr);
+            mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_syswr);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
@@ -1215,13 +1376,13 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             st_mem(j, R13, R14, CPU(icount));
             for (unsigned k = 0; k < 3; k++) {
                 if (uam_ref_is_none(args[k]))
-                    movabs(j, regs[k], 0);
+                    mov_imm(j, regs[k], 0);
                 else
                     load_operand(j, regs[k], blk, args[k], 64);
             }
             mov_rr(j, RDI, RBX);
-            movabs(j, RSI, in->aux);
-            movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_helper);
+            mov_imm(j, RSI, in->aux);
+            mov_imm(j, RAX, (uint64_t)(uintptr_t)&jit_br_helper);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
@@ -1262,7 +1423,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             if (!uam_ref_is_none(in->dst)) {
                 size_t over = jmp_fwd(j);
                 patch(j, guard_skip);
-                movabs(j, RAX, 0);
+                mov_imm(j, RAX, 0);
                 st_temp(j, in->dst, RAX);
                 patch(j, over);
             } else {
