@@ -44,6 +44,7 @@
 #define UAM_PAGE_SIZE  (UINT64_C(1) << UAM_PAGE_SHIFT)
 #define UAM_PAGE_MASK  (~(UAM_PAGE_SIZE - 1))
 #define UAM_BUS_TLB_SIZE 64u
+#define UAM_BUS_SUB_SIZE 64u   /* cache of regions smaller than a page (I/O ports, registers) */
 
 /* Priority for catch-all windows such as devices/unimp.c, below every real device. */
 #define UAM_PRIO_BACKGROUND (-1000)
@@ -110,6 +111,11 @@ typedef struct uam_bus {
         uam_region *r;        /* resolved region (never an alias); NULL = empty */
         uint64_t    origin;   /* offset in r = addr - origin */
     } tlb[UAM_BUS_TLB_SIZE];
+    struct {
+        uint64_t    lo, hi;   /* [lo, hi] resolves to r; r = NULL: empty */
+        uam_region *r;
+        uint64_t    origin;
+    } sub[UAM_BUS_SUB_SIZE];
     uam_code_write_fn  on_code_write;
     void              *code_write_ctx;
     uam_watch         *watches;

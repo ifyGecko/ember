@@ -363,6 +363,43 @@ static void test_watch(void)
     uam_bus_fini(&bus);
 }
 
+/* Regions smaller than a page (I/O ports, registers) resolve through a cache of their
+ * own: it must follow map changes and never hide a watch or a higher-priority region. */
+static void test_subpage_cache(void)
+{
+    uam_bus bus;
+    uam_bus_init(&bus);
+    const unsigned L = UAM_ACC_LE;
+    uam_device *win = uam_unimp_create("win", 0x5000);
+    regdev *a = regdev_new(&regdev_le_ops), *b = regdev_new(&regdev_le_ops);
+    CHECK(uam_bus_map_mmio_ex(&bus, "win", 0x5000, 0x1000, win,
+                              &(uam_map_attrs){ .prio = UAM_PRIO_BACKGROUND }) == UAM_OK, "map window");
+    CHECK(uam_bus_map_mmio(&bus, "a", 0x5004, 4, &a->dev) == UAM_OK, "map a");
+    a->reg[0] = 0x11223344u;
+    for (int i = 0; i < 3; i++) {   /* the same 8-byte granule: a register and a gap */
+        EQ64(rd(&bus, 0x5004, 4, L), 0x11223344u, "small register");
+        EQ64(rd(&bus, 0x5000, 4, L), 0, "gap beside it");
+    }
+    CHECK(uam_bus_map_mmio_ex(&bus, "b", 0x5004, 2, &b->dev, &(uam_map_attrs){ .prio = 1 })
+          == UAM_OK, "map b over a");
+    b->reg[0] = 0xBEEF;
+    EQ64(rd(&bus, 0x5004, 2, L), 0xBEEF, "a higher-priority region mapped later wins");
+    EQ64(rd(&bus, 0x5006, 2, L), 0x1122, "the rest of a still answers");
+    uam_bus_region_enable(&bus, (uam_region *)uam_bus_find(&bus, 0x5004), false);
+    EQ64(rd(&bus, 0x5004, 2, L), 0x3344, "a again once b is disabled");
+    watch_log w = { 0 };
+    int id = uam_bus_add_watch(&bus, 0x5004, 4, UAM_WATCH_READ, watch_cb, &w);
+    rd(&bus, 0x5004, 4, L);
+    EQ64(w.n, 1, "a watch added after caching fires");
+    CHECK(uam_bus_remove_watch(&bus, id), "remove watch");
+    uam_bus_region_move(&bus, (uam_region *)uam_bus_find(&bus, 0x5004), 0x5100);
+    EQ64(rd(&bus, 0x5004, 4, L), 0, "the old place is the window again");
+    EQ64(rd(&bus, 0x5100, 4, L), 0x11223344u, "the register at its new place");
+    uam_bus_fini(&bus);
+    free(a);
+    free(b);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Machine-level helpers (MIPS32 BE)                                         */
 /* ------------------------------------------------------------------------ */
@@ -1697,6 +1734,7 @@ int main(void)
     test_priority();
     test_romd_alias();
     test_watch();
+    test_subpage_cache();
     test_timer_reset();
     test_device_reset();
     test_romd_exec();

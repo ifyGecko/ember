@@ -42,6 +42,7 @@ static void tlb_flush(uam_bus *bus)
     bus->direct_gen++;
     bus->code_gen++;
     memset(bus->tlb, 0, sizeof(bus->tlb));
+    memset(bus->sub, 0, sizeof(bus->sub));
 }
 
 static bool overlaps(uint64_t a, uint64_t asize, uint64_t b, uint64_t bsize)
@@ -322,6 +323,15 @@ static res_kind resolve(uam_bus *bus, uint64_t addr, unsigned size, hit *h)
         h->watched = false;  /* watched pages are never cached */
         return RES_ONE;
     }
+    /* Regions that do not own a whole page (I/O ports, small register blocks) have a
+     * cache of their own, keyed by the address's 8-byte granule. */
+    const unsigned sub = (unsigned)(addr >> 3) & (UAM_BUS_SUB_SIZE - 1);
+    if (bus->sub[sub].r && addr >= bus->sub[sub].lo && end <= bus->sub[sub].hi && end >= addr) {
+        h->r = bus->sub[sub].r;
+        h->off = addr - bus->sub[sub].origin;
+        h->watched = false;  /* watched ranges are never cached */
+        return RES_ONE;
+    }
 
     uint32_t idx = 0;
     uam_region *w = winner(bus, addr, &idx);
@@ -353,6 +363,19 @@ static res_kind resolve(uam_bus *bus, uint64_t addr, unsigned size, hit *h)
         bus->tlb[slot].page = page;
         bus->tlb[slot].r = r;
         bus->tlb[slot].origin = origin;
+    } else if (!h->watched) {
+        /* Else cache the part of the page the region covers, if it is all the
+         * region's: no higher-priority region and no watch anywhere in it. */
+        uint64_t lo = w->base > page ? w->base : page;
+        uint64_t hi = w->base + w->size - 1 < page + UAM_PAGE_SIZE - 1 ? w->base + w->size - 1
+                                                                      : page + UAM_PAGE_SIZE - 1;
+        if (!shadowed(bus, idx, lo, hi - lo + 1)
+            && !(bus->n_watches && watched(bus, lo, hi - lo + 1))) {
+            bus->sub[sub].lo = lo;
+            bus->sub[sub].hi = hi;
+            bus->sub[sub].r = r;
+            bus->sub[sub].origin = origin;
+        }
     }
     return RES_ONE;
 }
