@@ -96,6 +96,44 @@ static void test_uart_chardev(void)
     fclose(out);
 }
 
+/* Registers 4 bytes apart, big-endian (a SoC's 16550): the register is the slot's last
+ * byte; a whole-slot access reaches it too, through the bus's byte-order handling. */
+static void test_uart_stride(void)
+{
+    FILE *out = tmpfile();
+    uam_chardev *cd = uam_chardev_buffer_create(out, "ok", 2);
+    const uam_uart16550_cfg cfg = { .reg_shift = 2, .endian = UAM_ACC_BE };
+    uam_device *u = uam_uart16550_create_cfg("uart", cd, &cfg);
+    uam_bus bus;
+    uam_bus_init(&bus);
+    CHECK(uam_bus_map_mmio(&bus, "uart", 0x1000, UAM_UART16550_SIZE, u) == UAM_OK, "map");
+    uint64_t v = 0;
+    uam_bus_read(&bus, 0x1000 + 5 * 4, 4, UAM_ACC_BE, &v);
+    CHECK((v & 0xFFFFFF00) == 0 && (v & 1), "LSR as a big-endian word (0x%llx)", (unsigned long long)v);
+    uam_bus_read(&bus, 0x1000 + 5 * 4, 1, UAM_ACC_BE, &v);
+    CHECK(v == 0, "other bytes of the slot read 0");
+    uam_bus_read(&bus, 0x1000 + 0 * 4 + 3, 1, UAM_ACC_BE, &v);
+    CHECK(v == 'o', "RBR through its byte (0x%llx)", (unsigned long long)v);
+    uam_bus_read(&bus, 0x1000, 4, UAM_ACC_BE, &v);
+    CHECK(v == 'k', "RBR through the word (0x%llx)", (unsigned long long)v);
+    uam_bus_write(&bus, 0x1000 + 7 * 4 + 3, 1, UAM_ACC_BE, 0x5A);
+    uam_bus_read(&bus, 0x1000 + 7 * 4, 4, UAM_ACC_BE, &v);
+    CHECK(v == 0x5A, "SCR written through its byte (0x%llx)", (unsigned long long)v);
+    uam_bus_write(&bus, 0x1000 + 7 * 4, 1, UAM_ACC_BE, 0x11);
+    uam_bus_read(&bus, 0x1000 + 7 * 4 + 3, 1, UAM_ACC_BE, &v);
+    CHECK(v == 0x5A, "a write to another byte of the slot is dropped");
+    uam_bus_write(&bus, 0x1000, 4, UAM_ACC_BE, 'Y');
+    uam_bus_write(&bus, 0x1003, 1, UAM_ACC_BE, 'Z');
+    const uam_uart16550_cfg big = { .reg_shift = 6 };
+    CHECK(!uam_uart16550_create_cfg("x", NULL, &big), "reg_shift 6 does not fit");
+    uam_bus_fini(&bus);
+    u->ops->destroy(u);
+    uam_chardev_destroy(cd);
+    rewind(out);
+    CHECK(fgetc(out) == 'Y' && fgetc(out) == 'Z', "THR through the word and its byte");
+    fclose(out);
+}
+
 /* ---- held console input ------------------------------------------------- */
 
 /* Fixed input held while the machine is set up survives whatever setup does
@@ -717,6 +755,7 @@ int main(void)
     }
     test_chardev_flow();
     test_uart_chardev();
+    test_uart_stride();
     test_console_hold();
     test_netdev(dir);
     test_tun_adapter();

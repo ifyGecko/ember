@@ -4,7 +4,7 @@
  * Host side: a uam_chardev (transmit is instantaneous; received bytes are
  * buffered in a 4 KiB FIFO and the chardev holds back what does not fit).
  *
- * Registers (DLAB = LCR bit 7):
+ * Registers (DLAB = LCR bit 7), register n at offset n << reg_shift:
  *   0 RBR (r) / THR (w) / DLL (DLAB)
  *   1 IER / DLM (DLAB)
  *   2 IIR (r) / FCR (w)
@@ -31,6 +31,7 @@
 
 typedef struct uart {
     uam_device dev;
+    unsigned   shift;         /* reg_shift */
     uam_chardev *cd;
     uam_signal irq;
     uint8_t    ier, lcr, mcr, scr, fcr, dll, dlm;
@@ -58,11 +59,23 @@ static uint8_t iir(uart *u)
     return fifo | IIR_NONE;
 }
 
+/* With registers 2^shift bytes apart, each fills a slot that wide whose least
+ * significant byte (in the device's byte order) holds it: the register an access
+ * reaches, or -1 when the access misses that byte (reads 0, writes nothing). */
+static int reg_of(const uart *u, uint64_t off, unsigned size)
+{
+    if (!u->shift)
+        return (int)off;
+    const uint64_t w = UINT64_C(1) << u->shift, at = off & (w - 1);
+    bool hit = u->dev.ops->endian == UAM_ACC_BE ? at + size == w : at == 0;
+    return hit ? (int)(off >> u->shift) : -1;
+}
+
 static uam_status uart_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
 {
     uart *u = to_uart(d);
-    (void)size;
-    switch (off) {
+    *val = 0;
+    switch (reg_of(u, off, size)) {
     case 0:
         if (u->lcr & LCR_DLAB) {
             *val = u->dll;
@@ -98,8 +111,7 @@ static uam_status uart_write(uam_device *d, uint64_t off, unsigned size, uint64_
 {
     uart *u = to_uart(d);
     uint8_t b = (uint8_t)v;
-    (void)size;
-    switch (off) {
+    switch (reg_of(u, off, size)) {
     case 0:
         if (u->lcr & LCR_DLAB) {
             u->dll = b;
@@ -193,6 +205,16 @@ static const uam_device_ops uart_ops = {
     .save = uart_save,
     .restore = uart_restore,
 };
+static const uam_device_ops uart_be_ops = {
+    .type = "16550a-uart",
+    .endian = UAM_ACC_BE,
+    .read = uart_read,
+    .write = uart_write,
+    .reset = uart_reset,
+    .destroy = uart_destroy,
+    .save = uart_save,
+    .restore = uart_restore,
+};
 
 static size_t uart_can_receive(void *ctx)
 {
@@ -207,10 +229,22 @@ static void uart_receive(void *ctx, const uint8_t *buf, size_t len)
 
 uam_device *uam_uart16550_create(const char *name, uam_chardev *cd)
 {
+    return uam_uart16550_create_cfg(name, cd, NULL);
+}
+
+uam_device *uam_uart16550_create_cfg(const char *name, uam_chardev *cd,
+                                     const uam_uart16550_cfg *cfg)
+{
+    const uam_uart16550_cfg none = { 0 };
+    if (!cfg)
+        cfg = &none;
+    if ((UAM_UART16550_REGS << cfg->reg_shift) > UAM_UART16550_SIZE)
+        return NULL;
     uart *u = calloc(1, sizeof(*u));
     if (!u)
         return NULL;
-    uam_device_init(&u->dev, &uart_ops, name);
+    uam_device_init(&u->dev, cfg->endian == UAM_ACC_BE ? &uart_be_ops : &uart_ops, name);
+    u->shift = cfg->reg_shift;
     u->cd = cd;
     uam_signal_init(&u->irq);
     uam_chardev_set_frontend(cd, uart_can_receive, uart_receive, u);
