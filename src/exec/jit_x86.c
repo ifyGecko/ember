@@ -7,9 +7,10 @@
  *
  * that leaves cpu/temps in exactly the state uam_interp_block would and writes the
  * block's outcome into jc->res. The hot opcodes are emitted inline; rare pure ops go
- * through the same C evaluator as the interpreter (ir_eval.h) and every memory access
- * through execops.h, so the backends cannot disagree. Unsupported ops make the block
- * run interpreted (uam_jit_compile sets UAM_JIT_INTERP).
+ * through the same C evaluator as the interpreter (ir_eval.h), and every memory access
+ * the inline data-TLB path cannot do goes through execops.h, so the backends cannot
+ * disagree. Every IR op compiles; only a block whose code overflows the scratch buffer
+ * runs interpreted (uam_jit_compile sets UAM_JIT_INTERP).
  *
  * Host register use (System V AMD64, all callee-saved so they survive bridge calls):
  *   rbx = jc    rbp = jc->temps    r14 = jc->cpu    r15 = jc->cpu->regfile
@@ -44,6 +45,7 @@ void     uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *t, uam_jit_chai
 #include <string.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "uam/bus.h"
 
@@ -80,6 +82,7 @@ typedef struct uam_jit_ctx {
     uint32_t                dgen;        /* bus->direct_gen at entry */
     uam_sched              *sched;
     uint64_t                next_when;   /* next timer at entry */
+    uam_exec_stats         *stats;       /* slow-path counters (jit_*_calls) */
 } uam_jit_ctx;
 
 /* After a bridge: if the bus mapping or the timer queue changed, the run loop has work
@@ -140,6 +143,7 @@ static int jit_br_load(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, uint32_t 
     uint32_t xf = 0;
     uint64_t fva;
     uam_status st = uam_execops_load(jc->cpu, addr, flags, size, &jc->scratch, &xf, &fva);
+    jc->stats->jit_load_calls++;
     chain_check(jc);
     if (st != UAM_OK)
         return jit_fault(jc, st, fva, xf, false);
@@ -153,6 +157,7 @@ static int jit_br_store(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t f
     uint32_t xf = 0;
     uint64_t fva;
     uam_status st = uam_execops_store(jc->cpu, addr, val, flags, size, &xf, &fva);
+    jc->stats->jit_store_calls++;
     chain_check(jc);
     if (st != UAM_OK)
         return jit_fault(jc, st, fva, xf, true);
@@ -237,9 +242,10 @@ static int jit_br_helper(uam_jit_ctx *jc, uint32_t id, uint64_t a, uint64_t b, u
 }
 
 /* packed = op | width << 8 | src_w << 16 */
-static uint64_t jit_br_eval(uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
+static uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 {
     uint64_t out = 0;
+    jc->stats->jit_eval_calls++;
     uam_ir_eval_pure((uam_opcode)(packed & 0xff), (packed >> 8) & 0xff, x, y, z,
                      (packed >> 16) & 0xff, &out);
     return out;
@@ -250,6 +256,12 @@ static uint64_t jit_br_eval(uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 #define ARENA_SIZE (64u << 20)
 #define CBUF_MAX   (64u << 10)   /* scratch code buffer per block */
 #define MAX_SLOTS  64u           /* EXITs per block that get a link (more just return) */
+
+/* Code-region kinds recorded for the op map (UAM_JIT_OPMAP; docs/jit-perf.md). */
+enum { MK_PROLOGUE, MK_OP, MK_IMARK_PC, MK_SLOW, MK_CHAIN, MK_EPILOGUE, MK_SLOTS };
+static const char *const mark_name[] = { "prologue", "op", "imark-pc", "slow", "chain",
+                                         "epilogue", "slots" };
+typedef struct jit_mark { uint32_t off, idx; uint8_t kind; } jit_mark;
 
 /* Host registers. */
 enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, RDI = 7, R8 = 8, R9 = 9,
@@ -276,6 +288,11 @@ struct uam_jit {
     bool         overflow;
     struct { size_t lea; uint64_t pc; } slot[MAX_SLOTS];  /* lea rel32 position, target */
     unsigned     n_slots;
+    /* profiling output, from the environment at creation (docs/jit-perf.md) */
+    FILE        *perf_map;   /* UAM_PERF_MAP: /tmp/perf-<pid>.map, one line per block */
+    FILE        *opmap;      /* UAM_JIT_OPMAP=FILE: code offset -> IR instruction */
+    jit_mark    *marks;      /* per-compile, only with opmap */
+    uint32_t     n_marks, cap_marks;
 };
 
 #define OFF(f)  ((int32_t)offsetof(uam_jit_ctx, f))
@@ -284,6 +301,22 @@ struct uam_jit {
 #define REXC(f) ((int32_t)(offsetof(uam_jit_ctx, res) + offsetof(uam_block_result, exc) + offsetof(uam_exception, f)))
 #define SLOT(f) ((int32_t)offsetof(jit_slot, f))
 #define COV(f)  ((int32_t)offsetof(uam_cov_state, f))
+
+/* Note that the code from here on belongs to `kind` (of IR instruction `idx`). */
+static void mark(uam_jit *j, unsigned kind, uint32_t idx)
+{
+    if (!j->opmap)
+        return;
+    if (j->n_marks == j->cap_marks) {
+        uint32_t cap = j->cap_marks ? 2 * j->cap_marks : 256;
+        jit_mark *m = realloc(j->marks, sizeof(*m) * cap);
+        if (!m)
+            return;
+        j->marks = m;
+        j->cap_marks = cap;
+    }
+    j->marks[j->n_marks++] = (jit_mark){ (uint32_t)j->n, idx, (uint8_t)kind };
+}
 
 static void g8(uam_jit *j, uint8_t b)
 {
@@ -638,11 +671,12 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
         src_w = uam_ref_is_imm(in->a) ? W : blk->temp_width[in->a];
 
     if (!pure_inline(op)) {
-        /* call jit_br_eval(packed, a, b, c) */
-        load_operand(j, RSI, blk, in->a, op == UAM_OP_SELECT ? 1 : src_w);
-        if (n_src > 1) load_operand(j, RDX, blk, in->b, W); else movabs(j, RDX, 0);
-        if (n_src > 2) load_operand(j, RCX, blk, in->c, W); else movabs(j, RCX, 0);
-        movabs(j, RDI, (uint32_t)op | (W << 8) | (src_w << 16));
+        /* call jit_br_eval(jc, packed, a, b, c) */
+        load_operand(j, RDX, blk, in->a, op == UAM_OP_SELECT ? 1 : src_w);
+        if (n_src > 1) load_operand(j, RCX, blk, in->b, W); else movabs(j, RCX, 0);
+        if (n_src > 2) load_operand(j, R8, blk, in->c, W); else movabs(j, R8, 0);
+        mov_rr(j, RDI, RBX);
+        movabs(j, RSI, (uint32_t)op | (W << 8) | (src_w << 16));
         movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_eval);
         g8(j, 0xFF); modrm_reg(j, 2, RAX);      /* call rax */
         mask_rax(j, W);
@@ -709,10 +743,11 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
     }
     case UAM_OP_SHL: case UAM_OP_LSHR: case UAM_OP_ASHR: {
         if (!uam_ref_is_imm(in->b)) {   /* variable amount: use the C evaluator */
-            load_operand(j, RSI, blk, in->a, W);
-            load_operand(j, RDX, blk, in->b, W);
-            movabs(j, RCX, 0);
-            movabs(j, RDI, (uint32_t)op | (W << 8) | (W << 16));
+            load_operand(j, RDX, blk, in->a, W);
+            load_operand(j, RCX, blk, in->b, W);
+            movabs(j, R8, 0);
+            mov_rr(j, RDI, RBX);
+            movabs(j, RSI, (uint32_t)op | (W << 8) | (W << 16));
             movabs(j, RAX, (uint64_t)(uintptr_t)&jit_br_eval);
             g8(j, 0xFF); modrm_reg(j, 2, RAX);
             mask_rax(j, W);
@@ -754,6 +789,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     j->n = 0;
     j->overflow = false;
     j->n_slots = 0;
+    j->n_marks = 0;
 
     for (uint32_t i = 0; i < blk->n_insn; i++) {
         uam_opcode op = (uam_opcode)blk->insn[i].op;
@@ -762,6 +798,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     }
 
     /* prologue */
+    mark(j, MK_PROLOGUE, 0);
     g8(j, 0x53);                                   /* push rbx */
     g8(j, 0x55);                                   /* push rbp */
     g8(j, 0x41); g8(j, 0x54);                      /* push r12 */
@@ -789,6 +826,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
         const uam_insn *in = &blk->insn[i];
         const uam_opcode op = (uam_opcode)in->op;
         const unsigned W = in->width;
+        mark(j, MK_OP, i);
 
         /* Guard on an effectful op. */
         size_t guard_skip = 0;
@@ -853,6 +891,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                     break;
                 }
             }
+            mark(j, MK_IMARK_PC, i);
             if (needs_pc) {
                 movabs(j, RAX, pc);
                 st_mem(j, RAX, RBX, OFF(cur_pc));
@@ -901,6 +940,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 for (unsigned k = 0; k < n_miss; k++)
                     patch(j, miss[k]);
             }
+            mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
             mov_rr(j, RDI, RBX);                        /* miss / slow path: the bridge */
             movabs(j, RDX, in->flags);
@@ -948,6 +988,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 for (unsigned k = 0; k < n_miss; k++)
                     patch(j, miss[k]);
             }
+            mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));
             mov_rr(j, RDI, RBX);
             load_operand(j, RDX, blk, in->b, W);        /* reload: the bridge call needs it in rdx */
@@ -991,6 +1032,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             break;
         case UAM_OP_EXIT:
             set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
+            mark(j, MK_CHAIN, i);
             if (j->n_slots < MAX_SLOTS)
                 emit_chain(j, blk, in->a, epi, &n_epi);
             else
@@ -1084,6 +1126,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     for (unsigned k = 0; k < n_epi; k++)
         patch(j, epi[k]);
     free(epi);
+    mark(j, MK_EPILOGUE, 0);
     st_mem(j, R13, R14, CPU(icount));                   /* flush icount */
     g8(j, 0x48); g8(j, 0x83); g8(j, 0xC4); g8(j, 0x08);  /* add rsp, 8 */
     g8(j, 0x41); g8(j, 0x5F);                            /* pop r15 */
@@ -1095,6 +1138,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
     g8(j, 0xC3);                                         /* ret */
 
     /* link slots, 8-byte aligned after the code (the code itself starts 16-aligned) */
+    mark(j, MK_SLOTS, 0);
     while (j->n & 7)
         g8(j, 0xCC);                                     /* int3 padding */
     for (unsigned k = 0; k < j->n_slots; k++) {
@@ -1128,7 +1172,47 @@ uam_jit *uam_jit_create(uam_exec *x)
     j->jc.regfile = x->cpu->regfile;
     j->jc.helpers = &x->cpu->isa->helpers;
     j->jc.sched = x->sched;
+    j->jc.stats = &x->stats;
+    /* Profiling output. Every JIT of the process appends to the same files. */
+    const char *pm = getenv("UAM_PERF_MAP");
+    if (pm && *pm && strcmp(pm, "0") != 0) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/perf-%d.map", (int)getpid());
+        j->perf_map = fopen(path, "a");
+    }
+    const char *om = getenv("UAM_JIT_OPMAP");
+    if (om && *om)
+        j->opmap = fopen(om, "a");
     return j;
+}
+
+/* Describe the block just placed at `code` in the perf map and the op map. */
+static void write_profile_maps(uam_jit *j, const uam_block *blk, const uint8_t *code)
+{
+    const char *isa = j->x->cpu->isa->name;
+    if (j->perf_map) {
+        fprintf(j->perf_map, "%llx %zx uam:%s:0x%llx\n", (unsigned long long)(uintptr_t)code,
+                j->n, isa, (unsigned long long)blk->guest_pc);
+        fflush(j->perf_map);
+    }
+    if (!j->opmap)
+        return;
+    fprintf(j->opmap, "B %llx %zx %llx %s\n", (unsigned long long)(uintptr_t)code, j->n,
+            (unsigned long long)blk->guest_pc, isa);
+    for (uint32_t k = 0; k < j->n_marks; k++) {
+        const jit_mark *m = &j->marks[k];
+        fprintf(j->opmap, "M %x %s %u", m->off, mark_name[m->kind], m->idx);
+        if (m->kind == MK_OP || m->kind == MK_SLOW) {
+            const uam_insn *in = &blk->insn[m->idx];
+            fprintf(j->opmap, " %s.%u", uam_opinfo_table[in->op].mnemonic, in->width);
+            if (in->op == UAM_OP_GET || in->op == UAM_OP_PUT)
+                fprintf(j->opmap, "@%u", in->aux);
+            if (in->op == UAM_OP_IMARK)
+                fprintf(j->opmap, " 0x%llx", (unsigned long long)blk->imm[uam_ref_index(in->a)]);
+        }
+        fputc('\n', j->opmap);
+    }
+    fflush(j->opmap);
 }
 
 void uam_jit_destroy(uam_jit *j)
@@ -1136,6 +1220,11 @@ void uam_jit_destroy(uam_jit *j)
     if (!j)
         return;
     munmap(j->arena, ARENA_SIZE);
+    if (j->perf_map)
+        fclose(j->perf_map);
+    if (j->opmap)
+        fclose(j->opmap);
+    free(j->marks);
     free(j);
 }
 
@@ -1152,9 +1241,13 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
         uam_tcache_flush(&j->x->tc);
         j->arena_used = 0;
         j->arena_gen++;
+        if (j->opmap)
+            fputs("R\n", j->opmap);   /* the addresses below are reused from here on */
     }
     uint8_t *code = j->arena + j->arena_used;
     memcpy(code, j->cb, j->n);
+    j->x->stats.code_bytes += j->n;
+    write_profile_maps(j, blk, code);
     j->arena_used += (j->n + 15) & ~(size_t)15;   /* keep 16-byte alignment */
     blk->backend = code;
     blk->backend_free = NULL;                      /* bulk-freed with the arena */

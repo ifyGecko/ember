@@ -416,6 +416,13 @@ void uam_machine_get_stats(const uam_machine *m, uam_exec_stats *out)
         out->blocks_compiled += s->blocks_compiled;
         out->blocks_interp += s->blocks_interp;
         out->blocks_chained += s->blocks_chained;
+        out->translate_ns += s->translate_ns;
+        out->ir_ops_lifted += s->ir_ops_lifted;
+        out->ir_ops_final += s->ir_ops_final;
+        out->code_bytes += s->code_bytes;
+        out->jit_eval_calls += s->jit_eval_calls;
+        out->jit_load_calls += s->jit_load_calls;
+        out->jit_store_calls += s->jit_store_calls;
     }
 }
 

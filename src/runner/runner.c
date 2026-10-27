@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "uam/boards.h"
 #include "uam/fuzz.h"
@@ -271,6 +272,11 @@ static void usage(FILE *out)
         "      --no-opt            do not optimize translated blocks\n"
         "      --jit               compile blocks to native code (x86-64 host)\n"
         "      --no-chain          with --jit, return to the run loop after every block\n"
+        "      --perf-map          with --jit, write /tmp/perf-PID.map so perf names compiled\n"
+        "                          blocks by guest pc (env UAM_PERF_MAP=1)\n"
+        "      --jit-opmap FILE    with --jit, append which IR instruction each piece of\n"
+        "                          native code came from to FILE, for tools/jitprof.py (env\n"
+        "                          UAM_JIT_OPMAP=FILE)\n"
         "      --cov-blocks        count edges between translated blocks (approximate: blocks\n"
         "                          are not basic blocks) in a coverage map\n"
         "      --cov-map-size N    coverage map bytes, a power of two (default 64K)\n"
@@ -524,7 +530,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
-           OPT_DUMP_MEM, OPT_EXT_BASE = 1000 };
+           OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -560,6 +566,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "no-opt", no_argument, NULL, OPT_NO_OPT },
         { "jit", no_argument, NULL, OPT_JIT },
         { "no-chain", no_argument, NULL, OPT_NO_CHAIN },
+        { "perf-map", no_argument, NULL, OPT_PERF_MAP },
+        { "jit-opmap", required_argument, NULL, OPT_JIT_OPMAP },
         { "cov-blocks", no_argument, NULL, OPT_COV_BLOCKS },
         { "cov-out", required_argument, NULL, OPT_COV_OUT },
         { "cov-map-size", required_argument, NULL, OPT_COV_MAP_SIZE },
@@ -714,6 +722,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_NO_OPT: optimize = false; break;
         case OPT_JIT: use_jit = true; break;
         case OPT_NO_CHAIN: chain = false; break;
+        /* read by the JIT when it is created (docs/jit-perf.md) */
+        case OPT_PERF_MAP: setenv("UAM_PERF_MAP", "1", 1); break;
+        case OPT_JIT_OPMAP: setenv("UAM_JIT_OPMAP", optarg, 1); break;
         case OPT_BLOCK_INSNS: block_insns = (unsigned)strtoul(optarg, NULL, 0); break;
         case OPT_TRACE_RANGE: {
             char *end;
@@ -1145,6 +1156,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
 
     uam_stop_reason why = UAM_STOP_NONE;
     uam_chardev_hold(console, false);   /* the machine is set up: input may flow */
+    struct timespec run_t0, run_t1;
+    const uint64_t run_icount0 = uam_machine_icount(&m);
+    clock_gettime(CLOCK_MONOTONIC, &run_t0);
     if (fuzzing) {
         rc = run_fuzz(&m, &fz, cov_blocks, fuzz_input, mmio_input, fuzz_replay, cov_out,
                       cov_map_size, stats, &xs, es);
@@ -1161,6 +1175,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     } else {
         why = uam_exec_run(&m.exec, max_insns);
     }
+    clock_gettime(CLOCK_MONOTONIC, &run_t1);
     fflush(stdout);
 
     sigaction(SIGINT, &old_int, NULL);
@@ -1211,6 +1226,18 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 (unsigned long long)s->blocks_native, (unsigned long long)s->blocks_chained,
                 (unsigned long long)(s->blocks_executed - s->blocks_native),
                 (unsigned long long)s->blocks_compiled, (unsigned long long)s->blocks_interp);
+        const double secs = (double)(run_t1.tv_sec - run_t0.tv_sec)
+                          + (double)(run_t1.tv_nsec - run_t0.tv_nsec) / 1e9;
+        const uint64_t ran = uam_machine_icount(&m) - run_icount0;
+        fprintf(stderr, "stats: time=%.3fs instructions=%llu MIPS=%.1f translate=%.3fs "
+                "ir ops lifted=%llu final=%llu code bytes=%llu\n",
+                secs, (unsigned long long)ran, secs > 0 ? (double)ran / secs / 1e6 : 0.0,
+                (double)s->translate_ns / 1e9, (unsigned long long)s->ir_ops_lifted,
+                (unsigned long long)s->ir_ops_final, (unsigned long long)s->code_bytes);
+        if (s->blocks_compiled)
+            fprintf(stderr, "stats: jit calls eval=%llu load=%llu store=%llu\n",
+                    (unsigned long long)s->jit_eval_calls, (unsigned long long)s->jit_load_calls,
+                    (unsigned long long)s->jit_store_calls);
         if (mmio_input)
             fprintf(stderr, "stats: mmio input used=%zu of %zu bytes\n",
                     uam_mmio_input_pos(mmio_input), mmio_input_len);

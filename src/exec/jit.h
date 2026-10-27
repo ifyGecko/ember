@@ -10,10 +10,13 @@
  * Design (see jit_x86.c): one compiled function per block, emitting inline host code
  * for the hot opcodes (IMARK, GET, PUT, LD, plain ST, EXIT, COV and the common integer,
  * compare, select and conversion ops) and calling shared C for the rest - rare pure
- * ops go through the same evaluator as the interpreter (ir_eval.h), and every memory
- * access goes through execops.h, so the two backends cannot diverge. A block using an
- * op the JIT does not emit (AMO, CAS, exclusive ST, SYSRD/SYSWR, TRAP, WAIT, FENCE,
- * HELPER) is marked to run on the interpreter.
+ * ops go through the same evaluator as the interpreter (ir_eval.h), and memory accesses
+ * off the inline data-TLB path, AMO/CAS, SYSRD/SYSWR and HELPER go through execops.h
+ * and the ISA's own functions, so the two backends cannot diverge. Every op compiles;
+ * a block too large for the code buffer is marked to run on the interpreter.
+ *
+ * Profiling: UAM_PERF_MAP and UAM_JIT_OPMAP make the JIT describe the code it places
+ * (docs/jit-perf.md).
  *
  * The compiled code is attached to the block (uam_block.backend) and freed with it.
  *

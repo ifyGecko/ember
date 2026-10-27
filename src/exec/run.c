@@ -3,6 +3,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "uam/exec.h"
 
@@ -438,6 +439,7 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
         *st = UAM_ERR_NOMEM;
         return NULL;
     }
+    x->stats.ir_ops_lifted += blk->n_insn;
     mark_block_code(cpu->bus, blk);
     for (uint32_t i = 0; i < blk->n_pages; i++)
         blk->page_gen[i] = uam_bus_page_gen(cpu->bus, blk->page[i]);
@@ -492,6 +494,7 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
     }
     if (x->n_hooks)
         mark_hooked_imarks(x, blk);
+    x->stats.ir_ops_final += blk->n_insn;
     /* A block with a PC hook on a non-first instruction is broken at that IMARK and
      * must stop there; the JIT honours UAM_IMARK_BREAK, so it can still run it. */
     if (x->use_jit && x->jit) {
@@ -753,7 +756,12 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         if (!blk) {
             uam_status st;
             uam_exception exc;
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             blk = translate(x, cpu->pc, &st, &exc);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            x->stats.translate_ns += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000LL
+                                                + (t1.tv_nsec - t0.tv_nsec));
             if (!blk) {
                 if (st == UAM_ERR_FAULT) {
                     /* The same fetch fault again without a single instruction

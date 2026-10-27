@@ -142,6 +142,15 @@ typedef struct uam_exec_stats {
     uint64_t blocks_compiled;    /* compiled to native code */
     uint64_t blocks_interp;      /* marked to run interpreted */
     uint64_t blocks_chained;     /* native blocks entered straight from another (no dispatch) */
+    /* translation cost */
+    uint64_t translate_ns;       /* host time spent translating (lift, verify, optimize, compile) */
+    uint64_t ir_ops_lifted;      /* IR instructions as lifted */
+    uint64_t ir_ops_final;       /* IR instructions after the optimizer and passes */
+    uint64_t code_bytes;         /* native code emitted by the JIT */
+    /* JIT slow paths taken (calls from native code into C) */
+    uint64_t jit_eval_calls;     /* pure ops evaluated by the shared C evaluator */
+    uint64_t jit_load_calls;     /* loads through the bridge (data-TLB miss, MMIO, special) */
+    uint64_t jit_store_calls;    /* stores through the bridge */
 } uam_exec_stats;
 
 /* --- reset requests ------------------------------------------------------- */
