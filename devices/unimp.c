@@ -6,6 +6,7 @@
 #include "uam/dev/unimp.h"
 
 #define TABLE_SIZE 1024u  /* distinct offsets tracked; power of two */
+#define MAX_PROBE  32u    /* slots an offset may sit past its hash: bounds a miss once full */
 #define HOT_LIST   10u
 
 typedef struct slot {
@@ -29,7 +30,10 @@ static slot *track(unimp *u, uint64_t off, bool is_write, unsigned size, uint64_
 {
     u->total++;
     uint32_t h = (uint32_t)((off * UINT64_C(0x9E3779B97F4A7C15)) >> 54) & (TABLE_SIZE - 1);
-    for (uint32_t probe = 0; probe < TABLE_SIZE; probe++) {
+    /* Linear probing limited to MAX_PROBE slots, for lookups and inserts alike, so an
+     * untracked offset costs MAX_PROBE probes once the table fills, not the whole table
+     * (a guest hammering such an offset otherwise scans 1024 slots per access). */
+    for (uint32_t probe = 0; probe < MAX_PROBE; probe++) {
         slot *s = &u->table[(h + probe) & (TABLE_SIZE - 1)];
         if (s->used && s->off == off)
             return s;
@@ -48,7 +52,7 @@ static slot *track(unimp *u, uint64_t off, bool is_write, unsigned size, uint64_
             return s;
         }
     }
-    return NULL; /* table full: still RAZ/WI, just not tracked */
+    return NULL; /* neighbourhood full: still RAZ/WI, just not tracked */
 }
 
 static uam_status unimp_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
