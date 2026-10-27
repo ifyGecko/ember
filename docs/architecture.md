@@ -438,6 +438,11 @@ Implemented (`make test`):
   strict flags, and `test_suzzer` reads the checkout's own conformance vectors. Without one,
   the suzzer tests are skipped.
 - The external-board example is built and run against the library.
+- `test_jitdiff` checks the JIT against the interpreter block by block: every pure op at
+  every width with temp and immediate operands, then random verified blocks (guards,
+  CONT/BREAK imarks, faulting, page-crossing, MMIO and exclusive accesses, helpers,
+  sysregs, traps) under every deadline and exit request. Each run must agree on the result,
+  registers, memory, icount and on the register file seen at every device, sysreg and helper
+  access. `make jitdiff-soak` runs it at length; docs/jit-perf.md has the performance side.
 
-Planned: per-instruction differential testing between the interpreter and the JIT (random
-instruction and state), riscv-tests / riscv-arch-test, golden text-form tests for the lifters.
+Planned: riscv-tests / riscv-arch-test, golden text-form tests for the lifters.

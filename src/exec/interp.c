@@ -71,7 +71,7 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
         const unsigned size = W / 8;
 
         /* Guarded op with a false guard: no effect, dst = 0 (section 4.1). */
-        if (!uam_ref_is_none(in->guard) && !t[in->guard]) {
+        if (!uam_ref_is_none(in->guard) && !opnd(blk, t, in->guard, 1)) {
             if (!uam_ref_is_none(in->dst))
                 t[in->dst] = 0;
             continue;

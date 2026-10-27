@@ -414,13 +414,16 @@ static void mask_rax(uam_jit *j, unsigned w)
     case 8:  g8(j, 0x0F); g8(j, 0xB6); modrm_reg(j, RAX, RAX); break; /* movzx eax,al */
     case 16: g8(j, 0x0F); g8(j, 0xB7); modrm_reg(j, RAX, RAX); break; /* movzx eax,ax */
     case 32: g8(j, 0x89); modrm_reg(j, RAX, RAX); break;              /* mov eax,eax */
-    default: break;                                                  /* 1, 64: no-op */
+    case 1:  g8(j, 0x83); modrm_reg(j, 4, RAX); g8(j, 1); break;      /* and eax,1 */
+    default: break;                                                  /* 64: no-op */
     }
 }
-/* Sign-extend the low `w` bits of `reg` (RAX or RCX) to 64 bits. */
+/* Sign-extend the low `w` bits of `reg` (RAX or RCX) to 64 bits. A 1-bit value is
+ * 0 or 1 (temps are masked to their width), so negating it sign-extends it. */
 static void sext_reg(uam_jit *j, int reg, unsigned w)
 {
     switch (w) {
+    case 1:  rex(j, 1, 0, 0, 0); g8(j, 0xF7); modrm_reg(j, 3, reg); break;              /* neg */
     case 8:  rex(j, 1, 0, 0, 0); g8(j, 0x0F); g8(j, 0xBE); modrm_reg(j, reg, reg); break; /* movsx */
     case 16: rex(j, 1, 0, 0, 0); g8(j, 0x0F); g8(j, 0xBF); modrm_reg(j, reg, reg); break;
     case 32: rex(j, 1, 0, 0, 0); g8(j, 0x63); modrm_reg(j, reg, reg); break;              /* movsxd */
@@ -754,7 +757,7 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in)
             st_temp(j, in->dst, RAX);
             break;
         }
-        uint64_t n = blk->imm[uam_ref_index(in->b)] % 256;  /* shift ops read amount mod 2^W via eval; here imm */
+        uint64_t n = blk->imm[uam_ref_index(in->b)];   /* any amount >= W shifts everything out */
         if (n >= W) {
             if (op == UAM_OP_ASHR) {
                 load_operand(j, RAX, blk, in->a, W);

@@ -129,6 +129,7 @@ TEST_MMIO := $(BUILD)/test_mmio
 TEST_COV  := $(BUILD)/test_cov
 TEST_SMP  := $(BUILD)/test_smp
 TEST_PPC  := $(BUILD)/test_ppc
+TEST_JITDIFF := $(BUILD)/test_jitdiff
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -146,7 +147,8 @@ EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test firmware-ppc ppc-test \
         example-test \
-        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test install clean FORCE
+        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak install \
+        clean FORCE
 
 all: $(RUN) lib
 
@@ -233,6 +235,9 @@ $(TEST_SMP): $(BUILD)/obj/tests/unit/test_smp.o $(LIB)
 $(TEST_PPC): $(BUILD)/obj/tests/unit/test_ppc.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_JITDIFF): $(BUILD)/obj/tests/unit/test_jitdiff.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -276,7 +281,7 @@ firmware-ppc:
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_JITDIFF) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -288,11 +293,19 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_FUZZ)
 	$(TEST_SMP)
 	$(TEST_PPC)
+	$(TEST_JITDIFF)
 ifeq ($(HAVE_SUZZER),1)
 	$(TEST_SUZZER) $(SUZZER_DIR)/test/vectors
 else
 	@echo "test_suzzer: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
+
+# The JIT differential test at length: JITDIFF_BLOCKS random blocks per seed, several seeds.
+JITDIFF_BLOCKS ?= 200000
+jitdiff-soak: $(TEST_JITDIFF)
+	$(TEST_JITDIFF) $(JITDIFF_BLOCKS) 1
+	$(TEST_JITDIFF) $(JITDIFF_BLOCKS) 2
+	$(TEST_JITDIFF) $(JITDIFF_BLOCKS) 3
 
 # Each self-test runs on the interpreter and on the JIT.
 firmware-test: $(RUN) firmware
@@ -469,4 +482,4 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
-         $(BUILD)/obj/tests/unit/test_suzzer.d
+         $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d
