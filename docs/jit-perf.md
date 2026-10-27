@@ -131,3 +131,4 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | baseline | 3.96 s | 3.10 s | |
 | 0: measurement | 3.92 s | 3.07 s | stats, perf map, op map, tools; no codegen change |
 | 1: differential test | - | - | `test_jitdiff`; fixed trunc.1, sext from 1 bit and shifts by an immediate >= 256 in the JIT, immediate guards in the interpreter |
+| 2: inline pure ops | 3.91 s | 3.09 s | carry/overflow, rotates, bit counts, bswap, mulh, div/rem and variable shifts inline (POPCNT if the host has it); eval calls 14.8 M / 6.2 M -> 0. These workloads barely used them; ARM/PPC flag code (CARRY, SBORROW) does |
