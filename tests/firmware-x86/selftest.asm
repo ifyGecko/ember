@@ -7,7 +7,8 @@
 ; interrupts and exceptions through the IVT and the IDT, paging faults,
 ; SYSCALL and SSE along the way, and SMM: SMIs sent through the local APIC,
 ; SMBASE relocation, a handler changing the saved state, the SMM range
-; registers (SMRR), and an SMI taken from long mode. The result goes to the test finisher at
+; registers (SMRR), an SMI taken from long mode, and a write to code just
+; translated. The result goes to the test finisher at
 ; port 0x700: 0x5555 on success, (test << 16) | 0x3333 on the first failure.
 
 %define TEST_PORT 0x700
@@ -699,6 +700,14 @@ lm64:
         or      eax, edx
         CHECK   eax, 0, 95
 
+        ; 97: a write to the last byte of a block whose last instruction starts at an
+        ; odd address drops the block (smc_fn below)
+        call    smc_fn
+        CHECK   eax, 1, 97
+        mov     byte [rel smc_jmp + 1], smc_t2 - (smc_jmp + 2)
+        call    smc_fn
+        CHECK   eax, 2, 97
+
         ; 61: CPUID vendor
         xor     eax, eax
         cpuid
@@ -757,6 +766,21 @@ fail64:
         out     dx, eax
         hlt
         jmp     fail64
+
+; Test 97. smc_fn starts at an odd address 3 bytes before the end of a 64-byte
+; line, so its last instruction (a short jump, also at an odd address) ends one
+; byte into the next line: the jump's displacement is that line's first byte,
+; and nothing else ever runs from that line.
+        align   64, db 0xCC
+smc_t1: mov     eax, 1
+        ret
+smc_t2: mov     eax, 2
+        ret
+        times   61 - ($ - smc_t1) db 0xCC
+smc_fn: mov     al, 0
+smc_jmp:
+        jmp     short smc_t1
+        times   64 db 0xCC
 
 ; ---------------------------------------------------------------------------
 ; SMI handler: copied to SMBASE + 0x8000, runs in SMM's real-address mode

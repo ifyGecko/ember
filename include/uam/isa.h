@@ -34,7 +34,8 @@ typedef struct uam_gdb_arch {
     /* Bits of a code address that select an instruction-set state instead of
      * addressing (ARM: bit 0, Thumb). gdb's addresses never carry them: the stub
      * puts a breakpoint at every state of an address, and a pc gdb sets keeps the
-     * current state. 0 for most ISAs. */
+     * current state. The executor also clears them to find a block's code bytes
+     * (uam_isa_pc_state_bits). 0 for most ISAs. */
     uint64_t pc_state_bits;
     /* Optional, for register files of mixed widths: each register's size in
      * bytes (NULL: all reg_bytes), and access to the ones wider than 64 bits
@@ -185,5 +186,12 @@ typedef struct uam_isa {
      * chipset's view of SMRAM, say) is switched to this processor's here. */
     void       (*switch_in)(uam_cpu *cpu);
 } uam_isa;
+
+/* The bits of a pc that select an instruction-set state rather than an address
+ * (uam_gdb_arch.pc_state_bits), or 0. */
+static inline uint64_t uam_isa_pc_state_bits(const uam_isa *isa)
+{
+    return isa->gdb ? isa->gdb->pc_state_bits : 0;
+}
 
 #endif /* UAM_ISA_H */

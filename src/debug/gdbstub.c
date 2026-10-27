@@ -334,11 +334,9 @@ static void watch_cb(void *ctx, uint64_t addr, unsigned size, bool is_write, uin
     }
 }
 
-/* The ISA's pc state bits (uam_gdb_arch.pc_state_bits), or 0. */
 static uint64_t state_bits(const uam_gdb *g)
 {
-    const uam_gdb_arch *a = g->m->cpu.isa->gdb;
-    return a ? a->pc_state_bits : 0;
+    return uam_isa_pc_state_bits(g->m->cpu.isa);
 }
 
 /* A breakpoint at addr in whichever instruction-set state the code there runs in. */

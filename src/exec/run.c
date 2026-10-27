@@ -43,7 +43,7 @@ static bool block_still_mapped(void *ctx, const uam_block *blk)
     uam_cpu *cpu = x->cpu;
     if (!cpu->isa->translate || blk->n_pages == 0)
         return true;
-    uint64_t va = blk->guest_pc & ~UINT64_C(1);   /* Thumb state bit */
+    uint64_t va = blk->guest_pc & ~uam_isa_pc_state_bits(cpu->isa);
     for (uint32_t i = 0; i < blk->n_pages; i++) {
         uint64_t v = i == 0 ? va : (va & UAM_PAGE_MASK) + UAM_PAGE_SIZE;
         uam_xlate xl = { 0 };
@@ -384,18 +384,18 @@ static uam_print_ctx print_ctx(const uam_isa *isa)
 /*
  * Mark the bytes a block was translated from as code, so that only writes to
  * them (at the bus's 64-byte line granularity) drop it. The guest bytes run
- * contiguously from the first IMARK's pc to the end of the last instruction;
- * they lie on page[0] and, past its end, page[1]. Anything else marks the
- * whole pages.
+ * contiguously from the first IMARK's pc (less the ISA's pc state bits) to the end
+ * of the last instruction; they lie on page[0] and, past its end, page[1].
+ * Anything else marks the whole pages.
  */
-static void mark_block_code(uam_bus *bus, const uam_block *blk)
+static void mark_block_code(uam_bus *bus, const uam_block *blk, uint64_t state_bits)
 {
     uint64_t lo = UINT64_MAX, hi = 0;
     for (uint32_t i = 0; i < blk->n_insn; i++) {
         const uam_insn *in = &blk->insn[i];
         if (in->op != UAM_OP_IMARK || !uam_ref_is_imm(in->a))
             continue;
-        uint64_t pc = blk->imm[uam_ref_index(in->a)] & ~UINT64_C(1);   /* Thumb state bit */
+        uint64_t pc = blk->imm[uam_ref_index(in->a)] & ~state_bits;
         if (pc < lo) lo = pc;
         if (pc + in->aux > hi) hi = pc + in->aux;
     }
@@ -440,7 +440,7 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
         return NULL;
     }
     x->stats.ir_ops_lifted += blk->n_insn;
-    mark_block_code(cpu->bus, blk);
+    mark_block_code(cpu->bus, blk, uam_isa_pc_state_bits(cpu->isa));
     for (uint32_t i = 0; i < blk->n_pages; i++)
         blk->page_gen[i] = uam_bus_page_gen(cpu->bus, blk->page[i]);
     /* A page that just became a code page must lose its JIT data-TLB write entry before
