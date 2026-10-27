@@ -1,5 +1,6 @@
-; smm-amd.asm - SMM with the AMD64 SMRAM save-state map, for the x86_64-ref board
-; with -o smm-map=amd64 (uam-run -b x86_64-ref -o smm-map=amd64 --raw-base 0 --entry 0).
+; smm-amd.asm - SMM with the AMD64 SMRAM save-state map, for the x86_64-test board
+; (tests/boards/: x86_64-ref plus the 0xB2 software SMI port) with -o smm-map=amd64
+; (uam-test-run -b x86_64-test -o smm-map=amd64 --raw-base 0 --entry 0).
 ;
 ; The SMI handler knows only the AMD64 map (SMBASE + 0xFE00..0xFFFF), as an AMD
 ; firmware's does: it relocates SMBASE through +0xFF00, sets the saved RAX at

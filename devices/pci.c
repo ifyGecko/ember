@@ -834,6 +834,11 @@ uam_device *uam_pci_bus_device(uam_pci_bus *pb) { return &pb->cam; }
 uam_device *uam_pci_cam(uam_pci_bus *pb)        { return &pb->cam; }
 uam_device *uam_pci_ecam(uam_pci_bus *pb)       { return &pb->ecam; }
 
+uam_pci_bus *uam_pci_bus_of(uam_device *cam)
+{
+    return cam && cam->ops == &cam_ops ? (uam_pci_bus *)cam : NULL;   /* cam comes first */
+}
+
 void uam_pci_cam_passthrough(uam_pci_bus *pb, uam_device *dev)
 {
     pb->cam_through = dev;

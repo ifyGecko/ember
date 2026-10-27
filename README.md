@@ -13,7 +13,8 @@ MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `
 `mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
 boards with a GIC, x86-64 (real, protected, virtual-8086 and long mode, SMM, x87/MMX/
-SSE2) on the `x86_64-ref` board, which also boots UEFI firmware and legacy BIOS images, and 32-bit
+SSE2) on the `x86_64-ref` board (a generic PC that starts boot flash or a BIOS ROM at the reset
+vector), and 32-bit
 PowerPC (the user instruction set with the FPU, and either privileged architecture as the CPU
 model selects: the classic one of the 6xx/7xx/74xx - BATs, segments and the hashed page table -
 or Book E - IVORs, critical and machine-check classes, TCR/TSR timers and watchdog, TLB arrays
@@ -24,7 +25,7 @@ with block chaining (a block optimizer feeds both). Every reference board takes 
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, host console and network backends (tap, tun, UDP,
-pcap; virtio-net on `rv32-ref`), and a library build for out-of-tree boards. C11, no
+pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
 dependencies beyond libc.
 
 ## Build and test
@@ -33,7 +34,7 @@ dependencies beyond libc.
 make                 # build/uam-run and the libraries
 make test            # unit tests, RISC-V, MIPS, ARM, x86 and PowerPC firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT)
-make net-check       # ARP/ping between an rv32-ref guest and the host kernel over a real tap and tun
+make net-check       # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
 make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
 make install PREFIX=DIR
 ```
@@ -222,14 +223,16 @@ backend, and a port left out is an unplugged cable. Backends:
 | `udp:LPORT:RHOST:RPORT` | a UDP socket pair: a "cable" or radio "air" to another emulator |
 | `null` | a link with nothing on the other end |
 
-Append `,pcap=FILE` to record the port's traffic. On the `rv32-ref` board, ports
+Append `,pcap=FILE` to record the port's traffic. The reference boards have no network
+ports (not every board of their architecture has one). The test board `rv32-test`
+(`tests/boards/`, run by `build/uam-test-run`) shows how a board adds them: ports
 `net0`..`net7` put a virtio-net device in the matching virtio-mmio slot
 (`-o net0.mac=02:75:61:6d:01:00`).
 
 ```bash
 ip tuntap add dev tap0 mode tap user $USER       # once, as root: then no privilege is needed
 ip addr add 10.0.2.2/24 dev tap0 && ip link set tap0 up
-build/uam-run --nic net0=tap:tap0,pcap=net0.pcap fw.elf
+build/uam-test-run -b rv32-test --nic net0=tap:tap0,pcap=net0.pcap fw.elf
 ```
 
 A host interface implies `--realtime`, because a guest network stack times out in virtual

@@ -1,6 +1,7 @@
 #!/bin/sh
 # runner-check.sh RUNNER X86_SELFTEST_BIN - checks of uam-run's debugging options on
-# x86_64-ref with the raw x86 self-test (loaded at 0, entered at 0):
+# x86_64-test (RUNNER is build/uam-test-run) with the raw x86 self-test (loaded at 0,
+# entered at 0):
 #   --log-pc     more than 64 addresses all take effect
 #   --dump-mem   at --break: the bytes are the image's (raw file and hex dump, virtual and
 #                p: physical); an unreadable range is reported with the reason (unmapped,
@@ -13,7 +14,7 @@ RUN=$1
 FW=$2
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-X="$RUN -b x86_64-ref --raw-base 0 --entry 0"
+X="$RUN -b x86_64-test --raw-base 0 --entry 0"
 fail() { echo "runner-check: FAIL: $*" >&2; exit 1; }
 
 # --log-pc: the 100 block starts the trace reports first, all of them reached

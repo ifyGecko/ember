@@ -157,7 +157,7 @@ static void setup_queue(unsigned i, vqueue *q)
 static int net_init(void)
 {
     if (VREG(0x000) != 0x74726976u || VREG(0x004) != 2 || VREG(0x008) != 1) {
-        puts_("nettest: no virtio-net device in slot 0 (run with --nic net0=...)\n");
+        puts_("nettest: no virtio-net device in slot 0 (run on rv32-test with --nic net0=...)\n");
         return -1;
     }
     VREG(0x070) = 0;                 /* reset */

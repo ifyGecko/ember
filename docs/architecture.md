@@ -153,6 +153,8 @@ fuzz/suzzer/      scheme.c (the bucket formula) import.c (LCV3/LCVB1 readers, si
 tools/            uam-run.c fetch-suzzer.sh (`make suzzer`: clone suzzer into ./suzzer, ignored
                   by git)
 examples/         external-board/ (an out-of-tree board built against `make lib`)
+tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: reference boards plus
+                  the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_mmio.c test_cov.c
                   test_fuzz.c test_suzzer.c test_smp.c test_ppc.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
@@ -204,15 +206,23 @@ devices.
 - **HAL interception**: replace a firmware function with a native handler through a PC hook
   (`uam_exec_add_pc_hook`): the hook reads arguments, writes results and sets the pc. Hooks are
   placed by address; lookup by symbol name is planned.
-- **Stock boards**: `rv32-ref`, an RV32IMAC M-mode reference board (CLINT, PLIC, NS16550A UART,
-  test finisher, virtio-net ports, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
+- **Stock boards**: reference boards, one per architecture, holding only what every board of
+  that architecture has. They are examples and starting points, not models of any real
+  board: a board emulator adds its own chipset and peripherals out of tree, on the generic
+  components or on top of a reference board (run its build, then wire to the parts
+  `uam_machine_find_device` finds). `rv32-ref`, an RV32IMAC M-mode reference board (CLINT,
+  PLIC, NS16550A UART, test finisher, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
   (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` / `armeb-ref` (ARMv7-A,
   little-endian and BE8, with a GICv2-style interrupt controller fed by the generic timer and
   the NS16550A UART, a test finisher, RAM at 0 under the vectors), and `ppc-ref` (32-bit
   PowerPC, classic or with `-o model=booke` Book E: RAM at 0 under the vectors, a boot ROM under
   the reset vector (0xfff00100; Book E 0xfffffffc, in the boot page it maps at reset), a NS16550A
-  UART and a test finisher). Real devices are built out of tree on the library
-  (`examples/external-board/`).
+  UART and a test finisher), and `x86_64-ref` (the PC/AT core devices, the APICs, HPET, PCI
+  configuration, boot flash or a BIOS ROM; no chipset, storage or display). Real devices are
+  built out of tree on the library (`examples/external-board/`). Ember's own tests also use
+  generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
+  virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
+  `rv32-test`, registered only by the test runner `build/uam-test-run`.
 - **Multiprocessor machines** (`-o cpus=N` on every reference board): processors share the
   bus and the clock and run in deterministic instruction slices (`--quantum`). Every processor
   starts at the reset address and firmware tells them apart by its architectural number:
@@ -233,8 +243,8 @@ devices.
   compose: the 8237 DMA controllers, an 82077 floppy controller, an IDE controller (PIO, CHS,
   48-bit, ATAPI, bus-master DMA; its drive side `ata_core.c` is shared with AHCI), a VGA
   (registers, planar memory and the read/write modes, text and graphics rendering for the
-  host), a parallel port, and PCI expansion ROMs for option ROMs. `x86_64-ref` offers them as
-  options and boots a legacy BIOS image (`--image bios=`: at 4 GiB, its last 128 KiB below 1
+  host), a parallel port, and PCI expansion ROMs for option ROMs. `x86_64-test` (tests only)
+  wires them as options; `x86_64-ref` boots a legacy BIOS image (`--image bios=`: at 4 GiB, its last 128 KiB below 1
   MiB). A board emulator adds its own chipset (shadow RAM, PAM, the board's I/O) out of tree.
 - **ARM state** (`isa/arm`, `uam/isa/arm.h`): Thumb state is bit 0 of the pc, the ARM
   convention for code addresses, so the translation cache, interrupted blocks and ELF entry

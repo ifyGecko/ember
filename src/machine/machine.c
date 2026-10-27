@@ -189,6 +189,14 @@ const uam_machine_input *uam_machine_find_input(const uam_machine *m, const char
     return NULL;
 }
 
+uam_device *uam_machine_find_device(const uam_machine *m, const char *name)
+{
+    for (uam_device *d = m->devices; d; d = d->next)
+        if (d->name && !strcmp(d->name, name))
+            return d;
+    return NULL;
+}
+
 void uam_machine_add_device_abi(uam_machine *m, uam_device *dev, const uam_abi_layout *abi)
 {
     abi_require(abi, "uam_machine_add_device");

@@ -8,7 +8,7 @@
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
 #   make suzzer          clone suzzer into ./suzzer (ignored by git) for the suzzer integration
-#   make net-check       boot the network test on rv32-ref against a real tap and tun interface
+#   make net-check       boot the network test on rv32-test against a real tap and tun interface
 #                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
 #   make clean
@@ -120,6 +120,9 @@ MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mi
                $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
                $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
+# uam-run plus the boards only ember's tests use (tests/boards/): the reference boards with
+# the generic components they leave out (the 0xB2 SMI port, storage, VGA, printer, virtio-net)
+TRUN      := $(BUILD)/uam-test-run
 TEST_IR   := $(BUILD)/test_ir
 TEST_CORE := $(BUILD)/test_core
 TEST_HOST := $(BUILD)/test_host
@@ -204,6 +207,9 @@ $(BUILD)/uam.pc: Makefile
 	$(call write_pc,$(PREFIX),$@)
 
 $(RUN): $(BUILD)/obj/tools/uam-run.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TRUN): $(BUILD)/obj/tests/boards/uam-test-run.o $(BUILD)/obj/tests/boards/test_boards.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_IR): $(BUILD)/obj/tests/unit/test_ir.o $(LIB)
@@ -339,15 +345,17 @@ arm-test: $(RUN) firmware-arm
 	$(RUN) -b arm-ref -o cpus=4 $(dir $(FW_ARM))smptest-arm.elf < /dev/null
 	$(RUN) -b armeb-ref -o cpus=4 --jit $(dir $(FW_ARM))smptest-thumb-be.elf < /dev/null
 
-# A flat image entered in real mode at 0; interpreter and JIT.
-x86-test: $(RUN) firmware-x86
-	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --stats $(FW_X86) < /dev/null
-	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit --stats $(FW_X86) < /dev/null
+# A flat image entered in real mode at 0; interpreter and JIT. The self-test and the AMD SMM
+# test raise SMIs through the 0xB2 port, and the BIOS boot needs storage, VGA and a printer:
+# x86_64-test (tests/boards/).
+x86-test: $(RUN) $(TRUN) firmware-x86
+	$(TRUN) -b x86_64-test --raw-base 0 --entry 0 --stats $(FW_X86) < /dev/null
+	$(TRUN) -b x86_64-test --raw-base 0 --entry 0 --jit --stats $(FW_X86) < /dev/null
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 $(dir $(FW_X86))legacy.bin < /dev/null
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit $(dir $(FW_X86))legacy.bin < /dev/null
-	$(RUN) -b x86_64-ref -o smm-map=amd64 --raw-base 0 --entry 0 $(dir $(FW_X86))smm-amd.bin < /dev/null
-	$(RUN) -b x86_64-ref -o smm-map=amd64 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smm-amd.bin < /dev/null
-	python3 tests/firmware-x86/bios-check.py $(RUN) $(dir $(FW_X86))biosrom.bin
+	$(TRUN) -b x86_64-test -o smm-map=amd64 --raw-base 0 --entry 0 $(dir $(FW_X86))smm-amd.bin < /dev/null
+	$(TRUN) -b x86_64-test -o smm-map=amd64 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smm-amd.bin < /dev/null
+	python3 tests/firmware-x86/bios-check.py $(TRUN) $(dir $(FW_X86))biosrom.bin
 	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 $(dir $(FW_X86))smp.bin < /dev/null
 	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smp.bin < /dev/null
 
@@ -371,7 +379,7 @@ example-test: lib firmware-mips
 
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
-snapshot-test: $(RUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc example-test
+snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
 	sh tests/snapshot/snapshot-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL) 5000
@@ -379,10 +387,10 @@ snapshot-test: $(RUN) firmware firmware-mips firmware-arm firmware-x86 firmware-
 	sh tests/snapshot/snapshot-check.sh $(RUN) arm-ref $(FW_THUMB) 4321 40000 61000
 	sh tests/snapshot/snapshot-check.sh $(RUN) armeb-ref $(FW_THUMB_BE) 2500 52000 66000
 	sh tests/snapshot/snapshot-check.sh $(EXAMPLE) ext-mips $(FW_MIPS_BE) 4000
-	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(FW_X86) 1000 5000 15000 -- --raw-base 0 --entry 0
+	sh tests/snapshot/snapshot-check.sh $(TRUN) x86_64-test $(FW_X86) 1000 5000 15000 -- --raw-base 0 --entry 0
 	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))legacy.bin 300 700 900 \
 	    -- --raw-base 0 --entry 0
-	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))smm-amd.bin 200 370 420 2000 14000 \
+	sh tests/snapshot/snapshot-check.sh $(TRUN) x86_64-test $(dir $(FW_X86))smm-amd.bin 200 370 420 2000 14000 \
 	    -- -o smm-map=amd64 --raw-base 0 --entry 0
 	sh tests/snapshot/snapshot-check.sh $(RUN) x86_64-ref $(dir $(FW_X86))smp.bin 1 5000 20001 40000 \
 	    -- -o cpus=4 --quantum 1000 --raw-base 0 --entry 0
@@ -472,11 +480,11 @@ xbench: $(RUN)
 	sh tools/xbench.sh --run $(RUN) --out $(abspath $(BUILD))/firmware-bench $(XBENCH_ARGS)
 
 # uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit)
-runner-test: $(RUN) firmware-x86
-	sh tests/runner/runner-check.sh $(RUN) $(FW_X86)
+runner-test: $(TRUN) firmware-x86
+	sh tests/runner/runner-check.sh $(TRUN) $(FW_X86)
 
-net-check: $(RUN) firmware
-	sh tests/net/net-check.sh $(RUN) $(BUILD)/firmware/nettest.elf both
+net-check: $(TRUN) firmware
+	sh tests/net/net-check.sh $(TRUN) $(BUILD)/firmware/nettest.elf both
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include
@@ -490,7 +498,8 @@ clean:
 
 FORCE:
 
--include $(LIB_OBJ:.o=.d) $(BUILD)/obj/tools/uam-run.d $(BUILD)/obj/tests/unit/test_ir.d \
+-include $(LIB_OBJ:.o=.d) $(BUILD)/obj/tools/uam-run.d $(BUILD)/obj/tests/boards/uam-test-run.d \
+         $(BUILD)/obj/tests/boards/test_boards.d $(BUILD)/obj/tests/unit/test_ir.d \
          $(BUILD)/obj/tests/unit/test_core.d $(BUILD)/obj/tests/unit/test_host.d \
          $(BUILD)/obj/tests/unit/test_snapshot.d \
          $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_mmio.d \

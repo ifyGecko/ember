@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""bios-check.py - a legacy BIOS boot on x86_64-ref's generic legacy devices.
+"""bios-check.py - a legacy BIOS boot on the generic legacy devices of x86_64-test
+(tests/boards/: x86_64-ref plus storage, VGA and a printer).
 
-    bios-check.py RUNNER BIOSROM
+    bios-check.py RUNNER BIOSROM          (RUNNER: build/uam-test-run)
 
 Runs biosrom.bin (--image bios=) with a floppy whose boot sector reports to the
 test finisher, an IDE disk whose sector n holds bytes n, a VGA and a printer,
@@ -30,7 +31,7 @@ with tempfile.TemporaryDirectory() as tmp:
         for n in range(128):
             f.write(bytes([n]) * 512)
     for backend in ([], ["--jit"]):
-        cmd = [runner, "-b", "x86_64-ref", "--image", "bios=" + rom, "-o", "floppy=" + fd,
+        cmd = [runner, "-b", "x86_64-test", "--image", "bios=" + rom, "-o", "floppy=" + fd,
                "-o", "ide0=" + hd, "-o", "vga=1", "-o", "vgadump=1", "-o", "lpt=1",
                "-n", "2000000"] + backend
         p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)

@@ -1,4 +1,4 @@
-; biosrom.asm - a legacy-BIOS-style boot ROM for the x86_64-ref board
+; biosrom.asm - a legacy-BIOS-style boot ROM for the x86_64-test board (tests/boards/)
 ; (--image bios=biosrom.bin), the flow of a PC BIOS in miniature on the
 ; generic legacy devices:
 ;

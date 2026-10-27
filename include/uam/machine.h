@@ -231,6 +231,9 @@ uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_sav
 uam_status uam_machine_add_input(uam_machine *m, const char *name, uam_input_fn fn, void *ctx);
 /* The input called `name`, or NULL. */
 const uam_machine_input *uam_machine_find_input(const uam_machine *m, const char *name);
+/* The device called `name` that the board added, or NULL. A board built on
+ * another (it runs that board's build first) finds the parts to wire to. */
+uam_device *uam_machine_find_device(const uam_machine *m, const char *name);
 /* Stop callback usable by devices: ctx is the machine. */
 void       uam_machine_stop_cb(void *ctx, int64_t status);
 /*

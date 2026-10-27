@@ -1,10 +1,13 @@
 /*
  * x86_64_ref.c - "x86_64-ref": the x86-64 reference board.
  *
- * A single-processor PC made only of ember's generic components, for testing
- * the ISA and the standard PC devices. It has no chipset: platforms that need
- * one (memory-controller registers, SMRAM, ACPI and SMI logic) build their own
- * board on these components out of tree.
+ * A PC made only of ember's generic components and only of what every x86-64
+ * PC has: the PC/AT core devices, the APICs, PCI configuration and a boot
+ * flash. It is an example and a starting point, not a model of any board. It
+ * has no chipset (memory-controller registers, SMRAM control, ACPI and SMI
+ * logic) and no optional peripherals (storage, display, printer): a board adds
+ * those out of tree, building on these components or on this board
+ * (uam_machine_find_device finds its parts after its build has run).
  *
  * Memory map:
  *   0x00000000 - low_top        RAM (up to 2 GiB below 4 GiB)
@@ -12,17 +15,15 @@
  *   0xFEC00000                  I/O APIC
  *   0xFED00000                  HPET
  *   0xFEE00000                  local APIC (relocatable via IA32_APIC_BASE)
- *   4 GiB - flash size - 4 GiB  boot flash (CFI): images "flash", or "vars" + "code"
+ *   4 GiB - flash size - 4 GiB  boot flash (CFI): image "flash"
  * I/O ports (the aperture at UAM_X86_PIO_BASE):
  *   0x20/0xA0/0x4D0 8259 + ELCR, 0x40-0x43/0x61 8254, 0x60/0x64 8042 PS/2,
  *   0x70-0x73 RTC/CMOS,
+ *   0x00-0x0F/0xC0-0xDF/0x81-0x8F 8237 DMA controllers and page registers,
  *   0x80 POST codes, 0x92 system control A (and, with the 8042's output
- *   port, the A20 gate), 0xB2 software SMI (any write
- *   raises SMI#), 0x3F8 COM1, 0xCF8-0xCFF PCI
- *   configuration, 0x700 test finisher, the rest
- *   RAZ/WI.
- * PCI bus 0: an AHCI controller at 00:02.0 when a disk or disc is given, an
- * NVMe controller at 00:03.0 when an NVMe image is.
+ *   port, the A20 gate), 0x3F8 COM1, 0xCF8-0xCFF PCI configuration,
+ *   0x700 test finisher, the rest RAZ/WI.
+ * PCI bus 0: empty.
  * Memory no device claims reads as all ones (master abort).
  * Interrupts: ISA IRQs go to the 8259 and to the I/O APIC (IRQ 0 on pin 2);
  * the 8259 feeds the local APIC's LINT0; the local APIC drives the processor.
@@ -37,30 +38,12 @@
  * (--raw-base 0 --entry 0), entered in real mode.
  *
  * Options:
- *   -o debugcon=PORT   debug console port writing to the console
  *   -o cpus=N          processors (default 1; up to 64): one local APIC each
  *                      (APIC ID = index), the others wait for a startup IPI
  *   -o apic-hz=HZ      local APIC timer input clock
  *   -o smm-map=MAP     SMRAM save-state map: intel64 (default) or amd64
  *                      (uam_x86_set_smm_map), for the SMM handler's vendor
- *   -o persist=1       write flash programs/erases back to the image files
- *   -o disk=PATH       ATA disk image on AHCI port 0 (-o disk-mode=rw|ro|volatile)
- *   -o cdrom=PATH      ATAPI disc image on AHCI port 1 (read-only)
- *   -o nvme=PATH       NVMe namespace 1 image (-o nvme-mode=rw|ro|volatile)
- *   -o ide0=PATH       ATA disk on the IDE primary master, -o ide1=PATH on the
- *                      primary slave, -o idecd=PATH an ATAPI disc on the
- *                      secondary master (-o <key>-mode=...); the controller
- *                      (PCI 00:04.0, compatibility mode) decodes 0x1F0/0x3F6
- *                      (IRQ 14) and 0x170/0x376 (IRQ 15)
- *   -o floppy=PATH     floppy image in drive A: (-o floppyb=PATH: drive B:),
- *                      82077 controller at 0x3F0-0x3F5/0x3F7, IRQ 6, DMA 2
- *   -o vga=1           VGA at 0x3B0-0x3DF and 0xA0000-0xBFFFF (PCI 00:05.0);
- *                      --image vgabios=PATH is its BIOS, at 0xC0000 and
- *                      behind the function's expansion ROM BAR
- *   -o vgadump=1       print the VGA text screen when the machine is torn down
- *   -o lpt=1           parallel port at 0x378 (IRQ 7) printing to the console
- * Always: the two 8237 DMA controllers (0x00-0x0F, 0xC0-0xDF, pages at
- * 0x81-0x8F).
+ *   -o persist=1       write flash programs/erases back to the image file
  *
  * --image bios=PATH is a legacy BIOS ROM (up to 1 MiB): it ends at 4 GiB, and
  * its last 128 KiB (all of it if smaller) also appear just below 1 MiB, the
@@ -71,17 +54,11 @@
 #include <string.h>
 
 #include "uam/boards.h"
-#include "uam/dev/ahci.h"
 #include "uam/dev/apic.h"
 #include "uam/dev/cfi_flash.h"
 #include "uam/dev/hpet.h"
-#include "uam/dev/fdc.h"
 #include "uam/dev/i8042.h"
 #include "uam/dev/i8237.h"
-#include "uam/dev/ide.h"
-#include "uam/dev/lpt.h"
-#include "uam/dev/vga.h"
-#include "uam/dev/nvme.h"
 #include "uam/dev/i8254.h"
 #include "uam/dev/i8259.h"
 #include "uam/dev/mc146818.h"
@@ -103,9 +80,6 @@
 #define IOAPIC_BASE    UINT64_C(0xFEC00000)
 #define HPET_BASE      UINT64_C(0xFED00000)
 #define FLASH_BLOCK    UINT64_C(0x1000)
-/* PCI functions of the board carry a vendor ID no vendor is assigned:
- * drivers bind them by class code. */
-#define REF_PCI_VENDOR 0xFFFEu
 #define RTC_EPOCH      UINT64_C(1767225600)   /* 2026-01-01 00:00:00 UTC */
 
 /* ISA interrupt: to the 8259 and to the I/O APIC (IRQ 0 is wired to pin 2). */
@@ -124,9 +98,6 @@ struct ref_board {
     char         lapic_name[MAX_CPUS][12];
     uam_region  *lapic_region;
     isa_irq      isa;
-    uam_blockdev *disk, *cdrom, *nvme, *ide[3], *floppy[2];
-    uam_device   *vga;
-    bool          vgadump;
 };
 
 static uint64_t pio(uint64_t port) { return UAM_X86_PIO_BASE + port; }
@@ -164,15 +135,6 @@ static bool ref_rdmsr(void *ctx, uint32_t msr, uint64_t *val)
 
 static int pic_inta(void *ctx) { return uam_i8259_inta(ctx); }
 
-/* The software SMI port reaches every processor's SMI#. */
-static void smi_all(void *ctx, unsigned input, int level)
-{
-    (void)input;
-    ref_board *b = ctx;
-    for (unsigned i = 0; i < b->ncpu; i++)
-        uam_cpu_irq_sink(uam_machine_cpu(b->m, i), UAM_X86_IRQ_SMI, level);
-}
-
 /* A20M# reaches every processor. */
 static void a20m_all(void *ctx, unsigned input, int level)
 {
@@ -197,18 +159,6 @@ static void pci_intx(void *ctx, unsigned slot, unsigned pin, int level)
 
 static void board_fini(uam_machine *m)
 {
-    ref_board *b = m->board_data;
-    if (b) {
-        if (b->vga && b->vgadump)
-            uam_vga_text_dump(b->vga, stderr);
-        uam_blockdev_close(b->disk);
-        uam_blockdev_close(b->cdrom);
-        uam_blockdev_close(b->nvme);
-        for (unsigned i = 0; i < 3; i++)
-            uam_blockdev_close(b->ide[i]);
-        for (unsigned i = 0; i < 2; i++)
-            uam_blockdev_close(b->floppy[i]);
-    }
     free(m->board_data);
     m->board_data = NULL;
 }
@@ -229,42 +179,32 @@ static uam_status map_io(uam_machine *m, const char *name, uint64_t port, uint64
     return uam_bus_map_mmio(&m->bus, name, pio(port), size, d);
 }
 
-/* Boot flash ending at 4 GiB: "flash" alone, or "vars" below "code". */
+/* Boot flash ending at 4 GiB: image "flash". */
 static uam_status map_flash(uam_machine *m, const uam_board_config *cfg)
 {
-    const char *names[2] = { uam_board_config_image(cfg, "code"), uam_board_config_image(cfg, "vars") };
-    const char *whole = uam_board_config_image(cfg, "flash");
-    uint64_t top = UINT64_C(0x100000000);
-    if (whole) {
-        names[0] = whole;
-        names[1] = NULL;
-    }
-    for (unsigned i = 0; i < 2; i++) {
-        if (!names[i])
-            continue;
-        uint8_t *data;
-        size_t len;
-        uam_status st = uam_load_file(names[i], &data, &len);
-        if (st != UAM_OK)
-            return st;
-        uint64_t size = (len + FLASH_BLOCK - 1) & ~(FLASH_BLOCK - 1);
-        if (!size || size > (UINT64_C(16) << 20)) {
-            free(data);
-            uam_log(UAM_LOG_ERROR, "x86_64-ref", "%s: flash image size %zu not supported", names[i], len);
-            return UAM_ERR_INVALID;
-        }
-        top -= size;
-        uam_device *f = uam_cfi_flash_map(&m->bus, i == 0 ? "flash-code" : "flash-vars", top, size,
-                                          FLASH_BLOCK, data, len);
+    const char *path = uam_board_config_image(cfg, "flash");
+    if (!path)
+        return UAM_OK;
+    uint8_t *data;
+    size_t len;
+    uam_status st = uam_load_file(path, &data, &len);
+    if (st != UAM_OK)
+        return st;
+    uint64_t size = (len + FLASH_BLOCK - 1) & ~(FLASH_BLOCK - 1);
+    if (!size || size > (UINT64_C(16) << 20)) {
         free(data);
-        if (!f)
-            return UAM_ERR_NOMEM;
-        uam_machine_add_device(m, f);
-        const char *persist = uam_board_config_option(cfg, "persist");
-        if (persist && strcmp(persist, "0") != 0 &&
-            (st = uam_cfi_flash_set_backing_file(f, names[i])) != UAM_OK)
-            return st;
+        uam_log(UAM_LOG_ERROR, "x86_64-ref", "%s: flash image size %zu not supported", path, len);
+        return UAM_ERR_INVALID;
     }
+    uam_device *f = uam_cfi_flash_map(&m->bus, "flash", UINT64_C(0x100000000) - size, size,
+                                      FLASH_BLOCK, data, len);
+    free(data);
+    if (!f)
+        return UAM_ERR_NOMEM;
+    uam_machine_add_device(m, f);
+    const char *persist = uam_board_config_option(cfg, "persist");
+    if (persist && strcmp(persist, "0") != 0)
+        return uam_cfi_flash_set_backing_file(f, path);
     return UAM_OK;
 }
 
@@ -442,125 +382,21 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
     uam_pci_set_intx_router(pci, pci_intx, ioapic);
     uam_pci_set_msi_sink(pci, uam_apic_bus_msi, abus);
 
-    /* storage */
-    if ((st = uam_board_open_disk(cfg, "disk", 512, &b->disk)) != UAM_OK ||
-        (st = uam_board_open_disk(cfg, "cdrom", 2048, &b->cdrom)) != UAM_OK)
-        return st;
-    if (b->disk || b->cdrom) {
-        uam_device *ahci = uam_ahci_create("ahci", 2, REF_PCI_VENDOR, 0x0001, 0);
-        if ((st = add(m, ahci)) != UAM_OK ||
-            (st = uam_pci_register(pci, uam_ahci_func(ahci), 2, 0)) != UAM_OK)
-            return st;
-        if ((b->disk && (st = uam_ahci_attach(ahci, 0, b->disk, false)) != UAM_OK) ||
-            (b->cdrom && (st = uam_ahci_attach(ahci, 1, b->cdrom, true)) != UAM_OK))
-            return st;
-    }
-    if ((st = uam_board_open_disk(cfg, "nvme", 512, &b->nvme)) != UAM_OK)
-        return st;
-    if (b->nvme) {
-        uam_device *nvme = uam_nvme_create("nvme", REF_PCI_VENDOR, 0x0002, 0);
-        if ((st = add(m, nvme)) != UAM_OK ||
-            (st = uam_pci_register(pci, uam_nvme_func(nvme), 3, 0)) != UAM_OK ||
-            (st = uam_nvme_attach(nvme, 1, b->nvme)) != UAM_OK)
-            return st;
-    }
-
-    /* legacy storage: DMA controllers, IDE, floppy */
+    /* the 8237 DMA controllers */
     uam_device *dma = uam_i8237_create("dma", &m->bus);
     if ((st = add(m, dma)) != UAM_OK ||
         (st = map_io(m, "dma1", 0x00, 16, uam_i8237_dma1(dma))) != UAM_OK ||
         (st = map_io(m, "dma2", 0xC0, 32, uam_i8237_dma2(dma))) != UAM_OK ||
         (st = map_io(m, "dma-page", 0x81, 15, uam_i8237_page(dma))) != UAM_OK)
         return st;
-    static const char *const ide_keys[3] = { "ide0", "ide1", "idecd" };
-    for (unsigned i = 0; i < 3; i++)
-        if ((st = uam_board_open_disk(cfg, ide_keys[i], i == 2 ? 2048 : 512, &b->ide[i])) != UAM_OK)
-            return st;
-    if (b->ide[0] || b->ide[1] || b->ide[2]) {
-        uam_device *ide = uam_ide_create("ide", REF_PCI_VENDOR, 0x0003, 0);
-        if ((st = add(m, ide)) != UAM_OK ||
-            (st = uam_pci_register(pci, uam_ide_func(ide), 4, 0)) != UAM_OK ||
-            (st = map_io(m, "ide0", 0x1F0, 8, uam_ide_cmd(ide, 0))) != UAM_OK ||
-            (st = map_io(m, "ide0-ctl", 0x3F6, 1, uam_ide_ctl(ide, 0))) != UAM_OK ||
-            (st = map_io(m, "ide1", 0x170, 8, uam_ide_cmd(ide, 1))) != UAM_OK ||
-            (st = map_io(m, "ide1-ctl", 0x376, 1, uam_ide_ctl(ide, 1))) != UAM_OK)
-            return st;
-        if ((b->ide[0] && (st = uam_ide_attach(ide, 0, 0, b->ide[0], false)) != UAM_OK) ||
-            (b->ide[1] && (st = uam_ide_attach(ide, 0, 1, b->ide[1], false)) != UAM_OK) ||
-            (b->ide[2] && (st = uam_ide_attach(ide, 1, 0, b->ide[2], true)) != UAM_OK))
-            return st;
-        uam_signal_connect(uam_ide_irq_line(ide, 0), isa_sink, isa, 14);
-        uam_signal_connect(uam_ide_irq_line(ide, 1), isa_sink, isa, 15);
-    }
-    static const char *const fd_keys[2] = { "floppy", "floppyb" };
-    for (unsigned i = 0; i < 2; i++)
-        if ((st = uam_board_open_disk(cfg, fd_keys[i], 512, &b->floppy[i])) != UAM_OK)
-            return st;
-    if (b->floppy[0] || b->floppy[1]) {
-        uam_device *fdc = uam_fdc_create("fdc", dma, 2);
-        if ((st = add(m, fdc)) != UAM_OK ||
-            (st = map_io(m, "fdc", 0x3F0, 6, uam_fdc_regs(fdc))) != UAM_OK ||
-            (st = map_io(m, "fdc-dir", 0x3F7, 1, uam_fdc_dir(fdc))) != UAM_OK)
-            return st;
-        for (unsigned i = 0; i < 2; i++)
-            if (b->floppy[i] && (st = uam_fdc_insert(fdc, i, b->floppy[i], false)) != UAM_OK) {
-                uam_log(UAM_LOG_ERROR, "x86_64-ref", "%s: not a floppy image size", fd_keys[i]);
-                return st;
-            }
-        uam_signal_connect(uam_fdc_irq_line(fdc), isa_sink, isa, 6);
-    }
-
-    /* display and printer */
-    const char *vgaopt = uam_board_config_option(cfg, "vga");
-    const char *vgabios = uam_board_config_image(cfg, "vgabios");
-    if ((vgaopt && strcmp(vgaopt, "0") != 0) || vgabios) {
-        uam_device *vga = uam_vga_create("vga", REF_PCI_VENDOR, 0x0004, 0);
-        if ((st = add(m, vga)) != UAM_OK ||
-            (st = map_io(m, "vga", 0x3B0, UAM_VGA_IO_SIZE, uam_vga_io(vga))) != UAM_OK ||
-            (st = uam_bus_map_mmio_ex(&m->bus, "vga-mem", 0xA0000, UAM_VGA_MEM_SIZE, uam_vga_mem(vga),
-                                      &(uam_map_attrs){ .prio = 1 })) != UAM_OK)
-            return st;
-        if (vgabios) {
-            uint8_t *data;
-            size_t len;
-            if ((st = uam_load_file(vgabios, &data, &len)) != UAM_OK)
-                return st;
-            uint64_t romsz = 2048;
-            while (romsz < len)
-                romsz <<= 1;
-            uam_device *img = uam_pci_rom_image_create("vgabios", data, len);
-            st = img ? uam_bus_map_rom(&m->bus, "vgabios-isa", 0xC0000, (len + 511) & ~511ull, data, len)
-                     : UAM_ERR_NOMEM;
-            free(data);
-            if (st != UAM_OK || (st = add(m, img)) != UAM_OK)
-                return st;
-            uam_pci_func_rom(uam_vga_func(vga), romsz, img);
-        }
-        if ((st = uam_pci_register(pci, uam_vga_func(vga), 5, 0)) != UAM_OK)
-            return st;
-        b->vga = vga;
-        const char *dump = uam_board_config_option(cfg, "vgadump");
-        b->vgadump = dump && strcmp(dump, "0") != 0;
-    }
-    const char *lptopt = uam_board_config_option(cfg, "lpt");
-    if (lptopt && strcmp(lptopt, "0") != 0) {
-        uam_device *lpt = uam_lpt_create("lpt1", cfg->console);
-        if ((st = add(m, lpt)) != UAM_OK || (st = map_io(m, "lpt1", 0x378, 3, lpt)) != UAM_OK)
-            return st;
-        uam_signal_connect(uam_lpt_irq_line(lpt), isa_sink, isa, 7);
-    }
 
     /* small platform registers */
     uam_device *sysctl = uam_pc_sysctl_create("sysctl");
     uam_device *post = uam_postcode_create("post");
     uam_device *test = uam_test_finisher_create("test", uam_machine_stop_cb, m);
-    uam_device *smip = uam_smi_port_create("smi-port");
-    if ((st = add(m, sysctl)) != UAM_OK || (st = add(m, post)) != UAM_OK || (st = add(m, test)) != UAM_OK ||
-        (st = add(m, smip)) != UAM_OK)
+    if ((st = add(m, sysctl)) != UAM_OK || (st = add(m, post)) != UAM_OK || (st = add(m, test)) != UAM_OK)
         return st;
-    uam_signal_connect(uam_smi_port_line(smip), smi_all, b, 0);
     if ((st = map_io(m, "sysctl", 0x92, 1, sysctl)) != UAM_OK ||
-        (st = map_io(m, "smi-port", 0xB2, 1, smip)) != UAM_OK ||
         (st = map_io(m, "post", 0x80, 1, post)) != UAM_OK ||
         (st = map_io(m, "test", 0x700, 0x10, test)) != UAM_OK)
         return st;
@@ -572,13 +408,6 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
     uam_signal_connect(uam_i8042_a20_line(kbc), uam_a20_gate_input, a20, 0);
     uam_signal_connect(uam_pc_sysctl_a20_line(sysctl), uam_a20_gate_input, a20, 1);
     uam_signal_connect(uam_a20_gate_a20m_line(a20), a20m_all, b, 0);
-    const char *dc = uam_board_config_option(cfg, "debugcon");
-    if (dc) {
-        uam_device *con = uam_debugcon_create("debugcon", cfg->console, 0xFF);
-        if ((st = add(m, con)) != UAM_OK ||
-            (st = map_io(m, "debugcon", strtoull(dc, NULL, 0) & 0xFFFF, 1, con)) != UAM_OK)
-            return st;
-    }
 
     /* each processor's view of the platform; its APIC offers x2APIC mode and
      * the TSC-deadline timer */

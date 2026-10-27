@@ -150,6 +150,8 @@ uam_pci_bus *uam_pci_bus_create(const char *name, uam_bus *sys, uint64_t io_base
 uam_device  *uam_pci_bus_device(uam_pci_bus *pb);   /* = uam_pci_cam */
 uam_device  *uam_pci_cam(uam_pci_bus *pb);
 uam_device  *uam_pci_ecam(uam_pci_bus *pb);
+/* The bus whose uam_pci_cam device `cam` is, or NULL if it is not one. */
+uam_pci_bus *uam_pci_bus_of(uam_device *cam);
 /* The device that sees accesses to CONFIG_ADDRESS other than a dword (offsets 0-3,
  * little-endian), or NULL. Reads go to it too: without one they return
  * CONFIG_ADDRESS's bytes. */

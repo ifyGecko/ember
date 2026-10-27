@@ -1,7 +1,8 @@
-; selftest.asm - x86-64 ISA self-test for the x86_64-ref board.
+; selftest.asm - x86-64 ISA self-test for the x86_64-test board (tests/boards/:
+; x86_64-ref plus the 0xB2 software SMI port).
 ;
 ; A flat image loaded at physical 0 and entered in real mode at 0
-; (uam-run -b x86_64-ref --raw-base 0 --entry 0). It tests real mode, then
+; (uam-test-run -b x86_64-test --raw-base 0 --entry 0). It tests real mode, then
 ; switches to 32-bit protected mode and to 64-bit long mode (identity-mapped
 ; with 2 MiB pages), checking arithmetic, flags, string instructions,
 ; interrupts and exceptions through the IVT and the IDT, paging faults,
