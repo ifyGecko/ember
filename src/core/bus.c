@@ -263,6 +263,20 @@ static bool watched(const uam_bus *bus, uint64_t base, uint64_t size)
     return false;
 }
 
+/* A UAM_WATCH_FAULT watch of the matching direction turns its range into a guard page:
+ * the overlapping access faults instead of returning/storing data. */
+static bool guard_hit(const uam_bus *bus, uint64_t addr, unsigned size, bool is_write)
+{
+    unsigned dir = is_write ? UAM_WATCH_WRITE : UAM_WATCH_READ;
+    for (uint32_t i = 0; i < bus->n_watches; i++) {
+        const uam_watch *w = &bus->watches[i];
+        if ((w->kinds & UAM_WATCH_FAULT) && (w->kinds & dir)
+            && overlaps(addr, size, w->base, w->size))
+            return true;
+    }
+    return false;
+}
+
 static void fire_watches(uam_bus *bus, uint64_t addr, unsigned size, bool is_write, uint64_t val)
 {
     for (uint32_t i = 0; i < bus->n_watches; i++) {
@@ -583,6 +597,9 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
     hit h;
     uam_status st;
 
+    if (!side_effect_free && bus->n_watches && guard_hit(bus, addr, size, false))
+        return UAM_ERR_FAULT;   /* UAM_WATCH_FAULT guard */
+
     switch (resolve(bus, addr, size, &h)) {
     case RES_SPLIT:
         return read_bytewise(bus, addr, size, attrs, val);
@@ -651,6 +668,9 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
     val &= uam_mask(size * 8);
     hit h;
     uam_status st;
+
+    if (!debug && bus->n_watches && guard_hit(bus, addr, size, true))
+        return UAM_ERR_FAULT;   /* UAM_WATCH_FAULT guard */
 
     switch (resolve(bus, addr, size, &h)) {
     case RES_SPLIT:

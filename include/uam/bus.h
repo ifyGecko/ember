@@ -92,7 +92,13 @@ typedef void (*uam_code_write_fn)(void *ctx, uint64_t page_base);
  * after the access completed; `val` is the value read or written. */
 typedef void (*uam_watch_fn)(void *ctx, uint64_t addr, unsigned size, bool is_write, uint64_t val);
 
-enum { UAM_WATCH_READ = 1u << 0, UAM_WATCH_WRITE = 1u << 1 };
+enum { UAM_WATCH_READ = 1u << 0, UAM_WATCH_WRITE = 1u << 1,
+       /* UAM_WATCH_FAULT: turn the watched range into a guard - a matching data access
+        * (READ and/or WRITE, honouring the direction bits) faults like an unmapped page
+        * (UAM_ERR_FAULT) instead of returning data, so an out-of-bounds access is caught
+        * as a bus fault by whoever observes exceptions. Fetches and debug accesses are
+        * exempt. The watch's fn is not called for a faulted access. */
+       UAM_WATCH_FAULT = 1u << 2 };
 
 typedef struct uam_watch {
     int          id;
