@@ -12,8 +12,9 @@
  *      - algebraic identities (x+0, x|0, x^0, x&-1, x*1, shifts by 0, x&0, x*0,
  *        select on a constant, conversions of constants);
  *      - register forwarding: a GET of a register whose value is known from an earlier
- *        GET or unguarded PUT in the block is replaced by that value. HELPER, SYSRD and
- *        SYSWR forget everything (their native code may touch the register file);
+ *        GET or unguarded PUT in the block is replaced by that value, and a GET of the
+ *        low bytes of a known wider value by a TRUNC of it. HELPER, SYSRD and SYSWR
+ *        forget everything (their native code may touch the register file);
  *      - constant guards: a guard known false removes the op (its result becomes 0), a
  *        guard known true is dropped; an EXIT/TRAP that thereby becomes unconditional
  *        ends the block (everything after it is unreachable);
@@ -110,6 +111,17 @@ static uam_ref lookup_known(const opt *o, uint32_t off, unsigned width)
     for (unsigned i = 0; i < o->n_known; i++)
         if (o->known[i].off == off && o->known[i].width == width)
             return o->known[i].val;
+    return UAM_REF_NONE;
+}
+
+/* A known value of more than width bits starting at off (*kw: its width), or NONE. */
+static uam_ref lookup_wider(const opt *o, uint32_t off, unsigned width, unsigned *kw)
+{
+    for (unsigned i = 0; i < o->n_known; i++)
+        if (o->known[i].off == off && o->known[i].width > width) {
+            *kw = o->known[i].width;
+            return o->known[i].val;
+        }
     return UAM_REF_NONE;
 }
 
@@ -389,7 +401,24 @@ bool uam_optimize(uam_block *blk)
                 o.repl[in.dst] = k;
                 continue;
             }
-            remember(&o, in.aux, in.width, in.dst);
+            unsigned kw;
+            k = lookup_wider(&o, in.aux, in.width, &kw);
+            if (uam_ref_is_none(k)) {
+                remember(&o, in.aux, in.width, in.dst);
+            } else {
+                /* The low bytes of a known wider value (the register file is
+                 * little-endian): a TRUNC of it, simplified like any other. */
+                in = (uam_insn){ .op = UAM_OP_TRUNC, .width = in.width, .guard = UAM_REF_NONE,
+                                 .dst = in.dst, .a = k, .b = UAM_REF_NONE, .c = UAM_REF_NONE };
+                uam_ref r = simplify(&o, &in, kw);
+                if (uam_ref_is_none(r))
+                    r = cse_find(&o, &in);
+                if (!uam_ref_is_none(r)) {
+                    o.repl[in.dst] = r;
+                    continue;
+                }
+                cse_add(&o, &in, w);
+            }
         } else if (op == UAM_OP_PUT) {
             if (uam_ref_is_none(in.guard))
                 remember(&o, in.aux, in.width, in.a);

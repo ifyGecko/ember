@@ -1,6 +1,6 @@
 # Step 13 design: the x86 gap (narrow register reads, writes carried across chained exits)
 
-Status: **proposed, for review** (2026-10-28). Nothing here is implemented yet. It builds on step 9 (docs/jit-dead-puts-design.md) and on the chaining of steps 7 and 10 (docs/jit-perf.md).
+Status: **approved** (2026-10-28). Stage N is implemented (§9); stages C1 and C2 are not yet. It builds on step 9 (docs/jit-dead-puts-design.md) and on the chaining of steps 7 and 10 (docs/jit-perf.md).
 
 ## 1. What it is, in one paragraph
 
@@ -64,7 +64,7 @@ This attacks the same spread step 9 did, where flag-heavy ISAs are slower than f
 
 **Rule:** a GET of bytes [off, off+w) whose bytes all lie inside a known value v at [koff, koff+kw) becomes:
 - `TRUNC.w v` when off == koff;
-- `TRUNC.w (LSHR v, 8·(off-koff))` otherwise. That case covers x86 `ah` and the sub-registers of other ISAs.
+- `TRUNC.w (LSHR v, 8·(off-koff))` otherwise. That case covers x86 `ah` and the sub-registers of other ISAs. (Not implemented: see §9.)
 
 The register file is little-endian by definition, so this holds for every guest byte order. The new ops then go through the existing simplify, peephole and CSE paths. For example, `TRUNC.32 (ZEXT.64 x)` becomes x.
 
@@ -253,3 +253,23 @@ The comparison covers the register file, RAM, icount and the device log.
 ## 8. What remains after this
 
 If both stages reach their bounds, x86 sits at about 1.0–1.17× RV32 on the kernels. The rest is common to every ISA: each loop pass re-reads its guest registers from memory. That is the "keep guest registers in host registers across a self-loop" item, a separate step judged on all guests.
+
+## 9. As implemented
+
+**Stage N** (`lookup_wider` and the GET case of `uam_optimize`, `src/ir/opt.c`):
+- **Only the same-offset case.** A GET of the low bytes of a known wider value becomes `TRUNC.w v`, which then goes through simplify and CSE like any pure op.
+- **The higher-offset case is left out.** It needs a second op (the LSHR), and so an insertion in the middle of the optimizer's in-place compacting pass. Counted with a throwaway build, statically over every translated block, it does not pay for that:
+
+| Workload | exact-match reads (forwarded before) | same offset, wider (now forwarded) | higher offset |
+|---|---:|---:|---:|
+| bench, x86 | 845 | 455 | 0 |
+| bench, RV32 / MIPS / ARM / Thumb / PPC | 847–1159 | 0 | 0 |
+| OVMF boot, 1e9 instructions | 105098 | 7802 | 91 |
+| VxWorks, 6e7 instructions | 30714 | 0 | 0 |
+
+- **Other guests are unaffected.** On the other guests the bench IR is identical before and after, since the new case never fires there.
+- **Tests:**
+  - test_jitdiff level C pattern 9 covers narrow reads: of a written value, of a constant, of an earlier wider GET, after a narrower write, at a higher offset, after a guarded write, and after a helper.
+  - `check_narrow_reads` checks the optimizer's output: the forwardable GETs are gone and the others remain.
+  - Mutation checks caught all five variants tried: a higher offset treated as the low bytes, no forwarding, a narrower write not forgetting the wide value, a guarded write remembered, and a helper keeping known values.
+

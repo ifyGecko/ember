@@ -148,6 +148,7 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 10: jump table for computed exits | 1.69 s | 1.72 s | a computed EXIT whose slot holds another target looks its target pc up in a 4096-entry direct-mapped table of links shared by all blocks (hash, then pc and epoch compared) and links it there on a miss, instead of returning to the run loop. Measured against 1.71 s / 1.81 s in the same session; blocks returning to the run loop 0.41 M -> 0.25 M / 5.5 M -> 3.2 M; code +1%. `UAM_JIT_JTAB_BITS=N` uses 2^N entries (test_jit runs N=1 so links collide). Consoles and the interpreter-vs-JIT state identical on both |
 | 11: spin loops | 1.69 s | 0.51 s | not a code generation change: the run loop adds the passes of a block that waits on memory (jumps back to itself, only loads, pure ops and register writes) up to the next deadline or host poll to icount at once, after evaluating one pass without effect shows it would change nothing (src/exec/spin.h; both backends). Measured against 1.68 s / 1.72 s in the same session; VxWorks under the interpreter 40.2 s -> 4.4 s; xbench unchanged (no kernel spins). `UAM_SPIN_SKIP=0` turns it off. Consoles, block counts and the interpreter-vs-JIT state identical on both |
 | 12: stores next to code | 1.74 s | 0.54 s | a page holding translated code goes into the data-TLB write set under a tag the inline probe never matches; a store that misses calls one of 16 shared stubs (size, byte order, alignment) that read the page's 64-byte code-line mask and store inline unless a byte falls in a code line (src/exec/jit_x86.c, emit_code_probe; `uam_bus_page_host_code`). Unchanged against 1.74 s / 0.53 s in the same session (bridge stores 76 K -> 38 K / 1.56 M -> 1.56 M, the rest device writes); code +1.1% / +1.5% (inline probes instead of stubs were +11% / +17% for 1-2% more on the bench). Consoles and the interpreter-vs-JIT state identical on both |
+| 13N: narrow register reads | 1.61 s | 8.22 s* | a GET of the low bytes of a register whose wider value the block already knows (from a PUT or a GET) becomes a TRUNC of that value instead of a register-file read, and folds from there (src/ir/opt.c, `lookup_wider`; docs/jit-carry-design.md, stage N). Only x86 has such reads (455 sites on the bench, 7802 on OVMF; none on the other guests, whose IR is unchanged). Measured against 1.64 s / 8.37 s in the same session; OVMF code +0.2%. *VxWorks is not comparable with the rows above: its board sources (~/tplink-qwen-emu, uncommitted GMAC work) changed since, and the baseline build of the same board sources gives the same console. Consoles and the interpreter-vs-JIT state identical on both |
 
 ## Where it stands (after step 8c)
 
@@ -315,10 +316,22 @@ Geometric-mean kernel time per guest after it: RV32 0.110 s, MIPS 0.117 / 0.116,
 PPC 0.133, ARM 0.143, Thumb 0.145 / 0.147, x86 0.149. The workloads store little next
 to their code and are unchanged.
 
+### After step 13, stage N
+
+x86 kernel time before over after (`--per-kernel --times --rounds 1600 --runs 9
+--variants x86`, two alternating pairs of runs, both pairs agreeing to 1%):
+
+| crc | sort | matmul | string | interp | list | u64 | fmt | **geomean** |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1.06 | 1.03 | 1.05 | 1.02 | 1.00 | 1.05 | 1.02 | 1.05 | **1.035** |
+
+The other guests' IR is identical before and after, so their runs only showed noise
+(up to 12% on single kernels in a full run). x86 over RV32 per kernel is now about 1.35-1.65x (full run, same session).
+Stages C1 and C2 (writes carried across chained exits) are next.
+
 Not done yet:
-- **The x86 gap** (x86 at 1.4-1.8x RV32's kernel time): writes live at block exits
-  and narrow register reads that are not forwarded. Proposed as step 13 in
-  docs/jit-carry-design.md, for review.
+- **The x86 gap** (x86 at about 1.35-1.65x RV32's kernel time): writes live at block exits.
+  Step 13, stages C1 and C2 in docs/jit-carry-design.md (approved; stage N done).
 - **Translation cost on OVMF**: 0.23 s of 1.69 s.
 - **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
   once at block entry. It changes how stopping at a deadline is implemented, so it

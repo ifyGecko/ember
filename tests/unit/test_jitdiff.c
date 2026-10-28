@@ -13,7 +13,8 @@
  *
  * Level A runs every pure op at every valid width with temp and immediate operands
  * over edge and random values. Level C runs fixed shapes the optimizer rewrites
- * (overwritten register writes, flags read back, CSE) over random register files.
+ * (overwritten register writes, flags read back, CSE, narrow reads of known wider
+ * values) over random register files.
  * Level D runs shapes of register writes the JIT defers across instructions (replayed
  * where the block may stop) under every stop condition below.
  * Level B runs random verified blocks: guards, CONT and
@@ -634,6 +635,28 @@ static void pattern(uam_builder *b, unsigned p)
         uam_exit(b, e, uam_imm(b, 0x3200), UAM_EXIT_JUMP);
         break;
     }
+    case 9: {   /* narrow reads of a register written or read whole earlier */
+        uam_put(b, 64, 0, uam_unop(b, UAM_OP_ZEXT, 64, uam_get(b, 32, 8)), N);
+        uam_put(b, 32, 40, uam_get(b, 32, 0), N);                 /* the low half */
+        uam_put(b, 8, 44, uam_get(b, 8, 0), N);
+        uam_put(b, 64, 16, uam_imm(b, 0x8877665544332211ull), N);
+        uam_put(b, 16, 46, uam_get(b, 16, 16), N);                 /* of a constant */
+        uam_ref w = uam_get(b, 64, 56);
+        uam_put(b, 32, 48, uam_binop(b, UAM_OP_ADD, 32, uam_get(b, 32, 56),
+                                     uam_unop(b, UAM_OP_TRUNC, 32, w)), N);
+        uam_imark(b, 0x3004, 4);
+        uam_put(b, 64, 24, uam_get(b, 64, 8), N);                  /* then a narrower write */
+        uam_put(b, 8, 24, uam_get(b, 8, 1), N);
+        uam_put(b, 32, 52, uam_get(b, 32, 24), N);
+        uam_put(b, 64, 32, uam_get(b, 64, 0), N);                  /* a higher offset */
+        uam_put(b, 8, 64, uam_get(b, 8, 33), N);
+        uam_put(b, 64, 8, uam_get(b, 64, 56), uam_unop(b, UAM_OP_TRUNC, 1, uam_get(b, 8, 66)));
+        uam_put(b, 32, 68, uam_get(b, 32, 8), N);                  /* after a guarded write */
+        uam_ref h = uam_helper(b, &test_isa.helpers, 1, uam_get(b, 64, 16), N, N, N);
+        uam_put(b, 8, 65, uam_get(b, 8, 0), N);                    /* after a helper */
+        uam_put(b, 32, 56, h, N);
+        break;
+    }
     default: {  /* commutative operands and repeated subexpressions */
         uam_ref x = uam_get(b, 32, 0), y = uam_get(b, 32, 8);
         uam_ref s1 = uam_binop(b, UAM_OP_ADD, 32, x, y), s2 = uam_binop(b, UAM_OP_ADD, 32, y, x);
@@ -650,6 +673,28 @@ static void pattern(uam_builder *b, unsigned p)
     uam_exit(b, NONE, uam_imm(b, 0x3008), UAM_EXIT_JUMP);
 }
 
+/* Pattern 9 after the optimizer: the narrow reads of a known wider value at the same
+ * offset are gone (5: offsets 0, 16, 56), the others still read the register file
+ * (offset 24 after a narrower write, 33, 8 after a guarded write, 0 after a helper). */
+static void check_narrow_reads(const uam_block *raw)
+{
+    uam_block *o = clone_block(raw);
+    unsigned narrow[REGFILE] = { 0 };
+    if (uam_optimize(o))
+        for (uint32_t i = 0; i < o->n_insn; i++)
+            if (o->insn[i].op == UAM_OP_GET && o->insn[i].width < 64)
+                narrow[o->insn[i].aux]++;
+    checks++;
+    if (narrow[16] || narrow[56] || narrow[0] != 1 || !narrow[24] || !narrow[33] || narrow[8] != 2) {
+        fprintf(stderr, "FAIL level C: narrow reads not forwarded as expected "
+                "(GETs at 0:%u 8:%u 16:%u 24:%u 33:%u 56:%u)\n", narrow[0], narrow[8],
+                narrow[16], narrow[24], narrow[33], narrow[56]);
+        uam_print_block(stderr, o, NULL);
+        failures++;
+    }
+    uam_block_free(o);
+}
+
 static void level_c(void)
 {
     uam_builder b;
@@ -657,7 +702,7 @@ static void level_c(void)
     with_mem = false;
     dev_exit_at = 0;
     unsigned n = 0;
-    for (unsigned p = 0; p < 9; p++) {
+    for (unsigned p = 0; p < 10; p++) {
         for (unsigned it = 0; it < 400; it++) {
             pattern(&b, p);
             uam_block *blk = uam_builder_finish(&b);
@@ -668,6 +713,8 @@ static void level_c(void)
                 uam_block_free(blk);
                 break;
             }
+            if (p == 9 && it == 0)
+                check_narrow_reads(blk);
             for (unsigned i = 0; i < ADDR_SLOTS; i++)
                 start.regfile[i] = chance(40) ? (uint8_t)rn(2) : (uint8_t)val(8);
             start.icount = ICOUNT0;
