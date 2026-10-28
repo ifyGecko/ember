@@ -316,6 +316,9 @@ PPC 0.133, ARM 0.143, Thumb 0.145 / 0.147, x86 0.149. The workloads store little
 to their code and are unchanged.
 
 Not done yet:
+- **The x86 gap** (x86 at 1.4-1.8x RV32's kernel time): writes live at block exits
+  and narrow register reads that are not forwarded. Proposed as step 13 in
+  docs/jit-carry-design.md, for review.
 - **Translation cost on OVMF**: 0.23 s of 1.69 s.
 - **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
   once at block entry. It changes how stopping at a deadline is implemented, so it
