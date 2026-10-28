@@ -5,7 +5,8 @@
  * Each scenario runs three ways - the interpreter, the JIT with chaining off, and
  * the JIT with chaining on - and must end in bit-identical machine state. The guest
  * is a hand-encoded MIPS32 big-endian program built to stress what chaining skips:
- * calls and returns (constant and computed EXITs), data-dependent branches, code it
+ * calls and returns (constant and computed EXITs, one with eight targets, also run with a
+ * two-entry jump table so its links collide), data-dependent branches, code it
  * rewrites itself (on a page other blocks link into), interrupts it disables and
  * re-enables (DI/EI) while a CP0 timer fires, and an MMIO device. Between runs the
  * host rewrites code, adds and removes PC hooks, and takes and restores snapshots.
@@ -34,7 +35,7 @@ static int n_checks, n_failed;
 
 /* ---- a tiny MIPS32 encoder ---------------------------------------------- */
 
-enum { ZERO = 0, T0 = 8, T1, T2, T3, T4, T5, T6, T7, S0 = 16, T8 = 24, T9, K0, K1, RA = 31 };
+enum { ZERO = 0, V0 = 2, T0 = 8, T1, T2, T3, T4, T5, T6, T7, S0 = 16, S1, T8 = 24, T9, K0, K1, RA = 31 };
 
 static uint32_t i_type(unsigned op, unsigned rs, unsigned rt, uint32_t imm)
 {
@@ -55,6 +56,7 @@ static uint32_t OR(unsigned rd, unsigned rs, unsigned rt)   { return r_type(rs, 
 static uint32_t SLL(unsigned rd, unsigned rt, unsigned sa)  { return r_type(0, rt, rd, sa, 0x00); }
 static uint32_t SRL(unsigned rd, unsigned rt, unsigned sa)  { return r_type(0, rt, rd, sa, 0x02); }
 static uint32_t JR(unsigned rs)                             { return r_type(rs, 0, 0, 0, 0x08); }
+static uint32_t JALR(unsigned rs)                           { return r_type(rs, 0, RA, 0, 0x09); }
 static uint32_t BNE(unsigned rs, unsigned rt, uint32_t at, uint32_t to)
 {
     return i_type(0x05, rs, rt, (uint16_t)((int32_t)(to - (at + 4)) >> 2));
@@ -76,6 +78,8 @@ static uint32_t MTC0(unsigned rt, unsigned rd)              { return 0x40800000u
 #define TICK_PHYS 0x1F000000u   /* kseg1 0xBF000000 */
 #define FUNC      0x1000u       /* the called function: its own code page */
 #define PATCH     (FUNC + 4)    /* the instruction the guest rewrites */
+#define STUBS     0x2000u       /* eight 2-instruction functions: one computed call */
+#define RET_PC    0x80000028u   /* where FUNC returns to */
 #define CP0(r, s) ((r) * 8 + (s))  /* sysreg id of CP0 register r, select s */
 
 typedef struct tickdev {
@@ -148,8 +152,8 @@ static void put_prog(uam_machine *m, uint32_t at, const uint32_t *w, size_t n)
         put32(m, at + 4 * i, w[i]);
 }
 
-typedef enum mode { INTERP, JIT_NOCHAIN, JIT_CHAIN } mode;
-static const char *const mode_name[] = { "interp", "jit (no chain)", "jit" };
+typedef enum mode { INTERP, JIT_NOCHAIN, JIT_CHAIN, JIT_TAB1 } mode;
+static const char *const mode_name[] = { "interp", "jit (no chain)", "jit", "jit (2-entry jump table)" };
 
 /*
  * main (0x80000000):
@@ -158,11 +162,18 @@ static const char *const mode_name[] = { "interp", "jit (no chain)", "jit" };
  *       lui  s0, 0x8000
  *       ori  s0, s0, PATCH       the patched instruction
  *       lui  t8, 0x258C          "addiu t4, t4, 0"
+ *       lui  s1, 0x8000
+ *       ori  s1, s1, STUBS
  *   loop:
  *       di
  *       jal  FUNC                computed return: jr ra
  *       nop
  *       ei                       the timer may have fired meanwhile
+ *       andi t2, t0, 7           computed call to one of eight stubs
+ *       sll  t2, t2, 3
+ *       addu t2, t2, s1
+ *       jalr t2
+ *       nop
  *       andi t2, t0, 3
  *       beq  t2, zero, skip      data-dependent branch
  *       nop
@@ -176,6 +187,9 @@ static const char *const mode_name[] = { "interp", "jit (no chain)", "jit" };
  *       andi t9, t9, 0x7F        "addiu t4, t4, (t0 >> 8) & 0x7F"
  *       or   t9, t9, t8
  *       sw   t9, 0(s0)
+ *       sw   t9, STUBS+12-PATCH(s0)   and the delay slots of stub 1 (the first target
+ *       sw   t9, STUBS+28-PATCH(s0)   after the rewrite: linked in its EXIT's slot) and
+ *                                     stub 3 (linked in the jump table)
  *       beq  zero, zero, loop
  *       nop
  * FUNC:
@@ -187,6 +201,9 @@ static const char *const mode_name[] = { "interp", "jit (no chain)", "jit" };
  *       sw   t0, 0(t3)
  *       jr   ra
  *       nop
+ * STUBS + 8k (k = 0..7):
+ *       jr   ra
+ *       addiu v0, v0, k + 1
  * CP0 timer handler (0x180): count in k0, re-arm Compare 300 cycles ahead.
  */
 static tickdev *build(uam_machine *m, mode md)
@@ -201,16 +218,19 @@ static tickdev *build(uam_machine *m, mode md)
     uam_machine_add_device(m, &t->dev);
     CHECK(uam_bus_map_mmio(&m->bus, "tick", TICK_PHYS, 0x100, &t->dev) == UAM_OK, "map tick");
 
-    const uint32_t B = 0x80000000u, LOOP = B + 0x14, SKIP = B + 0x38;
+    const uint32_t B = 0x80000000u, LOOP = B + 0x1C, SKIP = B + 0x54;
     const uint32_t main_prog[] = {
         LUI(T1, 0x8010), LUI(T7, 0xBF00), LUI(S0, 0x8000), ORI(S0, S0, PATCH), LUI(T8, 0x258C),
-        /* loop: 0x14 */
-        DI, JAL(B + FUNC), NOP, EI, ANDI(T2, T0, 3),
-        BEQ(T2, ZERO, B + 0x28, SKIP), NOP, LW(T6, 0, T7), ADDU(T5, T5, T6),
-        /* skip: 0x38 */
-        ANDI(T2, T0, 0xFF), BNE(T2, ZERO, B + 0x3C, LOOP), NOP,
+        LUI(S1, 0x8000), ORI(S1, S1, STUBS),
+        /* loop: 0x1C */
+        DI, JAL(B + FUNC), NOP, EI, ANDI(T2, T0, 7), SLL(T2, T2, 3), ADDU(T2, T2, S1),
+        JALR(T2), NOP, ANDI(T2, T0, 3),
+        BEQ(T2, ZERO, B + 0x44, SKIP), NOP, LW(T6, 0, T7), ADDU(T5, T5, T6),
+        /* skip: 0x54 */
+        ANDI(T2, T0, 0xFF), BNE(T2, ZERO, B + 0x58, LOOP), NOP,
         SRL(T9, T0, 8), ANDI(T9, T9, 0x7F), OR(T9, T9, T8), SW(T9, 0, S0),
-        BEQ(ZERO, ZERO, B + 0x54, LOOP), NOP,
+        SW(T9, STUBS + 12 - PATCH, S0), SW(T9, STUBS + 28 - PATCH, S0),
+        BEQ(ZERO, ZERO, B + 0x78, LOOP), NOP,
     };
     put_prog(m, 0, main_prog, UAM_ARRAY_LEN(main_prog));
     const uint32_t func[] = {
@@ -218,6 +238,10 @@ static tickdev *build(uam_machine *m, mode md)
         ADDU(T3, T3, T1), SW(T0, 0, T3), JR(RA), NOP,
     };
     put_prog(m, FUNC, func, UAM_ARRAY_LEN(func));
+    for (uint32_t k = 0; k < 8; k++) {
+        const uint32_t stub[] = { JR(RA), ADDIU(V0, V0, (int16_t)(k + 1)) };
+        put_prog(m, STUBS + 8 * k, stub, 2);
+    }
     const uint32_t handler[] = {
         ADDIU(K0, K0, 1), MFC0(K1, 9), ADDIU(K1, K1, 300), MTC0(K1, 11), ERET,
     };
@@ -228,8 +252,11 @@ static tickdev *build(uam_machine *m, mode md)
     m->cpu.isa->sysreg_write(&m->cpu, CP0(11, 0), 500);              /* Compare */
     uam_timer_arm(&m->sched, &t->timer, 777);
     if (md != INTERP) {
+        if (md == JIT_TAB1)
+            setenv("UAM_JIT_JTAB_BITS", "1", 1);
         CHECK(uam_exec_enable_jit(&m->exec), "jit available");
-        m->exec.chain = md == JIT_CHAIN;
+        unsetenv("UAM_JIT_JTAB_BITS");
+        m->exec.chain = md >= JIT_CHAIN;
     }
     return t;
 }
@@ -321,12 +348,12 @@ static outcome scenario(mode md)
     /* 3. A hook on a chain target (FUNC entry) and on the return target. */
     uint64_t hits = 0;
     CHECK(uam_exec_add_pc_hook(&m.exec, 0x80000000u + FUNC, count_hook, &hits) == UAM_OK, "hook");
-    CHECK(uam_exec_add_pc_hook(&m.exec, 0x80000020u, count_hook, &hits) == UAM_OK, "hook 2");
+    CHECK(uam_exec_add_pc_hook(&m.exec, RET_PC, count_hook, &hits) == UAM_OK, "hook 2");
     run(&m, 50000, "with hooks", md);
     CHECK(hits > 1000, "%s: hooks fired on chain targets (%llu)", mode_name[md],
           (unsigned long long)hits);
     uam_exec_remove_pc_hook(&m.exec, 0x80000000u + FUNC, count_hook, &hits);
-    uam_exec_remove_pc_hook(&m.exec, 0x80000020u, count_hook, &hits);
+    uam_exec_remove_pc_hook(&m.exec, RET_PC, count_hook, &hits);
     o.hook_hits = hits;
     run(&m, 50000, "hooks removed", md);
     note(&o, &m, t);
@@ -362,7 +389,7 @@ static outcome scenario(mode md)
 static void test_equivalence(void)
 {
     outcome ref = scenario(INTERP);
-    for (mode md = JIT_NOCHAIN; md <= JIT_CHAIN; md++) {
+    for (mode md = JIT_NOCHAIN; md <= JIT_TAB1; md++) {
         outcome o = scenario(md);
         CHECK(o.n_hash == ref.n_hash, "%s: same number of checkpoints", mode_name[md]);
         for (unsigned i = 0; i < ref.n_hash && i < o.n_hash; i++)
@@ -376,7 +403,10 @@ static void test_equivalence(void)
               mode_name[md], (unsigned long long)o.interrupts, (unsigned long long)ref.interrupts);
         CHECK(o.polls == ref.polls, "%s: host polls %llu, interpreter %llu", mode_name[md],
               (unsigned long long)o.polls, (unsigned long long)ref.polls);
-        if (md == JIT_CHAIN)
+        if (md == JIT_CHAIN)   /* 54% when only one target of a computed EXIT chains */
+            CHECK(o.chained > o.blocks / 5 * 3, "chained: %llu of %llu blocks entered by chaining",
+                  (unsigned long long)o.chained, (unsigned long long)o.blocks);
+        else if (md == JIT_TAB1)
             CHECK(o.chained > o.blocks / 2, "chained: %llu of %llu blocks entered by chaining",
                   (unsigned long long)o.chained, (unsigned long long)o.blocks);
         else

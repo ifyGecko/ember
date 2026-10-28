@@ -145,6 +145,7 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 8b: bus sub-page cache | 2.07 s | 2.10 s | regions smaller than a page (I/O ports, register blocks) were resolved by a linear scan of every region on each access; a 64-entry cache keyed by 8-byte granule now serves them (ABI 16) |
 | 8c: constant-address probes | 2.07 s | 1.86 s | a load/store to a constant address compares one known data-TLB entry with its page (a constant access that crosses a page or is misaligned goes straight to the bridge) |
 | 9: deferred register writes | 1.70 s | 1.81 s | a register write that a later instruction of the block overwrites unread is replayed only where the block can stop (IMARK stop stubs, load/store slow paths), and the pure ops only those writes need are recomputed there (docs/jit-dead-puts-design.md). Measured against 2.04 s / 1.87 s for the build before it in the same session; code +20% / +2%, translation 0.17 -> 0.23 s / 0.048 -> 0.061 s. Consoles and the interpreter-vs-JIT state identical on both |
+| 10: jump table for computed exits | 1.69 s | 1.72 s | a computed EXIT whose slot holds another target looks its target pc up in a 4096-entry direct-mapped table of links shared by all blocks (hash, then pc and epoch compared) and links it there on a miss, instead of returning to the run loop. Measured against 1.71 s / 1.81 s in the same session; blocks returning to the run loop 0.41 M -> 0.25 M / 5.5 M -> 3.2 M; code +1%. `UAM_JIT_JTAB_BITS=N` uses 2^N entries (test_jit runs N=1 so links collide). Consoles and the interpreter-vs-JIT state identical on both |
 
 ## Where it stands (after step 8c)
 
@@ -222,7 +223,7 @@ What it shows:
 - **The interpreter kernel is bimodal** (1.0 or 1.4 by guest, varying between runs):
   its switch is an indirect jump, and a computed exit links only its last target, so
   about 30% of its block exits return to the run loop (3.8M of 12.6M on MIPS). A
-  multi-target cache for computed exits would help every ISA alike.
+  multi-target cache for computed exits would help every ISA alike (step 10 did that).
 - RV32, MIPS and PPC are within 1.3x of each other everywhere; endianness costs nothing
   measurable (MIPS BE/LE, Thumb LE/BE8).
 
@@ -257,9 +258,31 @@ fastest guest on u64):
 x86 is still the slowest guest on most kernels (crc 1.78x, matmul 1.71x, fmt 1.74x of
 RV32; not yet profiled after this step). Thumb's gap to ARM is down to 3-4%.
 
+### After step 10
+
+Step 10 gives computed exits a shared jump table, so an EXIT with many targets chains
+too. On the interp kernel, whose switch is such an EXIT, the share of blocks entered by
+chaining goes from 70% to 99.9% on every guest, and its time drops 2.9-5.5x (RV32
+0.68 -> 0.13 s, x86 0.48 -> 0.17 s); it is no longer bimodal. The other kernels are
+unchanged (within +-2%, run-to-run noise). Each kernel's time after the step
+(`--per-kernel --times --rounds 1600`, medians of 5):
+
+| Kernel | RV32 | MIPS | MIPSel | ARM | Thumb | Thumb BE8 | PPC | x86 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| crc | 0.118 | 0.137 | 0.139 | 0.151 | 0.161 | 0.161 | 0.128 | 0.211 |
+| sort | 0.650 | 0.761 | 0.749 | 0.874 | 0.856 | 0.859 | 0.858 | 1.007 |
+| matmul | 0.092 | 0.102 | 0.102 | 0.125 | 0.127 | 0.131 | 0.093 | 0.161 |
+| string | 0.309 | 0.328 | 0.331 | 0.417 | 0.455 | 0.453 | 0.408 | 0.491 |
+| interp | 0.133 | 0.121 | 0.122 | 0.152 | 0.155 | 0.157 | 0.151 | 0.166 |
+| list | 0.169 | 0.197 | 0.191 | 0.240 | 0.242 | 0.246 | 0.222 | 0.262 |
+| u64 | 0.051 | 0.054 | 0.054 | 0.051 | 0.053 | 0.053 | 0.065 | 0.025 |
+| fmt | 0.083 | 0.092 | 0.093 | 0.105 | 0.105 | 0.104 | 0.107 | 0.148 |
+| **geomean** | 0.146 | 0.159 | 0.159 | 0.185 | 0.190 | 0.191 | 0.177 | 0.201 |
+
+Parity over RV32, now with the interp kernel included: MIPS 1.09 / 1.09, PPC 1.21,
+ARM 1.26, Thumb 1.30 / 1.31, x86 1.38.
+
 Not done yet:
-- **A multi-target cache for computed exits** (the interp kernel above): generic, helps
-  every ISA alike.
 - **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
   once at block entry. It changes how stopping at a deadline is implemented, so it
   needs sign-off.

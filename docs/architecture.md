@@ -293,8 +293,10 @@ devices.
 - **JIT block chaining** (`exec/jit.h`): a compiled block whose EXIT leads to another compiled
   block jumps straight into it instead of returning to the run loop, for as long as the run loop
   would have nothing to do in between: no exit request, deadline not reached, links current.
-  Each EXIT owns a link slot after its code (a computed EXIT caches its last target); a slot is
-  linked when the run loop next runs the block the EXIT went to. Links belong to an epoch that
+  Each EXIT owns a link slot after its code; a slot is linked when the run loop next runs the
+  block the EXIT went to. A computed EXIT's slot holds its first target of the epoch, and its
+  other targets (a switch, a return to many callers) go through a jump table shared by all
+  blocks, indexed by a hash of the target pc and linked the same way. Links belong to an epoch that
   moves on whenever a linked block may be invalid (a block freed or a code page written, a
   translation or privilege change). Interrupts are still taken only by the run loop, so an ISA
   must request an exit on anything that can make `irq_take` newly succeed (`isa.h`). Chained runs
@@ -411,9 +413,10 @@ Implemented (`make test`):
 - MMIO rules: `test_mmio` covers parsing, every policy, masks, narrow accesses on a big-endian
   CPU, priorities against real devices, catch-alls and holes, the input stream, snapshots, and a
   guest reading a rule through the interpreter and the JIT.
-- Chaining: `test_jit` runs one guest (calls, returns, branches, self-modifying code, DI/EI
-  with a timer, MMIO) through the interpreter and the JIT with and without chaining, with host
-  code patches, PC hooks and snapshot restores in between, and requires identical state; and
+- Chaining: `test_jit` runs one guest (calls, returns, an eight-way computed call whose targets
+  it rewrites, branches, self-modifying code, DI/EI with a timer, MMIO) through the interpreter and the JIT with and without chaining, with host
+  code patches, PC hooks and snapshot restores in between, and requires identical state (also
+  with a two-entry jump table, `UAM_JIT_JTAB_BITS=1`, so its links collide); and
   code rewritten on a page that has just become a code page again must run as rewritten.
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop

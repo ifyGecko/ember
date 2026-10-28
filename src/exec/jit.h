@@ -25,7 +25,10 @@
  * run loop. Each EXIT owns a link slot (target pc, entry, epoch) stored with the code.
  * A slot starts empty; when an EXIT misses, uam_jit_run notes the slot, and if the
  * next block the run loop executes natively is the one that EXIT went to, the slot is
- * pointed at it. A computed EXIT's slot caches its last target (compared at run time).
+ * pointed at it. A computed EXIT's slot caches its first target of the epoch (compared
+ * at run time); its other targets go through a jump table shared by all blocks, a
+ * direct-mapped cache of (target pc, entry, epoch) indexed by a hash of the pc and
+ * linked the same way, so an EXIT with many targets (a switch, a return) chains too.
  *
  * The jump is taken only when returning to the run loop would change nothing: no exit
  * request (stop, reset, interrupt line change, code write, translation change - the

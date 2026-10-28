@@ -70,6 +70,11 @@ typedef struct jit_slot {
 
 #define LINK_NONE UINT64_MAX
 
+/* The jump table: links for computed EXITs whose own slot holds another target, shared
+ * by every block and indexed by a hash of the target pc (emit_chain). */
+#define JTAB_BITS 12u
+#define JTAB_HASH 0x9E3779B1u    /* index = (uint32_t)(pc * JTAB_HASH) >> (32 - bits) */
+
 /* Where a bridge call happens, for a precise fault: stored with the block's code, and
  * pointed to by jc->site just before a call that may fault (so the common path pays
  * nothing per instruction). */
@@ -98,6 +103,7 @@ typedef struct uam_jit_ctx {
     uam_sched              *sched;
     uint64_t                next_when;   /* next timer at entry */
     uam_exec_stats         *stats;       /* slow-path counters (jit_*_calls) */
+    jit_slot                jtab[1u << JTAB_BITS];   /* the jump table (uses 1 << jtab_bits) */
 } uam_jit_ctx;
 
 /* After a bridge: if the bus mapping, the timer queue or the privilege level changed,
@@ -308,6 +314,7 @@ struct uam_jit {
     bool         popcnt;     /* the host has POPCNT (else that op uses the C evaluator) */
     unsigned     n_pool;     /* registers to allocate temps to (UAM_JIT_REGS, default all) */
     size_t       body_off;   /* prologue length: chained jumps enter here */
+    unsigned     jtab_bits;  /* jump table entries used: 1 << jtab_bits (UAM_JIT_JTAB_BITS) */
     uint32_t     arena_gen;  /* bumped when the arena is recycled */
     /* what the link epoch was last computed from */
     bool         key_valid;
@@ -1093,8 +1100,9 @@ static void set_res_pc_imm(uam_jit *j, uint32_t kind, uint64_t pc)
  * After an EXIT has stored res (NEXT, pc): jump straight into the next block if its
  * link is current and the run loop has nothing to do (jit.h), else go to the epilogue.
  * A miss records the slot in jc->link_slot so uam_jit_run can link it. `target` is the
- * EXIT's pc operand: for a constant the slot only ever links that pc; for a computed
- * one the slot caches the last target and res.pc is compared against it.
+ * EXIT's pc operand: for a constant the slot only ever links that pc. A computed one's
+ * slot caches its first target of the epoch (compared against res.pc); any other target
+ * is looked up in, and on a miss linked into, the jump table.
  */
 static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t *epi,
                        unsigned *n_epi)
@@ -1112,21 +1120,46 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t 
                                    : LINK_NONE;
     j->n_slots++;
     g32(j, 0);
-    size_t miss_pc = 0;
-    if (!fixed) {
-        ld_mem(j, RCX, RBX, RES(pc));
-        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));   /* cmp rcx, [slot.pc] */
-        miss_pc = jcc_fwd(j, 0x85);
+    if (fixed) {
+        ld_mem(j, RCX, RBX, OFF(epoch));
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(epoch));    /* cmp rcx, [slot.epoch] */
+        size_t miss = jcc_fwd(j, 0x85);
+        g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));         /* dec dword [chain_left] */
+        g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));             /* jmp [slot.entry] */
+        patch(j, miss);
+        st_mem(j, RAX, RBX, OFF(link_slot));
+        epi[(*n_epi)++] = jmp_fwd(j);
+        return;
     }
-    ld_mem(j, RCX, RBX, OFF(epoch));
-    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(epoch));    /* cmp rcx, [slot.epoch] */
-    size_t miss = jcc_fwd(j, 0x85);
+    ld_mem(j, RCX, RBX, RES(pc));
+    ld_mem(j, RDX, RBX, OFF(epoch));
+    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [slot.pc] */
+    size_t other = jcc_fwd(j, 0x85);
+    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [slot.epoch] */
+    size_t miss1 = jcc_fwd(j, 0x85);
     g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));             /* dec dword [chain_left] */
     g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));                 /* jmp [slot.entry] */
-    patch(j, miss);
-    if (!fixed)
-        patch(j, miss_pc);
-    st_mem(j, RAX, RBX, OFF(link_slot));
+    /* Another target: if the slot is unused this epoch, link it there. */
+    patch(j, other);
+    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [slot.epoch] */
+    size_t miss2 = jcc_fwd(j, 0x85);
+    /* rax = &jtab[(uint32_t)(pc * JTAB_HASH) >> (32 - bits)] */
+    g8(j, 0x69); g8(j, 0xC1); g32(j, JTAB_HASH);                    /* imul eax, ecx, JTAB_HASH */
+    g8(j, 0xC1); g8(j, 0xE8); g8(j, (uint8_t)(32 - j->jtab_bits));  /* shr eax, 32 - bits */
+    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x04); g8(j, 0x40);             /* lea rax, [rax + rax*2] */
+    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x84); g8(j, 0xC3);             /* lea rax, [rbx + rax*8 + jtab] */
+    g32(j, (uint32_t)OFF(jtab));
+    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [e.pc] */
+    size_t miss3 = jcc_fwd(j, 0x85);
+    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [e.epoch] */
+    size_t miss4 = jcc_fwd(j, 0x85);
+    g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));             /* dec dword [chain_left] */
+    g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));                 /* jmp [e.entry] */
+    patch(j, miss1);
+    patch(j, miss2);
+    patch(j, miss3);
+    patch(j, miss4);
+    st_mem(j, RAX, RBX, OFF(link_slot));                            /* the slot or the entry */
     epi[(*n_epi)++] = jmp_fwd(j);
 }
 
@@ -2329,6 +2362,13 @@ uam_jit *uam_jit_create(uam_exec *x)
     /* UAM_JIT_NODEFER=1 does every register write in place (no deferral to cold paths). */
     const char *nd = getenv("UAM_JIT_NODEFER");
     j->defer = !(nd && *nd && strcmp(nd, "0") != 0);
+    /* UAM_JIT_JTAB_BITS=N uses only 2^N jump table entries (1..12), to test collisions. */
+    const char *jb = getenv("UAM_JIT_JTAB_BITS");
+    j->jtab_bits = JTAB_BITS;
+    if (jb && *jb && strtoul(jb, NULL, 0) >= 1 && strtoul(jb, NULL, 0) < JTAB_BITS)
+        j->jtab_bits = (unsigned)strtoul(jb, NULL, 0);
+    for (unsigned k = 0; k < (1u << JTAB_BITS); k++)
+        j->jc.jtab[k].epoch = LINK_NONE;
     /* Profiling output. Every JIT of the process appends to the same files. */
     const char *pm = getenv("UAM_PERF_MAP");
     if (pm && *pm && strcmp(pm, "0") != 0) {
