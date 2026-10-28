@@ -5,6 +5,8 @@
 
 #include "uam/exec.h"
 
+#include "spin.h"
+
 #define TC_INITIAL_BUCKETS 4096u
 #define TC_MAX_BLOCKS      (1u << 18)   /* flush everything beyond this */
 #define TC_RECENT          4096u        /* direct-mapped cache in front of the buckets */
@@ -17,6 +19,7 @@ struct uam_tc_entry {
     bool                 remappable; /* may be revalidated through tc->remap */
     uint32_t             xlate_gen;  /* cpu->xlate_gen at translation (if mapped) */
     uint32_t             checked;    /* bus->code_gen when its pages were last found valid */
+    int8_t               spin;       /* spin.h: 0 undecided, 1 spin-loop candidate, -1 not */
     struct uam_tc_entry *next;
 };
 
@@ -90,9 +93,18 @@ static bool still_valid(uam_tcache *tc, struct uam_tc_entry *e, unsigned priv,
 
 uam_block *uam_tcache_lookup(uam_tcache *tc, uint64_t pc, unsigned priv, uint32_t xlate_gen)
 {
+    return uam_tcache_find(tc, pc, priv, xlate_gen, NULL);
+}
+
+uam_block *uam_tcache_find(uam_tcache *tc, uint64_t pc, unsigned priv, uint32_t xlate_gen,
+                           int8_t **spin)
+{
     struct uam_tc_entry *r = tc->recent[recent_slot(pc)];
-    if (r && r->pc == pc && still_valid(tc, r, priv, xlate_gen))
+    if (r && r->pc == pc && still_valid(tc, r, priv, xlate_gen)) {
+        if (spin)
+            *spin = &r->spin;
         return r->blk;
+    }
     struct uam_tc_entry **pp = &tc->buckets[hash_pc(pc, tc->n_buckets)];
     for (; *pp; pp = &(*pp)->next) {
         struct uam_tc_entry *e = *pp;
@@ -100,6 +112,8 @@ uam_block *uam_tcache_lookup(uam_tcache *tc, uint64_t pc, unsigned priv, uint32_
             continue;
         if (still_valid(tc, e, priv, xlate_gen)) {
             tc->recent[recent_slot(pc)] = e;
+            if (spin)
+                *spin = &e->spin;
             return e->blk;
         }
         /* Stale: its code was overwritten, its mapping changed, or it was
@@ -162,6 +176,7 @@ uam_status uam_tcache_insert_ex(uam_tcache *tc, uam_block *blk, unsigned priv, b
             e->remappable = remappable;
             e->xlate_gen = xlate_gen;
             e->checked = tc->bus->code_gen;
+            e->spin = 0;
             return UAM_OK;
         }
     }
@@ -175,6 +190,7 @@ uam_status uam_tcache_insert_ex(uam_tcache *tc, uam_block *blk, unsigned priv, b
     e->remappable = remappable;
     e->xlate_gen = xlate_gen;
     e->checked = tc->bus->code_gen;
+    e->spin = 0;
     e->next = *head;
     *head = e;
     tc->n_blocks++;

@@ -8,6 +8,7 @@
 #include "uam/exec.h"
 
 #include "jit.h"
+#include "spin.h"
 
 #define DEFAULT_MAX_BLOCK_INSNS 32u
 
@@ -752,7 +753,8 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         }
 
         /* 5. Find or translate the block. */
-        uam_block *blk = uam_tcache_lookup(&x->tc, cpu->pc, cpu->priv, cpu->xlate_gen);
+        int8_t *spin = NULL;   /* the block's spin state (spin.h), if it is cached */
+        uam_block *blk = uam_tcache_find(&x->tc, cpu->pc, cpu->priv, cpu->xlate_gen, &spin);
         if (!blk) {
             uam_status st;
             uam_exception exc;
@@ -793,6 +795,36 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
             deadline = cpu->icount + (tlimit - now);
         cpu->icount_deadline = deadline < limit ? deadline : limit;
 
+        /* 6b. A spin loop whose next pass would change nothing but icount (spin.h):
+         * account for every whole pass before the deadline and the next host poll at
+         * once, as the passes and the rounds of this loop between them would have,
+         * then go round again. Not while blocks are traced or the pc is hooked. */
+        if (spin && *spin >= 0 && !(x->trace & UAM_TRACE_BLOCKS)
+            && !(x->n_hooks && uam_exec_has_pc_hook(x, cpu->pc))) {
+            if (*spin == 0)
+                *spin = uam_spin_candidate(blk) ? SPIN_CAND : -1;
+            uint64_t k = *spin > 0 && cpu->icount_deadline > cpu->icount
+                       ? (cpu->icount_deadline - cpu->icount) / blk->n_guest : 0;
+            if (c->host.poll) {   /* no poll in between */
+                uint64_t room = c->blocks_since_poll < c->host.poll_interval
+                              ? c->host.poll_interval - c->blocks_since_poll : 0;
+                k = k < room ? k : room;
+            }
+            bool never = false;
+            if (k && uam_spin_fixed(cpu, blk, x->temps, &never)) {
+                *spin = SPIN_CAND;
+                cpu->icount += k * blk->n_guest;
+                x->stats.blocks_executed += k;
+                if (blk->backend && blk->backend != UAM_JIT_INTERP)
+                    x->stats.blocks_native += k;
+                if (c->host.poll)
+                    c->blocks_since_poll += (uint32_t)(k - 1);
+                continue;
+            }
+            if (k)
+                *spin = never || *spin - SPIN_CAND + 1 >= SPIN_GIVE_UP ? -1 : *spin + 1;
+        }
+
         if (x->trace && trace_block(x, blk->guest_pc))
             fprintf(x->trace_out, "blk 0x%llx icount=%llu\n", (unsigned long long)blk->guest_pc,
                     (unsigned long long)cpu->icount);
@@ -808,7 +840,9 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
                 ch.budget = !c->host.poll ? UINT32_C(1) << 30
                           : c->blocks_since_poll < c->host.poll_interval
                               ? c->host.poll_interval - 1 - c->blocks_since_poll : 0;
-                ch.link = !(x->n_hooks && uam_exec_has_pc_hook(x, blk->guest_pc));
+                /* A spin loop's EXIT back to itself must come back here (6b). */
+                ch.link = !(x->n_hooks && uam_exec_has_pc_hook(x, blk->guest_pc))
+                          && !(spin && *spin > 0);
             }
             uam_jit_run(x->jit, blk, x->temps, &ch, &r);
             x->stats.blocks_native += 1 + ch.hops;

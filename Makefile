@@ -80,7 +80,7 @@ IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c src/
 CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
                src/core/state.c
 EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit_x86.c \
-               src/exec/coverage.c
+               src/exec/coverage.c src/exec/spin.c
 ANALYSIS_SRC := analysis/cov.c
 LOADER_SRC  := src/loader/loader.c
 MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c
@@ -128,6 +128,7 @@ TEST_CORE := $(BUILD)/test_core
 TEST_HOST := $(BUILD)/test_host
 TEST_SNAP := $(BUILD)/test_snapshot
 TEST_JIT  := $(BUILD)/test_jit
+TEST_SPIN := $(BUILD)/test_spin
 TEST_MMIO := $(BUILD)/test_mmio
 TEST_COV  := $(BUILD)/test_cov
 TEST_SMP  := $(BUILD)/test_smp
@@ -227,6 +228,9 @@ $(TEST_SNAP): $(BUILD)/obj/tests/unit/test_snapshot.o $(LIB)
 $(TEST_JIT): $(BUILD)/obj/tests/unit/test_jit.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_SPIN): $(BUILD)/obj/tests/unit/test_spin.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 $(TEST_MMIO): $(BUILD)/obj/tests/unit/test_mmio.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -287,7 +291,7 @@ firmware-ppc:
 
 $(FIRMWARE): firmware
 
-unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
+unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
            $(TEST_SMP) $(TEST_PPC) $(TEST_JITDIFF) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
@@ -295,6 +299,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_HOST)
 	$(TEST_SNAP)
 	$(TEST_JIT)
+	$(TEST_SPIN)
 	$(TEST_MMIO)
 	$(TEST_COV)
 	$(TEST_FUZZ)
@@ -502,7 +507,8 @@ FORCE:
          $(BUILD)/obj/tests/boards/test_boards.d $(BUILD)/obj/tests/unit/test_ir.d \
          $(BUILD)/obj/tests/unit/test_core.d $(BUILD)/obj/tests/unit/test_host.d \
          $(BUILD)/obj/tests/unit/test_snapshot.d \
-         $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_mmio.d \
+         $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_spin.d \
+         $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d

@@ -146,6 +146,7 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 8c: constant-address probes | 2.07 s | 1.86 s | a load/store to a constant address compares one known data-TLB entry with its page (a constant access that crosses a page or is misaligned goes straight to the bridge) |
 | 9: deferred register writes | 1.70 s | 1.81 s | a register write that a later instruction of the block overwrites unread is replayed only where the block can stop (IMARK stop stubs, load/store slow paths), and the pure ops only those writes need are recomputed there (docs/jit-dead-puts-design.md). Measured against 2.04 s / 1.87 s for the build before it in the same session; code +20% / +2%, translation 0.17 -> 0.23 s / 0.048 -> 0.061 s. Consoles and the interpreter-vs-JIT state identical on both |
 | 10: jump table for computed exits | 1.69 s | 1.72 s | a computed EXIT whose slot holds another target looks its target pc up in a 4096-entry direct-mapped table of links shared by all blocks (hash, then pc and epoch compared) and links it there on a miss, instead of returning to the run loop. Measured against 1.71 s / 1.81 s in the same session; blocks returning to the run loop 0.41 M -> 0.25 M / 5.5 M -> 3.2 M; code +1%. `UAM_JIT_JTAB_BITS=N` uses 2^N entries (test_jit runs N=1 so links collide). Consoles and the interpreter-vs-JIT state identical on both |
+| 11: spin loops | 1.69 s | 0.51 s | not a code generation change: the run loop adds the passes of a block that waits on memory (jumps back to itself, only loads, pure ops and register writes) up to the next deadline or host poll to icount at once, after evaluating one pass without effect shows it would change nothing (src/exec/spin.h; both backends). Measured against 1.68 s / 1.72 s in the same session; VxWorks under the interpreter 40.2 s -> 4.4 s; xbench unchanged (no kernel spins). `UAM_SPIN_SKIP=0` turns it off. Consoles, block counts and the interpreter-vs-JIT state identical on both |
 
 ## Where it stands (after step 8c)
 
@@ -282,7 +283,21 @@ unchanged (within +-2%, run-to-run noise). Each kernel's time after the step
 Parity over RV32, now with the interp kernel included: MIPS 1.09 / 1.09, PPC 1.21,
 ARM 1.26, Thumb 1.30 / 1.31, x86 1.38.
 
+### After step 11
+
+68% of the VxWorks run was one 4-instruction block: load a word, compare, branch back
+(its idle loop). Step 11 skips the passes of such loops up to the next event instead of
+running them, which leaves exactly the state running them would. VxWorks (4e9
+instructions) takes 0.51 s, from 1.72 s; OVMF waits by polling I/O ports, which reads
+devices, so it runs as before; the bench kernels do not spin and are unchanged.
+
 Not done yet:
+- **Stores to pages that hold code.** A page with translated code gets no data-TLB write
+  entry, so every store to it takes the C path, even when it misses the 64-byte lines
+  that hold code (the bus tracks them). The bench keeps its data next to its code: about
+  30 M such stores on sort on every guest (73% of RV32 sort's time), 5 M on list, 4 M on
+  string, 3 M on crc. The workloads make few (VxWorks 1.6 M in 4e9, OVMF 76 K).
+- **Translation cost on OVMF**: 0.23 s of 1.69 s.
 - **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
   once at block entry. It changes how stopping at a deadline is implemented, so it
   needs sign-off.

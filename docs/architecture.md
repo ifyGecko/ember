@@ -58,7 +58,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into) and the core services ISA modules may call (`uam_cpu_xlate_changed`, ...) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit_x86` |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit_x86` |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
@@ -301,6 +301,17 @@ devices.
   translation or privilege change). Interrupts are still taken only by the run loop, so an ISA
   must request an exit on anything that can make `irq_take` newly succeed (`isa.h`). Chained runs
   are bit-identical to unchained ones and to the interpreter; `--no-chain` turns it off.
+- **Spin loops** (`exec/spin.h`): a block that jumps back to itself and does nothing but read
+  memory, compute and write registers (a guest waiting for a flag) leaves the machine as it was
+  once one pass has run, until a timer, an exit request or a host poll, which only the run loop
+  delivers. Before running such a block the run loop evaluates one pass without effect, on a
+  copy of the register file; if that pass would leave the register file unchanged, read only
+  RAM or ROM and jump back to the block, it adds every whole pass before the deadline and the
+  next host poll to icount (and the block counts) at once, and goes round again. Which blocks
+  qualify is decided from the IR alone: no ISA, board or address is involved. A loop that
+  counts, stores, reads a device or a system register, calls a helper, or is hooked, traced or
+  watched runs pass by pass. Both backends skip alike, and a run that skips ends in exactly the
+  state, time, polls and interrupts of one that does not; `UAM_SPIN_SKIP=0` turns it off.
 - **Snapshots** (`snapshot.h`): every hart's state and ISA state (with several processors, also
   where their interleaving stands: a run that stops mid-slice resumes there, so split and restored
   runs interleave exactly as one run), every RAM/ROM/ROMD backing store, virtual
@@ -413,6 +424,11 @@ Implemented (`make test`):
 - MMIO rules: `test_mmio` covers parsing, every policy, masks, narrow accesses on a big-endian
   CPU, priorities against real devices, catch-alls and holes, the input stream, snapshots, and a
   guest reading a rule through the interpreter and the JIT.
+- Spin loops: `test_spin` runs RV32 and MIPS guests that wait on a word a device timer changes
+  (on MIPS with a timer interrupt that logs the waiting registers), count down, poll a device
+  register and store while waiting, under both backends with and without skipping, with and
+  without host polling and over many short runs, and requires identical state, polls,
+  interrupts, device reads and block counts.
 - Chaining: `test_jit` runs one guest (calls, returns, an eight-way computed call whose targets
   it rewrites, branches, self-modifying code, DI/EI with a timer, MMIO) through the interpreter and the JIT with and without chaining, with host
   code patches, PC hooks and snapshot restores in between, and requires identical state (also
