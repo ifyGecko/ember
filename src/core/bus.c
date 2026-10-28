@@ -910,7 +910,7 @@ void uam_bus_mark_code(uam_bus *bus, uint64_t addr)
     uam_bus_mark_code_range(bus, addr & UAM_PAGE_MASK, UAM_PAGE_SIZE);
 }
 
-uint8_t *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write)
+static uint8_t *page_host(uam_bus *bus, uint64_t paddr, bool write, const uint64_t **lines)
 {
     const uint64_t page = paddr & UAM_PAGE_MASK;
     uint32_t idx = 0;
@@ -928,9 +928,15 @@ uint8_t *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write)
     }
     switch (r->kind) {
     case UAM_REGION_RAM:
-        if (write && (r->code_page[off >> UAM_PAGE_SHIFT]
-                      || (bus->track_dirty && !uam_region_page_dirty(r, off >> UAM_PAGE_SHIFT))))
+        if (!write)
+            break;
+        if (bus->track_dirty && !uam_region_page_dirty(r, off >> UAM_PAGE_SHIFT))
             return NULL;
+        if (r->code_page[off >> UAM_PAGE_SHIFT]) {
+            if (!lines)
+                return NULL;
+            *lines = &r->code_lines[off >> UAM_PAGE_SHIFT];
+        }
         break;
     case UAM_REGION_ROM:
         if (write)
@@ -944,6 +950,17 @@ uint8_t *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write)
         return NULL;
     }
     return r->host + off;
+}
+
+uint8_t *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write)
+{
+    return page_host(bus, paddr, write, NULL);
+}
+
+uint8_t *uam_bus_page_host_code(uam_bus *bus, uint64_t paddr, const uint64_t **lines)
+{
+    *lines = NULL;
+    return page_host(bus, paddr, true, lines);
 }
 
 uint32_t uam_bus_page_gen(uam_bus *bus, uint64_t addr)

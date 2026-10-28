@@ -147,6 +147,7 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 9: deferred register writes | 1.70 s | 1.81 s | a register write that a later instruction of the block overwrites unread is replayed only where the block can stop (IMARK stop stubs, load/store slow paths), and the pure ops only those writes need are recomputed there (docs/jit-dead-puts-design.md). Measured against 2.04 s / 1.87 s for the build before it in the same session; code +20% / +2%, translation 0.17 -> 0.23 s / 0.048 -> 0.061 s. Consoles and the interpreter-vs-JIT state identical on both |
 | 10: jump table for computed exits | 1.69 s | 1.72 s | a computed EXIT whose slot holds another target looks its target pc up in a 4096-entry direct-mapped table of links shared by all blocks (hash, then pc and epoch compared) and links it there on a miss, instead of returning to the run loop. Measured against 1.71 s / 1.81 s in the same session; blocks returning to the run loop 0.41 M -> 0.25 M / 5.5 M -> 3.2 M; code +1%. `UAM_JIT_JTAB_BITS=N` uses 2^N entries (test_jit runs N=1 so links collide). Consoles and the interpreter-vs-JIT state identical on both |
 | 11: spin loops | 1.69 s | 0.51 s | not a code generation change: the run loop adds the passes of a block that waits on memory (jumps back to itself, only loads, pure ops and register writes) up to the next deadline or host poll to icount at once, after evaluating one pass without effect shows it would change nothing (src/exec/spin.h; both backends). Measured against 1.68 s / 1.72 s in the same session; VxWorks under the interpreter 40.2 s -> 4.4 s; xbench unchanged (no kernel spins). `UAM_SPIN_SKIP=0` turns it off. Consoles, block counts and the interpreter-vs-JIT state identical on both |
+| 12: stores next to code | 1.74 s | 0.54 s | a page holding translated code goes into the data-TLB write set under a tag the inline probe never matches; a store that misses calls one of 16 shared stubs (size, byte order, alignment) that read the page's 64-byte code-line mask and store inline unless a byte falls in a code line (src/exec/jit_x86.c, emit_code_probe; `uam_bus_page_host_code`). Unchanged against 1.74 s / 0.53 s in the same session (bridge stores 76 K -> 38 K / 1.56 M -> 1.56 M, the rest device writes); code +1.1% / +1.5% (inline probes instead of stubs were +11% / +17% for 1-2% more on the bench). Consoles and the interpreter-vs-JIT state identical on both |
 
 ## Where it stands (after step 8c)
 
@@ -291,12 +292,30 @@ running them, which leaves exactly the state running them would. VxWorks (4e9
 instructions) takes 0.51 s, from 1.72 s; OVMF waits by polling I/O ports, which reads
 devices, so it runs as before; the bench kernels do not spin and are unchanged.
 
+### After step 12
+
+A page that holds translated code had no data-TLB write entry, so every store to it took
+the C path even when it missed the code lines. The bench keeps its data next to its code
+(about 30 M such stores on sort on every guest, 73% of RV32 sort's time). Each kernel's
+time before over after (`--per-kernel --times --rounds 1600`, medians of 5):
+
+| Kernel | RV32 | MIPS | MIPSel | ARM | Thumb | Thumb BE8 | PPC | x86 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| crc | 1.55 | 1.62 | 1.60 | 1.53 | 1.59 | 1.62 | 1.65 | 1.57 |
+| sort | 2.80 | 2.90 | 2.95 | 2.37 | 2.50 | 2.43 | 2.62 | 2.86 |
+| matmul | 1.19 | 1.21 | 1.19 | 1.16 | 1.17 | 1.17 | 1.22 | 1.19 |
+| string | 1.18 | 1.23 | 1.21 | 1.17 | 1.20 | 1.19 | 1.17 | 1.24 |
+| interp | 0.99 | 0.98 | 0.99 | 0.99 | 0.99 | 0.99 | 0.97 | 0.99 |
+| list | 1.68 | 1.71 | 1.76 | 1.53 | 1.56 | 1.53 | 1.66 | 1.83 |
+| u64 | 0.98 | 0.98 | 1.00 | 1.00 | 0.98 | 1.00 | 0.99 | 1.00 |
+| fmt | 1.00 | 0.99 | 0.99 | 1.00 | 0.99 | 0.99 | 1.00 | 1.00 |
+| **geomean** | 1.33 | 1.36 | 1.36 | 1.29 | 1.30 | 1.30 | 1.33 | 1.36 |
+
+Geometric-mean kernel time per guest after it: RV32 0.110 s, MIPS 0.117 / 0.116,
+PPC 0.133, ARM 0.143, Thumb 0.145 / 0.147, x86 0.149. The workloads store little next
+to their code and are unchanged.
+
 Not done yet:
-- **Stores to pages that hold code.** A page with translated code gets no data-TLB write
-  entry, so every store to it takes the C path, even when it misses the 64-byte lines
-  that hold code (the bus tracks them). The bench keeps its data next to its code: about
-  30 M such stores on sort on every guest (73% of RV32 sort's time), 5 M on list, 4 M on
-  string, 3 M on crc. The workloads make few (VxWorks 1.6 M in 4e9, OVMF 76 K).
 - **Translation cost on OVMF**: 0.23 s of 1.69 s.
 - **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
   once at block entry. It changes how stopping at a deadline is implemented, so it

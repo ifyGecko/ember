@@ -70,6 +70,11 @@ typedef struct jit_slot {
 
 #define LINK_NONE UINT64_MAX
 
+/* A write-set data-TLB tag with this bit is a page that holds translated code: the
+ * inline probe (tag == vpage) never matches it; the store's miss path does, and stores
+ * inline if no byte falls in a line that holds code (emit_code_probe). */
+#define DTLB_CODE (UINT64_C(1) << 62)
+
 /* The jump table: links for computed EXITs whose own slot holds another target, shared
  * by every block and indexed by a hash of the target pc (emit_chain). */
 #define JTAB_BITS 12u
@@ -103,6 +108,9 @@ typedef struct uam_jit_ctx {
     uam_sched              *sched;
     uint64_t                next_when;   /* next timer at entry */
     uam_exec_stats         *stats;       /* slow-path counters (jit_*_calls) */
+    /* For a write-set entry tagged DTLB_CODE: the page's code-line mask (dtlb_fill) */
+    const uint64_t         *clines[UAM_DTLB_SIZE];
+    const void             *cstub[16];   /* code-page store stubs (emit_code_stubs) */
     jit_slot                jtab[1u << JTAB_BITS];   /* the jump table (uses 1 << jtab_bits) */
 } uam_jit_ctx;
 
@@ -138,11 +146,14 @@ static int jit_fault(uam_jit_ctx *jc, uam_status st, uint64_t addr, uint32_t xf,
  * After a successful access, cache the page in the data-TLB so later accesses to it
  * take the inline fast path. Only RAM (both directions) and ROM (reads) are cached:
  * their host bytes are stable for the current generation, and the whole page must be
- * owned by one region, unwatched, and - for writes - not holding translated code
- * (uam_bus_page_host enforces the last three). Device and ROMD pages are never cached.
+ * owned by one region and unwatched (uam_bus_page_host enforces both). A RAM page that
+ * holds translated code goes into the write set tagged DTLB_CODE, with its code-line
+ * mask in jc->clines: stores to it stay inline only where they miss the code. Device
+ * and ROMD pages are never cached.
  */
-static void dtlb_fill(uam_cpu *cpu, uint64_t addr, uint32_t flags, unsigned size, bool write)
+static void dtlb_fill(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, unsigned size, bool write)
 {
+    uam_cpu *cpu = jc->cpu;
     if (flags & (UAM_ACC_PHYS | UAM_ACC_UNPRIV))
         return;   /* fast path only models the ordinary translation regime */
     uint64_t pa;
@@ -153,14 +164,22 @@ static void dtlb_fill(uam_cpu *cpu, uint64_t addr, uint32_t flags, unsigned size
     const uam_region *r = uam_bus_find(cpu->bus, pa);
     if (!r || (r->kind != UAM_REGION_RAM && !(r->kind == UAM_REGION_ROM && !write)))
         return;
-    uint8_t *h = uam_bus_page_host(cpu->bus, pa, write);
+    const uint64_t *lines = NULL;
+    uint8_t *h = write ? uam_bus_page_host_code(cpu->bus, pa, &lines)
+                       : uam_bus_page_host(cpu->bus, pa, false);
     if (!h)
         return;
     uint64_t vpage = addr >> UAM_PAGE_SHIFT;
     unsigned idx = (unsigned)vpage & (UAM_DTLB_SIZE - 1);
     uint64_t base = (uint64_t)(uintptr_t)h - (vpage << UAM_PAGE_SHIFT);
-    if (write) { cpu->dtlb_wt[idx] = vpage; cpu->dtlb_wb[idx] = base; }
-    else       { cpu->dtlb_rt[idx] = vpage; cpu->dtlb_rb[idx] = base; }
+    if (write) {
+        cpu->dtlb_wt[idx] = lines ? vpage | DTLB_CODE : vpage;
+        cpu->dtlb_wb[idx] = base;
+        jc->clines[idx] = lines;
+    } else {
+        cpu->dtlb_rt[idx] = vpage;
+        cpu->dtlb_rb[idx] = base;
+    }
 }
 
 /* Returns 1 on fault (jc->res filled), 0 on success (jc->scratch = loaded value). */
@@ -174,7 +193,7 @@ static int jit_br_load(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, uint32_t 
     if (st != UAM_OK)
         return jit_fault(jc, st, fva, xf, false);
     if (!(flags & UAM_ACC_X))
-        dtlb_fill(jc->cpu, addr, flags, size, false);
+        dtlb_fill(jc, addr, flags, size, false);
     return 0;
 }
 
@@ -187,7 +206,7 @@ static int jit_br_store(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t f
     chain_check(jc);
     if (st != UAM_OK)
         return jit_fault(jc, st, fva, xf, true);
-    dtlb_fill(jc->cpu, addr, flags, size, true);
+    dtlb_fill(jc, addr, flags, size, true);
     return 0;
 }
 
@@ -285,9 +304,9 @@ static uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64
 
 /* Code-region kinds recorded for the op map (UAM_JIT_OPMAP; docs/jit-perf.md). */
 enum { MK_PROLOGUE, MK_OP, MK_IMARK_PC, MK_SLOW, MK_CHAIN, MK_STUB, MK_EPILOGUE, MK_SLOTS,
-       MK_REPLAY };
+       MK_REPLAY, MK_CODE_ST };
 static const char *const mark_name[] = { "prologue", "op", "imark-pc", "slow", "chain", "stub",
-                                         "epilogue", "slots", "replay" };
+                                         "epilogue", "slots", "replay", "code-st" };
 typedef struct jit_mark { uint32_t off, idx; uint8_t kind; } jit_mark;
 
 /* Host registers. */
@@ -310,6 +329,7 @@ struct uam_jit {
     uam_exec    *x;
     uint8_t     *arena;
     size_t       arena_used;
+    size_t       arena_base; /* the shared stubs at the start of the arena (kept on recycle) */
     uam_jit_ctx  jc;         /* reused across block runs */
     bool         popcnt;     /* the host has POPCNT (else that op uses the C evaluator) */
     unsigned     n_pool;     /* registers to allocate temps to (UAM_JIT_REGS, default all) */
@@ -962,6 +982,89 @@ static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag
         }
     }
     rex(j, 1, 0, 0, 1); g8(j, 0x8B); modrm_sib(j, RCX, R14, RCX, 3, base_off);  /* mov rcx,[r14+rcx*8+base] */
+}
+
+/*
+ * After a write-set miss (rdx = addr, r11 = value): the page may be one that holds
+ * translated code (tag vpage | DTLB_CODE, see dtlb_fill). Hit if so, and the store
+ * neither crosses the page nor (ACC_ALIGNED) is misaligned, and none of its bytes is in
+ * a 64-byte line holding code (the bus's mask, read now: a write there must go through
+ * the bus, which drops that code). Then rcx = host base as after emit_dtlb_probe; else
+ * jumps are taken to be patched to the bridge path. Uses rax and rcx only.
+ */
+static void emit_code_probe(uam_jit *j, unsigned size, bool aligned, size_t *miss,
+                            unsigned *n_miss)
+{
+    *n_miss = 0;
+    mov_rr(j, RAX, RDX);                                   /* rax = addr */
+    rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 5, RAX); g8(j, UAM_PAGE_SHIFT); /* shr rax,12 */
+    g8(j, 0x89); modrm_reg(j, RAX, RCX);                   /* mov ecx, eax */
+    g8(j, 0x81); modrm_reg(j, 4, RCX); g32(j, UAM_DTLB_SIZE - 1);  /* and ecx, SIZE-1 (index) */
+    rex(j, 1, 0, 0, 0); g8(j, 0x0F); g8(j, 0xBA); modrm_reg(j, 5, RAX); g8(j, 62);  /* bts rax, 62 */
+    rex(j, 1, 0, 0, 1); g8(j, 0x3B); modrm_sib(j, RAX, R14, RCX, 3, CPU(dtlb_wt)); /* cmp rax,[tag] */
+    miss[(*n_miss)++] = jcc_fwd(j, 0x85);                  /* jne miss */
+    if (size > 1) {
+        g8(j, 0x89); modrm_reg(j, RDX, RAX);               /* mov eax, edx */
+        g8(j, 0x25); g32(j, UAM_PAGE_SIZE - 1);            /* and eax, 0xfff */
+        g8(j, 0x3D); g32(j, UAM_PAGE_SIZE - size);         /* cmp eax, 0x1000-size */
+        miss[(*n_miss)++] = jcc_fwd(j, 0x87);              /* ja miss (page cross) */
+        if (aligned) {
+            g8(j, 0xF7); modrm_reg(j, 0, RDX); g32(j, size - 1);       /* test edx, size-1 */
+            miss[(*n_miss)++] = jcc_fwd(j, 0x85);          /* jne miss (misaligned) */
+        }
+    }
+    rex(j, 1, 0, 0, 0); g8(j, 0x8B); modrm_sib(j, RAX, RBX, RCX, 3, OFF(clines)); /* rax = lines */
+    rex(j, 1, 0, 0, 0); g8(j, 0x8B); modrm_mem(j, RAX, RAX, 0);        /* rax = [rax] (mask) */
+    /* the lines of the first and the last byte (bt takes the bit number mod 64) */
+    g8(j, 0x89); modrm_reg(j, RDX, RCX);                   /* mov ecx, edx */
+    g8(j, 0xC1); modrm_reg(j, 5, RCX); g8(j, 6);           /* shr ecx, 6 */
+    rex(j, 1, 0, 0, 0); g8(j, 0x0F); g8(j, 0xA3); modrm_reg(j, RCX, RAX);   /* bt rax, rcx */
+    miss[(*n_miss)++] = jcc_fwd(j, 0x82);                  /* jc miss (code) */
+    if (size > 1) {
+        g8(j, 0x8D); modrm_mem(j, RCX, RDX, (int32_t)size - 1);         /* lea ecx, [rdx+size-1] */
+        g8(j, 0xC1); modrm_reg(j, 5, RCX); g8(j, 6);       /* shr ecx, 6 */
+        rex(j, 1, 0, 0, 0); g8(j, 0x0F); g8(j, 0xA3); modrm_reg(j, RCX, RAX);   /* bt rax, rcx */
+        miss[(*n_miss)++] = jcc_fwd(j, 0x82);              /* jc miss (code) */
+    }
+    mov_rr(j, RAX, RDX);
+    rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 5, RAX); g8(j, UAM_PAGE_SHIFT); /* shr rax,12 */
+    g8(j, 0x25); g32(j, UAM_DTLB_SIZE - 1);                /* and eax, SIZE-1 */
+    rex(j, 1, 0, 0, 1); g8(j, 0x8B); modrm_sib(j, RCX, R14, RAX, 3, CPU(dtlb_wb)); /* rcx = base */
+}
+
+/* Which code-page store stub serves a store of `size` bytes. */
+static unsigned code_stub(unsigned size, bool be, bool aligned)
+{
+    unsigned s = size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3;
+    return s << 2 | (unsigned)be << 1 | (unsigned)aligned;
+}
+
+/*
+ * The stores to pages that hold code, shared by all blocks (called from a store's miss
+ * path, so a store site costs a call and a branch): emit_code_probe, then the store.
+ * Return with ZF set if the store was done, clear if it must take the bridge (rdx and
+ * r11 unchanged). One stub per size, byte order and alignment rule, placed at the start
+ * of the arena by uam_jit_create.
+ */
+static void emit_code_stubs(uam_jit *j, size_t off[16])
+{
+    for (unsigned v = 0; v < 16; v++) {
+        const unsigned size = 1u << (v >> 2);
+        const bool be = v & 2, aligned = v & 1;
+        while (j->n & 15)
+            g8(j, 0xCC);
+        off[v] = j->n;
+        size_t miss[5];
+        unsigned n_miss;
+        emit_code_probe(j, size, aligned, miss, &n_miss);
+        emit_fast_store(j, size, be);
+        g8(j, 0x31); modrm_reg(j, RAX, RAX);               /* xor eax, eax (ZF = 1) */
+        g8(j, 0xC3);                                       /* ret */
+        for (unsigned k = 0; k < n_miss; k++)
+            patch(j, miss[k]);
+        g8(j, 0x85); modrm_reg(j, RSP, RSP);               /* test esp, esp (ZF = 0) */
+        g8(j, 0xC3);                                       /* ret */
+    }
 }
 
 /* A constant access the inline path can never take: it crosses a page, or it is
@@ -2105,7 +2208,7 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             const opnd ao = opnd_of(j, blk, in->a, aw);
             load(j, RDX, ao, aw);                       /* rdx = addr */
             fast = fast && !(ao.kind == O_IMM && const_slow(ao.imm, size, in->flags));
-            size_t done = 0, miss[3]; unsigned n_miss = 0;
+            size_t done = 0, done_code = 0, miss[5]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_wt), CPU(dtlb_wb),
                                 &ao, miss, &n_miss);
@@ -2113,6 +2216,11 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
                 done = jmp_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
                     patch(j, miss[k]);
+                /* not in the write set: maybe a page that holds code, away from it */
+                mark(j, MK_CODE_ST, i);
+                g8(j, 0xFF); modrm_mem(j, 2, RBX, OFF(cstub)       /* call [jc.cstub[v]] */
+                                       + 8 * (int32_t)code_stub(size, be, in->flags & UAM_ACC_ALIGNED));
+                done_code = jcc_fwd(j, 0x84);                      /* je done */
             }
             mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));
@@ -2129,8 +2237,10 @@ static bool compile_block(uam_jit *j, const uam_block *blk)
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
             ra_save(j, true);
-            if (fast)
+            if (fast) {
                 patch(j, done);
+                patch(j, done_code);
+            }
             break;
             }
         case UAM_OP_AMO:
@@ -2345,6 +2455,12 @@ uam_jit *uam_jit_create(uam_exec *x)
     }
     j->x = x;
     j->arena = mem;
+    size_t stub_off[16];
+    emit_code_stubs(j, stub_off);
+    memcpy(mem, j->cb, j->n);
+    for (unsigned v = 0; v < 16; v++)
+        j->jc.cstub[v] = (uint8_t *)mem + stub_off[v];
+    j->arena_base = j->arena_used = (j->n + 15) & ~(size_t)15;
     j->jc.cpu = x->cpu;
     j->jc.regfile = x->cpu->regfile;
     j->jc.helpers = &x->cpu->isa->helpers;
@@ -2375,6 +2491,9 @@ uam_jit *uam_jit_create(uam_exec *x)
         char path[64];
         snprintf(path, sizeof(path), "/tmp/perf-%d.map", (int)getpid());
         j->perf_map = fopen(path, "a");
+        if (j->perf_map)
+            fprintf(j->perf_map, "%llx %zx uam:code-store-stubs\n",
+                    (unsigned long long)(uintptr_t)j->arena, j->arena_base);
     }
     const char *om = getenv("UAM_JIT_OPMAP");
     if (om && *om)
@@ -2456,12 +2575,12 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
         blk->backend = UAM_JIT_INTERP;
         return true;
     }
-    if (j->n > ARENA_SIZE)
+    if (j->n > ARENA_SIZE - j->arena_base)
         return false;   /* a single block larger than the arena: impossible in practice */
     if (j->arena_used + j->n > ARENA_SIZE) {
         /* Arena full: drop every compiled block (and every link), then restart this one. */
         uam_tcache_flush(&j->x->tc);
-        j->arena_used = 0;
+        j->arena_used = j->arena_base;   /* the shared stubs stay */
         j->arena_gen++;
         if (j->opmap)
             fputs("R\n", j->opmap);   /* the addresses below are reused from here on */

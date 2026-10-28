@@ -301,6 +301,12 @@ devices.
   translation or privilege change). Interrupts are still taken only by the run loop, so an ISA
   must request an exit on anything that can make `irq_take` newly succeed (`isa.h`). Chained runs
   are bit-identical to unchained ones and to the interpreter; `--no-chain` turns it off.
+- **Stores next to code** (JIT): the bus records which 64-byte lines of a page hold translated
+  code, and only a write to such a line drops that code. The JIT's data-TLB keeps a page that
+  holds code in its write set under a tag the inline probe cannot match; a store that misses
+  there calls a shared stub that reads the page's line mask and stores inline if none of its
+  bytes is in a code line, else takes the bus path (`uam_bus_page_host_code`). Firmware that
+  keeps data on its code pages stores at full speed, and self-modifying code is still seen.
 - **Spin loops** (`exec/spin.h`): a block that jumps back to itself and does nothing but read
   memory, compute and write registers (a guest waiting for a flag) leaves the machine as it was
   once one pass has run, until a timer, an exit request or a host poll, which only the run loop
@@ -429,6 +435,10 @@ Implemented (`make test`):
   register and store while waiting, under both backends with and without skipping, with and
   without host polling and over many short runs, and requires identical state, polls,
   interrupts, device reads and block counts.
+- Stores next to code: `test_codestore` runs an RV32 guest that stores to data lines of its
+  own code page and rewrites a function in another line of it (alternately by a misaligned word
+  that ends in the function's line and a byte store into it), across a snapshot restore, under
+  the interpreter and the JIT, and requires identical state and inline stores.
 - Chaining: `test_jit` runs one guest (calls, returns, an eight-way computed call whose targets
   it rewrites, branches, self-modifying code, DI/EI with a timer, MMIO) through the interpreter and the JIT with and without chaining, with host
   code patches, PC hooks and snapshot restores in between, and requires identical state (also

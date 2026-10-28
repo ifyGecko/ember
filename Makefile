@@ -129,6 +129,7 @@ TEST_HOST := $(BUILD)/test_host
 TEST_SNAP := $(BUILD)/test_snapshot
 TEST_JIT  := $(BUILD)/test_jit
 TEST_SPIN := $(BUILD)/test_spin
+TEST_CODESTORE := $(BUILD)/test_codestore
 TEST_MMIO := $(BUILD)/test_mmio
 TEST_COV  := $(BUILD)/test_cov
 TEST_SMP  := $(BUILD)/test_smp
@@ -231,6 +232,9 @@ $(TEST_JIT): $(BUILD)/obj/tests/unit/test_jit.o $(LIB)
 $(TEST_SPIN): $(BUILD)/obj/tests/unit/test_spin.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_CODESTORE): $(BUILD)/obj/tests/unit/test_codestore.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 $(TEST_MMIO): $(BUILD)/obj/tests/unit/test_mmio.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -291,7 +295,7 @@ firmware-ppc:
 
 $(FIRMWARE): firmware
 
-unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
+unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
            $(TEST_SMP) $(TEST_PPC) $(TEST_JITDIFF) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
@@ -300,6 +304,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_SNAP)
 	$(TEST_JIT)
 	$(TEST_SPIN)
+	$(TEST_CODESTORE)
 	$(TEST_MMIO)
 	$(TEST_COV)
 	$(TEST_FUZZ)
@@ -508,6 +513,7 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_core.d $(BUILD)/obj/tests/unit/test_host.d \
          $(BUILD)/obj/tests/unit/test_snapshot.d \
          $(BUILD)/obj/tests/unit/test_jit.d $(BUILD)/obj/tests/unit/test_spin.d \
+         $(BUILD)/obj/tests/unit/test_codestore.d \
          $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \

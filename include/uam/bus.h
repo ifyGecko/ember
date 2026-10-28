@@ -210,6 +210,17 @@ bool       uam_bus_remove_watch(uam_bus *bus, int id);
 uint8_t   *uam_bus_page_host(uam_bus *bus, uint64_t paddr, bool write);
 
 /*
+ * As uam_bus_page_host(paddr, true), but a RAM page holding translated code is answered
+ * too: *lines then points at its code-line mask (bit n set: the 64-byte line n holds
+ * code), else *lines is NULL. A write to a line whose bit is set must go through
+ * uam_bus_write (it invalidates that code); a write that touches no such line may use
+ * the host page directly. The mask is the bus's own and is read at the time of each
+ * write: lines added later are seen. The pointer stays valid until bus->direct_gen
+ * changes.
+ */
+uint8_t   *uam_bus_page_host_code(uam_bus *bus, uint64_t paddr, const uint64_t **lines);
+
+/*
  * Dirty-page tracking, for snapshots (snapshot.h). Every write to a RAM, ROM
  * or ROMD backing store through the bus - guest stores, loader, DMA, and ROMD
  * updates reported with uam_bus_romd_dirty - marks its pages dirty. Once
