@@ -46,7 +46,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
 | `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32` |
-| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots | the core |
+| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
 | `sched.h` | Instruction-count clock (saturating at a 2^62-tick horizon), event queue with a per-call firing budget, a kick when the earliest deadline moves (the machine turns it into an exit request), cancel-all, list consistency checks | the core |
@@ -58,7 +58,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into) and the core services ISA modules may call (`uam_cpu_xlate_changed`, ...) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit_x86` |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit_x86` |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
@@ -117,7 +117,7 @@ Implemented:
 ```
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
                   loader.h machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
-                  state.h snapshot.h pass.h cov.h blockdev.h
+                  state.h snapshot.h pass.h cov.h blockdev.h guard.h fuzz.h
 include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.h unimp.h
                   mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
@@ -125,10 +125,10 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
 include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
-src/exec/         interp.c tcache.c run.c cpu.c jit_x86.c coverage.c jit.h execops.h
+src/exec/         interp.c tcache.c run.c cpu.c jit_x86.c coverage.c spin.c jit.h execops.h spin.h
 analysis/         cov.c (the edge-coverage pass)
 src/loader/       loader.c
-src/machine/      machine.c snapshot.c
+src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches)
 src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.c
 src/debug/        gdbstub.c
 src/runner/       runner.c
@@ -152,12 +152,14 @@ fuzz/suzzer/      scheme.c (the bucket formula) import.c (LCV3/LCVB1 readers, si
                   frontend_szr1.c (the SZR1 executor, --fuzz-szr) lcvs.c (the LCVS export,
                   --cov-shm) cli.c (the runner extension for all of them) suzzer.h
 tools/            uam-run.c fetch-suzzer.sh (`make suzzer`: clone suzzer into ./suzzer, ignored
-                  by git)
+                  by git) xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
+                  docs/jit-perf.md)
 examples/         external-board/ (an out-of-tree board built against `make lib`)
 tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: reference boards plus
                   the components only the tests use; build/uam-test-run)
-tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_mmio.c test_cov.c
-                  test_fuzz.c test_suzzer.c test_smp.c test_ppc.c
+tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
+                  test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
+                  test_smp.c test_ppc.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -165,6 +167,10 @@ tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats t
 tests/szr/        szr-check.sh fake_brain.py  (the SZR1 executor against a scripted brain)
                   brain-check.sh  (a session with suzzer's own brain)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
+tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dump-mem,
+                  --trace-after, traces with --jit, --guard/--watch)
+tests/gdb/        gdb-check.py  (the gdb stub over the remote protocol, four processors)
+tests/smp/        smp_test.h  (one multiprocessor self-test for RISC-V, MIPS, ARM, PowerPC)
 tests/bench/      bench.c x86-start.S x86.ld  (one C benchmark for every guest ISA; make
                   bench-test checks it, tools/xbench.sh times it)
 tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
@@ -173,6 +179,8 @@ tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
 tests/firmware-arm/   start.S selftest.c fuzztarget.c link.ld  (ARMv7: ARM and Thumb-2 builds)
 tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (32-bit PowerPC)
                       start-booke.S link-booke.ld  (the self-test for the Book E model)
+tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bios-check.py
+                      (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
 ```
 
 Planned: more passes in `analysis/` (cmp-log, taint), an Intel HEX loader, more boards and
@@ -351,11 +359,24 @@ devices.
 - **Exception observer** (`uam_exec_set_exc_hook`): sees each synchronous exception before
   the ISA takes it, with precise state, and may stop the run (`UAM_STOP_EXC_HOOK`) instead of
   delivering it. One slot (the fuzz harness owns it). Interrupts and resets are not reported.
+- **Guards** (`guard.h`, `--guard`/`--watch`): byte ranges of guest memory, virtual or
+  physical, whose data accesses (read, write or both) are refused and stop the run at the
+  faulting instruction (`UAM_STOP_GUARD`, resumable: the instruction runs again), refused as a
+  bus fault the guest takes, or allowed and logged. A guard is one bus watch per physically
+  contiguous piece (`UAM_WATCH_FAULT` for the refusing actions); a virtual range is translated
+  as processor 0 maps it when the guard is added. The precise stop comes from the executor: the
+  watch callback requests it (`uam_exec_request_fault_stop`), the access faults, and the run
+  loop returns at the fault's pc instead of delivering the exception, the same on the
+  interpreter and the JIT and on any processor. Instruction fetches, debug accesses and DMA are
+  exempt; a guarded page leaves the JIT's direct memory access. Guards are configuration, not
+  snapshot state. Every hit is recorded and goes to one observer; the fuzz harness's redzones
+  are STOP guards.
 - **Fuzz harness** (`fuzz.h`, [`fuzzing.md`](fuzzing.md)): boot to a begin pc, snapshot,
   and run each input from the snapshot through a named route (guest memory, MMIO `input`
   rules, or an input a board published such as a UART FIFO), with paired or begin-only
   iteration boundaries. Verdicts come from crash pcs, the exception observer filtered by
-  exception class, resets, and the executor's stop reasons (hangs, the per-input budget);
+  exception class, interrupts from chosen lines, resets, guards (the route's redzones around
+  its buffer and any others), and the executor's stop reasons (hangs, the per-input budget);
   an internal error stops the campaign instead. Coverage sites at the boundaries are
   counted by the boundary hooks, in the map they close. Frontends sit behind
   `uam_fuzz_frontend`; the replay frontend runs saved inputs. Observers
@@ -376,7 +397,8 @@ devices.
   are bus watches, registers come from `isa->gdb` (per-register widths for mixed files: the
   x86 view is gdb's whole amd64 core set, x87 included). Every processor is a thread in
   all-stop mode; a stop names the processor that hit the breakpoint or watchpoint, and
-  registers and steps follow the selected thread.
+  registers and steps follow the selected thread. A guard's stop is reported as SIGSEGV on
+  the processor that made the access.
 - **Host I/O** is outside the machine: devices use `chardev.h` / `netdev.h`; backends (stdio,
   pty, sockets, tap, tun, UDP, in-process pairs, pcap capture) and the host loop live in `src/host`.
   Virtual-time pacing (the default) keeps runs deterministic; an idle hart skips straight to its
@@ -426,6 +448,18 @@ Implemented (`make test`):
   processor, per-processor coverage history gives the same map whatever the slicing, and the
   fuzz harness reports the processor that ended an iteration. `tests/gdb/gdb-check.py` drives
   the gdb stub over the remote protocol on four processors.
+- Guards: `test_core` parses the text form and runs MIPS guests under the interpreter and the
+  JIT: a stop at the exact store with the store refused, debug and DMA accesses let through,
+  removal, a virtual range in front of an address, reads passing a write-only guard, an access
+  that starts before a guard, the fault action through the exception observer, logging with
+  the value (one bus watch for a contiguous range), and the errors (an unmapped virtual range,
+  an empty range or direction). `test_fuzz` checks the `mem:` route's redzones (in front, past
+  the input and past the buffer, read and write, length fields of either byte order) on every
+  fuzz target and backend; `tests/runner/runner-check.sh` checks `--guard`/`--watch` on the x86
+  self-test, with the interpreter and the JIT stopping at the same instruction.
+- Runner options: `tests/runner/runner-check.sh` (`make runner-test`) checks `--log-pc`,
+  `--break`, `--dump-mem`, `--trace-after` (absolute and `+N`, across a snapshot) and block
+  traces with `--jit`.
 - Snapshot determinism: `tests/snapshot/snapshot-check.sh` splits a run with `--save-snapshot`
   / `--load-snapshot` at several points and requires the same console output, pc and icount as
   the uninterrupted run, with the interpreter and the JIT on either side.

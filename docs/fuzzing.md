@@ -164,6 +164,24 @@ A `--guard ...,fault` instead lets the guest take the bus fault: that is a crash
 class crashes, and the result names the guard as well. Over SZR1 a crash (guard) is reported
 as `GUEST_FAULT` with the pc.
 
+Exception classes: `fetch`, `load`, `store` (bus faults), `align`, `xlate` (TLB misses and
+protection: firmware with a TLB takes these routinely), `trap` (illegal instructions, but also
+system calls and breakpoints), `sysreg`, `all`, `none`. The default is
+`fetch,load,store,align`. Exceptions outside the policy are delivered to the firmware as
+usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that end there.
+
+`--fuzz-crash-irq N` (repeatable, 0..63) makes taking an interrupt from line N a crash: a
+watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the
+`mcause` interrupt code (7 machine timer, 11 machine external), on MIPS32 the Cause.IP bit
+(0..7) that was pending and enabled, on ARMv7 0 for IRQ and 1 for FIQ (on `arm-ref` every
+device interrupt arrives as IRQ, through the GIC), on PowerPC the external interrupt sources
+0..7 that were high (on `ppc-ref`: 0 the UART, 1 the IPI doorbell), 8 soft reset, 9 machine
+check and 10 the Book E critical input; the timers have no line. On x86-64 they are the
+processor's pins that were high (`UAM_X86_IRQ_*`: 0 INTR, 1 NMI, 2 SMI, 3 INIT, 4 A20M#).
+The interrupt is reported once the CPU has taken it
+(`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
+detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
+
 ### Guards (`--guard`, `--watch`)
 
 Guards are ember's, not the harness's (`uam/guard.h`): they work in any run, fuzzing or not.
@@ -188,8 +206,24 @@ range hits it, in the directions given (default `rw`). What a hit does:
 ```
 build/uam-run --guard 0x80100000-16+16:w fw.elf     # catch writes 16 bytes either side of 0x80100000
 build/uam-run --watch p:0x3000+4:w fw.elf           # log every write to 4 physical bytes
-uam-run: guard lo (stop): cpu 0 pc 0xc8 write 2 at 0x3000 (+0) value 0xa55a
 ```
+
+On the x86 self-test (`tests/runner/runner-check.sh` checks the same), a watch logs each write
+and a guard stops at the first:
+
+```
+build/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --watch p:0x3000+4:w build/firmware-x86/selftest.bin
+guard p:0x3000+4:w (log): cpu 0 pc 0xbf write 2 at 0x3000 (+0) value 0xa55a
+guard p:0x3000+4:w (log): cpu 0 pc 0xc8 write 2 at 0x3002 (+2) value 0xa55a
+
+build/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --guard 0x3000-16+16:w,name=lo build/firmware-x86/selftest.bin
+uam-run: guard lo (stop): cpu 0 pc 0xc8 write 2 at 0x3000 (+16) value 0xa55a
+uam-run: guarded memory access (status 0) at pc=0xc8 after 144 instructions
+```
+
+The offset in parentheses is from the start of the guarded range. A stop names the faulting
+instruction; a logged access names the pc its block started at, which can be earlier (0xbf
+above). `--stats` adds the number of hits.
 
 In a fuzz run a `--guard` is armed from the start, so the boot is held to it as well (the
 fuzz target's start code clearing its BSS stops at a write guard on `g_buf`, and the boot then
@@ -200,22 +234,6 @@ page loses the JIT's direct memory access, so every access to it goes through th
 are not machine state: snapshots neither save nor restore them. In a program:
 `uam_machine_add_guard` (or `uam_machine_add_guard_text` with the same text form),
 `uam_machine_guard_last_hit`, `uam_machine_set_guard_observer` for every hit.
-
-Exception classes: `fetch`, `load`, `store` (bus faults), `align`, `xlate` (TLB misses and
-protection: firmware with a TLB takes these routinely), `trap` (illegal instructions, but also
-system calls and breakpoints), `sysreg`, `all`, `none`. The default is
-`fetch,load,store,align`. Exceptions outside the policy are delivered to the firmware as
-usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that end there.
-
-`--fuzz-crash-irq N` (repeatable, 0..63) makes taking an interrupt from line N a crash: a
-watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the
-`mcause` interrupt code (7 machine timer, 11 machine external), on MIPS32 the Cause.IP bit
-(0..7) that was pending and enabled, on ARMv7 0 for IRQ and 1 for FIQ (on `arm-ref` every
-device interrupt arrives as IRQ, through the GIC), on PowerPC the external interrupt sources
-0..7 that were high (on `ppc-ref`: 0 the UART, 1 the IPI doorbell), 8 soft reset, 9 machine
-check and 10 the Book E critical input; the timers have no line. The interrupt is reported once the CPU has taken it
-(`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
-detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
 
 ### Replay (`--fuzz-replay FILE|DIR`)
 
@@ -257,7 +275,10 @@ with id 0, then one report per input, `bye`).
 
 - Sites are keyed on the virtual pc. Code reached through both kseg0 and kseg1 needs two
   sites, and TLB-mapped code (ASIDs) is not distinguished.
-- One hart. Coverage state is per hart, so more harts need no format change.
+- Several processors (`-o cpus=N`) share one map: each counts in its own history, so the map
+  does not depend on where the slices end, and a result's pc is that of the processor that
+  ended the iteration (a guard hit also gives its number, `uam_fuzz_result.guard.cpu`). Edges
+  between processors are not counted.
 - Interrupts are reported only when taken, and only as a crash (`--fuzz-crash-irq`); an
   interrupt line that is raised but masked is invisible to the harness.
 - `uam_fuzz_abort` (SIGINT in the runner) ends a campaign at the next instruction boundary.
@@ -337,12 +358,13 @@ suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
-`mips32le`, `armv7`, `armv7be` or `ppc32`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+`mips32le`, `armv7`, `armv7be`, `ppc32` or `x86-64`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|
 | ok | COVERAGE, kind ITER | |
 | crash (fault) | CRASH `GUEST_FAULT` (5) | the faulting pc, low 32 bits |
+| crash (guard) | CRASH `GUEST_FAULT` (5) | the pc of the guarded access, low 32 bits |
 | crash (oracle) | CRASH `ORACLE` (6) | the detail, low 32 bits: the crash pc, a halt status, the interrupt lines |
 | hang | CRASH `HANG` (7) | the stop reason (ember's `uam_stop_reason` number) |
 | timeout | CRASH `TIMEOUT` (8) | 0 |

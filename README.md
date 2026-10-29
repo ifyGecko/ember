@@ -24,7 +24,8 @@ reference interpreter or, with `--jit`, a native x86-64 JIT
 with block chaining (a block optimizer feeds both). Every reference board takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
-once, resume in milliseconds), a gdb stub, host console and network backends (tap, tun, UDP,
+once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
+`--watch`), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
 pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
 dependencies beyond libc.
 
@@ -33,7 +34,12 @@ dependencies beyond libc.
 ```bash
 make                 # build/uam-run and the libraries
 make test            # unit tests, RISC-V, MIPS, ARM, x86 and PowerPC firmware self-tests, external-board example,
-                     # snapshot split runs (interpreter and JIT)
+                     # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
+                     # the runner's debugging options, the cross-ISA benchmark's checksums
+                     # (and suzzer interop, with a suzzer checkout)
+make runner-test     # one group on its own (also unit-test, fuzz-test, gdb-test, bench-test, ...)
+make jitdiff-soak    # the JIT-against-interpreter differential test, at length
+make xbench          # time the cross-ISA benchmark (docs/jit-perf.md)
 make net-check       # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
 make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
 make install PREFIX=DIR
@@ -51,6 +57,8 @@ The PowerPC self-test needs a GCC for PowerPC: by default `powerpc64le-linux-gnu
 builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works too
 (`make CROSS=powerpc-linux-gnu- ppc-test`).
 
+The x86 self-tests are assembled with `nasm`; the BIOS boot and gdb stub checks need `python3`.
+
 ## Run firmware
 
 ```bash
@@ -62,6 +70,9 @@ build/uam-run -b armeb-ref build/firmware-arm/selftest-arm-be.elf # big-endian (
 build/uam-run -b ppc-ref build/firmware-ppc/selftest.elf        # 32-bit PowerPC
 build/uam-run -b ppc-ref -o model=booke build/firmware-ppc/selftest-booke.elf  # Book E
 build/uam-run -b ppc-ref --raw-base 0xfff00000 --entry 0xfff00100 boot.bin   # a PowerPC boot ROM
+build/uam-run -b x86_64-ref --image flash=fw.rom -o cpus=4       # a PC: boot flash ending at 4 GiB
+build/uam-run -b x86_64-ref --image bios=bios.rom                # a legacy BIOS ROM (also below 1 MiB)
+build/uam-run -b x86_64-ref --raw-base 0 --entry 0 flat.bin      # a flat image, entered in real mode
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
@@ -70,6 +81,15 @@ build/uam-run --cov-blocks --cov-out cov.map fw.elf  # block-edge coverage map (
 build/uam-run --cov-blocks --fuzz-begin 0x80000318 --fuzz-input uart0 --fuzz-replay crashes/ fw.elf
 build/uam-run --help
 ```
+
+Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
+names the boards. Every reference board takes `--ram SIZE` and `-o cpus=N` (`--quantum N`:
+instructions each processor runs before the next, default 4096); `ppc-ref` takes
+`-o model=classic|booke`. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
+(a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
+(the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
+save-state layout the firmware's SMM handler expects).
 
 With `--jit`, compiled blocks jump straight into each other (block chaining) instead of
 returning to the run loop after every block, which pays off most on firmware with short
@@ -113,7 +133,8 @@ nothing (the default 4194304 events take about 0.1 s). Virtual time never passes
 All of these are counted in virtual time, so runs stay deterministic.
 The other exit statuses: the firmware's own status when it ends the run, 2 usage or setup error
 (including a library/header ABI mismatch), 125 deadlock (waiting with nothing that could wake it),
-126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 130 SIGINT/SIGTERM.
+126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 129 a `--guard` stopped the
+run, 130 SIGINT/SIGTERM. `--fuzz-replay` has its own (20-25, above).
 
 ```bash
 build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructions and idle time
@@ -164,6 +185,14 @@ served by a read handler, a frame buffer) is readable only if its device impleme
 otherwise the dump names the region and its device and writes no file. On PC boards an access
 no device claims reads all ones (master abort), as on hardware; the first one at each memory
 page or I/O port is logged as a warning, and the most frequent are listed at the end of the run.
+
+`--guard [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log][,name=NAME]` guards the bytes
+`[ADDR-BEFORE, ADDR+AFTER)` (a bare ADDR is one byte; ADDR is virtual unless `p:`). A data access
+that touches them in the given directions (default both) is refused and stops the run at that
+instruction (`stop`, the default: exit 129, SIGSEGV in gdb), becomes a bus fault for the guest
+(`fault`), or is allowed and logged (`log`; `--watch SPEC` is `--guard SPEC,log`). Instruction
+fetches, gdb and `--dump-mem` reads and DMA are not guarded. `uam/guard.h` is the same in a
+program; the fuzz harness builds its redzones on it ([`docs/fuzzing.md`](docs/fuzzing.md#guards---guard---watch)).
 
 Fixed console input (`string:TEXT`, `file:OUT,in=FILE`) reaches the guest when the run starts,
 after the board's power-on reset and any `--load-snapshot`, never while the board is being built.
@@ -268,18 +297,22 @@ the RISC-V lifter nor the stock boards.
 
 ```
 include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.h signal.h sched.h
-                   cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h host.h
-                   gdbstub.h runner.h boards.h
+                   cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
+                   blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
-src/exec/          interpreter, translation cache, run loop, x86-64 JIT (jit_x86.c)
+src/exec/          interpreter, translation cache, run loop, x86-64 JIT (jit_x86.c), coverage,
+                   spin-loop skipping
 src/loader/        ELF / raw loaders
-src/machine/       machine lifecycle, resets, board registry, snapshots
+src/machine/       machine lifecycle, resets, board registry, snapshots, guards
 src/host/          chardev/netdev/block-device backends, host loop, real-time pacing
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
+analysis/          IR passes (cov.c: the edge-coverage pass)
+fuzz/              the persistent-mode fuzz harness, the replay frontend, the runner's fuzz
+                   options; fuzz/suzzer/: suzzer's formats (built only with a suzzer checkout)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
@@ -302,14 +335,28 @@ boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
+tools/             also fetch-suzzer.sh (make suzzer), xbench.sh / jitbench.sh (timing),
+                   jitprof.py (native-code profiles; docs/jit-perf.md)
 examples/          external-board: an out-of-tree board using the library
-tests/unit/        IR semantics/verifier, core (bus, resets, hooks, ABI), host side, snapshots,
-                   JIT chaining, MMIO rules, the PowerPC board interface (test_ppc)
+tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
+                   snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
+                   loops, stores next to code, MMIO rules, coverage, the fuzz harness,
+                   multiprocessor observers, suzzer's formats, the PowerPC board interface
+tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
+                   use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
 tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
 tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E builds), multiprocessor
                    test and fuzz target
+tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
+                   ROM tests (nasm)
+tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
+tests/cov/ tests/fuzz/  block-coverage maps across backends; the fuzz harness on planted bugs
+tests/suzzer/ tests/szr/  suzzer's formats and the SZR1 executor (with a suzzer checkout)
+tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
+tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch
+tests/bench/       one C benchmark for every guest ISA (make bench-test, make xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```
