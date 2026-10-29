@@ -122,6 +122,18 @@ static bool walk(uam_cpu *cpu, uint64_t va, uint64_t *pbase, unsigned *shift, un
     return true;
 }
 
+/* True if accumulated page permissions `perm` allow `kind` at this privilege. */
+static bool x86_perm_ok(unsigned perm, uam_xlate_kind kind, bool user, const x86_state *s)
+{
+    if (user && !(perm & PERM_U))
+        return false;
+    if (kind == UAM_XLATE_STORE && !(perm & PERM_W) && (user || (s->cr0 & CR0_WP)))
+        return false;
+    if (kind == UAM_XLATE_FETCH && !(perm & PERM_X))
+        return false;
+    return true;
+}
+
 /* Translate with an explicit privilege: user = a CPL-3 access. */
 static uam_status xlate(uam_cpu *cpu, uint64_t va, uam_xlate_kind kind, bool user,
                         uint64_t *pa, uint32_t *fault)
@@ -129,44 +141,54 @@ static uam_status xlate(uam_cpu *cpu, uint64_t va, uam_xlate_kind kind, bool use
     x86_state *s = x86_st(cpu);
     uint64_t vpage = va >> 12;
     x86_tlb_ent *t = &s->tlb[vpage & (X86_TLB_SIZE - 1)];
-    unsigned perm;
-    uint64_t ppage;
+    unsigned perm = 0;
+    uint64_t ppage = 0;
+    bool cached = t->vpage == vpage && t->gen == cpu->xlate_gen;
 
-    if (t->vpage == vpage && t->gen == cpu->xlate_gen) {
+    if (cached) {
         perm = t->perm;
         ppage = t->ppage;
-    } else {
-        uint64_t base;
-        unsigned shift;
-        uint32_t f;
-        if (!walk(cpu, va, &base, &shift, &perm, &f)) {
-            *fault = f | (kind == UAM_XLATE_STORE ? PFEC_W : 0) | (user ? PFEC_U : 0) |
-                     (kind == UAM_XLATE_FETCH && (s->efer & EFER_NXE) ? PFEC_I : 0);
-            return UAM_ERR_XLATE;
-        }
-        ppage = base + (va & ((1ull << shift) - 1) & ~0xFFFull);
-        if (kind != UAM_XLATE_DEBUG) {
-            t->vpage = vpage;
-            t->ppage = ppage;
-            t->perm = (uint8_t)perm;
-            t->gen = cpu->xlate_gen;
-        }
     }
 
-    if (kind != UAM_XLATE_DEBUG) {
-        bool ok = true;
-        if (user && !(perm & PERM_U))
-            ok = false;
-        if (kind == UAM_XLATE_STORE && !(perm & PERM_W) && (user || (s->cr0 & CR0_WP)))
-            ok = false;
-        if (kind == UAM_XLATE_FETCH && !(perm & PERM_X))
-            ok = false;
-        if (!ok) {
+    for (;;) {
+        if (!cached) {
+            uint64_t base;
+            unsigned shift;
+            uint32_t f;
+            if (!walk(cpu, va, &base, &shift, &perm, &f)) {
+                *fault = f | (kind == UAM_XLATE_STORE ? PFEC_W : 0) | (user ? PFEC_U : 0) |
+                         (kind == UAM_XLATE_FETCH && (s->efer & EFER_NXE) ? PFEC_I : 0);
+                return UAM_ERR_XLATE;
+            }
+            ppage = base + (va & ((1ull << shift) - 1) & ~0xFFFull);
+            if (kind != UAM_XLATE_DEBUG) {
+                t->vpage = vpage;
+                t->ppage = ppage;
+                t->perm = (uint8_t)perm;
+                t->gen = cpu->xlate_gen;
+            }
+        }
+
+        if (kind == UAM_XLATE_DEBUG || x86_perm_ok(perm, kind, user, s))
+            break;
+
+        /* A cached translation denies the access. On x86 a PTE may be upgraded
+         * (a copy-on-write page made writable, NX cleared, ...) without an
+         * INVLPG: flush_tlb_fix_spurious_fault() is a no-op there, so the guest
+         * relies on the CPU re-walking the page tables when the stale TLB entry
+         * causes a spurious fault. Emulate that by walking once more from the
+         * tables before faulting, so the upgrade is seen; a genuinely-denied
+         * access still faults after that fresh walk. Without this a write to a
+         * just-un-write-protected page (e.g. post-fork COW in Linux) re-faults
+         * forever. */
+        if (!cached) {
             *fault = PFEC_P | (kind == UAM_XLATE_STORE ? PFEC_W : 0) | (user ? PFEC_U : 0) |
                      (kind == UAM_XLATE_FETCH && (s->efer & EFER_NXE) ? PFEC_I : 0);
             return UAM_ERR_XLATE;
         }
+        cached = false;
     }
+
     *pa = ppage | (va & 0xFFF);
     return UAM_OK;
 }
