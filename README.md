@@ -88,10 +88,11 @@ to 0.190 s (+31%), interpreter 2.93 s to 3.05 s (+4%). Real firmware has longer 
 `--fuzz-begin PC` turns the runner into a persistent-mode fuzz harness: it boots to PC,
 snapshots there and runs every input from the snapshot, delivered through `--fuzz-input`
 (`mem:ADDR`, `mmio`, or a board input such as `uart0`), and classifies each run as ok, crash
-(an exception, a `--fuzz-crash-pc`, a reset), hang or timeout, or rejected when the route
-refuses an input. `--fuzz-replay FILE|DIR` runs saved inputs once each and exits with the most
-severe verdict of any input (20/21 crash, else 22 hang, else 23 timeout, else 24 rejected,
-else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
+(an exception, a `--fuzz-crash-pc`, a reset, a touched redzone or guard), hang or timeout, or
+rejected when the route refuses an input. The `mem:` route can put read and/or write redzones
+in front of its buffer and past the input in it (`before=N`, `after`). `--fuzz-replay
+FILE|DIR` runs saved inputs once each and exits with the most severe verdict of any input
+(20/21/25 crash, else 22 hang, else 23 timeout, else 24 rejected, else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
 
 With a [suzzer](docs/suzzer.md) checkout (`make SUZZER_DIR=path`, or `make suzzer` to clone one
 into `./suzzer`), suzzer's site lists and boundary files plug in directly: `--cov-sites fw.lcv3` gives bitmaps
@@ -148,6 +149,8 @@ build/uam-run --log-pc 0x8023f00c fw.elf      # report every arrival at a pc
 build/uam-run --break 0x8023f00c -d fw.elf    # stop there and dump the hart
 build/uam-run --break 0x8023f00c --dump-mem 0x80100000+256 fw.elf   # and hex-dump guest memory
 build/uam-run --break 0x8023f00c --dump-mem p:0x100000+64K=heap.bin fw.elf  # physical, raw to a file
+build/uam-run --guard 0x80100000-16+16:w fw.elf   # stop before any write within 16 bytes of an address
+build/uam-run --watch p:0x3000+4 fw.elf          # log every access to 4 physical bytes
 build/uam-run --gdb 1234 fw.elf               # then: gdb-multiarch fw.elf -ex 'target remote :1234'
 build/uam-run --console pty fw.elf            # console on a pseudo-terminal (also tcp:PORT, unix:PATH,
                                               # stdio-raw, file:OUT[,in=FILE], string:TEXT, null)

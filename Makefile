@@ -83,7 +83,7 @@ EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c
                src/exec/coverage.c src/exec/spin.c
 ANALYSIS_SRC := analysis/cov.c
 LOADER_SRC  := src/loader/loader.c
-MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c
+MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c src/machine/guard.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c

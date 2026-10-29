@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "uam/gdbstub.h"
+#include "uam/guard.h"
 
 #define PKT_MAX   0x4000u
 #define MAX_BP    64u
@@ -484,6 +485,17 @@ static void report(uam_gdb *g, uam_stop_reason why, bool *done)
     case UAM_STOP_TIME_LIMIT:
         put_packet(g, "T0e");      /* SIGALRM: the virtual time budget is spent */
         return;
+    case UAM_STOP_GUARD: {
+        /* SIGSEGV at the guarded access, on the processor that made it */
+        const uam_guard_hit *h = uam_machine_guard_last_hit(g->m);
+        char th[32], buf[64];
+        if (h)
+            g->stop_cpu = h->cpu;
+        g->cur = g->stop_cpu;
+        snprintf(buf, sizeof(buf), "T0b%s", thread_field(g, th, sizeof(th)));
+        put_packet(g, buf);
+        return;
+    }
     case UAM_STOP_INSN_LIMIT:
         if (uam_machine_icount(g->m) >= g->end_icount) {
             put_packet(g, "T0e");  /* SIGALRM: the instruction budget is spent */

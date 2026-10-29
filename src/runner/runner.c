@@ -24,6 +24,7 @@
 #include "uam/boards.h"
 #include "uam/fuzz.h"
 #include "uam/gdbstub.h"
+#include "uam/guard.h"
 #include "uam/host.h"
 #include "uam/loader.h"
 #include "uam/machine.h"
@@ -256,6 +257,15 @@ static void usage(FILE *out)
         "                          keeps the count); +N: N instructions after the run starts\n"
         "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
+        "      --guard SPEC        guard guest memory (repeatable): a data access that\n"
+        "                          touches it stops the run before it happens (exit 129).\n"
+        "                          SPEC: [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log]\n"
+        "                          [,name=NAME]: the range [ADDR-BEFORE, ADDR+AFTER) (bare\n"
+        "                          ADDR: one byte), r/w/rw the accesses it catches (default\n"
+        "                          rw); fault makes the access a bus fault for the guest\n"
+        "                          instead, log only reports it. ADDR is virtual, translated\n"
+        "                          as processor 0 maps it when the run starts; p: physical\n"
+        "      --watch SPEC        --guard SPEC,log: report each access to it on stderr\n"
         "      --dump-mem [p:]ADDR+LEN[=FILE]  when the run stops (--break, -n, ...), hex-dump\n"
         "                          LEN bytes of guest memory at ADDR to stderr, or write them\n"
         "                          raw to FILE (repeatable). ADDR is virtual, translated as\n"
@@ -290,7 +300,11 @@ static void usage(FILE *out)
         "      --fuzz-begin-skip N boot passes the begin PC N times and snapshots at the next\n"
         "                          arrival (firmware that runs its handler at start-up)\n"
         "      --fuzz-input ROUTE  how inputs reach the guest: mem:ADDR[,len=ADDR][,max=N]\n"
-        "                          [,reject] (reject: refuse longer inputs, verdict rejected),\n"
+        "                          [,reject] (reject: refuse longer inputs, verdict rejected)\n"
+        "                          [,before=N[:DIR]] [,after[=N][:DIR]] (redzones in front of\n"
+        "                          the buffer and past the input in it: verdict crash-guard;\n"
+        "                          DIR r, w or rw) [,extent=@OFF:SZ[:le|:be][+-D]] (the input's\n"
+        "                          length field bounds it instead of its size),\n"
         "                          mmio (--mmio-rule input registers), or a board input\n"
         "                          (stock boards: uart0)\n"
         "      --fuzz-crash-pc PC  reaching PC is a crash (repeatable)\n"
@@ -302,7 +316,7 @@ static void usage(FILE *out)
         "      --fuzz-iter-insns N instruction budget per input (default 10000000; timeout)\n"
         "      --fuzz-replay PATH  run each input in FILE or DIR once and print the verdict;\n"
         "                          -n bounds the boot; exit 0 ok, 20 fault, 21 oracle,\n"
-        "                          22 hang, 23 timeout, 24 rejected (the most severe of\n"
+        "                          22 hang, 23 timeout, 24 rejected, 25 guard (the most severe of\n"
         "                          any input: a crash, a hang, a timeout, a rejection)\n"
         "  -s, --stats             print execution statistics at exit\n"
         "  -d, --dump-state        print hart state at exit (every processor's)\n"
@@ -486,10 +500,12 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
     } else {
         rc = r ? uam_fuzz_replay_exit_status(r) : 0;
     }
-    fprintf(stderr, "uam-run: fuzz: %llu inputs: %llu ok, %llu crash (fault), %llu crash (oracle), "
-            "%llu hang, %llu timeout, %llu rejected\n", (unsigned long long)fs->iterations,
+    fprintf(stderr, "uam-run: fuzz: %llu inputs: %llu ok, %llu crash (fault), %llu crash (guard), "
+            "%llu crash (oracle), %llu hang, %llu timeout, %llu rejected\n",
+            (unsigned long long)fs->iterations,
             (unsigned long long)fs->by_verdict[UAM_FUZZ_OK],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_FAULT],
+            (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_GUARD],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_CRASH_ORACLE],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_HANG],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_TIMEOUT],
@@ -525,7 +541,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
            OPT_IMAGE, OPT_CONSOLE, OPT_REALTIME, OPT_TRACE_RANGE, OPT_TRACE_AFTER, OPT_LOG_PC,
-           OPT_BREAK, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL, OPT_QUANTUM,
+           OPT_BREAK, OPT_GUARD, OPT_WATCH, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL, OPT_QUANTUM,
            OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT, OPT_MMIO_RULE, OPT_MMIO_INPUT,
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
@@ -556,6 +572,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "trace-after", required_argument, NULL, OPT_TRACE_AFTER },
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
+        { "guard", required_argument, NULL, OPT_GUARD },
+        { "watch", required_argument, NULL, OPT_WATCH },
         { "gdb", required_argument, NULL, OPT_GDB },
         { "load-snapshot", required_argument, NULL, OPT_LOAD_SNAP },
         { "save-snapshot", required_argument, NULL, OPT_SAVE_SNAP },
@@ -603,6 +621,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint32_t quantum = 0;
     uint64_t realtime_tps = 0, *log_hits = NULL;
     pc_list log_pcs = { 0 }, break_pcs = { 0 };
+    const char *guard_texts[MAX_LIST];
+    uam_guard_action guard_dflt[MAX_LIST];
+    unsigned n_guards = 0;
     mem_dump mem_dumps[MAX_LIST];
     unsigned n_mem_dumps = 0;
     bool trace_after_rel = false;
@@ -743,6 +764,21 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 return 2;
             }
             break;
+        case OPT_GUARD:
+        case OPT_WATCH: {
+            uam_guard_spec gs;
+            char gname[128], gerr[256];
+            uam_guard_action a = c == OPT_WATCH ? UAM_GUARD_LOG : UAM_GUARD_STOP;
+            if (n_guards == MAX_LIST
+                || !uam_guard_parse(optarg, a, &gs, gname, sizeof(gname), gerr, sizeof(gerr))) {
+                fprintf(stderr, "uam-run: bad --%s: %s\n", c == OPT_WATCH ? "watch" : "guard",
+                        n_guards == MAX_LIST ? "too many (at most 64)" : gerr);
+                return 2;
+            }
+            guard_texts[n_guards] = optarg;
+            guard_dflt[n_guards++] = a;
+            break;
+        }
         case OPT_GDB: gdb_port = optarg; break;
         case OPT_LOAD_SNAP: load_snap = optarg; break;
         case OPT_SAVE_SNAP: save_snap = optarg; break;
@@ -1054,6 +1090,14 @@ static int run_main(int argc, char **argv, const ext_set *es)
         uam_machine_fini(&m);
         goto out_host;
     }
+    for (unsigned i = 0; i < n_guards; i++) {
+        char gerr[256];
+        if (uam_machine_add_guard_text(&m, guard_texts[i], guard_dflt[i], gerr, sizeof(gerr)) < 0) {
+            fprintf(stderr, "uam-run: cannot arm '%s': %s\n", guard_texts[i], gerr);
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+    }
     uam_runner_setup xs = { .m = &m, .have_image = image != NULL, .image = info,
                             .have_raw_base = have_raw_base, .raw_base = raw_base,
                             .map_size_option = cov_map_size_given ? (uint32_t)cov_map_size : 0 };
@@ -1203,7 +1247,14 @@ static int run_main(int argc, char **argv, const ext_set *es)
     case UAM_STOP_LIVELOCK:   rc = 128; break;
     case UAM_STOP_DEBUG:
     case UAM_STOP_HOOK:       rc = 127; break;
+    case UAM_STOP_GUARD:      rc = 129; break;
     default:                  rc = 126; break;
+    }
+
+    if (!fuzzing && why == UAM_STOP_GUARD && uam_machine_guard_last_hit(&m)) {
+        char line[256];
+        uam_guard_hit_format(uam_machine_guard_last_hit(&m), line, sizeof(line));
+        fprintf(stderr, "uam-run: %s\n", line);
     }
 
     if (!fuzzing)
@@ -1234,6 +1285,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 secs, (unsigned long long)ran, secs > 0 ? (double)ran / secs / 1e6 : 0.0,
                 (double)s->translate_ns / 1e9, (unsigned long long)s->ir_ops_lifted,
                 (unsigned long long)s->ir_ops_final, (unsigned long long)s->code_bytes);
+        if (n_guards)
+            fprintf(stderr, "stats: guard hits=%llu\n",
+                    (unsigned long long)uam_machine_guard_hits(&m));
         if (s->blocks_compiled)
             fprintf(stderr, "stats: jit calls eval=%llu load=%llu store=%llu\n",
                     (unsigned long long)s->jit_eval_calls, (unsigned long long)s->jit_load_calls,

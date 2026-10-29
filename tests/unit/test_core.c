@@ -29,6 +29,7 @@
 #include "uam/dev/pci.h"
 #include "uam/dev/unimp.h"
 #include "uam/device.h"
+#include "uam/guard.h"
 #include "uam/isa.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/x86.h"
@@ -426,6 +427,173 @@ static void mips_machine(uam_machine *m)
 {
     CHECK(uam_machine_init(m, &uam_isa_mips32be) == UAM_OK, "machine init");
     CHECK(uam_bus_map_ram(&m->bus, "ram", 0, 32 << 20) == UAM_OK, "map ram");
+}
+
+/* ------------------------------------------------------------------------ */
+/* Guards (uam/guard.h): stop, fault and log; ranges before and after an     */
+/* address; exempt accesses                                                  */
+/* ------------------------------------------------------------------------ */
+
+static void test_guard_parse(void)
+{
+    uam_guard_spec g;
+    char name[64], err[256];
+    CHECK(uam_guard_parse("0x1000", UAM_GUARD_STOP, &g, name, sizeof(name), err, sizeof(err)), "%s", err);
+    CHECK(g.addr == 0x1000 && g.len == 1 && g.dir == UAM_GUARD_RW && !g.phys
+          && g.action == UAM_GUARD_STOP && !strcmp(g.name, "0x1000"), "bare address: one byte");
+    CHECK(uam_guard_parse("0x1000+16", UAM_GUARD_STOP, &g, name, sizeof(name), err, sizeof(err))
+          && g.addr == 0x1000 && g.len == 16, "after");
+    CHECK(uam_guard_parse("0x1000-16", UAM_GUARD_STOP, &g, name, sizeof(name), err, sizeof(err))
+          && g.addr == 0xff0 && g.len == 16, "before");
+    CHECK(uam_guard_parse("0x1000-16+16:w", UAM_GUARD_LOG, &g, name, sizeof(name), err, sizeof(err))
+          && g.addr == 0xff0 && g.len == 32 && g.dir == UAM_GUARD_WRITE && g.action == UAM_GUARD_LOG,
+          "both sides, write, the default action");
+    CHECK(uam_guard_parse("p:4096+4K:r,fault,name=hdr", UAM_GUARD_STOP, &g, name, sizeof(name), err,
+                          sizeof(err))
+          && g.phys && g.addr == 4096 && g.len == 4096 && g.dir == UAM_GUARD_READ
+          && g.action == UAM_GUARD_FAULT && !strcmp(g.name, "hdr"), "physical, K, options");
+    CHECK(uam_guard_parse("0x10,log", UAM_GUARD_STOP, &g, name, sizeof(name), err, sizeof(err))
+          && g.action == UAM_GUARD_LOG && !strcmp(g.name, "0x10"), "log");
+    static const char *const bad[] = { "", "x", "0x10-", "0x10+0", "0x10-0x20", "0x10:x", "0x10:rwx",
+                                       "0x10,nope", "0x10+4junk", "0xffffffffffffffff+2" };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(bad); i++)
+        CHECK(!uam_guard_parse(bad[i], UAM_GUARD_STOP, &g, name, sizeof(name), err, sizeof(err))
+              && err[0], "'%s' is refused", bad[i]);
+}
+
+static uam_hook_action stop_on_exc(void *ctx, uam_cpu *cpu, const uam_exception *e)
+{
+    (void)cpu;
+    *(uam_exception *)ctx = *e;
+    return UAM_HOOK_STOP;
+}
+
+/* At 0x80000000 (physical 0): lw t1, 0x1000; sw t1, 0x1004; lw t2, 0xffc; b . */
+static void guard_program(uam_machine *m, bool jit)
+{
+    mips_machine(m);
+    if (jit)
+        CHECK(uam_exec_enable_jit(&m->exec), "jit available");
+    put32(m, 0x00, 0x3C088000u);   /* lui t0, 0x8000 */
+    put32(m, 0x04, 0x8D091000u);   /* lw  t1, 0x1000(t0) */
+    put32(m, 0x08, 0xAD091004u);   /* sw  t1, 0x1004(t0) */
+    put32(m, 0x0c, 0x8D0A0FFCu);   /* lw  t2, 0x0ffc(t0) */
+    put32(m, 0x10, 0x1000FFFFu);   /* b . */
+    put32(m, 0x14, 0x00000000u);   /* nop */
+    put32(m, 0x1000, 0x11223344u);
+    put32(m, 0xffc, 0x55667788u);
+    uam_machine_set_guard_log(m, NULL);
+    uam_machine_reset(m, 0x80000000u);
+}
+
+static void test_guards(bool jit)
+{
+    const char *bk = jit ? "jit" : "interp";
+    uam_machine m;
+    char err[256];
+    uint64_t v;
+
+    /* STOP on a write: the store does not happen, the run stops at it; resuming
+     * without the guard re-executes it. */
+    guard_program(&m, jit);
+    uam_guard_spec g = { .addr = 0x1004, .len = 4, .phys = true, .dir = UAM_GUARD_WRITE,
+                         .action = UAM_GUARD_STOP, .name = "w" };
+    int id = uam_machine_add_guard(&m, &g, err, sizeof(err));
+    CHECK(id > 0, "%s: add: %s", bk, err);
+    EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_GUARD, "write guard stops");
+    EQ64(m.cpu.pc, 0x80000008u, "at the store");
+    const uam_guard_hit *h = uam_machine_guard_last_hit(&m);
+    CHECK(h && h->id == id && !strcmp(h->name, "w") && h->is_write && h->size == 4
+          && h->addr == 0x1004 && h->paddr == 0x1004 && h->val == 0x11223344u
+          && h->pc == 0x80000008u && h->cpu == 0 && h->action == UAM_GUARD_STOP, "%s: the hit", bk);
+    EQ64(uam_machine_guard_hits(&m), 1, "one hit");
+    uam_bus_read(&m.bus, 0x1004, 4, UAM_ACC_BE | UAM_ACC_DEBUG, &v);
+    EQ64(v, 0, "the store was refused");
+    EQ64(gpr(&m, 9), 0x11223344u, "the load before it ran");
+    /* Exempt: debug accesses and DMA. */
+    CHECK(uam_bus_read(&m.bus, 0x1004, 4, UAM_ACC_BE | UAM_ACC_DEBUG, &v) == UAM_OK, "debug read");
+    CHECK(uam_bus_write(&m.bus, 0x1004, 4, UAM_ACC_BE | UAM_ACC_DEBUG, 0) == UAM_OK, "debug write");
+    uint8_t z[4] = { 0 };
+    CHECK(uam_bus_dma_write(&m.bus, 0x1004, z, 4) == UAM_OK, "dma");
+    EQ64(uam_machine_guard_hits(&m), 1, "exempt accesses do not hit");
+    CHECK(uam_machine_remove_guard(&m, id) && !uam_machine_remove_guard(&m, id), "remove once");
+    EQ64(m.bus.n_watches, 0, "its watch is gone");
+    EQ64(uam_exec_run(&m.exec, 3), UAM_STOP_INSN_LIMIT, "resumes");
+    uam_bus_read(&m.bus, 0x1004, 4, UAM_ACC_BE | UAM_ACC_DEBUG, &v);
+    EQ64(v, 0x11223344u, "and the store happens");
+    uam_machine_fini(&m);
+
+    /* A read guard in front of an address (0x1000-4, virtual): only the under-read hits;
+     * the load at 0x1000 and the store do not. */
+    guard_program(&m, jit);
+    CHECK(uam_machine_add_guard_text(&m, "0x80001000-4:r", UAM_GUARD_STOP, err, sizeof(err)) > 0,
+          "%s: text: %s", bk, err);
+    EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_GUARD, "under-read stops");
+    EQ64(m.cpu.pc, 0x8000000cu, "at the under-read");
+    h = uam_machine_guard_last_hit(&m);
+    CHECK(h && !h->is_write && h->addr == 0x80000ffcu && h->paddr == 0xffc && h->start == 0x80000ffcu
+          && h->len == 4, "%s: virtual hit", bk);
+    uam_bus_read(&m.bus, 0x1004, 4, UAM_ACC_BE | UAM_ACC_DEBUG, &v);
+    EQ64(v, 0x11223344u, "the store before it ran");
+    EQ64(gpr(&m, 10), 0, "the guarded load did not");
+    uam_machine_fini(&m);
+
+    /* A range over both sides that only catches writes; an access overlapping a guard
+     * partly hits it (the 4-byte store at 0x1004 against [0x1006, 0x1007)). */
+    guard_program(&m, jit);
+    CHECK(uam_machine_add_guard_text(&m, "p:0x1000-4+4:w", UAM_GUARD_STOP, err, sizeof(err)) > 0,
+          "%s: %s", bk, err);
+    EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_INSN_LIMIT, "reads pass a write guard");
+    uam_machine_remove_guards(&m);
+    uam_machine_reset(&m, 0x80000000u);
+    CHECK(uam_machine_add_guard_text(&m, "p:0x1006", UAM_GUARD_STOP, err, sizeof(err)) > 0, "%s", err);
+    EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_GUARD, "a partly overlapping access hits");
+    h = uam_machine_guard_last_hit(&m);
+    CHECK(h && h->addr == 0x1004 && (int64_t)(h->addr - h->start) == -2, "%s: it starts 2 before", bk);
+    uam_machine_fini(&m);
+
+    /* FAULT: the guest takes the bus fault (seen here by the exception observer). */
+    guard_program(&m, jit);
+    CHECK(uam_machine_add_guard_text(&m, "p:0x1000+4:r,fault", UAM_GUARD_STOP, err, sizeof(err)) > 0,
+          "%s", err);
+    uam_exception e = { 0 };
+    uam_machine_set_exc_hook(&m, stop_on_exc, &e);
+    EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_EXC_HOOK, "fault guard raises an exception");
+    EQ64(e.kind, UAM_EXC_LOAD_FAULT, "a load bus fault");
+    EQ64(e.pc, 0x80000004u, "at the load");
+    h = uam_machine_guard_last_hit(&m);
+    CHECK(h && h->action == UAM_GUARD_FAULT && !h->is_write, "%s: recorded", bk);
+    uam_machine_fini(&m);
+
+    /* LOG: the access happens and is recorded, with the value; a virtual range across a
+     * page boundary that kseg0 maps contiguously is one watch. */
+    guard_program(&m, jit);
+    CHECK(uam_machine_add_guard_text(&m, "0x80000ff0+32,log", UAM_GUARD_STOP, err, sizeof(err)) > 0,
+          "%s", err);
+    EQ64(m.bus.n_watches, 1, "one physically contiguous piece");
+    EQ64(uam_exec_run(&m.exec, 100), UAM_STOP_INSN_LIMIT, "log does not stop");
+    EQ64(uam_machine_guard_hits(&m), 3, "all three accesses logged");
+    h = uam_machine_guard_last_hit(&m);
+    CHECK(h && h->action == UAM_GUARD_LOG && !h->is_write && h->paddr == 0xffc && h->val == 0x55667788u,
+          "%s: the last, with the value read", bk);
+    EQ64(gpr(&m, 10), 0x55667788u, "the load happened");
+    char line[256];
+    uam_guard_hit_format(h, line, sizeof(line));
+    CHECK(strstr(line, "read 4 at 0x80000ffc") && strstr(line, "physical 0xffc")
+          && strstr(line, "value 0x55667788"), "format: %s", line);
+    uam_machine_fini(&m);
+
+    /* Errors: an unmapped virtual range, bad specs. */
+    guard_program(&m, jit);
+    CHECK(uam_machine_add_guard_text(&m, "0xC0000000+4", UAM_GUARD_STOP, err, sizeof(err)) < 0
+          && strstr(err, "does not map"), "kseg2 without a TLB entry: %s", err);
+    g = (uam_guard_spec){ .addr = 0, .len = 0, .phys = true, .dir = UAM_GUARD_RW };
+    CHECK(uam_machine_add_guard(&m, &g, err, sizeof(err)) < 0, "len 0");
+    g.len = 4;
+    g.dir = 0;
+    CHECK(uam_machine_add_guard(&m, &g, err, sizeof(err)) < 0, "no direction");
+    EQ64(m.bus.n_watches, 0, "nothing left behind");
+    uam_machine_fini(&m);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1817,6 +1985,9 @@ int main(void)
     test_priority();
     test_romd_alias();
     test_watch();
+    test_guard_parse();
+    test_guards(false);
+    test_guards(true);
     test_subpage_cache();
     test_timer_reset();
     test_device_reset();

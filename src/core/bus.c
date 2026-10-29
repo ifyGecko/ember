@@ -263,18 +263,22 @@ static bool watched(const uam_bus *bus, uint64_t base, uint64_t size)
     return false;
 }
 
-/* A UAM_WATCH_FAULT watch of the matching direction turns its range into a guard page:
- * the overlapping access faults instead of returning/storing data. */
-static bool guard_hit(const uam_bus *bus, uint64_t addr, unsigned size, bool is_write)
+/* A UAM_WATCH_FAULT watch of the matching direction turns its range into a guard: the
+ * overlapping access faults instead of returning/storing data. Every such watch it
+ * overlaps is told first (`val`: the value a write would have stored; 0 for a read). */
+static bool guard_hit(uam_bus *bus, uint64_t addr, unsigned size, bool is_write, uint64_t val)
 {
     unsigned dir = is_write ? UAM_WATCH_WRITE : UAM_WATCH_READ;
+    bool hit = false;
     for (uint32_t i = 0; i < bus->n_watches; i++) {
         const uam_watch *w = &bus->watches[i];
         if ((w->kinds & UAM_WATCH_FAULT) && (w->kinds & dir)
-            && overlaps(addr, size, w->base, w->size))
-            return true;
+            && overlaps(addr, size, w->base, w->size)) {
+            w->fn(w->ctx, addr, size, is_write, val);
+            hit = true;
+        }
     }
-    return false;
+    return hit;
 }
 
 static void fire_watches(uam_bus *bus, uint64_t addr, unsigned size, bool is_write, uint64_t val)
@@ -597,7 +601,7 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
     hit h;
     uam_status st;
 
-    if (!side_effect_free && bus->n_watches && guard_hit(bus, addr, size, false))
+    if (!side_effect_free && bus->n_watches && guard_hit(bus, addr, size, false, 0))
         return UAM_ERR_FAULT;   /* UAM_WATCH_FAULT guard */
 
     switch (resolve(bus, addr, size, &h)) {
@@ -669,7 +673,7 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
     hit h;
     uam_status st;
 
-    if (!debug && bus->n_watches && guard_hit(bus, addr, size, true))
+    if (!debug && bus->n_watches && guard_hit(bus, addr, size, true, val))
         return UAM_ERR_FAULT;   /* UAM_WATCH_FAULT guard */
 
     switch (resolve(bus, addr, size, &h)) {

@@ -111,9 +111,28 @@ continuously, publishes it as a separate GAP map; ember has none.
 
 | Route | Delivery |
 |---|---|
-| `mem:ADDR[,len=ADDR][,max=N][,reject]` | the input written at virtual ADDR (truncated to N bytes, default 4096; with `reject`, a longer input is refused instead: verdict rejected), and optionally its length as a 32-bit word in the CPU's byte order |
+| `mem:ADDR[,len=ADDR][,max=N][,reject]` `[,before=N[:DIR]][,after[=N][:DIR]][,extent=@OFF:SZ[:le\|:be][+D\|-D]]` | the input written at virtual ADDR (truncated to N bytes, default 4096; with `reject`, a longer input is refused instead: verdict rejected), and optionally its length as a 32-bit word in the CPU's byte order; redzones around the buffer (below) |
 | `mmio` | the stream that `--mmio-rule ...:input` registers read |
 | a board input | anything a board published with `uam_machine_add_input`; the stock boards publish `uart0` (the receive FIFO; what does not fit is dropped) |
+
+**Redzones.** The `mem:` route can guard the memory around its buffer `[ADDR, ADDR+max)`
+with STOP guards ([guards](#guards---guard---watch)): an access that touches one ends the
+iteration before it happens, with verdict *crash (guard)*. `DIR` is `r`, `w` or `rw` (the
+default), so under- and over-reads and under- and over-writes are each caught or let through.
+
+| Option | Guarded range | Catches |
+|---|---|---|
+| `before=N` | `[ADDR-N, ADDR)`, armed at the first input | `buf[-1]`, a header read from in front of the buffer |
+| `after[=N]` | `[ADDR+L, ADDR+max+N)`, re-armed for each input | anything past the input's legitimate extent L: the unused rest of the buffer, and N bytes beyond it (default 0) |
+| `extent=@OFF:SZ[:le\|:be][+D\|-D]` | (places `after`) | L is the SZ-byte (1, 2, 4, 8) length field at input offset OFF, in the given byte order (default the CPU's), plus D, instead of the delivered byte count |
+
+L never falls before the end of the length field itself, which the firmware may read; an input
+too short to hold the field gets no `after` zone. Guard memory that belongs to the firmware's
+own objects only with care: `after=N` past the buffer is someone else's memory, and code that
+terminates a string in place (`buf[len] = 0`) writes into `after`'s zone, so use `after:r`
+there. The older forms still work: `guard` is `after:r`, `guard=@OFF:SZ[+-D]` is
+`after:r,extent=@OFF:SZ[+-D]`, and `guardabs=ADDR:N` a fixed read zone (`--guard` does that
+generally).
 
 The harness never names a device: boards publish inputs, the harness picks one by name.
 A route that cannot deliver a particular input (too long for its buffer, not in the shape
@@ -126,10 +145,61 @@ the campaign goes on. Any other error from a route is a harness error and stops 
 |---|---|---|---|
 | ok | the iteration ended (or the firmware halted with status 0) | 0 | 0 |
 | crash (fault) | an exception of a crashing class (`--fuzz-crash-exc`), a fetch fault loop | faulting pc | 20 |
+| crash (guard) | a STOP guard was touched: a route's redzone, a `--guard` | pc of the access | 25 |
 | crash (oracle) | a `--fuzz-crash-pc` reached, a `--fuzz-crash-irq` interrupt taken, a reset during the iteration, a non-zero halt, a debug trap | the pc (0 for a reset, the status for a halt, the crashing lines for an interrupt) | 21 |
 | hang | deadlock or livelock | the stop reason (`uam_stop_reason`: `UAM_STOP_DEADLOCK` or `UAM_STOP_LIVELOCK`, numbered as in `uam/exec.h` of this ember) | 22 |
 | timeout | `--fuzz-iter-insns` (default 1e7) exhausted | 0 | 23 |
 | rejected | the input route refused the input (`UAM_ERR_REJECTED`); nothing ran | 0 | 24 |
+
+A crash (guard) names the guard and the access (`uam_fuzz_result.guard`). Here a read guard
+over the rv32 fuzz target's input buffer catches `parse` reading it:
+
+```
+build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
+    --fuzz-input uart0 --guard 0x80000470+256:r,name=g_buf --fuzz-replay in/ build/firmware/fuzztarget.elf
+replay: in/1-hello: crash-guard pc=0x80000262 (read 1 at 0x80000470: +0 into guard g_buf [0x80000470, 0x80000570)) insns=60 buckets=8
+```
+
+A `--guard ...,fault` instead lets the guest take the bus fault: that is a crash (fault) if its
+class crashes, and the result names the guard as well. Over SZR1 a crash (guard) is reported
+as `GUEST_FAULT` with the pc.
+
+### Guards (`--guard`, `--watch`)
+
+Guards are ember's, not the harness's (`uam/guard.h`): they work in any run, fuzzing or not.
+`--guard SPEC` (repeatable) guards a byte range of guest memory:
+
+```
+[p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log][,name=NAME]
+```
+
+The range is `[ADDR-BEFORE, ADDR+AFTER)` around the anchor ADDR: `0x1000+16` is the 16 bytes
+from 0x1000, `0x1000-16` the 16 in front of it, `0x1000-16+16` both, a bare `0x1000` one
+byte. ADDR is virtual, translated as processor 0 maps it when the run starts (after
+`--load-snapshot`), a page at a time; `p:` makes it physical. Any data access that overlaps the
+range hits it, in the directions given (default `rw`). What a hit does:
+
+| Action | The access | The run |
+|---|---|---|
+| `stop` (default) | does not happen | stops at the instruction (exit 129; in gdb, SIGSEGV on that processor); fuzzing: crash (guard) |
+| `fault` | does not happen | the guest takes the bus fault an unmapped address raises |
+| `log` | happens | goes on; a line on stderr per access (`--watch SPEC` is `--guard SPEC,log`) |
+
+```
+build/uam-run --guard 0x80100000-16+16:w fw.elf     # catch writes 16 bytes either side of 0x80100000
+build/uam-run --watch p:0x3000+4:w fw.elf           # log every write to 4 physical bytes
+uam-run: guard lo (stop): cpu 0 pc 0xc8 write 2 at 0x3000 (+0) value 0xa55a
+```
+
+In a fuzz run a `--guard` is armed from the start, so the boot is held to it as well (the
+fuzz target's start code clearing its BSS stops at a write guard on `g_buf`, and the boot then
+fails to reach the begin pc). A route's redzones are armed only once inputs arrive.
+
+Instruction fetches, debug accesses (gdb, `--dump-mem`) and DMA are not guarded. A guarded
+page loses the JIT's direct memory access, so every access to it goes through the bus. Guards
+are not machine state: snapshots neither save nor restore them. In a program:
+`uam_machine_add_guard` (or `uam_machine_add_guard_text` with the same text form),
+`uam_machine_guard_last_hit`, `uam_machine_set_guard_observer` for every hit.
 
 Exception classes: `fetch`, `load`, `store` (bus faults), `align`, `xlate` (TLB misses and
 protection: firmware with a TLB takes these routinely), `trap` (illegal instructions, but also
@@ -159,7 +229,7 @@ replay: crashes//2-store: crash-fault pc=0x800002b2 (store-fault cause 0x0 tval 
 
 (The pcs are `fuzz_iteration` and `fuzz_panic` from `readelf -s`; they move with the
 toolchain.) The exit status is the most severe verdict of any input: a crash (the first
-one's kind), else a hang, else a timeout, else a rejected input (24), else 0. So a directory of crashes fails however
+one's kind: 20 fault, 21 oracle, 25 guard), else a hang, else a timeout, else a rejected input (24), else 0. So a directory of crashes fails however
 it is ordered and whatever other files it holds. Every regular file runs as an input, except
 a fuzzer's notes saved beside an input: a runner extension can name their suffixes, and a
 file X plus that suffix is then skipped when X is in the directory too. With suzzer

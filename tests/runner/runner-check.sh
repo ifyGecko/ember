@@ -9,6 +9,10 @@
 #                peek handler (VGA) is readable
 #   --trace-after  +N counts from a loaded snapshot; an absolute N before the snapshot is
 #                warned about; interpreter and --jit block traces are the same after it
+#   --watch      logs writes (address, size, value) and does not change the run
+#   --guard      stops before the first write into a range given around an address
+#                (exit 129), at the same instruction with --jit; a read guard lets the
+#                writes pass and stops at the read-back; a bad SPEC is refused
 set -eu
 RUN=$1
 FW=$2
@@ -49,6 +53,28 @@ $X -o vga=1 --break 0 --dump-mem p:0xb8000+32="$T/vga.bin" "$FW" </dev/null >/de
 [ "$(wc -c <"$T/vga.bin" 2>/dev/null || echo 0)" -eq 32 ] || fail "--dump-mem: VGA memory not read through peek"
 if $X --dump-mem 0x1000 "$FW" </dev/null >/dev/null 2>&1; then fail "--dump-mem without +LEN accepted"; fi
 
+# --watch / --guard: the self-test's first writes into its scratch area at 0x3000
+$X --watch p:0x3000+4:w -n 20000 "$FW" </dev/null 2>"$T/log" >/dev/null || true
+grep -q '^guard p:0x3000+4:w (log): cpu 0 pc 0x[0-9a-f]* write 2 at 0x3000 (+0) value 0xa55a$' "$T/log" ||
+    fail "--watch: the first write is not logged"
+[ "$(grep -c '^guard p:0x3000+4:w' "$T/log")" -ge 2 ] || fail "--watch: the second write is not logged"
+grc=0
+$X --guard p:0x3002-2:w,name=lo -n 20000 "$FW" </dev/null 2>"$T/log" >/dev/null || grc=$?
+[ $grc -eq 129 ] || fail "--guard: exit $grc, expected 129"
+gline=$(grep '^uam-run: guard lo (stop): cpu 0 pc 0x[0-9a-f]* write 2 at 0x3000 (+0) value 0xa55a$' "$T/log") ||
+    fail "--guard: no hit line"
+gstop=$(grep 'guarded memory access' "$T/log")
+$X --guard p:0x3002-2:w,name=lo -n 20000 --jit "$FW" </dev/null 2>"$T/log" >/dev/null || true
+[ "$(grep '^uam-run: guard lo' "$T/log")" = "$gline" ] && [ "$(grep 'guarded memory access' "$T/log")" = "$gstop" ] ||
+    fail "--guard: --jit stops elsewhere"
+# a read guard lets those writes pass and stops later, when the self-test reads them back
+$X --guard p:0x3000+4:r -n 20000 "$FW" </dev/null 2>"$T/log" >/dev/null || true
+grep -q '^uam-run: guard p:0x3000+4:r (stop): .* read [0-9]* at 0x300' "$T/log" || fail "--guard :r: no read hit"
+wn=$(echo "$gstop" | sed 's/.* after \([0-9]*\) instructions/\1/')
+rn=$(sed -n 's/.*guarded memory access.* after \([0-9]*\) instructions/\1/p' "$T/log")
+[ -n "$rn" ] && [ "$rn" -gt "$wn" ] || fail "--guard :r: stopped at instruction ${rn:-?}, not after the writes ($wn)"
+if $X --guard 0x3000:x "$FW" </dev/null >/dev/null 2>&1; then fail "--guard with a bad direction accepted"; fi
+
 # --trace-after after --load-snapshot
 pc=$(grep '^blk' "$T/tr" | sed -n 3000p | awk '{print $2}')
 $X --snapshot-at "$pc" --save-snapshot "$T/s.snap" "$FW" </dev/null >/dev/null 2>&1 || true
@@ -67,5 +93,5 @@ $X --load-snapshot "$T/s.snap" -t blocks --jit "$FW" </dev/null 2>&1 | grep '^bl
 [ -s "$T/interp" ] || fail "no blocks traced after the snapshot"
 cmp -s "$T/interp" "$T/jit" || fail "block trace differs between the interpreter and --jit"
 
-echo "runner-check: ok ($hits --log-pc addresses, --dump-mem, --trace-after +N from icount $snap, \
+echo "runner-check: ok ($hits --log-pc addresses, --dump-mem, --watch, --guard, --trace-after +N from icount $snap, \
 $(wc -l <"$T/jit") blocks traced alike with --jit)"

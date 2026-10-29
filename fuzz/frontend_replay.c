@@ -183,7 +183,8 @@ static int verdict_rank(uam_fuzz_verdict v)
 {
     switch (v) {
     case UAM_FUZZ_CRASH_FAULT:
-    case UAM_FUZZ_CRASH_ORACLE: return 4;
+    case UAM_FUZZ_CRASH_ORACLE:
+    case UAM_FUZZ_CRASH_GUARD:  return 4;
     case UAM_FUZZ_HANG:         return 3;
     case UAM_FUZZ_TIMEOUT:      return 2;
     case UAM_FUZZ_REJECTED:     return 1;
@@ -235,6 +236,20 @@ static int replay_next(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     return 1;
 }
 
+/* " (read 4 at 0x7ffc: 4 before guard mem-before [0x7ff8, 0x8000))" */
+static void print_guard(FILE *out, const uam_guard_hit *h)
+{
+    int64_t rel = (int64_t)(h->addr - h->start);
+    fprintf(out, " (%s %u at 0x%llx: ", h->is_write ? "write" : "read", h->size,
+            (unsigned long long)h->addr);
+    if (rel < 0)
+        fprintf(out, "%llu before", (unsigned long long)-rel);
+    else
+        fprintf(out, "+%llu into", (unsigned long long)rel);
+    fprintf(out, " guard %s [0x%llx, 0x%llx))", h->name, (unsigned long long)h->start,
+            (unsigned long long)(h->start + h->len));
+}
+
 static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
                                 const uint8_t *map, size_t map_size, int kind)
 {
@@ -263,6 +278,12 @@ static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint
                     (unsigned long long)res->exc.cause, (unsigned long long)res->exc.tval);
         else
             fprintf(r->out, " (%s)", uam_stop_reason_str(res->stop));
+        if (res->guard_valid)
+            print_guard(r->out, &res->guard);
+        break;
+    case UAM_FUZZ_CRASH_GUARD:
+        fprintf(r->out, " pc=0x%llx", (unsigned long long)detail);
+        print_guard(r->out, &res->guard);
         break;
     case UAM_FUZZ_CRASH_ORACLE:
         if (res->reset)

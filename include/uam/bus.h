@@ -89,21 +89,23 @@ typedef struct uam_region {
 typedef void (*uam_code_write_fn)(void *ctx, uint64_t page_base);
 
 /* Watchpoint callback: a guest data access hit a watched physical range. Runs
- * after the access completed; `val` is the value read or written. */
+ * after the access completed; `val` is the value read or written. (A
+ * UAM_WATCH_FAULT watch is called before, and instead of, the access.) */
 typedef void (*uam_watch_fn)(void *ctx, uint64_t addr, unsigned size, bool is_write, uint64_t val);
 
 enum { UAM_WATCH_READ = 1u << 0, UAM_WATCH_WRITE = 1u << 1,
        /* UAM_WATCH_FAULT: turn the watched range into a guard - a matching data access
         * (READ and/or WRITE, honouring the direction bits) faults like an unmapped page
-        * (UAM_ERR_FAULT) instead of returning data, so an out-of-bounds access is caught
-        * as a bus fault by whoever observes exceptions. Fetches and debug accesses are
-        * exempt. The watch's fn is not called for a faulted access. */
+        * (UAM_ERR_FAULT) instead of returning or storing data. Fetches, debug accesses
+        * and DMA are exempt. The watch's fn is called BEFORE the access faults, with
+        * `val` the value a write would have stored (0 for a read); it must not add or
+        * remove watches. Guards with a stop/fault/log policy: uam/guard.h. */
        UAM_WATCH_FAULT = 1u << 2 };
 
 typedef struct uam_watch {
     int          id;
     uint64_t     base, size;
-    unsigned     kinds;     /* UAM_WATCH_READ | UAM_WATCH_WRITE */
+    unsigned     kinds;     /* UAM_WATCH_READ | UAM_WATCH_WRITE [| UAM_WATCH_FAULT] */
     uam_watch_fn fn;
     void        *ctx;
 } uam_watch;

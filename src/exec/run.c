@@ -29,6 +29,7 @@ const char *uam_stop_reason_str(uam_stop_reason r)
     case UAM_STOP_LIVELOCK:   return "livelock (timers keep firing, the hart never wakes)";
     case UAM_STOP_EXC_HOOK:   return "stopped by the exception observer";
     case UAM_STOP_IRQ_HOOK:   return "stopped by the interrupt observer";
+    case UAM_STOP_GUARD:      return "guarded memory access";
     }
     return "?";
 }
@@ -121,6 +122,26 @@ void uam_exec_stop(uam_exec *x, int64_t status)
     x->stop_request = true;
     x->stop_status = status;
     uam_cpu_request_exit(x->cpu);
+}
+
+void uam_exec_request_fault_stop(uam_exec *x, uint64_t *pc_out)
+{
+    x->fault_stop = true;
+    x->fault_stop_pc = pc_out;
+    uam_cpu_request_exit(x->cpu);   /* an absorbed failure: stop at the next boundary */
+}
+
+/* A requested fault stop (uam_exec_request_fault_stop): at the faulting instruction
+ * when the block raised `exc`, else where the block left the processor. */
+static uam_stop_reason fault_stopped(uam_exec *x, const uam_exception *exc)
+{
+    if (exc)
+        x->cpu->pc = (exc->flags & UAM_EXC_F_CONT) ? exc->parent_pc : exc->pc;
+    if (x->fault_stop_pc)
+        *x->fault_stop_pc = x->cpu->pc;
+    x->fault_stop = false;
+    x->fault_stop_pc = NULL;
+    return UAM_STOP_GUARD;
 }
 
 void uam_exec_request_reset(uam_exec *x, uam_reset_kind kind)
@@ -859,18 +880,26 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         case UAM_BR_NEXT:
         case UAM_BR_INTERRUPTED:
             cpu->pc = r.pc;
+            if (x->fault_stop)
+                return fault_stopped(x, NULL);
             break;
         case UAM_BR_WAIT:
             cpu->pc = r.pc;
             cpu->waiting = true;
+            if (x->fault_stop)
+                return fault_stopped(x, NULL);
             break;
         case UAM_BR_FAULT:
+            if (x->fault_stop)
+                return fault_stopped(x, &r.exc);
             if (!deliver(x, &r.exc))
                 return UAM_STOP_EXC_HOOK;
             break;
         case UAM_BR_TRAP:
             switch (r.trap_class) {
             case UAM_TRAP_EXCEPTION:
+                if (x->fault_stop)
+                    return fault_stopped(x, &r.exc);
                 if (!deliver(x, &r.exc))
                     return UAM_STOP_EXC_HOOK;
                 break;
@@ -998,6 +1027,11 @@ static uam_stop_reason run_smp(uam_exec *x, uint64_t max_insns)
 
 uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
 {
+    for (uint32_t i = 0; i < (x->n_smp ? x->n_smp : 1); i++) {
+        uam_exec *e = x->n_smp ? x->smp[i] : x;
+        e->fault_stop = false;     /* requests from outside a run are dropped */
+        e->fault_stop_pc = NULL;
+    }
     if (x->n_smp > 1)
         return run_smp(x, max_insns);
     uint64_t before = x->cpu->icount;

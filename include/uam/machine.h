@@ -128,6 +128,7 @@ struct uam_machine {
     uam_exec         **all_execs;          /* processor 0's first (exec.smp) */
     uint32_t           n_aps;
     uam_cov_state     *ap_cov;             /* coverage state of processor i + 1 (uam_machine_set_coverage) */
+    struct uam_guard_set *guards;          /* guarded and watched memory (guard.h); NULL: none yet */
 };
 
 /*

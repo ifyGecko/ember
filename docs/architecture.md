@@ -64,6 +64,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
 | `boards.h` | The stock boards and their registration | `boards/stock.c` |
 | `pass.h` | IR → IR transformations run on every new block, after the optimizer and before native compilation (instrumentation); block editing helpers | `analysis/*`; registered with `uam_exec_add_pass` |
+| `guard.h` | Guarded and watched guest memory: byte ranges (virtual or physical, around an anchor) whose data accesses stop the run at the instruction (`UAM_STOP_GUARD`), become a bus fault for the guest, or are logged; hit records and an observer; the text form `--guard`/`--watch` and fuzz redzones use | `src/machine` (on bus fault watches and `uam_exec_request_fault_stop`) |
 | `fuzz.h` | The persistent-mode fuzz harness (boot to a begin pc, snapshot, one restore per input, verdicts) and its frontend interface; the replay frontend | `fuzz/` (see [`fuzzing.md`](fuzzing.md)) |
 | `cov.h` | The edge-coverage pass: `UAM_OP_COV` at a table of guest pcs (or at every block start), knowing nothing about where the table came from | `analysis/cov.c` |
 
@@ -369,7 +370,8 @@ devices.
     insert, compile in the JIT like every other IR op).
   - More crash checks: execution outside code regions, an icount watchdog per function.
 
-  PC hooks, watchpoints and `uam_exec_stop` are already available to build oracles by hand.
+  PC hooks, watchpoints, guards (`guard.h`) and `uam_exec_stop` are already available to
+  build oracles by hand.
 - **GDB stub** against the abstract state (`--gdb PORT`): breakpoints are PC hooks, watchpoints
   are bus watches, registers come from `isa->gdb` (per-register widths for mixed files: the
   x86 view is gdb's whole amd64 core set, x87 included). Every processor is a thread in

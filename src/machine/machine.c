@@ -114,8 +114,11 @@ uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_ab
     return UAM_OK;
 }
 
+void uam_machine_guards_fini(uam_machine *m);   /* guard.c */
+
 void uam_machine_fini(uam_machine *m)
 {
+    uam_machine_guards_fini(m);
     if (m->board_fini)
         m->board_fini(m);
     m->board_fini = NULL;

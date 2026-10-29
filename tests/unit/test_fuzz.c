@@ -543,6 +543,126 @@ static void test_routes(const target *t)
     uam_machine_fini(&m);
 }
 
+/* ---- redzones (mem: before/after/extent) and guards ----------------------- */
+
+static uam_fuzz_verdict one(uam_fuzz *f, const char *spec, const char *in, size_t n, uam_fuzz_result *r)
+{
+    char err[256];
+    CHECK(uam_fuzz_select_route(f, spec, err, sizeof(err)) == UAM_OK, "route %s: %s", spec, err);
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)in, n, r) == UAM_OK, "run %s", spec);
+    return r->verdict;
+}
+
+/* The STOP guard watches the harness has armed whose range starts at physical `pa`. */
+static unsigned zones_at(const uam_machine *m, uint64_t pa, uint64_t size)
+{
+    unsigned n = 0;
+    for (uint32_t i = 0; i < m->bus.n_watches; i++)
+        n += (m->bus.watches[i].kinds & UAM_WATCH_FAULT) && m->bus.watches[i].base == pa
+             && m->bus.watches[i].size == size;
+    return n;
+}
+
+/* The target reads the length word at BUF-4 and the first input byte at BUF (physical
+ * 0x7ffc and 0x8000 on every target); nothing else of the buffer. */
+static void test_redzones(const target *t, backend bk)
+{
+    const char *tn = t->name, *bn = bk_name[bk];
+    const uint64_t buf = strtoull(t->route + 4, NULL, 0);
+    uam_machine m;
+    machine_for(&m, t, bk);
+    uam_fuzz *f = harness_for(&m, t, NULL, 0, UAM_FUZZ_EXC_DEFAULT);
+    uam_fuzz_result r;
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "boot");
+    char spec[256], err[256];
+
+    /* before: the length word is an under-read of the buffer; reads pass a write zone. */
+    snprintf(spec, sizeof(spec), "%s,before=4:r", t->route);
+    EQ64(one(f, spec, "AA", 2, &r), UAM_FUZZ_CRASH_GUARD, "under-read");
+    CHECK(r.guard_valid && !strcmp(r.guard.name, "mem-before") && !r.guard.is_write
+          && r.guard.size == 4 && r.guard.start == buf - 4 && r.guard.addr == buf - 4
+          && r.guard.paddr == 0x7ffc && r.detail == r.guard.pc && r.pc == r.guard.pc,
+          "%s %s: the before hit (pc 0x%llx)", tn, bn, (unsigned long long)r.detail);
+    uint64_t pc_len = r.detail;
+    EQ64(one(f, spec, "AA", 2, &r), UAM_FUZZ_CRASH_GUARD, "again after the restore");
+    EQ64(r.detail, pc_len, "deterministic");
+    snprintf(spec, sizeof(spec), "%s,before=4:w", t->route);
+    EQ64(one(f, spec, "AA", 2, &r), UAM_FUZZ_OK, "reads pass a write zone");
+
+    /* after: an empty input makes reading BUF[0] an over-read; any byte makes it fine. */
+    snprintf(spec, sizeof(spec), "%s,after", t->route);
+    EQ64(one(f, spec, "", 0, &r), UAM_FUZZ_CRASH_GUARD, "over-read of an empty input");
+    CHECK(r.guard_valid && !strcmp(r.guard.name, "mem-after") && r.guard.size == 1
+          && r.guard.addr == buf && r.guard.start == buf && r.guard.len == 64, "%s %s: the after hit",
+          tn, bn);
+    EQ64(one(f, spec, "A", 1, &r), UAM_FUZZ_OK, "one byte: fine");
+    EQ64(zones_at(&m, 0x8001, 63), 1, "the zone is the unused rest of the buffer");
+    snprintf(spec, sizeof(spec), "%s,after=16:w", t->route);
+    EQ64(one(f, spec, "", 0, &r), UAM_FUZZ_OK, "reads pass a write zone");
+    EQ64(zones_at(&m, 0x8000, 64 + 16), 1, "after=16 reaches 16 past the buffer");
+    EQ64(one(f, spec, "ABCD", 4, &r), UAM_FUZZ_OK, "re-armed for each input");
+    EQ64(zones_at(&m, 0x8004, 60 + 16), 1, "behind the input");
+    EQ64(zones_at(&m, 0x8000, 64 + 16), 0, "the previous zone is gone");
+
+    /* extent: the length field places the after zone (never before the field's end). */
+    snprintf(spec, sizeof(spec), "%s,after,extent=@1:2:be", t->route);
+    EQ64(one(f, spec, "A\x00\x05", 3, &r), UAM_FUZZ_OK, "field 5 (be)");
+    EQ64(zones_at(&m, 0x8005, 59), 1, "from the field's extent");
+    snprintf(spec, sizeof(spec), "%s,after,extent=@1:2:le", t->route);
+    EQ64(one(f, spec, "A\x00\x05", 3, &r), UAM_FUZZ_OK, "field 0x500 (le)");
+    EQ64(zones_at(&m, 0x8005, 59) + zones_at(&m, 0x8003, 61), 0, "past the buffer: no zone");
+    snprintf(spec, sizeof(spec), "%s,after,extent=@1:2:be-5", t->route);
+    EQ64(one(f, spec, "A\x00\x05", 3, &r), UAM_FUZZ_OK, "field 5 - 5");
+    EQ64(zones_at(&m, 0x8003, 61), 1, "not before the end of the field");
+    EQ64(one(f, spec, "A", 1, &r), UAM_FUZZ_OK, "no field: no zone");
+    EQ64(zones_at(&m, 0x8003, 61), 0, "removed");
+
+    /* The older forms. */
+    snprintf(spec, sizeof(spec), "%s,guard", t->route);
+    EQ64(one(f, spec, "", 0, &r), UAM_FUZZ_CRASH_GUARD, "guard = after:r");
+    snprintf(spec, sizeof(spec), "%s,guardabs=0x%llx:4", t->route, (unsigned long long)(buf - 4));
+    EQ64(one(f, spec, "AA", 2, &r), UAM_FUZZ_CRASH_GUARD, "guardabs");
+    CHECK(!strcmp(r.guard.name, "mem-abs"), "%s %s: named", tn, bn);
+
+    /* Bad forms. */
+    static const char *const bad[] = { ",extent=@0:1", ",before=0", ",after:x", ",after=:r",
+                                       ",before=4:rwx", ",after,extent=@0:3", ",after,extent=0:1" };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(bad); i++) {
+        snprintf(spec, sizeof(spec), "%s%s", t->route, bad[i]);
+        CHECK(uam_fuzz_select_route(f, spec, err, sizeof(err)) == UAM_ERR_INVALID, "%s refused", bad[i]);
+    }
+
+    /* Another route takes the zones away. */
+    snprintf(spec, sizeof(spec), "%s,before=4,after", t->route);
+    one(f, spec, "AA", 2, &r);
+    CHECK(m.bus.n_watches == 2, "%s %s: both zones armed (%u)", tn, bn, m.bus.n_watches);
+    route_log mine = { 0 };
+    CHECK(uam_fuzz_add_route(f, "mine", log_route, &mine) == UAM_OK, "route");
+    CHECK(uam_fuzz_select_route(f, "mine", err, sizeof(err)) == UAM_OK, "select mine");
+    EQ64(m.bus.n_watches, 0, "gone with the mem: route");
+
+    /* A machine guard: STOP is crash-guard, FAULT a crash-fault that names it. */
+    CHECK(uam_fuzz_select_route(f, t->route, err, sizeof(err)) == UAM_OK, "plain mem");
+    int id = uam_machine_add_guard_text(&m, "p:0x7ffc+4:r,fault,name=lenword", UAM_GUARD_STOP, err,
+                                        sizeof(err));
+    CHECK(id > 0, "machine guard: %s", err);
+    EQ64(one(f, t->route, "AA", 2, &r), UAM_FUZZ_CRASH_FAULT, "fault guard: crash-fault");
+    CHECK(r.exc_valid && r.exc.kind == UAM_EXC_LOAD_FAULT && r.guard_valid
+          && !strcmp(r.guard.name, "lenword") && r.detail == pc_len, "%s %s: names the guard", tn, bn);
+    uam_machine_remove_guard(&m, id);
+    EQ64(one(f, t->route, "AA", 2, &r), UAM_FUZZ_OK, "and without it");
+    CHECK(!r.guard_valid, "no guard on an ok iteration");
+
+    const uam_fuzz_stats *st = uam_fuzz_get_stats(f);
+    CHECK(st->by_verdict[UAM_FUZZ_CRASH_GUARD] == 6, "%s %s: counted (%llu)", tn, bn,
+          (unsigned long long)st->by_verdict[UAM_FUZZ_CRASH_GUARD]);
+    EQ64(uam_fuzz_exit_status(UAM_FUZZ_CRASH_GUARD), UAM_FUZZ_EXIT_CRASH_GUARD, "exit code");
+    CHECK(!strcmp(uam_fuzz_verdict_str(UAM_FUZZ_CRASH_GUARD), "crash-guard"), "name");
+    uam_fuzz_destroy(f);
+    EQ64(m.bus.n_watches, 0, "destroy leaves no zone");
+    uam_machine_fini(&m);
+}
+
 /* ---- begin_skip: snapshot at a later arrival ----------------------------- */
 
 static uint32_t reg32(const uam_machine *m, uint32_t off)
@@ -1181,6 +1301,8 @@ int main(void)
         test_replay(&ts[i]);
         test_irq(&ts[i]);
         test_markers(&ts[i]);
+        for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++)
+            test_redzones(&ts[i], (backend)bk);
     }
     test_internal_error(&ts[1]);
     test_replay_sidecars();

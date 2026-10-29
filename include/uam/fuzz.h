@@ -29,7 +29,8 @@
  * The harness owns the machine's exception and interrupt observers and wraps its reset hook while it
  * exists, and owns the coverage map.
  *
- * Dependencies: machine.h, snapshot.h, exec.h, dev/mmio_stub.h (the input stream type).
+ * Dependencies: machine.h, snapshot.h, exec.h, guard.h, dev/mmio_stub.h (the input
+ * stream type).
  */
 #ifndef UAM_FUZZ_H
 #define UAM_FUZZ_H
@@ -37,6 +38,7 @@
 #include <stdio.h>
 
 #include "uam/dev/mmio_stub.h"
+#include "uam/guard.h"
 #include "uam/machine.h"
 
 typedef enum uam_fuzz_verdict {
@@ -49,6 +51,8 @@ typedef enum uam_fuzz_verdict {
     UAM_FUZZ_TIMEOUT,       /* detail: 0 */
     UAM_FUZZ_REJECTED,      /* the route could not deliver the input (it returned
                              * UAM_ERR_REJECTED): nothing ran. detail: 0 */
+    UAM_FUZZ_CRASH_GUARD,   /* a STOP guard (guard.h: a route's redzone, a --guard) was
+                             * hit: detail: pc of the instruction that touched it */
 } uam_fuzz_verdict;
 
 const char *uam_fuzz_verdict_str(uam_fuzz_verdict v);
@@ -119,6 +123,8 @@ typedef struct uam_fuzz_result {
     bool             reset;       /* the machine was reset during the iteration */
     bool             irq_valid;   /* a crashing interrupt (crash_irq_lines): */
     uam_interrupt    irq;
+    bool             guard_valid; /* CRASH_GUARD, or a CRASH_FAULT a FAULT guard raised: */
+    uam_guard_hit    guard;       /* the hit (its name is valid while the guard exists) */
 } uam_fuzz_result;
 
 /* uam_fuzz_frontend.report kind */
@@ -164,20 +170,27 @@ uam_status uam_fuzz_set_block_coverage(uam_fuzz *f);
 
 /*
  * Input routes. Built in, by spec string:
- *   "mem:ADDR[,len=ADDR][,max=N][,reject][,guard|,guard=@OFF:SZ]"
+ *   "mem:ADDR[,len=ADDR][,max=N][,reject][,before=N[:DIR]][,after[=N][:DIR]]
+ *        [,extent=@OFF:SZ[:le|:be][+D|-D]]"
  *                                  write the input to guest memory at virtual ADDR,
  *                                  optionally its length as a 32-bit word in the CPU's
  *                                  byte order, truncated to N bytes (default 4096), or with
  *                                  "reject" refused when longer (verdict REJECTED).
- *                                  "guard" arms a read-fault guard (UAM_WATCH_FAULT) at
- *                                  ADDR + L so a read past the input's legitimate extent L
- *                                  faults and is caught: L is the delivered byte count, or
- *                                  with "guard=@OFF:SZ" the SZ-byte length field at input
- *                                  offset OFF (e.g. a descriptor's wTotalLength), optionally
- *                                  "+D"/"-D" to guard at field+delta (skip a known N-past read).
- *                                  "guardabs=ADDR:N" arms a FIXED read-fault redzone at the
- *                                  absolute range [ADDR, ADDR+N), independent of the input - a
- *                                  redzone before a buffer catches an under-read (e.g. buf[-1])
+ *                                  Redzones around the buffer [ADDR, ADDR + max) are STOP
+ *                                  guards (guard.h), so touching one is CRASH_GUARD; DIR is
+ *                                  r, w or rw (the default):
+ *                                    before=N   [ADDR - N, ADDR): an under-read/-write
+ *                                    after[=N]  [ADDR + L, ADDR + max + N): past the input's
+ *                                               legitimate extent L - the unused rest of
+ *                                               the buffer and N bytes beyond it (default 0)
+ *                                  L is the delivered byte count, or with "extent" the
+ *                                  SZ-byte (1, 2, 4, 8) length field at input offset OFF, in
+ *                                  the given byte order (default the CPU's), plus D; never
+ *                                  less than the end of the field itself. An input too short
+ *                                  to hold the field gets no after zone.
+ *                                  Older forms: "guard" = after:r; "guard=@OFF:SZ[+-D]" =
+ *                                  after:r,extent=@OFF:SZ[+-D]; "guardabs=ADDR:N" a fixed
+ *                                  read zone [ADDR, ADDR+N).
  * Registered: uam_fuzz_add_route, then the machine's inputs (uam_machine_add_input,
  * e.g. a board's "uart0"). uam_fuzz_mmio_deliver feeds a uam_mmio_input (ctx) for
  * --mmio-rule input registers; the runner registers it as "mmio".
@@ -219,7 +232,7 @@ bool       uam_fuzz_aborted(const uam_fuzz *f);
 /* Counts per verdict over the harness's life. */
 typedef struct uam_fuzz_stats {
     uint64_t iterations;
-    uint64_t by_verdict[UAM_FUZZ_REJECTED + 1];
+    uint64_t by_verdict[UAM_FUZZ_CRASH_GUARD + 1];
 } uam_fuzz_stats;
 const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 
@@ -237,6 +250,7 @@ const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 #define UAM_FUZZ_EXIT_HANG         22
 #define UAM_FUZZ_EXIT_TIMEOUT      23
 #define UAM_FUZZ_EXIT_REJECTED     24
+#define UAM_FUZZ_EXIT_CRASH_GUARD  25
 int uam_fuzz_exit_status(uam_fuzz_verdict v);
 
 typedef struct uam_fuzz_replay uam_fuzz_replay;

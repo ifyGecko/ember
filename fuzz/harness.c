@@ -2,8 +2,9 @@
  * harness.c - Persistent-mode fuzz harness (uam/fuzz.h).
  *
  * Built only on public interfaces: PC hooks for the iteration boundaries and crash
- * pcs, the exception observer, the machine's reset hook, edge coverage, snapshots and
- * named machine inputs. No device, ISA or fuzzer format is named here.
+ * pcs, the exception observer, the machine's reset hook, edge coverage, snapshots,
+ * named machine inputs and guards (redzones around the mem: route's buffer). No
+ * device, ISA or fuzzer format is named here.
  */
 #include <signal.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 
 #include "uam/fuzz.h"
+#include "uam/guard.h"
 #include "uam/snapshot.h"
 
 typedef enum { PH_IDLE, PH_BOOT, PH_ITER } phase;
@@ -21,25 +23,33 @@ typedef struct route {
     void               *ctx;
 } route;
 
+/* A length field inside the input: the input's legitimate extent (mem_route.extent). */
+enum { ORDER_CPU, ORDER_LE, ORDER_BE };
+
 typedef struct mem_route {
     uint64_t addr, len_addr, max;
     bool     has_len, reject;   /* reject: refuse inputs over max instead of truncating */
-    /* guard: after delivery, arm a read-fault guard (UAM_WATCH_FAULT) at addr + L, so a
-     * read past the input's legitimate extent faults and is caught as a bus fault. L is the
-     * delivered byte count, or - with guard_field - a little/big-endian length field inside
-     * the input at [guard_off, guard_off+guard_sz) (e.g. a descriptor's wTotalLength). The
-     * guard covers to the end of that page and is re-armed each iteration (guard_wid). */
-    bool     guard, guard_field;
-    uint64_t guard_off;
-    unsigned guard_sz;
-    int64_t  guard_delta;       /* guard at addr + field + delta: skip a known N-past read to hunt deeper */
-    int      guard_wid;
-    /* guard_abs: a FIXED read-fault guard on an absolute virtual range [guard_abs_addr,
-     * +guard_abs_n), independent of the input buffer - a redzone BEFORE a buffer catches an
-     * under-read (e.g. buf[-1]), which a trailing guard cannot. Re-armed each iteration. */
-    bool     guard_abs;
-    uint64_t guard_abs_addr, guard_abs_n;
-    int      guard_abs_wid;
+    /* Redzones: STOP guards (uam/guard.h) around the buffer [addr, addr + max), virtual
+     * addresses translated when they are armed.
+     *   before: [addr - before_n, addr), armed at the first delivery and kept.
+     *   after:  [addr + L, addr + max + after_n), re-armed for each input: everything past
+     *           the input's legitimate extent L - the unused rest of the buffer, plus
+     *           after_n bytes beyond it. L is the delivered byte count, or with `extent`
+     *           a length field inside the input plus ext_delta (never less than the end
+     *           of the field itself, which the firmware may read).
+     * A direction of 0 leaves that zone out. */
+    unsigned before_dir, after_dir;
+    uint64_t before_n, after_n;
+    bool     extent;
+    uint64_t ext_off;
+    unsigned ext_sz, ext_order;
+    int64_t  ext_delta;
+    int      before_id, after_id;
+    uint64_t after_lo, after_hi;   /* the armed after zone (after_id > 0) */
+    /* guardabs=ADDR:N (the older form of a fixed zone; --guard does it generally) */
+    bool     abs;
+    uint64_t abs_addr, abs_n;
+    int      abs_id;
 } mem_route;
 
 struct uam_fuzz {
@@ -79,6 +89,7 @@ struct uam_fuzz {
     uint32_t       boot_arrivals;  /* at the begin pc during boot (cfg.begin_skip) */
     uint64_t       oracle_pc;
     uam_exception  exc;
+    uint64_t       guard_hits0;    /* uam_machine_guard_hits when the iteration began */
 
     uam_machine_reset_hook prev_reset;
     void          *prev_reset_ctx;
@@ -91,6 +102,8 @@ struct uam_fuzz {
     uam_fuzz_result last;
     uam_fuzz_stats  stats;
 };
+
+static void mem_disarm(mem_route *r, uam_machine *m);
 
 void uam_fuzz_set_boot_hook(uam_fuzz *f, uam_fuzz_boot_fn fn, void *ctx)
 {
@@ -113,6 +126,7 @@ const char *uam_fuzz_verdict_str(uam_fuzz_verdict v)
     case UAM_FUZZ_HANG:         return "hang";
     case UAM_FUZZ_TIMEOUT:      return "timeout";
     case UAM_FUZZ_REJECTED:     return "rejected";
+    case UAM_FUZZ_CRASH_GUARD:  return "crash-guard";
     }
     return "?";
 }
@@ -126,6 +140,7 @@ int uam_fuzz_exit_status(uam_fuzz_verdict v)
     case UAM_FUZZ_HANG:         return UAM_FUZZ_EXIT_HANG;
     case UAM_FUZZ_TIMEOUT:      return UAM_FUZZ_EXIT_TIMEOUT;
     case UAM_FUZZ_REJECTED:     return UAM_FUZZ_EXIT_REJECTED;
+    case UAM_FUZZ_CRASH_GUARD:  return UAM_FUZZ_EXIT_CRASH_GUARD;
     }
     return 1;
 }
@@ -412,6 +427,7 @@ void uam_fuzz_destroy(uam_fuzz *f)
     }
     if (f->has_cov)
         uam_machine_set_coverage(m, NULL, 0, NULL, NULL, 0);
+    mem_disarm(&f->mem, m);
     free(f->snap_last_pc);
     uam_snapshot_free(f->snap);
     for (size_t i = 0; i < f->n_routes; i++)
@@ -545,73 +561,79 @@ static uam_status write_virt(uam_machine *m, uint64_t va, const uint8_t *data, s
     return UAM_OK;
 }
 
-/* No-op observer for a guard watch: a guarded access faults in the bus before fire_watches,
- * so this is never actually called; it only satisfies uam_bus_add_watch's non-NULL fn. */
-static void guard_noop(void *ctx, uint64_t a, unsigned s, bool w, uint64_t v)
+static int arm_zone(uam_machine *m, const char *name, uint64_t lo, uint64_t hi, unsigned dir)
 {
-    (void)ctx; (void)a; (void)s; (void)w; (void)v;
+    char err[256];
+    uam_guard_spec g = { .addr = lo, .len = hi - lo, .dir = dir, .action = UAM_GUARD_STOP,
+                         .name = name };
+    int id = uam_machine_add_guard(m, &g, err, sizeof(err));
+    if (id < 0)
+        uam_log(UAM_LOG_ERROR, "fuzz", "cannot arm the %s redzone [0x%llx, 0x%llx): %s", name,
+                (unsigned long long)lo, (unsigned long long)hi, err);
+    return id;
 }
 
-static uam_status virt_to_phys(uam_machine *m, uint64_t va, uint64_t *pa)
+static void disarm(uam_machine *m, int *id)
 {
-    uam_cpu *cpu = &m->cpu;
-    if (!cpu->isa->translate) { *pa = va; return UAM_OK; }
-    uam_xlate xl = { 0 };
-    if (cpu->isa->translate(cpu, va, UAM_XLATE_LOAD, &xl) != UAM_OK)
-        return UAM_ERR_XLATE;
-    *pa = xl.paddr;
-    return UAM_OK;
+    if (*id > 0)
+        uam_machine_remove_guard(m, *id);
+    *id = 0;
 }
 
-/* Re-arm the read-fault guard at addr + L for this iteration (see mem_route.guard). */
-static void arm_guard(mem_route *r, uam_machine *m, const uint8_t *data, size_t len)
+static void mem_disarm(mem_route *r, uam_machine *m)
 {
-    if (r->guard_wid > 0) {
-        uam_bus_remove_watch(&m->bus, r->guard_wid);
-        r->guard_wid = 0;
-    }
-    uint64_t L;
-    if (r->guard_field) {
-        if (r->guard_off + r->guard_sz > len)
-            return;                         /* the length field is not in the input */
-        bool be = m->cpu.isa->default_endian & UAM_ACC_BE;
-        uint64_t field = 0;
-        for (unsigned i = 0; i < r->guard_sz; i++)
-            field |= (uint64_t)data[r->guard_off + i] << (be ? 8 * (r->guard_sz - 1 - i) : 8 * i);
-        int64_t LL = (int64_t)field + r->guard_delta;   /* delta skips a known N-past read */
-        if (LL <= 0)
-            return;
-        L = (uint64_t)LL;
-    } else {
-        L = len;
-    }
-    if (L == 0 || L > r->max + UAM_PAGE_SIZE)
-        return;                             /* nothing legitimate to read, or absurdly past our window */
-    uint64_t pa;
-    if (virt_to_phys(m, r->addr + L, &pa) != UAM_OK)
-        return;
-    uint64_t span = UAM_PAGE_SIZE - (pa & (UAM_PAGE_SIZE - 1));   /* stay within one page (PA) */
-    int id = uam_bus_add_watch(&m->bus, pa, span, UAM_WATCH_FAULT | UAM_WATCH_READ,
-                               guard_noop, NULL);
-    if (id > 0)
-        r->guard_wid = id;
+    disarm(m, &r->before_id);
+    disarm(m, &r->after_id);
+    disarm(m, &r->abs_id);
 }
 
-/* Re-arm the fixed absolute read-fault guard [guard_abs_addr, +guard_abs_n) (see mem_route). */
-static void arm_guard_abs(mem_route *r, uam_machine *m)
+/* The input's legitimate extent: its length, or what its length field says. false: the
+ * field is not in the input (no after zone this time). */
+static bool extent(const mem_route *r, const uam_machine *m, const uint8_t *data, size_t len,
+                   uint64_t *L)
 {
-    if (r->guard_abs_wid > 0) {
-        uam_bus_remove_watch(&m->bus, r->guard_abs_wid);
-        r->guard_abs_wid = 0;
+    if (!r->extent) {
+        *L = len;
+        return true;
     }
-    uint64_t pa;
-    if (virt_to_phys(m, r->guard_abs_addr, &pa) != UAM_OK)
-        return;
-    uint64_t rem = UAM_PAGE_SIZE - (pa & (UAM_PAGE_SIZE - 1));
-    uint64_t n = r->guard_abs_n < rem ? r->guard_abs_n : rem;    /* stay within one page (PA) */
-    int id = uam_bus_add_watch(&m->bus, pa, n, UAM_WATCH_FAULT | UAM_WATCH_READ, guard_noop, NULL);
-    if (id > 0)
-        r->guard_abs_wid = id;
+    if (r->ext_off + r->ext_sz > len)
+        return false;
+    bool be = r->ext_order == ORDER_BE
+           || (r->ext_order == ORDER_CPU && (m->cpu.isa->default_endian & UAM_ACC_BE));
+    uint64_t field = 0;
+    for (unsigned i = 0; i < r->ext_sz; i++)
+        field |= (uint64_t)data[r->ext_off + i] << (be ? 8 * (r->ext_sz - 1 - i) : 8 * i);
+    int64_t v = (int64_t)field + r->ext_delta;
+    uint64_t floor = r->ext_off + r->ext_sz;
+    *L = v < (int64_t)floor ? floor : (uint64_t)v;
+    return true;
+}
+
+/* Arm this input's redzones (see mem_route). */
+static uam_status arm_zones(mem_route *r, uam_machine *m, const uint8_t *data, size_t len)
+{
+    if (r->before_dir && r->before_id <= 0
+        && (r->before_id = arm_zone(m, "mem-before", r->addr - r->before_n, r->addr,
+                                    r->before_dir)) < 0)
+        return UAM_ERR_INVALID;
+    if (r->abs && r->abs_id <= 0
+        && (r->abs_id = arm_zone(m, "mem-abs", r->abs_addr, r->abs_addr + r->abs_n,
+                                 UAM_GUARD_READ)) < 0)
+        return UAM_ERR_INVALID;
+    if (!r->after_dir)
+        return UAM_OK;
+    uint64_t L, hi = r->max + r->after_n;
+    if (!extent(r, m, data, len, &L) || L >= hi) {
+        disarm(m, &r->after_id);
+        return UAM_OK;
+    }
+    if (r->after_id > 0 && r->after_lo == r->addr + L && r->after_hi == r->addr + hi)
+        return UAM_OK;   /* the same zone as last time */
+    disarm(m, &r->after_id);
+    r->after_lo = r->addr + L;
+    r->after_hi = r->addr + hi;
+    r->after_id = arm_zone(m, "mem-after", r->after_lo, r->after_hi, r->after_dir);
+    return r->after_id < 0 ? UAM_ERR_INVALID : UAM_OK;
 }
 
 static uam_status mem_deliver(void *ctx, uam_machine *m, const uint8_t *data, size_t len)
@@ -629,10 +651,8 @@ static uam_status mem_deliver(void *ctx, uam_machine *m, const uint8_t *data, si
             w[i] = (uint8_t)((uint32_t)len >> (be ? 24 - 8 * i : 8 * i));
         st = write_virt(m, r->len_addr, w, 4);
     }
-    if (st == UAM_OK && r->guard)
-        arm_guard(r, m, data, len);
-    if (st == UAM_OK && r->guard_abs)
-        arm_guard_abs(r, m);
+    if (st == UAM_OK)
+        st = arm_zones(r, m, data, len);
     return st;
 }
 
@@ -648,6 +668,44 @@ static bool parse_u64(const char *s, size_t n, uint64_t *out)
     return *end == '\0';
 }
 
+/* "", ":r", ":w" or ":rw" (default rw) at s[0..n). */
+static bool parse_dir(const char *s, size_t n, unsigned *dir)
+{
+    if (n == 0 || (n == 3 && !strncmp(s, ":rw", 3)))
+        *dir = UAM_GUARD_RW;
+    else if (n == 2 && !strncmp(s, ":r", 2))
+        *dir = UAM_GUARD_READ;
+    else if (n == 2 && !strncmp(s, ":w", 2))
+        *dir = UAM_GUARD_WRITE;
+    else
+        return false;
+    return true;
+}
+
+/* @OFF:SZ[:le|:be][+D|-D] (the extent field) */
+static bool parse_extent(mem_route *r, const char *s, size_t n, bool orders)
+{
+    const char *end = s + n;
+    char *e;
+    if (*s != '@')
+        return false;
+    r->ext_off = strtoull(s + 1, &e, 0);
+    if (e == s + 1 || *e != ':')
+        return false;
+    r->ext_sz = (unsigned)strtoul(e + 1, &e, 0);
+    if (r->ext_sz != 1 && r->ext_sz != 2 && r->ext_sz != 4 && r->ext_sz != 8)
+        return false;
+    r->ext_order = ORDER_CPU;
+    if (orders && e + 3 <= end && (!strncmp(e, ":le", 3) || !strncmp(e, ":be", 3))) {
+        r->ext_order = e[1] == 'l' ? ORDER_LE : ORDER_BE;
+        e += 3;
+    }
+    if (e < end && (*e == '+' || *e == '-'))
+        r->ext_delta = (int64_t)strtoll(e, &e, 0);
+    r->extent = true;
+    return e == end;
+}
+
 static bool parse_mem(mem_route *r, const char *spec)
 {
     *r = (mem_route){ .max = 4096 };
@@ -657,6 +715,9 @@ static bool parse_mem(mem_route *r, const char *spec)
     for (const char *p = spec + n; *p == ',';) {
         p++;
         n = strcspn(p, ",");
+        size_t k = strcspn(p, ":,");   /* the option's value ends at a direction */
+        if (k > n)
+            k = n;
         if (n > 4 && !strncmp(p, "len=", 4)) {
             if (!parse_u64(p + 4, n - 4, &r->len_addr))
                 return false;
@@ -666,38 +727,42 @@ static bool parse_mem(mem_route *r, const char *spec)
                 return false;
         } else if (n == 6 && !strncmp(p, "reject", 6)) {
             r->reject = true;
+        } else if (k > 7 && !strncmp(p, "before=", 7)) {
+            /* before=N[:DIR]: a redzone of N bytes in front of the buffer */
+            if (!parse_u64(p + 7, k - 7, &r->before_n) || !r->before_n || r->before_n > r->addr
+                || !parse_dir(p + k, n - k, &r->before_dir))
+                return false;
+        } else if (k >= 5 && !strncmp(p, "after", 5) && (k == 5 || p[5] == '=')) {
+            /* after[=N][:DIR]: a redzone from the input's extent to N bytes past the buffer */
+            if ((k > 5 && !parse_u64(p + 6, k - 6, &r->after_n))
+                || !parse_dir(p + k, n - k, &r->after_dir))
+                return false;
+        } else if (n > 7 && !strncmp(p, "extent=", 7)) {
+            if (!parse_extent(r, p + 7, n - 7, true))
+                return false;
         } else if (n == 5 && !strncmp(p, "guard", 5)) {
-            r->guard = true;                 /* guard at addr + delivered byte count */
-        } else if (n > 7 && !strncmp(p, "guard=@", 7)) {
-            /* guard=@OFF:SZ - the legit length is the SZ-byte field at input offset OFF */
-            char *e;
-            r->guard_off = strtoull(p + 7, &e, 0);
-            if (*e != ':')
+            r->after_dir = UAM_GUARD_READ;            /* older form of after:r */
+        } else if (n > 6 && !strncmp(p, "guard=", 6)) {
+            /* older form of after:r,extent=@OFF:SZ[+-D] (the field in the CPU's order) */
+            if (!parse_extent(r, p + 6, n - 6, false))
                 return false;
-            r->guard_sz = (unsigned)strtoul(e + 1, &e, 0);
-            if (r->guard_sz != 1 && r->guard_sz != 2 && r->guard_sz != 4)
-                return false;
-            if (*e == '+' || *e == '-')     /* optional +DELTA/-DELTA: guard at field + delta */
-                r->guard_delta = (int64_t)strtoll(e, &e, 0);
-            if (e != p + n)
-                return false;
-            r->guard = r->guard_field = true;
+            r->after_dir = UAM_GUARD_READ;
         } else if (n > 9 && !strncmp(p, "guardabs=", 9)) {
-            /* guardabs=ADDR:N - a fixed read-fault redzone at absolute [ADDR, ADDR+N) */
+            /* guardabs=ADDR:N - a fixed read redzone at absolute [ADDR, ADDR+N) */
             char *e;
-            r->guard_abs_addr = strtoull(p + 9, &e, 0);
+            r->abs_addr = strtoull(p + 9, &e, 0);
             if (*e != ':')
                 return false;
-            r->guard_abs_n = strtoull(e + 1, &e, 0);
-            if (r->guard_abs_n == 0 || e != p + n)
+            r->abs_n = strtoull(e + 1, &e, 0);
+            if (r->abs_n == 0 || e != p + n)
                 return false;
-            r->guard_abs = true;
+            r->abs = true;
         } else {
             return false;
         }
         p += n;
     }
-    return true;
+    return !r->extent || r->after_dir;   /* an extent only places the after zone */
 }
 
 uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_t errlen)
@@ -705,15 +770,21 @@ uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_
     if (err && errlen)
         err[0] = '\0';
     if (!strncmp(spec, "mem:", 4)) {
-        if (!parse_mem(&f->mem, spec + 4)) {
-            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N][,reject]"
-                                 "[,guard|,guard=@OFF:SZ[+-D]][,guardabs=ADDR:N]");
+        mem_route r;
+        if (!parse_mem(&r, spec + 4)) {
+            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N][,reject][,before=N[:DIR]]"
+                                 "[,after[=N][:DIR]][,extent=@OFF:SZ[:le|:be][+-D]] (DIR: r, w, "
+                                 "rw; extent needs after)");
             return UAM_ERR_INVALID;
         }
+        mem_disarm(&f->mem, f->m);
+        f->mem = r;
         f->deliver = mem_deliver;
         f->deliver_ctx = &f->mem;
         return UAM_OK;
     }
+    /* Another route: the mem: route's redzones go. */
+    mem_disarm(&f->mem, f->m);
     for (size_t i = 0; i < f->n_routes; i++) {
         if (!strcmp(f->routes[i].name, spec)) {
             f->deliver = f->routes[i].fn;
@@ -816,11 +887,26 @@ static void classify(uam_fuzz *f, uam_fuzz_result *r)
     r->detail = 0;
     if (f->ended && r->stop == UAM_STOP_HOOK)
         return;
+    /* A guard hit this iteration: a STOP guard ended it, a FAULT guard's fault may be
+     * the crash below. */
+    const uam_guard_hit *gh = uam_machine_guard_hits(m) != f->guard_hits0
+                            ? uam_machine_guard_last_hit(m) : NULL;
+    if (r->stop == UAM_STOP_GUARD && gh) {
+        r->verdict = UAM_FUZZ_CRASH_GUARD;
+        r->guard_valid = true;
+        r->guard = *gh;
+        r->detail = gh->pc;
+        return;
+    }
     if (f->exc_crash) {
         r->verdict = UAM_FUZZ_CRASH_FAULT;
         r->exc_valid = true;
         r->exc = f->exc;
         r->detail = f->exc.pc;
+        if (gh && gh->action == UAM_GUARD_FAULT) {
+            r->guard_valid = true;
+            r->guard = *gh;
+        }
         return;
     }
     if (f->oracle) {
@@ -914,9 +1000,12 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     }
     uint64_t ic0 = uam_machine_icount(m);
     f->hit_cpu = &m->cpu;
+    f->guard_hits0 = uam_machine_guard_hits(m);
     f->ph = PH_ITER;
     r->stop = uam_exec_run(&m->exec, f->cfg.iter_insns);
     f->ph = PH_IDLE;
+    if (r->stop == UAM_STOP_GUARD && uam_machine_guard_last_hit(m))
+        f->hit_cpu = uam_machine_cpu(m, uam_machine_guard_last_hit(m)->cpu);
     r->pc = f->hit_cpu->pc;   /* the processor that ended it (processor 0 otherwise) */
     r->insns = uam_machine_icount(m) - ic0;
     if (f->aborted)

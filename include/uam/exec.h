@@ -121,6 +121,7 @@ typedef enum uam_stop_reason {
     UAM_STOP_LIVELOCK,    /* timers keep firing, no instruction retires, nothing else can wake the hart */
     UAM_STOP_EXC_HOOK,    /* the exception observer returned UAM_HOOK_STOP */
     UAM_STOP_IRQ_HOOK,    /* the interrupt observer returned UAM_HOOK_STOP */
+    UAM_STOP_GUARD,       /* uam_exec_request_fault_stop: a guarded access (guard.h) */
 } uam_stop_reason;
 
 const char *uam_stop_reason_str(uam_stop_reason r);
@@ -307,6 +308,10 @@ typedef struct uam_exec {
     bool             last_fetch_fault_valid;
     uint64_t         last_fetch_fault_pc, last_fetch_fault_icount;
 
+    /* uam_exec_request_fault_stop */
+    bool             fault_stop;
+    uint64_t        *fault_stop_pc;
+
     /* Multiprocessor machines (uam_machine_add_cpus). Processor 0's executor
      * runs them all: `smp` lists every processor's executor, its own first,
      * and uam_exec_run(processor 0's) interleaves them in slices of `quantum`
@@ -337,6 +342,17 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns);
 /* Request a stop at the next instruction boundary. Safe to call from a
  * device, a hook, or a signal handler. */
 void            uam_exec_stop(uam_exec *x, int64_t status);
+/*
+ * For a data access the bus refused on purpose (a guard, guard.h), made while x's
+ * processor runs: stop the run with UAM_STOP_GUARD instead of delivering the
+ * exception the access raises. cpu->pc is then the faulting instruction (as for an
+ * exception observer's stop: resuming re-executes it), also stored in *pc_out if
+ * pc_out is not NULL. If the block ends without an exception (the access's failure
+ * was absorbed, or it came from a device between instructions), the run stops at
+ * the next instruction boundary instead. A request made outside uam_exec_run is
+ * dropped when the next run starts.
+ */
+void            uam_exec_request_fault_stop(uam_exec *x, uint64_t *pc_out);
 
 /* Request a reset at the next instruction boundary. uam_exec_run performs it
  * through the reset handler and keeps running; without a handler it returns

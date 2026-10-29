@@ -7,6 +7,8 @@
  *
  *   UAM_FUZZ_OK            COVERAGE, kind ITER
  *   UAM_FUZZ_CRASH_FAULT   CRASH GUEST_FAULT, status = faulting pc (low 32 bits)
+ *   UAM_FUZZ_CRASH_GUARD   CRASH GUEST_FAULT, status = pc of the guarded access (low
+ *                                             32 bits): a redzone or --guard hit
  *   UAM_FUZZ_CRASH_ORACLE  CRASH ORACLE,      status = detail (low 32 bits): the crash
  *                                             pc, a halt status or interrupt lines
  *   UAM_FUZZ_HANG          CRASH HANG,        status = the uam_stop_reason
@@ -349,7 +351,8 @@ static uam_status szr_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
         uint8_t reason;
         uint32_t status = (uint32_t)detail;
         switch (v) {
-        case UAM_FUZZ_CRASH_FAULT:  reason = SZR_CRASH_GUEST_FAULT; break;
+        case UAM_FUZZ_CRASH_FAULT:
+        case UAM_FUZZ_CRASH_GUARD:  reason = SZR_CRASH_GUEST_FAULT; break;
         case UAM_FUZZ_CRASH_ORACLE: reason = SZR_CRASH_ORACLE; break;
         case UAM_FUZZ_HANG:         reason = SZR_CRASH_HANG; break;
         case UAM_FUZZ_REJECTED:     reason = SZR_CRASH_DELIVERY; status = 0; break;
