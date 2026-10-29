@@ -164,11 +164,20 @@ uam_status uam_fuzz_set_block_coverage(uam_fuzz *f);
 
 /*
  * Input routes. Built in, by spec string:
- *   "mem:ADDR[,len=ADDR][,max=N][,reject]"
+ *   "mem:ADDR[,len=ADDR][,max=N][,reject][,guard|,guard=@OFF:SZ]"
  *                                  write the input to guest memory at virtual ADDR,
  *                                  optionally its length as a 32-bit word in the CPU's
  *                                  byte order, truncated to N bytes (default 4096), or with
- *                                  "reject" refused when longer (verdict REJECTED)
+ *                                  "reject" refused when longer (verdict REJECTED).
+ *                                  "guard" arms a read-fault guard (UAM_WATCH_FAULT) at
+ *                                  ADDR + L so a read past the input's legitimate extent L
+ *                                  faults and is caught: L is the delivered byte count, or
+ *                                  with "guard=@OFF:SZ" the SZ-byte length field at input
+ *                                  offset OFF (e.g. a descriptor's wTotalLength), optionally
+ *                                  "+D"/"-D" to guard at field+delta (skip a known N-past read).
+ *                                  "guardabs=ADDR:N" arms a FIXED read-fault redzone at the
+ *                                  absolute range [ADDR, ADDR+N), independent of the input - a
+ *                                  redzone before a buffer catches an under-read (e.g. buf[-1])
  * Registered: uam_fuzz_add_route, then the machine's inputs (uam_machine_add_input,
  * e.g. a board's "uart0"). uam_fuzz_mmio_deliver feeds a uam_mmio_input (ctx) for
  * --mmio-rule input registers; the runner registers it as "mmio".

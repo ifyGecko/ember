@@ -24,6 +24,22 @@ typedef struct route {
 typedef struct mem_route {
     uint64_t addr, len_addr, max;
     bool     has_len, reject;   /* reject: refuse inputs over max instead of truncating */
+    /* guard: after delivery, arm a read-fault guard (UAM_WATCH_FAULT) at addr + L, so a
+     * read past the input's legitimate extent faults and is caught as a bus fault. L is the
+     * delivered byte count, or - with guard_field - a little/big-endian length field inside
+     * the input at [guard_off, guard_off+guard_sz) (e.g. a descriptor's wTotalLength). The
+     * guard covers to the end of that page and is re-armed each iteration (guard_wid). */
+    bool     guard, guard_field;
+    uint64_t guard_off;
+    unsigned guard_sz;
+    int64_t  guard_delta;       /* guard at addr + field + delta: skip a known N-past read to hunt deeper */
+    int      guard_wid;
+    /* guard_abs: a FIXED read-fault guard on an absolute virtual range [guard_abs_addr,
+     * +guard_abs_n), independent of the input buffer - a redzone BEFORE a buffer catches an
+     * under-read (e.g. buf[-1]), which a trailing guard cannot. Re-armed each iteration. */
+    bool     guard_abs;
+    uint64_t guard_abs_addr, guard_abs_n;
+    int      guard_abs_wid;
 } mem_route;
 
 struct uam_fuzz {
@@ -529,9 +545,78 @@ static uam_status write_virt(uam_machine *m, uint64_t va, const uint8_t *data, s
     return UAM_OK;
 }
 
+/* No-op observer for a guard watch: a guarded access faults in the bus before fire_watches,
+ * so this is never actually called; it only satisfies uam_bus_add_watch's non-NULL fn. */
+static void guard_noop(void *ctx, uint64_t a, unsigned s, bool w, uint64_t v)
+{
+    (void)ctx; (void)a; (void)s; (void)w; (void)v;
+}
+
+static uam_status virt_to_phys(uam_machine *m, uint64_t va, uint64_t *pa)
+{
+    uam_cpu *cpu = &m->cpu;
+    if (!cpu->isa->translate) { *pa = va; return UAM_OK; }
+    uam_xlate xl = { 0 };
+    if (cpu->isa->translate(cpu, va, UAM_XLATE_LOAD, &xl) != UAM_OK)
+        return UAM_ERR_XLATE;
+    *pa = xl.paddr;
+    return UAM_OK;
+}
+
+/* Re-arm the read-fault guard at addr + L for this iteration (see mem_route.guard). */
+static void arm_guard(mem_route *r, uam_machine *m, const uint8_t *data, size_t len)
+{
+    if (r->guard_wid > 0) {
+        uam_bus_remove_watch(&m->bus, r->guard_wid);
+        r->guard_wid = 0;
+    }
+    uint64_t L;
+    if (r->guard_field) {
+        if (r->guard_off + r->guard_sz > len)
+            return;                         /* the length field is not in the input */
+        bool be = m->cpu.isa->default_endian & UAM_ACC_BE;
+        uint64_t field = 0;
+        for (unsigned i = 0; i < r->guard_sz; i++)
+            field |= (uint64_t)data[r->guard_off + i] << (be ? 8 * (r->guard_sz - 1 - i) : 8 * i);
+        int64_t LL = (int64_t)field + r->guard_delta;   /* delta skips a known N-past read */
+        if (LL <= 0)
+            return;
+        L = (uint64_t)LL;
+    } else {
+        L = len;
+    }
+    if (L == 0 || L > r->max + UAM_PAGE_SIZE)
+        return;                             /* nothing legitimate to read, or absurdly past our window */
+    uint64_t pa;
+    if (virt_to_phys(m, r->addr + L, &pa) != UAM_OK)
+        return;
+    uint64_t span = UAM_PAGE_SIZE - (pa & (UAM_PAGE_SIZE - 1));   /* stay within one page (PA) */
+    int id = uam_bus_add_watch(&m->bus, pa, span, UAM_WATCH_FAULT | UAM_WATCH_READ,
+                               guard_noop, NULL);
+    if (id > 0)
+        r->guard_wid = id;
+}
+
+/* Re-arm the fixed absolute read-fault guard [guard_abs_addr, +guard_abs_n) (see mem_route). */
+static void arm_guard_abs(mem_route *r, uam_machine *m)
+{
+    if (r->guard_abs_wid > 0) {
+        uam_bus_remove_watch(&m->bus, r->guard_abs_wid);
+        r->guard_abs_wid = 0;
+    }
+    uint64_t pa;
+    if (virt_to_phys(m, r->guard_abs_addr, &pa) != UAM_OK)
+        return;
+    uint64_t rem = UAM_PAGE_SIZE - (pa & (UAM_PAGE_SIZE - 1));
+    uint64_t n = r->guard_abs_n < rem ? r->guard_abs_n : rem;    /* stay within one page (PA) */
+    int id = uam_bus_add_watch(&m->bus, pa, n, UAM_WATCH_FAULT | UAM_WATCH_READ, guard_noop, NULL);
+    if (id > 0)
+        r->guard_abs_wid = id;
+}
+
 static uam_status mem_deliver(void *ctx, uam_machine *m, const uint8_t *data, size_t len)
 {
-    const mem_route *r = ctx;
+    mem_route *r = ctx;
     if (len > r->max && r->reject)
         return UAM_ERR_REJECTED;
     if (len > r->max)
@@ -544,6 +629,10 @@ static uam_status mem_deliver(void *ctx, uam_machine *m, const uint8_t *data, si
             w[i] = (uint8_t)((uint32_t)len >> (be ? 24 - 8 * i : 8 * i));
         st = write_virt(m, r->len_addr, w, 4);
     }
+    if (st == UAM_OK && r->guard)
+        arm_guard(r, m, data, len);
+    if (st == UAM_OK && r->guard_abs)
+        arm_guard_abs(r, m);
     return st;
 }
 
@@ -577,6 +666,32 @@ static bool parse_mem(mem_route *r, const char *spec)
                 return false;
         } else if (n == 6 && !strncmp(p, "reject", 6)) {
             r->reject = true;
+        } else if (n == 5 && !strncmp(p, "guard", 5)) {
+            r->guard = true;                 /* guard at addr + delivered byte count */
+        } else if (n > 7 && !strncmp(p, "guard=@", 7)) {
+            /* guard=@OFF:SZ - the legit length is the SZ-byte field at input offset OFF */
+            char *e;
+            r->guard_off = strtoull(p + 7, &e, 0);
+            if (*e != ':')
+                return false;
+            r->guard_sz = (unsigned)strtoul(e + 1, &e, 0);
+            if (r->guard_sz != 1 && r->guard_sz != 2 && r->guard_sz != 4)
+                return false;
+            if (*e == '+' || *e == '-')     /* optional +DELTA/-DELTA: guard at field + delta */
+                r->guard_delta = (int64_t)strtoll(e, &e, 0);
+            if (e != p + n)
+                return false;
+            r->guard = r->guard_field = true;
+        } else if (n > 9 && !strncmp(p, "guardabs=", 9)) {
+            /* guardabs=ADDR:N - a fixed read-fault redzone at absolute [ADDR, ADDR+N) */
+            char *e;
+            r->guard_abs_addr = strtoull(p + 9, &e, 0);
+            if (*e != ':')
+                return false;
+            r->guard_abs_n = strtoull(e + 1, &e, 0);
+            if (r->guard_abs_n == 0 || e != p + n)
+                return false;
+            r->guard_abs = true;
         } else {
             return false;
         }
@@ -591,7 +706,8 @@ uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_
         err[0] = '\0';
     if (!strncmp(spec, "mem:", 4)) {
         if (!parse_mem(&f->mem, spec + 4)) {
-            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N][,reject]");
+            set_err(err, errlen, "expected mem:ADDR[,len=ADDR][,max=N][,reject]"
+                                 "[,guard|,guard=@OFF:SZ[+-D]][,guardabs=ADDR:N]");
             return UAM_ERR_INVALID;
         }
         f->deliver = mem_deliver;

@@ -773,14 +773,25 @@ static lr lift_80(xl *x)
     }
     case 0x8F: {   /* POP Ev: rSP is incremented before the address is formed */
         uam_ref v = x_pop(x, w);
-        xop d;
         if (x->in.mod == 3) {
             x_commit_sp(x);
             x_setreg(x, x->in.rm, w, v);
             return LR_CONT;
         }
-        d = x_rm(x);   /* uses the pre-pop rSP from the register file: rare case */
-        x_st(x, w, d.lin, v);
+        /* POP m: the Intel SDM forms the destination address *after* rSP is
+         * incremented, so when rSP is the operand's base the address must use
+         * the post-pop value. x_ea_off() reads the pre-pop rSP from the register
+         * file; add the pop width (in the address-size domain) when the base is
+         * rSP (rSP can never be a SIB index, so the base is the only place it
+         * appears). Without this, `pop disp(%rsp)` writes the wrong slot — e.g.
+         * Linux's `pushf; pop 8(%rsp)` local_irq_save stores the flags one slot
+         * low, and the matching local_irq_restore then reads a stale byte and
+         * re-enables interrupts inside a hard IRQ. rSP is committed only after
+         * the store, which may fault and must precede any register write. */
+        uam_ref off = x_ea_off(x);
+        if (x->in.ea_base == X86_RSP)
+            off = x_bin(x, UAM_OP_ADD, x->in.asz, off, x_imm(x, w / 8));
+        x_st(x, w, x_lin(x, x_seg(x, x->in.ea_dseg), off, x->in.asz), v);
         x_commit_sp(x);
         return LR_CONT;
     }
