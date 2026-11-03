@@ -352,6 +352,7 @@ typedef struct x86_state {
     bool     halted_in_smm;       /* auto-HALT restart in the save state */
     bool     shutdown;            /* triple fault: the hart stops */
     bool     wait_sipi;           /* an application processor waiting for a startup IPI */
+    bool     wait_sipi_in_smm;    /* took an SMI while in wait-for-SIPI: return there on RSM */
     /* SMM I/O state (I/O instruction restart): the I/O instruction executing
      * (recorded by X86_H_IO, valid while icount == io_icount), what an SMI
      * it raised latched, and what the SMM handler may restart */

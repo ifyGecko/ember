@@ -588,7 +588,9 @@ static bool x86_irq_wakeup(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
     if (s->wait_sipi)
-        return s->sipi_pending || s->init_pending;
+        /* A wait-for-SIPI AP still takes an SMI: SMM (e.g. PiSmmCpu SMBASE
+         * relocation) is broadcast to every core before the APs are started. */
+        return s->sipi_pending || s->init_pending || (s->smi_pending && !s->in_smm);
     if (s->shutdown)
         return s->init_pending;
     return (s->smi_pending && !s->in_smm) || (s->init_pending && !s->in_smm) ||
@@ -598,7 +600,18 @@ static bool x86_irq_wakeup(uam_cpu *cpu)
 static bool x86_irq_take(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
-    if (s->wait_sipi) {          /* only INIT and SIPI are recognised */
+    if (s->wait_sipi) {          /* INIT, SIPI and SMI are recognised */
+        if (s->smi_pending && !s->in_smm && !s->shutdown) {
+            /* SMI reaches an AP even in wait-for-SIPI (SMBASE relocation runs
+             * before APs are started). Enter SMM now and, on RSM, go back to
+             * waiting for the startup IPI rather than resuming execution. */
+            s->smi_pending = false;
+            s->wait_sipi = false;
+            s->wait_sipi_in_smm = true;
+            cpu->waiting = false;
+            x86_smm_enter(cpu);
+            return true;
+        }
         if (s->init_pending) {
             s->init_pending = false;
             enter_wait_sipi(cpu);
@@ -638,14 +651,18 @@ static bool x86_irq_take(uam_cpu *cpu)
         s->smrr_mask = smrr_mask;
         s->pat = pat;
         s->apic_base = apic_base;
-        if (!bsp) {
+        /* A received INIT IPI puts ANY processor - the BSP included - into
+         * wait-for-SIPI; only a true power-on RESET runs the BSP from the
+         * reset vector. (Firmware MP flows legitimately INIT-SIPI the BSP,
+         * e.g. a SwitchBsp handoff.) The only BSP/AP difference is that an
+         * AP clears its APIC-base BSP flag; the BSP keeps it. The directed
+         * SIPI captured here then restarts the core at vector<<12. */
+        if (!bsp)
             s->apic_base &= ~(uint64_t)(1u << 8);
-            s->sipi_pending = sipi;
-            s->sipi_vector = vec;
-            enter_wait_sipi(cpu);
-            return false;
-        }
-        return true;
+        s->sipi_pending = sipi;
+        s->sipi_vector = vec;
+        enter_wait_sipi(cpu);
+        return false;
     }
     if (s->shutdown)
         return false;
@@ -913,7 +930,7 @@ static void x86_save(uam_cpu *cpu, uam_state_writer *w)
     uam_state_put_u8(w, s->sipi_vector);
     const bool b[] = { s->nmi_pending, s->smi_pending, s->init_pending, s->nmi_blocked,
                        s->in_smm, s->halted_in_smm, s->shutdown, s->wait_sipi, s->sipi_pending,
-                       s->smi_io, s->smm_io, s->mmx };
+                       s->smi_io, s->smm_io, s->mmx, s->wait_sipi_in_smm };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         uam_state_put_bool(w, b[i]);
     for (unsigned i = 0; i < 8; i++) {
@@ -942,7 +959,8 @@ static void x86_restore(uam_cpu *cpu, uam_state_reader *r)
     s->sipi_vector = uam_state_get_u8(r);
     bool *const b[] = { &s->nmi_pending, &s->smi_pending, &s->init_pending, &s->nmi_blocked,
                         &s->in_smm, &s->halted_in_smm, &s->shutdown, &s->wait_sipi,
-                        &s->sipi_pending, &s->smi_io, &s->smm_io, &s->mmx };
+                        &s->sipi_pending, &s->smi_io, &s->smm_io, &s->mmx,
+                        &s->wait_sipi_in_smm };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         *b[i] = uam_state_get_bool(r);
     for (unsigned i = 0; i < 8; i++) {

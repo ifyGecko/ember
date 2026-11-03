@@ -357,6 +357,13 @@ uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t *new_pc)
     if (s->plat.smm_changed)
         s->plat.smm_changed(s->plat.ctx, false);
     s->smbase = ri.smbase;   /* the handler may relocate SMBASE */
+    if (s->wait_sipi_in_smm) {
+        /* The SMI had woken a wait-for-SIPI AP: return it to that state (the
+         * relocated SMBASE is kept) rather than executing the restored context. */
+        s->wait_sipi_in_smm = false;
+        s->wait_sipi = true;
+        cpu->waiting = true;
+    }
     x86_tlb_flush(cpu);
     x86_update_priv(cpu);
     uam_cpu_xlate_changed(cpu);
