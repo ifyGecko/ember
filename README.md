@@ -179,8 +179,8 @@ program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored inter
 MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets into microMIPS.
 MIPS32, MIPS16e and microMIPS firmware runs (mx and mz switch between their two ISAs through
 JALX and jumps to odd addresses; mm is microMIPS only), and mz has the FPU (FR = 0 and 1, in
-either ISA) and the DSP ASE revision 2 (again in either ISA). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
-16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
+either ISA) and the DSP ASE revision 2 (again in either ISA).
+`x86_64-ref` takes the images `flash` (a CFI boot flash of up to 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
 save-state layout the firmware's SMM handler expects).
