@@ -6,7 +6,8 @@
 #                        x86-64 real/protected/long mode, 32-bit PowerPC, 8-bit AVR in five core families,
 #                        AVR32A/B when an AVR32 toolchain is found: AVR32_CROSS, 8-bit PIC in four
 #                        core families when gputils is: GPASM, the 8051 in three core models when
-#                        as31 (and, for its fuzz target, SDCC) is found),
+#                        as31 (and, for its fuzz target, SDCC) is found), the 6502 in three core
+#                        models when sdas6500 is (its fuzz target SDCC too),
 #                        external-board example,
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
@@ -69,6 +70,13 @@ HAVE_AS31  := $(if $(shell command -v $(AS31) 2>/dev/null),1)
 HAVE_SDCC  := $(if $(shell command -v $(SDCC) 2>/dev/null),1)
 MCS51_SKIP  = @echo "$@: 8051 firmware skipped (no $(AS31); set AS31=path)"
 SDCC_SKIP   = @echo "$@: 8051 fuzz target skipped (no $(SDCC); set SDCC=path)"
+# The 6502 self-tests are assembled with SDCC's sdas6500 and linked with sdld; its fuzz
+# target is built with SDCC too. Without them they are skipped.
+SDAS6500     ?= sdas6500
+SDLD         ?= sdld
+HAVE_SDAS6500 := $(if $(and $(shell command -v $(SDAS6500) 2>/dev/null),$(shell command -v $(SDLD) 2>/dev/null)),1)
+M6502_SKIP    = @echo "$@: 6502 firmware skipped (no $(SDAS6500)/$(SDLD): install SDCC, or set SDAS6500=path)"
+M6502_SDCC_SKIP = @echo "$@: 6502 fuzz target skipped (no $(SDCC); set SDCC=path)"
 
 # ---- suzzer ------------------------------------------------------------------------------
 # SUZZER_DIR: an existing suzzer checkout to use in place; empty turns the integration off.
@@ -173,6 +181,7 @@ TEST_F80  := $(BUILD)/test_f80
 TEST_AVR  := $(BUILD)/test_avr
 TEST_PIC  := $(BUILD)/test_pic
 TEST_MCS51 := $(BUILD)/test_mcs51
+TEST_M6502 := $(BUILD)/test_m6502
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -201,11 +210,13 @@ FW_PIC    := $(BUILD)/firmware-pic
 PIC_MODELS := baseline mid enhanced pic18
 FW_MCS51  := $(BUILD)/firmware-mcs51
 MCS51_MODELS := 8051 8052 cip51
+FW_6502   := $(BUILD)/firmware-6502
+M6502_MODELS := nmos 2a03 65c02
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test firmware-pic pic-test \
-        firmware-mcs51 mcs51-test firmware-pic32 pic32-test \
+        firmware-mcs51 mcs51-test firmware-pic32 pic32-test firmware-6502 6502-test \
         example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
         bench-test xbench install \
@@ -334,6 +345,9 @@ $(TEST_PIC): $(BUILD)/obj/tests/unit/test_pic.o $(LIB)
 $(TEST_MCS51): $(BUILD)/obj/tests/unit/test_mcs51.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_M6502): $(BUILD)/obj/tests/unit/test_m6502.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -392,6 +406,18 @@ else
 	$(SDCC_SKIP)
 endif
 
+firmware-6502:
+ifeq ($(HAVE_SDAS6500),1)
+	$(MAKE) -C tests/firmware-6502 SDAS=$(SDAS6500) SDLD=$(SDLD) OUT=$(abspath $(FW_6502))
+else
+	$(M6502_SKIP)
+endif
+ifeq ($(HAVE_SDCC),1)
+	$(MAKE) -C tests/firmware-6502 SDCC=$(SDCC) OUT=$(abspath $(FW_6502)) fuzz
+else
+	$(M6502_SDCC_SKIP)
+endif
+
 firmware-avr32:
 ifeq ($(HAVE_AVR32),1)
 	$(MAKE) -C tests/firmware-avr32 CROSS=$(AVR32_CROSS) OUT=$(abspath $(BUILD))/firmware-avr32
@@ -409,7 +435,7 @@ endif
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_JITDIFF) $(TEST_F80) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_JITDIFF) $(TEST_F80) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -426,6 +452,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_AVR)
 	$(TEST_PIC)
 	$(TEST_MCS51)
+	$(TEST_M6502)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
@@ -532,6 +559,18 @@ else
 	$(MCS51_SKIP)
 endif
 
+# The 6502 self-test on every core the board models.
+6502-test: $(RUN) firmware-6502
+ifeq ($(HAVE_SDAS6500),1)
+	@set -e; for m in $(M6502_MODELS); do \
+	    echo "$(RUN) -b 6502-ref -o model=$$m [--jit] --stats $(FW_6502)/selftest-$$m.bin"; \
+	    $(RUN) -b 6502-ref -o model=$$m --stats $(FW_6502)/selftest-$$m.bin < /dev/null; \
+	    $(RUN) -b 6502-ref -o model=$$m --jit --stats $(FW_6502)/selftest-$$m.bin < /dev/null; \
+	done
+else
+	$(M6502_SKIP)
+endif
+
 avr32-test: $(RUN) firmware-avr32
 ifeq ($(HAVE_AVR32),1)
 	$(RUN) -b avr32-ref --stats $(FW_AVR32_A) < /dev/null
@@ -570,7 +609,7 @@ example-test: lib firmware-mips
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
 snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc firmware-avr firmware-avr32 firmware-pic \
-               firmware-mcs51 firmware-pic32 \
+               firmware-mcs51 firmware-pic32 firmware-6502 \
                example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
@@ -617,6 +656,14 @@ ifeq ($(HAVE_AS31),1)
 else
 	$(MCS51_SKIP)
 endif
+ifeq ($(HAVE_SDAS6500),1)
+	sh tests/snapshot/snapshot-check.sh $(RUN) 6502-ref $(FW_6502)/selftest-nmos.bin 1 5000 60000 127000 127500 \
+	    127800 128000
+	sh tests/snapshot/snapshot-check.sh $(RUN) 6502-ref $(FW_6502)/selftest-65c02.bin 777 40000 86400 86900 87200 \
+	    -- -o model=65c02
+else
+	$(M6502_SKIP)
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr32-ref $(FW_AVR32_A) 777 164500 165000 165300 165600 165900
@@ -635,7 +682,7 @@ endif
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
 cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
-          firmware-pic32
+          firmware-pic32 firmware-6502
 	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
 	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
@@ -659,6 +706,12 @@ ifeq ($(HAVE_AS31),1)
 else
 	$(MCS51_SKIP)
 endif
+ifeq ($(HAVE_SDAS6500),1)
+	@set -e; for m in $(M6502_MODELS); do \
+	    sh tests/cov/cov-check.sh $(RUN) 6502-ref $(FW_6502)/selftest-$$m.bin -- -o model=$$m; done
+else
+	$(M6502_SKIP)
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/cov/cov-check.sh $(RUN) avr32-ref $(FW_AVR32_A)
@@ -675,7 +728,7 @@ endif
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
 fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
-           firmware-pic32
+           firmware-pic32 firmware-6502
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -694,6 +747,7 @@ else
 endif
 ifeq ($(HAVE_SDCC),1)
 	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) mcs51-ref $(FW_MCS51)/fuzztarget.bin
+	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) 6502-ref $(FW_6502)/fuzztarget.bin
 else
 	$(SDCC_SKIP)
 endif
@@ -739,7 +793,7 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test \
+test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test \
       example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
       gdb-test runner-test bench-test
@@ -782,5 +836,5 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
-         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_f80.d \
+         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d

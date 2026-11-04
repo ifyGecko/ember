@@ -180,7 +180,7 @@ static bool m6502_irq_take(uam_cpu *cpu)
     const bool masked = poll_i0 ? false : (cpu->regfile[M6502_PX] & UAM_M6502_P_I) != 0;
     if (masked)
         return false;
-    if (defer) {   /* one more instruction first: stop the hart after it */
+    if (defer && !poll_i0) {   /* one more instruction first: stop the hart after it */
         uam_cpu_request_exit(cpu);
         return false;
     }
