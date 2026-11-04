@@ -4,7 +4,8 @@
 #   make lib             only the libraries (for out-of-tree projects)
 #   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE, ARM and Thumb LE/BE8,
 #                        x86-64 real/protected/long mode, 32-bit PowerPC, 8-bit AVR in five core families,
-#                        AVR32A/B when an AVR32 toolchain is found: AVR32_CROSS),
+#                        AVR32A/B when an AVR32 toolchain is found: AVR32_CROSS, the 8051 in
+#                        three core models when as31 (and, for its fuzz target, SDCC) is found),
 #                        external-board example,
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
@@ -30,6 +31,7 @@
 #   libuam-riscv.a    RISC-V ISA module          libuam-mips.a   MIPS32 ISA module
 #   libuam-arm.a      ARM (AArch32) ISA module   libuam-ppc.a    32-bit PowerPC ISA module
 #   libuam-avr.a      8-bit AVR ISA module       libuam-avr32.a  AVR32 (A and B) ISA module
+#   libuam-mcs51.a    8051 (MCS-51) ISA module
 #   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref, ...)
 #   libuam-fuzz.a     the fuzz harness and its frontends (fuzz/)
 #   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main; uses libuam-fuzz)
@@ -52,6 +54,15 @@ BUILD ?= build
 AVR32_CROSS ?= avr32-
 HAVE_AVR32  := $(if $(shell command -v $(AVR32_CROSS)gcc 2>/dev/null),1)
 AVR32_SKIP  = @echo "$@: AVR32 firmware skipped (no $(AVR32_CROSS)gcc; set AVR32_CROSS=prefix)"
+
+# The 8051 self-tests need the as31 assembler, its fuzz target SDCC; without them they
+# are skipped.
+AS31       ?= as31
+SDCC       ?= sdcc
+HAVE_AS31  := $(if $(shell command -v $(AS31) 2>/dev/null),1)
+HAVE_SDCC  := $(if $(shell command -v $(SDCC) 2>/dev/null),1)
+MCS51_SKIP  = @echo "$@: 8051 firmware skipped (no $(AS31); set AS31=path)"
+SDCC_SKIP   = @echo "$@: 8051 fuzz target skipped (no $(SDCC); set SDCC=path)"
 
 # ---- suzzer ------------------------------------------------------------------------------
 # SUZZER_DIR: an existing suzzer checkout to use in place; empty turns the integration off.
@@ -99,6 +110,7 @@ PPC_SRC     := isa/ppc32/ppc_lift.c isa/ppc32/ppc_fpu.c isa/ppc32/ppc_mmu.c isa/
                isa/ppc32/ppc_system.c
 AVR_SRC     := isa/avr8/avr_lift.c isa/avr8/avr_system.c isa/avr8/avr_des.c
 AVR32_SRC   := isa/avr32/avr32_lift.c isa/avr32/avr32_dec.c isa/avr32/avr32_dsp.c isa/avr32/avr32_system.c
+MCS51_SRC   := isa/mcs51/mcs51_lift.c isa/mcs51/mcs51_system.c
 X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_f80.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
                isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
@@ -108,9 +120,10 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_f
                devices/gic.c devices/i8259.c devices/i8254.c devices/mc146818.c devices/lapic.c \
                devices/ioapic.c devices/pci.c devices/ata_core.c devices/ahci.c devices/ide.c devices/nvme.c \
                devices/cfi_flash.c devices/pc_misc.c devices/acpi_pm.c devices/ipi.c devices/i8237.c devices/vga.c devices/fdc.c devices/lpt.c \
-               devices/i8042.c devices/hpet.c devices/gptimer.c devices/avr32_intc.c
+               devices/i8042.c devices/hpet.c devices/gptimer.c devices/avr32_intc.c \
+               devices/mcs51_timer.c devices/mcs51_serial.c devices/mcs51_port.c
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c \
-               boards/avr_ref.c boards/avr32_ref.c boards/stock.c boards/mmio_rules.c
+               boards/avr_ref.c boards/avr32_ref.c boards/mcs51_ref.c boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
@@ -120,14 +133,14 @@ HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/b
                src/debug/gdbstub.c src/runner/runner.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
-LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
+LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(MCS51_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
 obj = $(1:%.c=$(BUILD)/obj/%.o)
 LIB_OBJ  := $(call obj,$(LIB_SRC))
 
 LIB        := $(BUILD)/libuam.a
 MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mips.a \
                $(BUILD)/libuam-arm.a $(BUILD)/libuam-x86.a $(BUILD)/libuam-ppc.a $(BUILD)/libuam-avr.a \
-               $(BUILD)/libuam-avr32.a \
+               $(BUILD)/libuam-avr32.a $(BUILD)/libuam-mcs51.a \
                $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
                $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
@@ -148,6 +161,7 @@ TEST_PPC  := $(BUILD)/test_ppc
 TEST_JITDIFF := $(BUILD)/test_jitdiff
 TEST_F80  := $(BUILD)/test_f80
 TEST_AVR  := $(BUILD)/test_avr
+TEST_MCS51 := $(BUILD)/test_mcs51
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -164,10 +178,12 @@ FW_AVR    := $(BUILD)/firmware-avr
 AVR_MODELS := e eplus xm xt rc
 FW_AVR32_A := $(BUILD)/firmware-avr32/selftest-a.elf
 FW_AVR32_B := $(BUILD)/firmware-avr32/selftest-b.elf
+FW_MCS51  := $(BUILD)/firmware-mcs51
+MCS51_MODELS := 8051 8052 cip51
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
-        firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test \
+        firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test firmware-mcs51 mcs51-test \
         example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
         bench-test xbench install \
@@ -210,6 +226,7 @@ $(BUILD)/libuam-x86.a:     $(call obj,$(X86_SRC))
 $(BUILD)/libuam-ppc.a:     $(call obj,$(PPC_SRC))
 $(BUILD)/libuam-avr.a:     $(call obj,$(AVR_SRC))
 $(BUILD)/libuam-avr32.a:   $(call obj,$(AVR32_SRC))
+$(BUILD)/libuam-mcs51.a:   $(call obj,$(MCS51_SRC))
 $(BUILD)/libuam-devices.a: $(call obj,$(DEV_SRC))
 $(BUILD)/libuam-boards.a:  $(call obj,$(BOARD_SRC))
 $(BUILD)/libuam-fuzz.a:    $(call obj,$(FUZZ_SRC))
@@ -278,6 +295,9 @@ $(TEST_F80): $(BUILD)/obj/tests/unit/test_f80.o $(LIB)
 $(TEST_AVR): $(BUILD)/obj/tests/unit/test_avr.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_MCS51): $(BUILD)/obj/tests/unit/test_mcs51.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -321,6 +341,18 @@ firmware-ppc:
 firmware-avr:
 	$(MAKE) -C tests/firmware-avr OUT=$(abspath $(FW_AVR))
 
+firmware-mcs51:
+ifeq ($(HAVE_AS31),1)
+	$(MAKE) -C tests/firmware-mcs51 AS31=$(AS31) OUT=$(abspath $(FW_MCS51))
+else
+	$(MCS51_SKIP)
+endif
+ifeq ($(HAVE_SDCC),1)
+	$(MAKE) -C tests/firmware-mcs51 SDCC=$(SDCC) OUT=$(abspath $(FW_MCS51)) fuzz
+else
+	$(SDCC_SKIP)
+endif
+
 firmware-avr32:
 ifeq ($(HAVE_AVR32),1)
 	$(MAKE) -C tests/firmware-avr32 CROSS=$(AVR32_CROSS) OUT=$(abspath $(BUILD))/firmware-avr32
@@ -331,7 +363,7 @@ endif
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_JITDIFF) $(TEST_F80) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_MCS51) $(TEST_JITDIFF) $(TEST_F80) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -346,6 +378,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_SMP)
 	$(TEST_PPC)
 	$(TEST_AVR)
+	$(TEST_MCS51)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
@@ -422,6 +455,18 @@ avr-test: $(RUN) firmware-avr
 	    $(RUN) -b avr-ref -o model=$$m --jit --stats $(FW_AVR)/selftest-$$m.elf < /dev/null; \
 	done
 
+# The 8051 self-test on every core the board models.
+mcs51-test: $(RUN) firmware-mcs51
+ifeq ($(HAVE_AS31),1)
+	@set -e; for m in $(MCS51_MODELS); do \
+	    echo "$(RUN) -b mcs51-ref -o model=$$m [--jit] --stats $(FW_MCS51)/selftest-$$m.bin"; \
+	    $(RUN) -b mcs51-ref -o model=$$m --stats $(FW_MCS51)/selftest-$$m.bin < /dev/null; \
+	    $(RUN) -b mcs51-ref -o model=$$m --jit --stats $(FW_MCS51)/selftest-$$m.bin < /dev/null; \
+	done
+else
+	$(MCS51_SKIP)
+endif
+
 avr32-test: $(RUN) firmware-avr32
 ifeq ($(HAVE_AVR32),1)
 	$(RUN) -b avr32-ref --stats $(FW_AVR32_A) < /dev/null
@@ -445,6 +490,7 @@ example-test: lib firmware-mips
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
 snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc firmware-avr firmware-avr32 \
+               firmware-mcs51 \
                example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
@@ -474,6 +520,14 @@ snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 f
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-eplus.elf 1 5000 100000 200000 280000
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-xm.elf 777 150000 260000 -- -o model=xm
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-rc.elf 300 7000 14000 -- -o model=rc
+ifeq ($(HAVE_AS31),1)
+	sh tests/snapshot/snapshot-check.sh $(RUN) mcs51-ref $(FW_MCS51)/selftest-8052.bin 1 5000 263500 264700 \
+	    264900 265000 265100 265400
+	sh tests/snapshot/snapshot-check.sh $(RUN) mcs51-ref $(FW_MCS51)/selftest-cip51.bin 777 265100 265400 \
+	    -- -o model=cip51
+else
+	$(MCS51_SKIP)
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr32-ref $(FW_AVR32_A) 777 164500 165000 165300 165600 165900
@@ -485,7 +539,7 @@ endif
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
-cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32
+cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-mcs51
 	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
 	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
@@ -496,6 +550,12 @@ cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr f
 	sh tests/cov/cov-check.sh $(RUN) ppc-ref $(FW_PPC_BOOKE) -- -o model=booke
 	@set -e; for m in $(AVR_MODELS); do \
 	    sh tests/cov/cov-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-$$m.elf -- -o model=$$m; done
+ifeq ($(HAVE_AS31),1)
+	@set -e; for m in $(MCS51_MODELS); do \
+	    sh tests/cov/cov-check.sh $(RUN) mcs51-ref $(FW_MCS51)/selftest-$$m.bin -- -o model=$$m; done
+else
+	$(MCS51_SKIP)
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/cov/cov-check.sh $(RUN) avr32-ref $(FW_AVR32_A)
@@ -506,7 +566,7 @@ endif
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
-fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32
+fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-mcs51
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -518,6 +578,11 @@ fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr 
 	sh tests/fuzz/fuzz-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf \
 	    $(BUILD)/firmware-ppc/fuzztarget.bin
 	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) avr-ref $(FW_AVR)/fuzztarget.elf
+ifeq ($(HAVE_SDCC),1)
+	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) mcs51-ref $(FW_MCS51)/fuzztarget.bin
+else
+	$(SDCC_SKIP)
+endif
 ifeq ($(HAVE_AVR32),1)
 	sh tests/fuzz/fuzz-check.sh $(RUN) avr32-ref $(BUILD)/firmware-avr32/fuzztarget-a.elf
 else
@@ -558,7 +623,7 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test example-test snapshot-test cov-test fuzz-test \
+test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test mcs51-test example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
       gdb-test runner-test bench-test
 
@@ -599,5 +664,5 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
-         $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_f80.d \
+         $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d

@@ -16,9 +16,14 @@ X86_CROSS    ?= x86_64-linux-gnu-
 AVR_CROSS    ?= avr-
 AVR32_CROSS  ?= avr32-
 HAVE_AVR32   := $(if $(shell command -v $(AVR32_CROSS)gcc 2>/dev/null),1)
+SDCC         ?= sdcc
+HAVE_SDCC    := $(if $(shell command -v $(SDCC) 2>/dev/null),1)
 # Without the toolchain, images from an earlier build would be tested as current: drop them.
 ifneq ($(HAVE_AVR32),1)
 $(shell rm -f $(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf)
+endif
+ifneq ($(HAVE_SDCC),1)
+$(shell rm -f $(OUT)/bench-mcs51.bin)
 endif
 
 DEFS   = $(if $(ROUNDS),-DBENCH_ROUNDS=$(ROUNDS)) $(if $(ONLY),-DBENCH_ONLY=$(ONLY))
@@ -37,7 +42,8 @@ FW := ../firmware
 ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-arm.elf $(OUT)/bench-thumb.elf $(OUT)/bench-thumb-be.elf \
        $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host \
-       $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf)
+       $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf) \
+       $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin)
 
 all: $(ALL)
 
@@ -91,6 +97,20 @@ $(OUT)/bench-avr32a.elf: bench.c $(FW)-avr32/start.S $(OUT)/.config
 $(OUT)/bench-avr32b.elf: bench.c $(FW)-avr32/start.S $(OUT)/.config
 	LC_ALL=C $(AVR32_CROSS)gcc -mpart=ap7000 $(AVR32_FLAGS) -Wl,-T,$(FW)-avr32/link-b.ld \
 	    $(FW)-avr32/start.S bench.c -lgcc -o $@
+
+# 8051 (mcs51-ref, model 8052), only when SDCC is found: its large reentrant model
+# (data in external RAM, locals on the internal-RAM stack, whose 128 directly addressed
+# bytes the non-reentrant model's spill slots overflow). SDCC ships no 8051 build of its
+# 64-bit multiply, so it is compiled here from SDCC's own library source.
+SDCC_LIBSRC ?= $(dir $(shell command -v $(SDCC) 2>/dev/null))../share/sdcc/lib/src
+MCS51_FLAGS = -mmcs51 --model-large --stack-auto --std-c11 --iram-size 256 --xram-size 0xff00 \
+              --code-size 0x10000 $(DEFS)
+$(OUT)/bench-mcs51.bin: bench.c $(OUT)/.config
+	@mkdir -p $(OUT)/mcs51
+	$(SDCC) $(MCS51_FLAGS) -c $(SDCC_LIBSRC)/_mullonglong.c -o $(OUT)/mcs51/mullonglong.rel
+	$(SDCC) $(MCS51_FLAGS) -c bench.c -o $(OUT)/mcs51/bench.rel
+	$(SDCC) $(MCS51_FLAGS) $(OUT)/mcs51/bench.rel $(OUT)/mcs51/mullonglong.rel -o $(OUT)/mcs51/bench.ihx
+	makebin -p $(OUT)/mcs51/bench.ihx $@
 
 $(OUT)/bench-ppc.elf: bench.c $(FW)-ppc/start.S $(OUT)/.config
 	$(PPC_CROSS)gcc $(PPC_FLAGS) $(COMMON) $(LDCOMMON) -Wl,-T,$(FW)-ppc/link.ld \

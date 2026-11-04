@@ -21,6 +21,7 @@
 #include "uam/isa/arm.h"
 #include "uam/isa/avr.h"
 #include "uam/isa/avr32.h"
+#include "uam/isa/mcs51.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
 #include "uam/isa/riscv.h"
@@ -401,6 +402,27 @@ static prog avr32_prog(int n)
     p.site[2] = p.base + 12;
     p.site[3] = p.base + 20;
     p.done = p.base + 24;
+    return p;
+}
+
+/* 8051 (the default model): bytes packed little-endian into the words; x is R1:R0 of
+ * bank 0 (internal RAM 0-1, with R3:R2 zero, so a 32-bit read of it is x). */
+static prog mcs51_prog(int n)
+{
+    prog p = { .name = "mcs51", .isa = &uam_isa_mcs51, .base = 0x1000, .phys = 0x1000, .be = false,
+               .xreg = 0, .illegal = 0xA5, .no_exc = true };
+    const uint32_t lo = (uint32_t)n & 0xFF, hi = ((uint32_t)n >> 8) & 0xFF;
+    p.w[0] = 0x00790078u;                         /* mov r0,#0; mov r1,#0 */
+    p.w[1] = 0x0100B808u;                         /* loop: inc r0; cjne r0,#0,+1 */
+    p.w[2] = 0xF800B809u | lo << 16;              /* inc r1; cjne r0,#lo,loop */
+    p.w[3] = 0x7CF500B9u | hi << 8;               /* cjne r1,#hi,loop; mov r4,... */
+    p.w[4] = 0x00FE8007u;                         /* ...#7; sjmp . */
+    p.n = 5;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 4;
+    p.site[2] = p.base + 9;
+    p.site[3] = p.base + 15;
+    p.done = p.base + 17;
     return p;
 }
 
@@ -853,10 +875,12 @@ int main(void)
 
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
-                            arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3) };
+                            arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3),
+                            mcs51_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
-                              arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300) };
+                              arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300),
+                              mcs51_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

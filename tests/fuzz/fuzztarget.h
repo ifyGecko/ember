@@ -1,21 +1,29 @@
 /*
  * fuzztarget.h - The ISA-neutral body of the fuzz target firmware.
  *
- * Included by tests/firmware/fuzztarget.c (RV32) and tests/firmware-mips/fuzztarget.c
- * (MIPS32), which define UART_THR, UART_LSR and BAD_ADDR for their board first. The
+ * Included by each board's fuzztarget.c (in tests/firmware-ISA), which defines UART_THR,
+ * UART_LSR (a 16550's registers) or the UART_* functions below, and BAD_ADDR first. The
  * start code (start.S in each directory) calls main and, on any exception,
  * trap_handler.
  */
 #define BUF_SIZE 256
+
+/* A board whose UART is not a 16550 defines these four instead of UART_THR/UART_LSR. */
+#ifndef UART_PUT
+#define UART_TX_READY() (UART_LSR & 0x20)
+#define UART_RX_READY() (UART_LSR & 0x01)
+#define UART_PUT(c)     (UART_THR = (uint8_t)(c))
+#define UART_GET()      ((uint8_t)UART_THR)
+#endif
 
 static uint8_t g_buf[BUF_SIZE];
 volatile uint32_t g_sink;
 
 static void putc_(char c)
 {
-    while (!(UART_LSR & 0x20))
+    while (!UART_TX_READY())
         ;
-    UART_THR = (uint8_t)c;
+    UART_PUT(c);
 }
 
 static void puts_(const char *s)
@@ -63,8 +71,8 @@ void fuzz_iteration(void) __attribute__((noinline));
 void fuzz_iteration(void)
 {
     unsigned n = 0;
-    while ((UART_LSR & 0x01) && n < BUF_SIZE)
-        g_buf[n++] = UART_THR;
+    while (UART_RX_READY() && n < BUF_SIZE)
+        g_buf[n++] = UART_GET();
     g_sink = parse(g_buf, n);
 }
 

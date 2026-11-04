@@ -2,14 +2,14 @@
 
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
-and AVR32B), the
+and AVR32B, the 8051 in three core models), the
 snapshot part of phase 3 and the JIT from
 phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), 8-bit AVR
-(`avr-ref`), AVR32 (`avr32-ref`), host
+(`avr-ref`), AVR32 (`avr32-ref`), the 8051 (`mcs51-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -48,7 +48,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/mcs51` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -125,8 +125,9 @@ include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sch
 include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.h unimp.h
                   mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
-                  i8237.h ide.h fdc.h vga.h lpt.h
-include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
+                  i8237.h ide.h fdc.h vga.h lpt.h gptimer.h avr32_intc.h mcs51_timer.h
+                  mcs51_serial.h mcs51_port.h
+include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h mcs51.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
@@ -144,14 +145,17 @@ isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32)
 isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_booke.c ppc_system.c ppc.h (private)
 isa/avr8/         avr_lift.c avr_system.c avr_des.c avr.h (private)
 isa/avr32/        avr32_dec.c avr32_op.h avr32_lift.c avr32_dsp.c avr32_system.c avr32.h (private)
+isa/mcs51/        mcs51_lift.c mcs51_system.c mcs51.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
 devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.c unimp.c
                   mmio_stub.c virtio_net.c i8259.c i8254.c mc146818.c lapic.c ioapic.c hpet.c
                   i8042.c acpi_pm.c pc_misc.c pci.c ata_core.c ahci.c ide.c nvme.c cfi_flash.c
-                  ipi.c i8237.c fdc.c vga.c lpt.c
-boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+                  ipi.c i8237.c fdc.c vga.c lpt.c gptimer.c avr32_intc.c mcs51_timer.c
+                  mcs51_serial.c mcs51_port.c
+boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c avr_ref.c avr32_ref.c
+                  mcs51_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
@@ -166,7 +170,7 @@ tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: refe
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
-                  test_smp.c test_ppc.c test_avr.c test_f80.c
+                  test_smp.c test_ppc.c test_avr.c test_mcs51.c test_f80.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -188,6 +192,8 @@ tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.
 tests/firmware-avr/   selftest.c gen_vectors.py fuzztarget.c  (8-bit AVR, one build per core
                       family, with avr-libc's start-up code)
 tests/firmware-avr32/ start.S selftest.c fuzztarget.c link-a.ld link-b.ld  (AVR32A and AVR32B)
+tests/firmware-mcs51/ selftest.asm model-*.asm gen_vectors.py bank.asm mkimage.py fuzztarget.c
+                      (the 8051: as31 self-tests per core model, an SDCC fuzz target)
                       start-booke.S link-booke.ld  (the self-test for the Book E model)
 tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bios-check.py
                       (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
@@ -242,7 +248,10 @@ devices.
   of it: program memory, SRAM, 32 general-purpose I/O registers, a NS16550A UART, the
   general-purpose timer and a test finisher), and `avr32-ref` (AVR32A or, with `-o model=b`,
   AVR32B: RAM, code memory at the reset address, an AVR32-style interrupt controller fed by
-  COUNT/COMPARE and the UART, a NS16550A UART and a test finisher). Real devices are
+  COUNT/COMPARE and the UART, a NS16550A UART and a test finisher), and `mcs51-ref` (the
+  8051, `-o model=8051|8052|cip51`: program memory (banked on `cip51`), external data RAM, the
+  8051's own Timer 0/1, serial port and ports in the SFR space, on `cip51` across SFR pages,
+  and a test finisher in external data). Real devices are
   built out of tree on the library (`examples/external-board/`). Ember's own tests also use
   generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
   virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
@@ -346,6 +355,27 @@ devices.
   autovector each. Not modelled: caches (`cache` does nothing), the Java and secure states
   (their instructions raise the events), coprocessors (coprocessor-absent), the on-chip debug
   registers; TLB Accessed bits are set by tlbw, not by translation (which has no side effects).
+- **8051** (`isa/mcs51`, `uam/isa/mcs51.h`): one descriptor for every core running the MCS-51
+  instruction set. What derivatives share is the ISA module (the instruction set, the four
+  address spaces, the register banks, the core SFRs ACC, B, PSW, SP, DPL/DPH, IE, IP, PCON);
+  how cores differ is the CPU model (`uam_mcs51_configure`: internal RAM size, interrupt
+  sources and their extended enable/priority registers, IPH for four levels, a second data
+  pointer, the SFR that pages MOVX @Ri, SFR paging, code banking), with presets for the 8051,
+  the 8052 and a CIP-51-style core; and every other SFR is a peripheral the board maps, so a
+  part with two UARTs or a CAN controller is a board, not another ISA. Code is at bus 0,
+  external data and the SFRs at their own bus bases, the internal RAM in the hart (direct
+  addresses become GET/PUT, indirect ones helpers). Blocks are translated for one register
+  bank and data pointer (`cpu->priv`), so R0-R7 and DPTR are fixed offsets; a PSW or DPS write
+  ends the block (uam-isa.md section 10f). Interrupt input n is source n, vector 0x03 + 8n;
+  levels in progress end with RETI, a higher level preempts, the lowest source wins a tie;
+  with SFR paging the core saves the page on entry and restores it on RETI. Code banking maps
+  the window above `bank_from` onto flash blocks through `isa->translate` (fetch and MOVC
+  banks apart). The 8051's own peripherals are generic devices (`uam/dev/mcs51_timer.h`: Timer
+  0/1 in modes 0-3 with TCON's external interrupts; `mcs51_serial.h`: SCON/SBUF;
+  `mcs51_port.h`: ports and plain SFR registers). An 8051 has no exceptions: 0xA5 (undefined)
+  stops into the debugger, an access nothing answers halts the core. Not modelled: the
+  instruction after RETI before the next interrupt (after an IE/IP write one runs), power-down
+  (it idles like IDL), instruction timing (one tick per instruction) and Timer 2.
 
 ## 6. Analysis and fuzzing
 
@@ -514,7 +544,12 @@ Implemented (`make test`):
   against the FIPS 46 example on AVRxm); the AVR32 self-test on AVR32A and AVR32B (the ALU and
   wide arithmetic, every load/store form, bit operations, multiply/divide, atomics, conditional
   execution, DSP, SIMD on B, breakpoint, scall, user mode, exceptions, CONFIG, the COMPARE
-  interrupt and priorities, the MPU or MMU), built when an AVR32 toolchain is found; and a multiprocessor self-test on four processors of each
+  interrupt and priorities, the MPU or MMU), built when an AVR32 toolchain is found; the 8051
+  self-test on each core model (ADD/ADDC/SUBB/DA/MUL/DIV/RLC/RRC/CJNE flags against vectors
+  worked bit by bit from the instruction set's definitions, register banks, the stack and
+  calls, every bit instruction, MOVC/MOVX, Timer 0/1 modes, interrupts with priorities and
+  idle, and per model the upper RAM, dual DPTR and four levels, or SFR pages and code banks;
+  every opcode's length checked against as31); and a multiprocessor self-test on four processors of each
   architecture (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
   `tests/firmware-x86/legacy.asm` (task switches, gates, the I/O bitmap, virtual-8086 mode,
   A20, MMX) and `biosrom.asm`, a BIOS-style ROM from the reset vector through VGA, floppy (DMA),

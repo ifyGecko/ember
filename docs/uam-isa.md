@@ -553,6 +553,32 @@ AVR32 needed no new IR; these are conventions of its lifter (`isa/avr32`).
 - **Translation without side effects.** AVR32B's TLB lookup is `isa->translate`; a miss or a
   protection fault becomes the event, and the TLB entries' Accessed bits are set by tlbw only.
 
+## 10f. Four address spaces and banked registers (8051)
+
+The 8051 needed no new IR; these are conventions of its lifter (`isa/mcs51`).
+
+- **Spaces on one bus, RAM in the hart.** Code is at bus 0, external data (MOVX) at
+  `UAM_MCS51_XDATA_BASE` and the SFRs at `UAM_MCS51_SFR_BASE` (plus page x 0x100 with SFR
+  paging), so MOVX and peripheral SFR accesses are plain `LD`/`ST`. The 256 bytes of internal
+  RAM are the first bytes of the register file: a direct address below 0x80 (and a bit in the
+  bit-addressable area) is a `GET`/`PUT`, an indirect one (@R0, @R1, the stack) a `HELPER`.
+  With SFR paging the page is a register-file byte the address adds in.
+- **The bank as translation state.** R0-R7 are internal RAM 8 x PSW.RS + n. A block is lifted
+  for the bank (and, on a core with two, the data pointer) in effect, which the ISA keeps in
+  `cpu->priv`; a write to PSW or the data-pointer select is a `SYSWR` that updates it and
+  ends the block, so the next block is looked up, and translated, for the new state.
+- **The core's SFRs.** ACC, B, SP, DPL/DPH and the page register are register-file bytes
+  (`GET`/`PUT` for a direct address); PSW is CY, AC and OV one byte each plus a byte of its
+  other bits, P being computed from ACC when PSW is read; IE, IP, PCON and the model's
+  extended interrupt registers are `SYSRD`/`SYSWR`. Bit instructions on any SFR are a
+  read-modify-write of its byte.
+- **IE's shadow.** A write to IE or IP requests an exit and lifts the next instruction as a
+  continuation (`UAM_IMARK_CONT`), so it runs before the interrupt the write enabled. PCON's
+  IDL (and PD) make the hart wait from the system register write.
+- **Code banks through translation.** Above the model's `bank_from`, `isa->translate` maps
+  fetches and MOVC loads onto the bank each selects; those translations are not fixed, and a
+  bank change calls `uam_cpu_xlate_changed`.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |

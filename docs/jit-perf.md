@@ -213,6 +213,12 @@ on an 8-bit CPU), so its time measures the ISA more than the emulator; per instr
 runs at 843 MIPS. AVR32B pays for its MMU (a TLB lookup on every access). The AVR32 rows
 need an AVR32 toolchain (README, "Build and test"); without one they are skipped.
 
+The 8051 build (SDCC, `bench-mcs51.bin`) is in `make bench-test`'s checksum check but not in
+the timed run: SDCC's reentrant 8051 code needs about 450 million instructions per round,
+some 350 times what RV32 needs, which a 400-round run would take minutes to show
+(`tools/xbench.sh --variants mcs51 --rounds 4` times it). Its rate is near 400 MIPS: the
+stack and @Ri accesses that code is made of go through helpers into the internal RAM.
+
 Each kernel on its own (`--per-kernel --rounds 1600`, medians of 3): time over the
 fastest guest's on that kernel.
 

@@ -23,14 +23,17 @@
 #
 # Builds go to DIR (default build/firmware-bench), DIR-kN per kernel, DIR-check.
 # Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b
-# (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS).
+# (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS), and
+# with --check also mcs51 (when SDCC built it): the 8051 needs some 450 million
+# instructions a round, ~400 times RV32's, so timing it takes --variants mcs51 (and a
+# small --rounds).
 # Exits non-zero if any guest's console differs from the host build's.
 set -eu
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 runs=5 mode=--jit rounds= only= per_kernel=0 times=0 check=0 run=$here/build/uam-run
 base=$here/build/firmware-bench
-variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b"
+variants=
 while [ $# -gt 0 ]; do
     case $1 in
     --runs) runs=$2; shift 2;;
@@ -46,6 +49,11 @@ while [ $# -gt 0 ]; do
     *) echo "xbench.sh: unknown option $1" >&2; exit 2;;
     esac
 done
+
+if [ -z "$variants" ]; then
+    variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b"
+    [ $check = 0 ] || variants="$variants mcs51"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -70,6 +78,7 @@ run_all() {
         avr)      board=avr-ref    img=bench-avr.elf extra="--ram 0xFE00";;
         avr32a)   board=avr32-ref  img=bench-avr32a.elf extra="-o model=a";;
         avr32b)   board=avr32-ref  img=bench-avr32b.elf extra="-o model=b";;
+        mcs51)    board=mcs51-ref  img=bench-mcs51.bin;;
         *) echo "xbench.sh: unknown variant $v" >&2; exit 2;;
         esac
         if [ ! -f "$out/$img" ]; then

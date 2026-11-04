@@ -34,6 +34,17 @@ static void putc_(char c)
     while (!(lsr & 0x20));
     __asm__ volatile("outb %0, %1" : : "a"((uint8_t)c), "Nd"((uint16_t)COM1));
 }
+#elif defined(__SDCC_mcs51)
+/* mcs51-ref: the 8051's serial port (SCON, SBUF), polled */
+__sfr __at(0x98) SCON;
+__sfr __at(0x99) SBUF;
+static void putc_(char c)
+{
+    SBUF = (uint8_t)c;
+    while (!(SCON & 0x02))
+        ;
+    SCON &= (uint8_t)~0x02;
+}
 #else
 #if defined(__riscv)
 #define UART0 0x10000000u
@@ -260,7 +271,14 @@ static const uint8_t prog[] = {
 };
 static uint32_t k_interp(void)
 {
-    uint32_t stack[32], n = 0, t = 0;
+    /* SDCC's reentrant 8051 code keeps locals on a stack in the 256-byte internal RAM,
+     * which this array would overflow; it is written before it is read, so static
+     * storage gives the same results. */
+#if defined(__SDCC_mcs51)
+    static
+#endif
+    uint32_t stack[32];
+    uint32_t n = 0, t = 0;
     unsigned sp = 0, pc = 0;
     uint32_t h = 0;
     for (int run = 0; run < 1; run++) {
@@ -376,6 +394,9 @@ static const struct kernel {
     { "fmt",    k_fmt },
 };
 
+#if defined(__SDCC_mcs51)
+#define main bench_main   /* SDCC's start code ignores main's value: see below */
+#endif
 int main(void)
 {
     uint32_t total = 0;
@@ -400,3 +421,18 @@ int main(void)
     putc_('\n');
     return 0x5555;
 }
+
+#if defined(__SDCC_mcs51)
+#undef main
+/* Hand bench's value to mcs51-ref's test finisher (external data 0xFF00: 0x55 passes,
+ * a byte at 0xFF01 fails). */
+void main(void)
+{
+    if (bench_main() == 0x5555)
+        *(volatile __xdata uint8_t *)0xFF00 = 0x55;
+    else
+        *(volatile __xdata uint8_t *)0xFF01 = 1;
+    for (;;)
+        ;
+}
+#endif
