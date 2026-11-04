@@ -464,6 +464,24 @@ reads instructions in the guest's order (MIPS is bi-endian), and optionally
 `fetch_endian` when code and data differ (ARM BE8: little-endian instructions,
 big-endian data; the lifter puts the data order on each memory op).
 
+Later MIPS conventions (`isa/mips32`, for PIC32-class cores), again without new IR:
+
+- **What the core has is read from its Config registers** (`uam_mips_config`): Config.MT
+  (TLB or fixed mapping), Config1.CA (MIPS16e), Config3.ISA/ISAOnExc (microMIPS),
+  Config1.FP, Config3.DSPP/DSP2P, Config3.MCU, Config3.VInt/VEIC, and `shadow_sets`.
+- **ISA mode in pc bit 0**, as for ARM's Thumb bit (`pc_state_bits = 1`): EPC, ErrorEPC, jump
+  targets and link addresses carry it; a handler enters in Config3.ISAOnExc's ISA.
+- **Lift-time Status bits.** CU1, FR and MX change how instructions lift (the FPU's
+  register layout, whether DSP instructions trap), so they are tagged in `cpu->priv` above the
+  operating mode (`MIPS_PRIV_MODE`): code translated under one setting is not reused under
+  another.
+- **Shadow register sets** are swapped in and out of the register file on exception entry
+  and ERET (only there does the current set change), so lifted code always reads the current
+  set at fixed offsets; RDPGPR/WRPGPR reach the previous set through helpers.
+- **External interrupt controller.** The controller pushes its request (RIPL, vector,
+  optional explicit offset, shadow set) with `uam_mips_eic_input`, which requests an exit;
+  `irq_take` compares RIPL with Status.IPL.
+
 ## 10b. Two instruction sets and IT blocks (ARMv7)
 
 ARM needed no new IR; these are conventions of its lifter (`isa/arm`).

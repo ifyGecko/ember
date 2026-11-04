@@ -241,7 +241,10 @@ devices.
   components or on top of a reference board (run its build, then wire to the parts
   `uam_machine_find_device` finds). `rv32-ref`, an RV32IMAC M-mode reference board (CLINT,
   PLIC, NS16550A UART, test finisher, RAM at 0x80000000), and `mips-ref` / `mipsel-ref`
-  (MIPS32 with a NS16550A UART and a test finisher), and `arm-ref` / `armeb-ref` (ARMv7-A,
+  (MIPS32 with a NS16550A UART and a test finisher), and `pic32-ref` (a little-endian MIPS
+  microcontroller with the PIC32 memory map: `-o model=mx|mm|mz` picks a reference core,
+  `devices/pic32_intc.c` presents requests to the processor's external interrupt controller
+  interface, and the generic UART, timer and test finisher sit in the SFR region), and `arm-ref` / `armeb-ref` (ARMv7-A,
   little-endian and BE8, with a GICv2-style interrupt controller fed by the generic timer and
   the NS16550A UART, a test finisher, RAM at 0 under the vectors), and `ppc-ref` (32-bit
   PowerPC, classic or with `-o model=booke` Book E: RAM at 0 under the vectors, a boot ROM under

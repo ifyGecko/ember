@@ -8,9 +8,11 @@ with one module per concern.
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: seven guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
-MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
-`mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
+Status: eight guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
+MIPS32r2 big/little-endian (CP0, an R4K-style TLB or fixed mapping, GPR shadow register sets,
+vectored and external-controller interrupts, configurable CPU model) on the `mips-ref` /
+`mipsel-ref` boards and, as a MIPS32 microcontroller, the PIC32 memory map with a vectored
+interrupt controller on the `pic32-ref` board (`-o model=mx|mm|mz`), and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
 boards with a GIC, x86-64 (real, protected, virtual-8086 and long mode, SMM, x87/MMX/
 SSE2) on the `x86_64-ref` board (a generic PC that starts boot flash or a BIOS ROM at the reset
@@ -82,7 +84,8 @@ make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
 make install PREFIX=DIR
 ```
 
-The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc`.
+The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc`; so does the PIC32
+self-test (`pic32-ref`), which is built as MIPS32 little-endian.
 
 The ARM self-test (built as ARM and as Thumb-2 code, little-endian and BE8) needs
 `arm-linux-gnueabi-gcc`.
@@ -138,6 +141,7 @@ build/uam-run -b pic-ref build/firmware-pic/selftest-pic18.elf  # PIC18
 build/uam-run -b pic-ref -o model=enhanced build/firmware-pic/selftest-enhanced.elf  # PIC16F1xxx
 build/uam-run -b mcs51-ref build/firmware-mcs51/selftest-8052.bin  # an 8052 (raw image at 0)
 build/uam-run -b mcs51-ref -o model=cip51 build/firmware-mcs51/selftest-cip51.bin  # CIP-51 style
+build/uam-run -b pic32-ref -o model=mz build/firmware-pic32/selftest-mz.elf  # PIC32 (MIPS32, TLB, EIC)
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
@@ -168,7 +172,14 @@ listing's labels as symbols.
 KiB banked from 0x8000 on `cip51`, with PSBANK at SFR 0xB1 and SFR paging), external data RAM
 below 0xFF00 (`--ram` sets its size) with the test finisher at 0xFF00, and in the SFR space the
 8051's Timer 0/1 (TCON at 0x88), serial port (the console, SCON at 0x98) and ports P0-P3; an
-image built with SDCC runs as a raw binary (`makebin -p`). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+image built with SDCC runs as a raw binary (`makebin -p`).
+`pic32-ref` is a MIPS32 microcontroller with the PIC32 memory map (boot flash at 0x1fc00000,
+program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored interrupt controller;
+`-o model=mx|mm|mz` picks the core (mx: MIPS16e-capable, fixed mapping; mm: microMIPS-only; mz:
+MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets into microMIPS.
+The MIPS16e and microMIPS instruction sets, the FPU and the DSP ASE are configured and decoded
+but not yet lifted (a reserved-instruction exception), so today only MIPS32 firmware runs,
+which the mz and mx models execute. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -399,7 +410,9 @@ analysis/          IR passes (cov.c: the edge-coverage pass)
 fuzz/              the persistent-mode fuzz harness, the replay frontend, the runner's fuzz
                    options; fuzz/suzzer/: suzzer's formats (built only with a suzzer checkout)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
-isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c)
+isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c);
+                   mips16.c / mips_umips.c / mips_fpu.c / mips_dsp.c (the compressed ISAs, the
+                   FPU and the DSP ASE: config and decode hooks in place, lifting still to come)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
 isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_fpu.c), MMU
@@ -470,6 +483,7 @@ tests/firmware-pic/ 8-bit PIC self-tests in gpasm assembly, one per core family 
 tests/firmware-mcs51/ 8051 self-test (as31), one build per core model (arithmetic vectors from
                    the instruction set's definitions: gen_vectors.py; CIP-51 code banks:
                    mkimage.py), and fuzz target (SDCC)
+tests/firmware-pic32/ bare-metal MIPS32 self-test for the pic32-ref board (mz model)
 tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
                    ROM tests (nasm)
 tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC
