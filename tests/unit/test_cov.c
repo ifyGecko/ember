@@ -23,6 +23,7 @@
 #include "uam/isa/pic.h"
 #include "uam/isa/avr32.h"
 #include "uam/isa/mcs51.h"
+#include "uam/isa/m6502.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
 #include "uam/isa/riscv.h"
@@ -497,6 +498,29 @@ static prog mcs51_prog(int n)
     return p;
 }
 
+/* 6502 (the default model, NMOS): x is X (low byte) and Y (high byte), with S and C,
+ * which a 32-bit read of x also covers, cleared. The code is at 0, where the reset
+ * vector of the zeroed RAM points. */
+static prog m6502_prog(int n)
+{
+    prog p = { .name = "6502", .isa = &uam_isa_m6502, .base = 0, .phys = 0, .be = false,
+               .xreg = 1, .illegal = 0x02, .no_exc = true };
+    const uint32_t lo = (uint32_t)n & 0xFF, hi = ((uint32_t)n >> 8) & 0xFF;
+    p.w[0] = 0xA09A00A2u;                         /* ldx #0; txs; ldy ... */
+    p.w[1] = 0x01D0E800u;                         /* ...#0; loop: inx; bne +1 */
+    p.w[2] = 0xD000E0C8u | lo << 16;              /* iny; cpx #lo; bne ... */
+    p.w[3] = 0xD000C0F8u | hi << 16;              /* ...loop; cpy #hi; bne ... */
+    p.w[4] = 0x1807A9F4u;                         /* ...loop; lda #7; clc */
+    p.w[5] = 0x0000144Cu;                         /* jmp . */
+    p.n = 6;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 5;
+    p.site[2] = p.base + 9;
+    p.site[3] = p.base + 17;
+    p.done = p.base + 20;
+    return p;
+}
+
 typedef enum { BK_INTERP, BK_JIT, BK_JIT_NOCHAIN } backend;
 static const char *const bk_name[] = { "interp", "jit", "jit-nochain" };
 
@@ -949,11 +973,13 @@ int main(void)
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
                             arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3),
-                            pic_prog(3), mcs51_prog(3), mips16_prog(3), umips_prog(3) };
+                            pic_prog(3), mcs51_prog(3), mips16_prog(3), umips_prog(3),
+                            m6502_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
                               arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300),
-                              pic_prog(300), mcs51_prog(300), mips16_prog(300), umips_prog(300) };
+                              pic_prog(300), mcs51_prog(300), mips16_prog(300), umips_prog(300),
+                              m6502_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);
