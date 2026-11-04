@@ -17,6 +17,7 @@ extern const uam_board uam_board_armeb_ref;   /* "armeb-ref": ARMv7-A big-endian
 extern const uam_board uam_board_x86_64_ref;  /* "x86_64-ref": x86-64 PC of generic components */
 extern const uam_board uam_board_ppc_ref;     /* "ppc-ref": 32-bit PowerPC */
 extern const uam_board uam_board_avr_ref;     /* "avr-ref": 8-bit AVR (-o model=) */
+extern const uam_board uam_board_avr32_ref;   /* "avr32-ref": AVR32A (UC3 class) or AVR32B (AP7 class) */
 
 /* Register every stock board with uam_board_register(). */
 void uam_boards_register_stock(void);

@@ -20,6 +20,7 @@
 
 #include "uam/isa/arm.h"
 #include "uam/isa/avr.h"
+#include "uam/isa/avr32.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
 #include "uam/isa/riscv.h"
@@ -377,6 +378,29 @@ static prog avr_prog(int n)
     p.site[2] = p.base + 14;
     p.site[3] = p.base + 16;
     p.done = p.base + 18;
+    return p;
+}
+
+/* AVR32 (big-endian; AVR32A after reset, no MPU enabled: addresses are physical). The
+ * extended (32-bit) forms keep one instruction per word. */
+static prog avr32_prog(int n)
+{
+    enum { R4 = 4 };
+    prog p = { .name = "avr32", .isa = &uam_isa_avr32, .base = 0x1000, .phys = 0x1000, .be = true,
+               .xreg = R4 * 4, .illegal = 0xE000E000u };
+    p.w[0] = 0xE0640000u;                         /* mov r4,0 */
+    p.w[1] = 0xE0650000u | ((uint32_t)n & 0xFFFF); /* mov r5,n */
+    p.w[2] = 0xE8C4FFFFu;                         /* sub r4,r4,-1 */
+    p.w[3] = 0xE0440000u | ((uint32_t)n & 0xFFFF); /* cp.w r4,n */
+    p.w[4] = 0xFE91FFFCu;                         /* brne base+8 */
+    p.w[5] = 0xE0660007u;                         /* mov r6,7 */
+    p.w[6] = 0xE08F0000u;                         /* bral . */
+    p.n = 7;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 8;
+    p.site[2] = p.base + 12;
+    p.site[3] = p.base + 20;
+    p.done = p.base + 24;
     return p;
 }
 
@@ -829,10 +853,10 @@ int main(void)
 
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
-                            arm_prog(3, true, true), ppc_prog(3), avr_prog(3) };
+                            arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
-                              arm_prog(300, true, true), ppc_prog(300), avr_prog(300) };
+                              arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);
