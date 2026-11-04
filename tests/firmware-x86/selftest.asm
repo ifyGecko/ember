@@ -6,7 +6,7 @@
 ; switches to 32-bit protected mode and to 64-bit long mode (identity-mapped
 ; with 2 MiB pages), checking arithmetic, flags, string instructions,
 ; interrupts and exceptions through the IVT and the IDT, paging faults,
-; SYSCALL and SSE along the way, and SMM: SMIs sent through the local APIC,
+; SYSCALL, SSE and the x87 along the way, and SMM: SMIs sent through the local APIC,
 ; SMBASE relocation, a handler changing the saved state, the SMM range
 ; registers (SMRR), an SMI taken from long mode, and a write to code just
 ; translated. The result goes to the test finisher at
@@ -708,6 +708,70 @@ lm64:
         mov     byte [rel smc_jmp + 1], smc_t2 - (smc_jmp + 2)
         call    smc_fn
         CHECK   eax, 2, 97
+
+        ; 110-118: x87 (the model computes in software: these bits are the same on
+        ; every host)
+        fninit
+        fld1
+        fld1
+        faddp                                   ; 2.0
+        fstp    qword [SCRATCH]
+        mov     rax, [SCRATCH]
+        CHECK64 rax, 0x4000000000000000, 110
+        mov     dword [SCRATCH + 16], 3
+        fld1
+        fild    dword [SCRATCH + 16]
+        fdivp                                   ; 1/3, 64 bits rounded to nearest
+        fld     st0
+        fstp    tword [SCRATCH]
+        mov     rax, [SCRATCH]
+        CHECK64 rax, 0xAAAAAAAAAAAAAAAB, 111
+        movzx   eax, word [SCRATCH + 8]
+        CHECK   eax, 0x3FFD, 111
+        fstp    dword [SCRATCH]                 ; 1/3 as a float
+        mov     eax, [SCRATCH]
+        CHECK   eax, 0x3EAAAAAB, 112
+        fldpi
+        fstp    tword [SCRATCH]
+        mov     rax, [SCRATCH]
+        CHECK64 rax, 0xC90FDAA22168C235, 113
+        mov     dword [SCRATCH + 16], 2
+        fild    dword [SCRATCH + 16]
+        fsqrt
+        fstp    tword [SCRATCH]
+        mov     rax, [SCRATCH]
+        CHECK64 rax, 0xB504F333F9DE6484, 114
+        mov     dword [SCRATCH + 20], 7
+        fild    dword [SCRATCH + 16]            ; st1 = 2
+        fild    dword [SCRATCH + 20]            ; st0 = 7
+        fprem1                                  ; 7 - 4 * 2 = -1, quotient 4 (to even)
+        fnstsw  ax
+        and     eax, 0x4700                     ; C3 C2 C1 C0
+        CHECK   eax, 0x0100, 115                ; C0 = quotient bit 2, complete
+        fistp   dword [SCRATCH]
+        mov     eax, [SCRATCH]
+        CHECK   eax, 0xFFFFFFFF, 116
+        fstp    st0
+        mov     dword [SCRATCH + 16], 5
+        fild    dword [SCRATCH + 16]
+        fld1
+        fld1
+        faddp
+        fdivp                                   ; 2.5
+        fistp   dword [SCRATCH]                 ; to nearest even: 2
+        mov     eax, [SCRATCH]
+        CHECK   eax, 2, 117
+        mov     qword [SCRATCH], 1              ; the smallest denormal
+        mov     word [SCRATCH + 8], 0
+        fld     tword [SCRATCH]
+        fxam
+        fnstsw  ax
+        and     eax, 0x4700
+        CHECK   eax, 0x4400, 118                ; C3 C2: denormal
+        fld1
+        fcomip  st0, st1                        ; 1 > denormal
+        FAILIF  be, 118
+        fstp    st0
 
         ; 61: CPUID vendor
         xor     eax, eax

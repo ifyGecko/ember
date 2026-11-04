@@ -1,16 +1,18 @@
 /*
  * x86_x87.c - The x87 floating-point unit, behind the X86_H_X87 helper.
  *
- * Registers are kept as host long double (the 80-bit extended format on
- * x86-64 hosts; at least as precise elsewhere) and converted to and from the
- * 80-bit memory format explicitly. Implemented: loads and stores of every
+ * Registers are kept in the 80-bit format and computed on in software (x86_f80.c),
+ * so the results are the same on every host; only the transcendentals go through
+ * the host's long double (exact on x86-64 hosts, as precise as it is elsewhere).
+ * Implemented: loads and stores of every
  * memory format, the arithmetic, compare (FCOM/FUCOM/FCOMI/FICOM) and
  * conditional-move instructions, the constants, FXCH/FFREE/FINCSTP/FDECSTP,
  * FCHS/FABS/FTST/FXAM, FSQRT/FRNDINT/FSCALE/FXTRACT/FPREM/FPREM1 and the
  * transcendentals, FNSTSW/FNSTCW/FLDCW/FNCLEX/FNINIT, and FNSTENV/FLDENV/
  * FNSAVE/FRSTOR (32-bit layouts). Exceptions are always treated as masked
- * (their status flags are set; #MF is never raised), and the precision-control
- * field does not round results.
+ * (their status flags are set; #MF is never raised), the precision-control
+ * field does not round results, and arithmetic rounds to nearest whatever the
+ * rounding control says (the integer conversions and FRNDINT follow it).
  */
 #include <math.h>
 #include <string.h>
@@ -21,58 +23,18 @@ enum { FSW_IE = 1u << 0, FSW_ZE = 1u << 2, FSW_SF = 1u << 6, FSW_ES = 1u << 7,
        FSW_C0 = 1u << 8, FSW_C1 = 1u << 9, FSW_C2 = 1u << 10, FSW_C3 = 1u << 14 };
 #define FSW_CC (FSW_C0 | FSW_C1 | FSW_C2 | FSW_C3)
 
-/* ---- the 80-bit format --------------------------------------------------- */
+/* ---- constants ----------------------------------------------------------- */
 
-long double x86_f80_load(const uint8_t in[10])
-{
-    uint64_t mant = 0;
-    for (unsigned i = 0; i < 8; i++)
-        mant |= (uint64_t)in[i] << (8 * i);
-    unsigned exp = ((unsigned)(in[9] & 0x7F) << 8) | in[8];
-    bool neg = in[9] & 0x80;
-    long double v;
-    if (exp == 0x7FFF)
-        v = (mant << 1) ? NAN : INFINITY;
-    else if (exp == 0)
-        v = ldexpl((long double)mant, -16382 - 63);
-    else
-        v = ldexpl((long double)mant, (int)exp - 16383 - 63);
-    return neg ? -v : v;
-}
+#define F80(e, m) ((x86_f80){ UINT64_C(m), (e) })
+static const x86_f80 K_ZERO = F80(0, 0), K_ONE = F80(0x3FFF, 0x8000000000000000);
+/* FLDL2T, FLDL2E, FLDPI, FLDLG2, FLDLN2, rounded to nearest */
+static const x86_f80 K_L2T = F80(0x4000, 0xD49A784BCD1B8AFE), K_L2E = F80(0x3FFF, 0xB8AA3B295C17F0BC),
+                     K_PI  = F80(0x4000, 0xC90FDAA22168C235), K_LG2 = F80(0x3FFD, 0x9A209A84FBCFF799),
+                     K_LN2 = F80(0x3FFE, 0xB17217F7D1CF79AC);
 
-void x86_f80_store(uint8_t out[10], long double v)
-{
-    uint64_t mant;
-    int exp;
-    bool neg = signbit(v);
-    if (isnan(v)) {
-        mant = 0xC000000000000000ull;   /* the default quiet NaN */
-        exp = 0x7FFF;
-    } else if (isinf(v)) {
-        mant = 0x8000000000000000ull;
-        exp = 0x7FFF;
-    } else if (v == 0) {
-        mant = 0;
-        exp = 0;
-    } else {
-        int e;
-        long double m = frexpl(fabsl(v), &e);       /* [0.5, 1) * 2^e */
-        mant = (uint64_t)ldexpl(m, 64);
-        exp = e - 1 + 16383;
-        if (exp <= 0) {                              /* denormal */
-            unsigned sh = (unsigned)(1 - exp);
-            mant = sh < 64 ? mant >> sh : 0;
-            exp = 0;
-        } else if (exp >= 0x7FFF) {
-            mant = 0x8000000000000000ull;
-            exp = 0x7FFF;
-        }
-    }
-    for (unsigned i = 0; i < 8; i++)
-        out[i] = (uint8_t)(mant >> (8 * i));
-    out[8] = (uint8_t)exp;
-    out[9] = (uint8_t)((exp >> 8) | (neg ? 0x80 : 0));
-}
+/* The transcendentals, in the host's long double. */
+#define LD(v)  x86_f80_to_ld(v)
+#define F80L(v) x86_f80_from_ld(v)
 
 /* ---- state --------------------------------------------------------------- */
 
@@ -90,29 +52,29 @@ static bool valid(const fpu *f, unsigned i) { return (f->ftw >> phys(f, i)) & 1;
 
 static void fault(fpu *f, uint16_t bits) { f->fsw |= bits; }
 
-static long double st(fpu *f, unsigned i)
+static x86_f80 st(fpu *f, unsigned i)
 {
-    if (!valid(f, i)) {
+    if (!valid(f, i)) {                 /* stack underflow: the indefinite */
         fault(f, FSW_IE | FSW_SF);
         f->fsw &= (uint16_t)~FSW_C1;
-        return NAN;
+        return X86_F80_INDEFINITE;
     }
     return f->s->fpr[phys(f, i)];
 }
 
-static void set_st(fpu *f, unsigned i, long double v)
+static void set_st(fpu *f, unsigned i, x86_f80 v)
 {
     unsigned p = phys(f, i);
     f->s->fpr[p] = v;
     f->ftw |= (uint8_t)(1u << p);
 }
 
-static void push(fpu *f, long double v)
+static void push(fpu *f, x86_f80 v)
 {
     unsigned t = (top(f) - 1) & 7;
     if ((f->ftw >> t) & 1) {        /* stack overflow */
         fault(f, FSW_IE | FSW_SF | FSW_C1);
-        v = NAN;
+        v = X86_F80_INDEFINITE;
     }
     set_top(f, t);
     set_st(f, 0, v);
@@ -125,22 +87,24 @@ static void pop(fpu *f)
 }
 
 /* Set C3/C2/C0 from a comparison (C1 cleared). */
-static void set_cc(fpu *f, long double a, long double b)
+static void set_cc(fpu *f, x86_f80 a, x86_f80 b)
 {
+    const int c = x86_f80_cmp(a, b);
     f->fsw &= (uint16_t)~FSW_CC;
-    if (isnan(a) || isnan(b))
+    if (c == 2)
         f->fsw |= FSW_C3 | FSW_C2 | FSW_C0;
-    else if (a < b)
+    else if (c < 0)
         f->fsw |= FSW_C0;
-    else if (a == b)
+    else if (c == 0)
         f->fsw |= FSW_C3;
 }
 
 /* FCOMI/FUCOMI: ZF, PF, CF from the comparison; OF, SF, AF cleared. */
-static void set_eflags(fpu *f, long double a, long double b)
+static void set_eflags(fpu *f, x86_f80 a, x86_f80 b)
 {
-    bool un = isnan(a) || isnan(b);
-    bool zf = un || a == b, cf = un || a < b;
+    const int c = x86_f80_cmp(a, b);
+    bool un = c == 2;
+    bool zf = un || c == 0, cf = un || c < 0;
     uam_cpu *cpu = f->cpu;
     uam_cpu_reg_write(cpu, X86_OFF_FLAG(X86_F_ZF), 8, zf);
     uam_cpu_reg_write(cpu, X86_OFF_FLAG(X86_F_CF), 8, cf);
@@ -151,24 +115,24 @@ static void set_eflags(fpu *f, long double a, long double b)
 }
 
 /* Integer conversion under FCW.RC; out-of-range and NaN give the indefinite value. */
-static int64_t to_int(fpu *f, long double v, unsigned bits, bool trunc)
+static int64_t to_int(fpu *f, x86_f80 v, unsigned bits, bool trunc)
 {
     unsigned rc = trunc ? 3 : (f->fcw >> 10) & 3;
-    long double r = rc == 0 ? rintl(v) : rc == 1 ? floorl(v) : rc == 2 ? ceill(v) : truncl(v);
-    long double lim = ldexpl(1.0L, (int)bits - 1);
-    if (isnan(r) || r >= lim || r < -lim) {
+    int64_t r;
+    bool inexact;
+    if (!x86_f80_to_int(v, rc, bits, &r, &inexact)) {
         fault(f, FSW_IE);
         return (int64_t)(UINT64_C(1) << (bits - 1));   /* the integer indefinite */
     }
-    if (r != v)
+    if (inexact)
         f->fsw |= 1u << 5;   /* PE */
-    return (int64_t)r;
+    return r;
 }
 
-static long double rnd_int(fpu *f, long double v)
+static x86_f80 rnd_int(fpu *f, x86_f80 v)
 {
-    unsigned rc = (f->fcw >> 10) & 3;
-    return rc == 0 ? rintl(v) : rc == 1 ? floorl(v) : rc == 2 ? ceill(v) : truncl(v);
+    bool inexact;
+    return x86_f80_round(v, (f->fcw >> 10) & 3, &inexact);
 }
 
 /* ---- memory operands ----------------------------------------------------- */
@@ -183,28 +147,23 @@ static uam_status wr(fpu *f, uint64_t lin, unsigned size, uint64_t v)
     return x86_lin_write(f->cpu, lin, size, v, false);
 }
 
-static uam_status ld_f32(fpu *f, uint64_t lin, long double *out)
+static uam_status ld_f32(fpu *f, uint64_t lin, x86_f80 *out)
 {
     uint64_t v = 0;
     uam_status st = rd(f, lin, 4, &v);
-    uint32_t u = (uint32_t)v;
-    float x;
-    memcpy(&x, &u, 4);
-    *out = x;
+    *out = x86_f80_from_f32((uint32_t)v);
     return st;
 }
 
-static uam_status ld_f64(fpu *f, uint64_t lin, long double *out)
+static uam_status ld_f64(fpu *f, uint64_t lin, x86_f80 *out)
 {
     uint64_t v = 0;
     uam_status st = rd(f, lin, 8, &v);
-    double x;
-    memcpy(&x, &v, 8);
-    *out = x;
+    *out = x86_f80_from_f64(v);
     return st;
 }
 
-static uam_status ld_f80(fpu *f, uint64_t lin, long double *out)
+static uam_status ld_f80(fpu *f, uint64_t lin, x86_f80 *out)
 {
     uint64_t lo = 0, hi = 0;
     uam_status st = rd(f, lin, 8, &lo);
@@ -218,32 +177,27 @@ static uam_status ld_f80(fpu *f, uint64_t lin, long double *out)
     return st;
 }
 
-static uam_status ld_int(fpu *f, uint64_t lin, unsigned bytes, long double *out)
+static uam_status ld_int(fpu *f, uint64_t lin, unsigned bytes, x86_f80 *out)
 {
     uint64_t v = 0;
     uam_status st = rd(f, lin, bytes, &v);
     int64_t i = bytes == 2 ? (int16_t)v : bytes == 4 ? (int32_t)v : (int64_t)v;
-    *out = (long double)i;
+    *out = x86_f80_from_i64(i);
     return st;
 }
 
-static uam_status st_f32(fpu *f, uint64_t lin, long double v)
+/* Stores to the narrower formats round to nearest, like the arithmetic. */
+static uam_status st_f32(fpu *f, uint64_t lin, x86_f80 v)
 {
-    float x = (float)v;
-    uint32_t u;
-    memcpy(&u, &x, 4);
-    return wr(f, lin, 4, u);
+    return wr(f, lin, 4, x86_f80_to_f32(v));
 }
 
-static uam_status st_f64(fpu *f, uint64_t lin, long double v)
+static uam_status st_f64(fpu *f, uint64_t lin, x86_f80 v)
 {
-    double x = (double)v;
-    uint64_t u;
-    memcpy(&u, &x, 8);
-    return wr(f, lin, 8, u);
+    return wr(f, lin, 8, x86_f80_to_f64(v));
 }
 
-static uam_status st_f80(fpu *f, uint64_t lin, long double v)
+static uam_status st_f80(fpu *f, uint64_t lin, x86_f80 v)
 {
     uint8_t b[10];
     x86_f80_store(b, v);
@@ -264,8 +218,8 @@ static uint16_t full_tags(fpu *f)
         if (!((f->ftw >> p) & 1)) {
             tag = 3;
         } else {
-            long double v = f->s->fpr[p];
-            tag = v == 0 ? 1 : (isnan(v) || isinf(v) || fpclassify(v) == FP_SUBNORMAL) ? 2 : 0;
+            const int c = x86_f80_class(f->s->fpr[p]);
+            tag = c == X86_F80_ZERO ? 1 : c == X86_F80_NORMAL ? 0 : 2;
         }
         t |= (uint16_t)(tag << (2 * p));
     }
@@ -314,19 +268,27 @@ static void finit(fpu *f)
 /* ---- arithmetic ---------------------------------------------------------- */
 
 /* op: 0 add, 1 mul, 4 sub (a-b), 5 subr (b-a), 6 div (a/b), 7 divr (b/a) */
-static long double arith(fpu *f, unsigned op, long double a, long double b)
+/* x / 0 with x a nonzero number raises ZE */
+static bool zero_divide(x86_f80 x, x86_f80 y)
+{
+    const int cx = x86_f80_class(x);
+    return x86_f80_class(y) == X86_F80_ZERO && cx != X86_F80_ZERO && cx != X86_F80_NAN
+        && cx != X86_F80_UNSUPPORTED;
+}
+
+static x86_f80 arith(fpu *f, unsigned op, x86_f80 a, x86_f80 b)
 {
     switch (op) {
-    case 0: return a + b;
-    case 1: return a * b;
-    case 4: return a - b;
-    case 5: return b - a;
+    case 0: return x86_f80_add(a, b);
+    case 1: return x86_f80_mul(a, b);
+    case 4: return x86_f80_sub(a, b);
+    case 5: return x86_f80_sub(b, a);
     case 6:
-        if (b == 0 && a != 0 && !isnan(a)) fault(f, FSW_ZE);
-        return a / b;
+        if (zero_divide(a, b)) fault(f, FSW_ZE);
+        return x86_f80_div(a, b);
     default:
-        if (a == 0 && b != 0 && !isnan(b)) fault(f, FSW_ZE);
-        return b / a;
+        if (zero_divide(b, a)) fault(f, FSW_ZE);
+        return x86_f80_div(b, a);
     }
 }
 
@@ -350,24 +312,23 @@ static void fxam(fpu *f)
         f->fsw |= FSW_C3 | FSW_C0;
         return;
     }
-    long double v = f->s->fpr[phys(f, 0)];
-    if (signbit(v)) f->fsw |= FSW_C1;
-    switch (fpclassify(v)) {
-    case FP_NAN:       f->fsw |= FSW_C0; break;
-    case FP_INFINITE:  f->fsw |= FSW_C2 | FSW_C0; break;
-    case FP_ZERO:      f->fsw |= FSW_C3; break;
-    case FP_SUBNORMAL: f->fsw |= FSW_C3 | FSW_C2; break;
-    default:           f->fsw |= FSW_C2; break;
+    x86_f80 v = f->s->fpr[phys(f, 0)];
+    if (x86_f80_sign(v)) f->fsw |= FSW_C1;
+    switch (x86_f80_class(v)) {
+    case X86_F80_NAN:       f->fsw |= FSW_C0; break;
+    case X86_F80_INF:       f->fsw |= FSW_C2 | FSW_C0; break;
+    case X86_F80_ZERO:      f->fsw |= FSW_C3; break;
+    case X86_F80_SUBNORMAL: f->fsw |= FSW_C3 | FSW_C2; break;
+    case X86_F80_NORMAL:    f->fsw |= FSW_C2; break;
+    default:                break;                  /* unsupported: 000 */
     }
 }
 
 /* FPREM / FPREM1: complete in one step (C2 = 0), quotient bits in C0 C3 C1. */
 static void fprem(fpu *f, bool ieee)
 {
-    long double a = st(f, 0), b = st(f, 1);
-    long double q = ieee ? rintl(a / b) : truncl(a / b);
-    long double r = ieee ? remainderl(a, b) : fmodl(a, b);
-    uint64_t qi = isnan(q) || isinf(q) ? 0 : (uint64_t)fabsl(fmodl(q, 8.0L));
+    unsigned qi;
+    x86_f80 r = x86_f80_rem(st(f, 0), st(f, 1), ieee, &qi);
     f->fsw &= (uint16_t)~FSW_CC;
     if (qi & 1) f->fsw |= FSW_C1;
     if (qi & 2) f->fsw |= FSW_C3;
@@ -378,43 +339,66 @@ static void fprem(fpu *f, bool ieee)
 /* D9 E0-FF */
 static bool d9_reg(fpu *f, unsigned modrm)
 {
-    long double a;
+    x86_f80 a;
     switch (modrm) {
     case 0xD0: return true;                                  /* FNOP */
-    case 0xE0: set_st(f, 0, -st(f, 0)); return true;         /* FCHS */
-    case 0xE1: set_st(f, 0, fabsl(st(f, 0))); return true;   /* FABS */
-    case 0xE4: set_cc(f, st(f, 0), 0.0L); return true;       /* FTST */
+    case 0xE0: set_st(f, 0, x86_f80_neg(st(f, 0))); return true;   /* FCHS */
+    case 0xE1: set_st(f, 0, x86_f80_abs(st(f, 0))); return true;   /* FABS */
+    case 0xE4: set_cc(f, st(f, 0), K_ZERO); return true;     /* FTST */
     case 0xE5: fxam(f); return true;
-    case 0xE8: push(f, 1.0L); return true;
-    case 0xE9: push(f, log2l(10.0L)); return true;
-    case 0xEA: push(f, log2l(expl(1.0L))); return true;
-    case 0xEB: push(f, acosl(-1.0L)); return true;
-    case 0xEC: push(f, log10l(2.0L)); return true;
-    case 0xED: push(f, logl(2.0L)); return true;
-    case 0xEE: push(f, 0.0L); return true;
-    case 0xF0: set_st(f, 0, exp2l(st(f, 0)) - 1.0L); return true;            /* F2XM1 */
-    case 0xF1: a = st(f, 1) * log2l(st(f, 0)); pop(f); set_st(f, 0, a); return true;   /* FYL2X */
-    case 0xF2: set_st(f, 0, tanl(st(f, 0))); f->fsw &= (uint16_t)~FSW_C2; push(f, 1.0L); return true;
-    case 0xF3: a = atan2l(st(f, 1), st(f, 0)); pop(f); set_st(f, 0, a); return true;   /* FPATAN */
+    case 0xE8: push(f, K_ONE); return true;
+    case 0xE9: push(f, K_L2T); return true;
+    case 0xEA: push(f, K_L2E); return true;
+    case 0xEB: push(f, K_PI); return true;
+    case 0xEC: push(f, K_LG2); return true;
+    case 0xED: push(f, K_LN2); return true;
+    case 0xEE: push(f, K_ZERO); return true;
+    case 0xF0: set_st(f, 0, F80L(exp2l(LD(st(f, 0))) - 1.0L)); return true;              /* F2XM1 */
+    case 0xF1: a = F80L(LD(st(f, 1)) * log2l(LD(st(f, 0)))); pop(f); set_st(f, 0, a); return true;   /* FYL2X */
+    case 0xF2: set_st(f, 0, F80L(tanl(LD(st(f, 0))))); f->fsw &= (uint16_t)~FSW_C2; push(f, K_ONE); return true;
+    case 0xF3: a = F80L(atan2l(LD(st(f, 1)), LD(st(f, 0)))); pop(f); set_st(f, 0, a); return true;   /* FPATAN */
     case 0xF4: {                                             /* FXTRACT */
-        int e;
-        long double v = st(f, 0);
-        long double m = frexpl(v, &e);
-        set_st(f, 0, v == 0 ? -INFINITY : (long double)(e - 1));
-        push(f, v == 0 ? v : m * 2.0L);
+        x86_f80 v = st(f, 0);
+        switch (x86_f80_class(v)) {
+        case X86_F80_ZERO:                                   /* exponent -inf */
+            set_st(f, 0, x86_f80_neg(F80(0x7FFF, 0x8000000000000000)));
+            push(f, v);
+            break;
+        case X86_F80_INF:                                    /* exponent +inf */
+            set_st(f, 0, F80(0x7FFF, 0x8000000000000000));
+            push(f, v);
+            break;
+        case X86_F80_NORMAL: case X86_F80_SUBNORMAL: {
+            int32_t e;
+            x86_f80 sig = x86_f80_xtract_sig(v, &e);
+            set_st(f, 0, x86_f80_from_i64(e));
+            push(f, sig);
+            break;
+        }
+        default: {                                           /* a NaN, quieted, twice */
+            x86_f80 q = x86_f80_class(v) == X86_F80_NAN ? x86_f80_add(v, K_ZERO) : X86_F80_INDEFINITE;
+            set_st(f, 0, q);
+            push(f, q);
+            break;
+        }
+        }
         return true;
     }
     case 0xF5: fprem(f, true); return true;
     case 0xF6: set_top(f, top(f) - 1); return true;          /* FDECSTP */
     case 0xF7: set_top(f, top(f) + 1); return true;          /* FINCSTP */
     case 0xF8: fprem(f, false); return true;
-    case 0xF9: a = st(f, 1) * log2l(st(f, 0) + 1.0L); pop(f); set_st(f, 0, a); return true;
-    case 0xFA: set_st(f, 0, sqrtl(st(f, 0))); return true;
-    case 0xFB: a = st(f, 0); set_st(f, 0, sinl(a)); f->fsw &= (uint16_t)~FSW_C2; push(f, cosl(a)); return true;
+    case 0xF9: a = F80L(LD(st(f, 1)) * log2l(LD(st(f, 0)) + 1.0L)); pop(f); set_st(f, 0, a); return true;
+    case 0xFA: set_st(f, 0, x86_f80_sqrt(st(f, 0))); return true;
+    case 0xFB: {                                             /* FSINCOS */
+        long double v = LD(st(f, 0));
+        set_st(f, 0, F80L(sinl(v))); f->fsw &= (uint16_t)~FSW_C2; push(f, F80L(cosl(v)));
+        return true;
+    }
     case 0xFC: set_st(f, 0, rnd_int(f, st(f, 0))); return true;
-    case 0xFD: set_st(f, 0, ldexpl(st(f, 0), (int)truncl(st(f, 1)))); return true;   /* FSCALE */
-    case 0xFE: set_st(f, 0, sinl(st(f, 0))); f->fsw &= (uint16_t)~FSW_C2; return true;
-    case 0xFF: set_st(f, 0, cosl(st(f, 0))); f->fsw &= (uint16_t)~FSW_C2; return true;
+    case 0xFD: set_st(f, 0, x86_f80_scale(st(f, 0), st(f, 1))); return true;       /* FSCALE */
+    case 0xFE: set_st(f, 0, F80L(sinl(LD(st(f, 0))))); f->fsw &= (uint16_t)~FSW_C2; return true;
+    case 0xFF: set_st(f, 0, F80L(cosl(LD(st(f, 0))))); f->fsw &= (uint16_t)~FSW_C2; return true;
     }
     return false;
 }
@@ -423,7 +407,7 @@ static bool d9_reg(fpu *f, unsigned modrm)
 static bool reg_form(fpu *f, unsigned op, unsigned modrm)
 {
     unsigned r = (modrm >> 3) & 7, i = modrm & 7;
-    long double a, b;
+    x86_f80 a, b;
     switch (op) {
     case 0xD8:
         if (r == 2 || r == 3) {
@@ -500,7 +484,7 @@ static bool reg_form(fpu *f, unsigned op, unsigned modrm)
 /* Memory forms. Returns false for an invalid encoding; *st is the access status. */
 static bool mem_form(fpu *f, unsigned op, unsigned r, uint64_t lin, uam_status *ast)
 {
-    long double v = 0;
+    x86_f80 v = K_ZERO;
     uam_status rs = UAM_OK;
     switch (op) {
     case 0xD8: case 0xDA: case 0xDC: case 0xDE:

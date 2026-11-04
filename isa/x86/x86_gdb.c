@@ -56,7 +56,7 @@ static const uint8_t gdb_seg[6] = { X86_SEG_CS, X86_SEG_SS, X86_SEG_DS, X86_SEG_
                                     X86_SEG_FS, X86_SEG_GS };
 
 /* ST(i), the stack-relative register gdb calls st<i>. */
-static long double *st_reg(uam_cpu *cpu, unsigned i)
+static x86_f80 *st_reg(uam_cpu *cpu, unsigned i)
 {
     unsigned top = ((unsigned)uam_cpu_reg_read(cpu, X86_OFF_FSW, 16) >> 11) & 7;
     return &x86_st(cpu)->fpr[(top + i) & 7];

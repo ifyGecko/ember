@@ -317,6 +317,8 @@ typedef struct x86_dtr { uint64_t base; uint32_t limit; } x86_dtr;
 typedef struct x86_sysseg { uint64_t base; uint32_t limit; uint16_t sel, attr; } x86_sysseg;
 
 typedef struct x86_msr_ent { uint32_t msr; uint64_t val; } x86_msr_ent;
+/* An x87 80-bit value: the significand (explicit integer bit) and sign << 15 | exponent. */
+typedef struct x86_f80 { uint64_t m; uint16_t se; } x86_f80;
 
 /* A tiny direct-mapped cache of page walks (non-architectural; flushed with
  * every uam_cpu_xlate_changed() through xlate_gen). */
@@ -380,7 +382,7 @@ typedef struct x86_state {
 
     /* x87 register stack, by physical register number (ST(i) is
      * fpr[(TOP + i) & 7]); FCW/FSW/FTW live in the register file. */
-    long double fpr[8];
+    x86_f80     fpr[8];
     uint64_t    fpu_ip, fpu_dp;   /* last instruction / operand pointers (FNSTENV) */
     uint16_t    fpu_op;
     /* MMX registers. They alias the x87 registers' significands on hardware;
@@ -492,9 +494,42 @@ uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val);
 uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val);
 void       x86_cpuid_defaults(uam_x86_cpuid_info *info);
 
-/* x87 (x86_x87.c): 80-bit memory format <-> host value, and FXSAVE support */
-void        x86_f80_store(uint8_t out[10], long double v);
-long double x86_f80_load(const uint8_t in[10]);
+/* The x87 80-bit format in software (x86_f80.c): rounding to nearest, x87 NaN rules,
+ * the indefinite for an invalid operation. */
+x86_f80     x86_f80_load(const uint8_t in[10]);          /* the memory format (exact) */
+void        x86_f80_store(uint8_t out[10], x86_f80 v);
+enum { X86_F80_ZERO, X86_F80_SUBNORMAL, X86_F80_NORMAL, X86_F80_INF, X86_F80_NAN,
+       X86_F80_UNSUPPORTED };
+extern const x86_f80 X86_F80_INDEFINITE;
+int         x86_f80_class(x86_f80 a);
+bool        x86_f80_sign(x86_f80 a);
+x86_f80     x86_f80_neg(x86_f80 a);
+x86_f80     x86_f80_abs(x86_f80 a);
+x86_f80     x86_f80_add(x86_f80 a, x86_f80 b);
+x86_f80     x86_f80_sub(x86_f80 a, x86_f80 b);
+x86_f80     x86_f80_mul(x86_f80 a, x86_f80 b);
+x86_f80     x86_f80_div(x86_f80 a, x86_f80 b);
+x86_f80     x86_f80_sqrt(x86_f80 a);
+int         x86_f80_cmp(x86_f80 a, x86_f80 b);           /* -1, 0, 1; 2: unordered */
+x86_f80     x86_f80_from_i64(int64_t v);
+x86_f80     x86_f80_from_f32(uint32_t bits);
+x86_f80     x86_f80_from_f64(uint64_t bits);
+uint32_t    x86_f80_to_f32(x86_f80 a);
+uint64_t    x86_f80_to_f64(x86_f80 a);
+/* to an integral value under a rounding control (FCW.RC encoding) */
+x86_f80     x86_f80_round(x86_f80 a, unsigned rc, bool *inexact);
+/* to a `bits`-bit integer; false if out of range (or not a number) */
+bool        x86_f80_to_int(x86_f80 a, unsigned rc, unsigned bits, int64_t *out, bool *inexact);
+/* a - q * b, q truncated (ieee: to nearest even); *q = q's low three bits */
+x86_f80     x86_f80_rem(x86_f80 a, x86_f80 b, bool ieee, unsigned *q);
+x86_f80     x86_f80_scale(x86_f80 a, x86_f80 b);         /* a * 2^trunc(b) */
+/* a finite nonzero a = sig * 2^*exp, sig in [1, 2) */
+x86_f80     x86_f80_xtract_sig(x86_f80 a, int32_t *exp);
+/* the host's long double, for the transcendentals (exact on x86-64 hosts) */
+long double x86_f80_to_ld(x86_f80 a);
+x86_f80     x86_f80_from_ld(long double v);
+
+/* x87 (x86_x87.c) */
 uint64_t    x86_h_x87(void *env, uint64_t desc, uint64_t lin, uint64_t c, uam_status *st);
 
 /* SMM (x86_smm.c) */

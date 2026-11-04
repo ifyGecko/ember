@@ -89,7 +89,7 @@ MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c
 PPC_SRC     := isa/ppc32/ppc_lift.c isa/ppc32/ppc_fpu.c isa/ppc32/ppc_mmu.c isa/ppc32/ppc_booke.c \
                isa/ppc32/ppc_system.c
-X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
+X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_f80.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
                isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
                isa/x86/x86_gdb.c isa/x86/x86_system.c isa/x86/x86_task.c
@@ -135,6 +135,7 @@ TEST_COV  := $(BUILD)/test_cov
 TEST_SMP  := $(BUILD)/test_smp
 TEST_PPC  := $(BUILD)/test_ppc
 TEST_JITDIFF := $(BUILD)/test_jitdiff
+TEST_F80  := $(BUILD)/test_f80
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -253,6 +254,9 @@ $(TEST_PPC): $(BUILD)/obj/tests/unit/test_ppc.o $(LIB)
 $(TEST_JITDIFF): $(BUILD)/obj/tests/unit/test_jitdiff.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_F80): $(BUILD)/obj/tests/unit/test_f80.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -296,7 +300,7 @@ firmware-ppc:
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_JITDIFF) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_JITDIFF) $(TEST_F80) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -313,6 +317,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
+	$(TEST_F80)
 ifeq ($(HAVE_SUZZER),1)
 	$(TEST_SUZZER) $(SUZZER_DIR)/test/vectors
 else
