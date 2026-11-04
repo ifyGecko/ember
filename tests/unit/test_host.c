@@ -1,11 +1,13 @@
 /*
  * test_host.c - Unit tests for the host side and its interfaces: chardev
- * buffering and flow control, the 16550 over a chardev, netdev pairs and
+ * buffering and flow control, fixed input released by guest output
+ * (expect/send scripts, after=), the 16550 over a chardev, netdev pairs and
  * pcap capture, the tun Ethernet adapter, bus DMA and the virtio-net device,
  * the host loop (idle hart woken by socket input, deadlock detection, a
  * stalled hart blocking on host input instead of livelocking), the
  * board registry and board configuration lookups.
  */
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,6 +158,164 @@ static void test_console_hold(void)
     CHECK(v == 'k', "second byte after release");
     u->ops->destroy(u);
     uam_chardev_destroy(cd);
+}
+
+/* ---- fixed input after guest output (expect/send) --------------------- */
+
+/* Send fd 1 or 2 to /dev/null (string:'s stdout, an expected error), and back. */
+static void quiet(int fd, bool on)
+{
+    static int saved[3] = { -1, -1, -1 };
+    fflush(fd == 1 ? stdout : stderr);
+    if (on) {
+        int null = open("/dev/null", O_WRONLY);
+        saved[fd] = dup(fd);
+        if (null >= 0) {
+            dup2(null, fd);
+            close(null);
+        }
+    } else if (saved[fd] >= 0) {
+        dup2(saved[fd], fd);
+        close(saved[fd]);
+        saved[fd] = -1;
+    }
+}
+
+static void guest_puts(uam_chardev *cd, const char *s)
+{
+    while (*s)
+        uam_chardev_write(cd, s++, 1);   /* a byte at a time, as a UART sends it */
+}
+
+/* The step engine over a plain frontend: KMP across writes, steps in order. */
+static void test_console_script(void)
+{
+    const uam_chardev_step steps[] = {
+        { UAM_CHARDEV_SEND, "a", 1 },
+        { UAM_CHARDEV_EXPECT, "aab", 3 },        /* needs the failure table: "aaab" */
+        { UAM_CHARDEV_SEND, "b", 1 },
+        { UAM_CHARDEV_SEND, "c", 1 },
+        { UAM_CHARDEV_EXPECT, "", 0 },           /* satisfied at once */
+        { UAM_CHARDEV_EXPECT, "$ ", 2 },
+        { UAM_CHARDEV_SEND, "d", 1 },
+    };
+    uam_chardev *cd = uam_chardev_script_create(NULL, steps, UAM_ARRAY_LEN(steps));
+    static sink s;
+    s.len = 0;
+    s.window = 100;
+    uam_chardev_set_frontend(cd, sink_can, sink_rx, &s);
+    CHECK(s.len == 1 && s.data[0] == 'a', "leading SEND goes at once (%zu)", s.len);
+    guest_puts(cd, "$ aa");
+    CHECK(s.len == 1, "output before a step is reached does not count for it");
+    uam_chardev_write(cd, "ab", 2);
+    CHECK(s.len == 3 && !memcmp(s.data, "abc", 3), "\"aaab\" matches \"aab\" (%zu)", s.len);
+    uam_chardev_write(cd, "x$ y", 4);
+    CHECK(s.len == 4 && s.data[3] == 'd', "pattern within one write (%zu)", s.len);
+    uam_chardev_destroy(cd);
+}
+
+/* The bug this exists for: input that sits in the UART from power-on is
+ * flushed by the OS driver (FCR clear) before the shell reads it. With
+ * after=, nothing is queued until the prompt is printed. */
+static void test_console_after_prompt(void)
+{
+    uam_chardev *cd = uam_chardev_open("file:/dev/null,in=/dev/null");
+    CHECK(cd != NULL, "file: with in= still opens");
+    uam_chardev_destroy(cd);
+    quiet(2, true);
+    uam_chardev *bad = uam_chardev_open("file:/dev/null,after=x");
+    quiet(2, false);
+    CHECK(!bad, "after= without in= is refused");
+
+    quiet(1, true);   /* string: writes the guest's output to stdout */
+    cd = uam_chardev_open("string:ls\\n\\x2cafter=\\n,after=# ");
+    CHECK(cd != NULL, "string:...,after= opens");
+    if (!cd) {
+        quiet(1, false);
+        return;
+    }
+    uam_chardev_hold(cd, true);
+    uam_device *u = uam_uart16550_create("uart", cd);
+    uam_chardev_hold(cd, false);
+    uint64_t v = 0;
+    u->ops->read(u, 5, 1, &v);
+    CHECK(!(v & 1), "nothing in the UART at power-on");
+    const char *boot = "firmware #1 ready\n";   /* '#' with no space: not the prompt */
+    for (const char *p = boot; *p; p++)
+        u->ops->write(u, 0, 1, (uint8_t)*p);
+    u->ops->write(u, 2, 1, 0x07);              /* the driver clears both FIFOs */
+    u->ops->read(u, 5, 1, &v);
+    CHECK(!(v & 1), "still nothing before the prompt");
+    u->ops->write(u, 0, 1, '#');
+    u->ops->write(u, 0, 1, ' ');
+    char got[16];
+    size_t n = 0;
+    while (n < sizeof(got) && u->ops->read(u, 5, 1, &v) == UAM_OK && (v & 1)) {
+        u->ops->read(u, 0, 1, &v);
+        got[n++] = (char)v;
+    }
+    CHECK(n == 3 && !memcmp(got, "ls\n", 3), "the first line follows the prompt (%zu)", n);
+    for (const char *p = "ls\nbin\n# "; *p; p++)   /* echo, output, the next prompt */
+        u->ops->write(u, 0, 1, (uint8_t)*p);
+    n = 0;
+    while (n < sizeof(got) && u->ops->read(u, 5, 1, &v) == UAM_OK && (v & 1)) {
+        u->ops->read(u, 0, 1, &v);
+        got[n++] = (char)v;
+    }
+    u->ops->destroy(u);
+    uam_chardev_destroy(cd);
+    quiet(1, false);
+    CHECK(n == 8 && !memcmp(got, ",after=\n", 8), "one line per prompt, \\x2c kept (%zu)", n);
+}
+
+static void test_console_script_file(const char *dir)
+{
+    char path[256], out[256];
+    snprintf(path, sizeof(path), "%s/console.script", dir);
+    snprintf(out, sizeof(out), "%s/console.out", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        CHECK(0, "write %s", path);
+        return;
+    }
+    fputs("# log in, then run a command\n\nexpect login: \nsend root\\n\n"
+          "expect Password:\\x20\nsend \nsend hunter2\\r\nexpect # \nsend /wmi_example\\n\n", f);
+    fclose(f);
+    char spec[600];
+    snprintf(spec, sizeof(spec), "file:%s,script=%s", out, path);
+    uam_chardev *cd = uam_chardev_open(spec);
+    CHECK(cd != NULL, "file:OUT,script= opens");
+    if (!cd)
+        return;
+    static sink s;
+    s.len = 0;
+    s.window = 100;
+    uam_chardev_set_frontend(cd, sink_can, sink_rx, &s);
+    CHECK(s.len == 0, "script starts with an expect");
+    guest_puts(cd, "login: ");
+    CHECK(s.len == 5 && !memcmp(s.data, "root\n", 5), "login sent (%zu)", s.len);
+    guest_puts(cd, "Password: ");
+    CHECK(s.len == 13 && !memcmp(s.data + 5, "hunter2\r", 8), "password sent (%zu)", s.len);
+    guest_puts(cd, "# ");
+    CHECK(s.len == 26 && !memcmp(s.data + 13, "/wmi_example\n", 13), "command sent (%zu)", s.len);
+    uam_chardev_destroy(cd);
+    f = fopen(out, "r");
+    char buf[64] = { 0 };
+    CHECK(f && fread(buf, 1, sizeof(buf) - 1, f) == 19 && !strcmp(buf, "login: Password: # "),
+          "guest output reaches OUT");
+    if (f)
+        fclose(f);
+
+    f = fopen(path, "w");
+    if (f) {
+        fputs("expect ok\nsned typo\n", f);
+        fclose(f);
+    }
+    snprintf(spec, sizeof(spec), "script:%s", path);
+    quiet(2, true);
+    cd = uam_chardev_open(spec);
+    quiet(2, false);
+    CHECK(!cd, "an unknown keyword is refused");
 }
 
 #define RV32REF_UART UINT64_C(0x10000000)
@@ -757,6 +917,9 @@ int main(void)
     test_uart_chardev();
     test_uart_stride();
     test_console_hold();
+    test_console_script();
+    test_console_after_prompt();
+    test_console_script_file(dir);
     test_netdev(dir);
     test_tun_adapter();
     test_virtio_net();

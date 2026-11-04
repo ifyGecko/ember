@@ -61,14 +61,65 @@ uam_chardev *uam_chardev_null_create(void)
     return cd;
 }
 
-/* ---- buffer: FILE * output, fixed input ---------------------------------- */
+/* ---- buffer: FILE * output, fixed input (a script of steps) --------------- */
+
+typedef struct buf_step {
+    bool      expect;
+    uint8_t  *data;
+    size_t    len;
+    uint32_t *fail;   /* EXPECT: KMP failure table (fail[i]: border of data[0..i]) */
+} buf_step;
 
 typedef struct buf_cd {
     uam_chardev cd;
     FILE       *out;
-    uint8_t    *in;
-    size_t      in_len, in_off;
+    buf_step   *steps;
+    size_t      n_steps, cur;
+    size_t      off;   /* SEND: bytes queued; EXPECT: pattern bytes matched */
 } buf_cd;
+
+/* Queue SEND steps until one waits for ring room or an EXPECT is reached.
+ * The step only advances after uam_chardev_input returns, so a frontend that
+ * writes output from its receive handler finds the current step a SEND and
+ * matches nothing. */
+static void buf_run(buf_cd *b)
+{
+    while (b->cur < b->n_steps) {
+        buf_step *st = &b->steps[b->cur];
+        if (st->expect) {
+            if (st->len)
+                return;
+        } else {
+            if (b->off < st->len)
+                b->off += uam_chardev_input(&b->cd, st->data + b->off, st->len - b->off);
+            if (b->off < st->len)
+                return;   /* the ring is full: go on when the frontend takes some */
+        }
+        b->cur++;
+        b->off = 0;
+    }
+}
+
+/* Look for the current EXPECT step's pattern in guest output. */
+static void buf_match(buf_cd *b, const uint8_t *p, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (b->cur >= b->n_steps || !b->steps[b->cur].expect)
+            return;   /* done, or a SEND still waiting for ring room */
+        const buf_step *st = &b->steps[b->cur];
+        size_t k = b->off;
+        while (k && st->data[k] != p[i])
+            k = st->fail[k - 1];
+        if (st->data[k] == p[i])
+            k++;
+        b->off = k;
+        if (k == st->len) {
+            b->cur++;
+            b->off = 0;
+            buf_run(b);
+        }
+    }
+}
 
 static size_t buf_write(uam_chardev *cd, const void *buf, size_t len)
 {
@@ -78,14 +129,13 @@ static size_t buf_write(uam_chardev *cd, const void *buf, size_t len)
         if (memchr(buf, '\n', len))
             fflush(b->out);
     }
+    buf_match(b, buf, len);
     return len;
 }
 
 static void buf_poll(uam_chardev *cd)
 {
-    buf_cd *b = UAM_CONTAINER_OF(cd, buf_cd, cd);
-    if (b->in_off < b->in_len)
-        b->in_off += uam_chardev_input(cd, b->in + b->in_off, b->in_len - b->in_off);
+    buf_run(UAM_CONTAINER_OF(cd, buf_cd, cd));
 }
 
 static void buf_destroy(uam_chardev *cd)
@@ -93,7 +143,21 @@ static void buf_destroy(uam_chardev *cd)
     buf_cd *b = UAM_CONTAINER_OF(cd, buf_cd, cd);
     if (b->out)
         fflush(b->out);
-    free(b->in);
+    if (b->cur < b->n_steps && b->steps[b->cur].expect) {
+        size_t left = 0;
+        for (size_t i = b->cur; i < b->n_steps; i++)
+            if (!b->steps[i].expect)
+                left += b->steps[i].len;
+        const buf_step *st = &b->steps[b->cur];
+        uam_log(UAM_LOG_WARN, "chardev", "console input: %zu byte(s) never sent, waiting for "
+                "'%.*s' (step %zu of %zu)", left, (int)st->len, (const char *)st->data,
+                b->cur + 1, b->n_steps);
+    }
+    for (size_t i = 0; i < b->n_steps; i++) {
+        free(b->steps[i].data);
+        free(b->steps[i].fail);
+    }
+    free(b->steps);
     free(b);
 }
 
@@ -101,24 +165,49 @@ static const uam_chardev_ops buf_ops = {
     .type = "buffer", .write = buf_write, .poll = buf_poll, .destroy = buf_destroy,
 };
 
-uam_chardev *uam_chardev_buffer_create(FILE *out, const void *input, size_t len)
+uam_chardev *uam_chardev_script_create(FILE *out, const uam_chardev_step *steps, size_t n)
 {
     buf_cd *b = calloc(1, sizeof(*b));
     if (!b)
         return NULL;
     uam_chardev_init(&b->cd, &buf_ops);
     b->out = out;
-    if (input && len) {
-        b->in = malloc(len);
-        if (!b->in) {
-            free(b);
-            return NULL;
+    if (n && !(b->steps = calloc(n, sizeof(*b->steps))))
+        goto fail;
+    for (size_t i = 0; i < n; i++) {
+        buf_step *st = &b->steps[b->n_steps++];
+        st->expect = steps[i].kind == UAM_CHARDEV_EXPECT;
+        st->len = steps[i].data ? steps[i].len : 0;
+        if (!st->len)
+            continue;
+        if (!(st->data = malloc(st->len)))
+            goto fail;
+        memcpy(st->data, steps[i].data, st->len);
+        if (!st->expect)
+            continue;
+        if (!(st->fail = malloc(st->len * sizeof(*st->fail))))
+            goto fail;
+        st->fail[0] = 0;
+        for (size_t j = 1, k = 0; j < st->len; j++) {
+            while (k && st->data[j] != st->data[k])
+                k = st->fail[k - 1];
+            if (st->data[j] == st->data[k])
+                k++;
+            st->fail[j] = (uint32_t)k;
         }
-        memcpy(b->in, input, len);
-        b->in_len = len;
-        buf_poll(&b->cd);
     }
+    buf_run(b);
     return &b->cd;
+fail:
+    b->cur = b->n_steps;   /* nothing waiting: no warning */
+    buf_destroy(&b->cd);
+    return NULL;
+}
+
+uam_chardev *uam_chardev_buffer_create(FILE *out, const void *input, size_t len)
+{
+    const uam_chardev_step send = { UAM_CHARDEV_SEND, input, len };
+    return uam_chardev_script_create(out, &send, input && len ? 1 : 0);
 }
 
 /* ---- file descriptors: stdio, pty, sockets -------------------------------- */
@@ -429,37 +518,153 @@ static size_t unescape(const char *s, uint8_t *out)
     return n;
 }
 
+/* Fixed input `in`, each line of it (through its \n) after `after` when given. */
+static uam_chardev *create_input(FILE *out, const uint8_t *in, size_t len, const char *after)
+{
+    if (!after)
+        return uam_chardev_buffer_create(out, in, len);
+    uint8_t *pat = malloc(strlen(after) + 1);
+    size_t lines = 0;
+    for (size_t i = 0; i < len; i++)
+        lines += in[i] == '\n' || i + 1 == len;
+    uam_chardev_step *steps = calloc(2 * lines + 1, sizeof(*steps));
+    uam_chardev *cd = NULL;
+    if (pat && steps) {
+        size_t plen = unescape(after, pat), n = 0;
+        for (size_t i = 0; i < len;) {
+            const uint8_t *nl = memchr(in + i, '\n', len - i);
+            size_t end = nl ? (size_t)(nl - in) + 1 : len;
+            steps[n++] = (uam_chardev_step){ UAM_CHARDEV_EXPECT, pat, plen };
+            steps[n++] = (uam_chardev_step){ UAM_CHARDEV_SEND, in + i, end - i };
+            i = end;
+        }
+        cd = uam_chardev_script_create(out, steps, n);
+    }
+    free(steps);
+    free(pat);
+    return cd;
+}
+
+/* An expect/send script file (uam/host.h). */
+static uam_chardev *open_script(FILE *out, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        uam_log(UAM_LOG_ERROR, "chardev", "cannot open %s", path);
+        return NULL;
+    }
+    uam_chardev_step *steps = NULL;
+    uint8_t **bufs = NULL;
+    size_t n = 0, cap = 0, lineno = 0;
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t got;
+    bool ok = true;
+    while (ok && (got = getline(&line, &line_cap, f)) >= 0) {
+        lineno++;
+        while (got && (line[got - 1] == '\n' || line[got - 1] == '\r'))
+            line[--got] = 0;
+        if (!got || line[0] == '#')
+            continue;
+        uam_chardev_step_kind kind;
+        const char *text;
+        if (!strncmp(line, "send ", 5) || !strcmp(line, "send")) {
+            kind = UAM_CHARDEV_SEND;
+            text = line[4] ? line + 5 : "";
+        } else if (!strncmp(line, "expect ", 7) || !strcmp(line, "expect")) {
+            kind = UAM_CHARDEV_EXPECT;
+            text = line[6] ? line + 7 : "";
+        } else {
+            uam_log(UAM_LOG_ERROR, "chardev", "%s:%zu: expected 'send TEXT' or 'expect TEXT'",
+                    path, lineno);
+            ok = false;
+            break;
+        }
+        if (n == cap) {
+            cap = cap ? 2 * cap : 16;
+            uam_chardev_step *ns = realloc(steps, cap * sizeof(*steps));
+            uint8_t **nb = ns ? realloc(bufs, cap * sizeof(*bufs)) : NULL;
+            if (ns)
+                steps = ns;
+            if (nb)
+                bufs = nb;
+            if (!ns || !nb) {
+                ok = false;
+                break;
+            }
+        }
+        if (!(bufs[n] = malloc(strlen(text) + 1))) {
+            ok = false;
+            break;
+        }
+        steps[n] = (uam_chardev_step){ kind, bufs[n], unescape(text, bufs[n]) };
+        n++;
+    }
+    fclose(f);
+    free(line);
+    uam_chardev *cd = ok ? uam_chardev_script_create(out, steps, n) : NULL;
+    for (size_t i = 0; i < n; i++)
+        free(bufs[i]);
+    free(bufs);
+    free(steps);
+    return cd;
+}
+
+/* OUT[,in=FILE[,after=PATTERN]] or OUT,script=FILE */
 static uam_chardev *open_file_spec(const char *arg)
 {
     char *copy = strdup(arg);
     if (!copy)
         return NULL;
-    char *in_path = NULL, *comma = strstr(copy, ",in=");
+    char *after = strstr(copy, ",after=");
+    if (after) {
+        *after = 0;
+        after += 7;
+    }
+    char *in_path = NULL, *script = NULL, *comma = strstr(copy, ",in=");
     if (comma) {
         *comma = 0;
         in_path = comma + 4;
+    } else if ((comma = strstr(copy, ",script="))) {
+        *comma = 0;
+        script = comma + 8;
+    }
+    if (after && !in_path) {
+        uam_log(UAM_LOG_ERROR, "chardev", "file:%s: after= needs in=FILE", arg);
+        free(copy);
+        return NULL;
     }
     FILE *out = strcmp(copy, "-") == 0 ? stdout : fopen(copy, "w");
-    uint8_t *in = NULL;
-    size_t in_len = 0;
-    if (in_path) {
-        FILE *fi = fopen(in_path, "rb");
-        if (fi) {
-            fseek(fi, 0, SEEK_END);
-            long sz = ftell(fi);
-            rewind(fi);
-            in = malloc(sz > 0 ? (size_t)sz : 1);
-            if (in && sz > 0)
-                in_len = fread(in, 1, (size_t)sz, fi);
-            fclose(fi);
-        } else {
-            uam_log(UAM_LOG_ERROR, "chardev", "cannot open %s", in_path);
-        }
-    }
-    uam_chardev *cd = out ? uam_chardev_buffer_create(out, in, in_len) : NULL;
-    if (!out)
+    if (!out) {
         uam_log(UAM_LOG_ERROR, "chardev", "cannot open %s", copy);
-    free(in);
+        free(copy);
+        return NULL;
+    }
+    uam_chardev *cd = NULL;
+    if (script) {
+        cd = open_script(out, script);
+    } else {
+        uint8_t *in = NULL;
+        size_t in_len = 0;
+        if (in_path) {
+            FILE *fi = fopen(in_path, "rb");
+            if (fi) {
+                fseek(fi, 0, SEEK_END);
+                long sz = ftell(fi);
+                rewind(fi);
+                in = malloc(sz > 0 ? (size_t)sz : 1);
+                if (in && sz > 0)
+                    in_len = fread(in, 1, (size_t)sz, fi);
+                fclose(fi);
+            } else {
+                uam_log(UAM_LOG_ERROR, "chardev", "cannot open %s", in_path);
+            }
+        }
+        cd = create_input(out, in, in_len, after);
+        free(in);
+    }
+    if (!cd && out != stdout)
+        fclose(out);
     free(copy);
     return cd;
 }
@@ -478,13 +683,22 @@ uam_chardev *uam_chardev_open(const char *spec)
         return uam_chardev_socket_create(spec);
     if (!strncmp(spec, "file:", 5))
         return open_file_spec(spec + 5);
+    if (!strncmp(spec, "script:", 7))
+        return open_script(stdout, spec + 7);
     if (!strncmp(spec, "string:", 7)) {
-        uint8_t *buf = malloc(strlen(spec + 7) + 1);
-        if (!buf)
-            return NULL;
-        size_t n = unescape(spec + 7, buf);
-        uam_chardev *cd = uam_chardev_buffer_create(stdout, buf, n);
+        char *text = strdup(spec + 7);
+        uint8_t *buf = text ? malloc(strlen(text) + 1) : NULL;
+        uam_chardev *cd = NULL;
+        if (buf) {
+            char *after = strstr(text, ",after=");
+            if (after) {
+                *after = 0;
+                after += 7;
+            }
+            cd = create_input(stdout, buf, unescape(text, buf), after);
+        }
         free(buf);
+        free(text);
         return cd;
     }
     uam_log(UAM_LOG_ERROR, "chardev", "unknown backend '%s'", spec);

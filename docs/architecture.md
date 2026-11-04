@@ -586,7 +586,10 @@ devices.
   next timer, and host input is looked at every 64 skips. Real-time pacing is opt-in, and
   implied by the runner when a port is attached to a host network interface. The runner holds
   console input until the run starts, so fixed input (`string:`, `in=FILE`) is not lost to the
-  board's power-on reset or to a snapshot restore.
+  board's power-on reset or to a snapshot restore. Fixed input can also wait for the guest's
+  output (`,after=PATTERN`, `script:FILE` expect/send steps): the backend watches what the guest
+  writes and queues the next input when it matches, so a boot that polls the console or clears
+  its FIFO cannot eat input meant for a prompt. Devices take no part; it works on any frontend.
 - **Networking** follows the console's path. A board names its ports and looks them up in its
   config (`uam_board_config_netdev`); a missing port is an unplugged cable. The NIC model
   (any MAC, switch or radio) is a netdev frontend and moves frames with bus DMA. The netdev

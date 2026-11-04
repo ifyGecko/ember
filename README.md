@@ -291,7 +291,9 @@ build/uam-run --guard 0x80100000-16+16:w fw.elf   # stop before any write within
 build/uam-run --watch p:0x3000+4 fw.elf          # log every access to 4 physical bytes
 build/uam-run --gdb 1234 fw.elf               # then: gdb-multiarch fw.elf -ex 'target remote :1234'
 build/uam-run --console pty fw.elf            # console on a pseudo-terminal (also tcp:PORT, unix:PATH,
-                                              # stdio-raw, file:OUT[,in=FILE], string:TEXT, null)
+                                              # stdio-raw, file:OUT[,in=FILE], string:TEXT,
+                                              # script:FILE, null)
+build/uam-run --console 'string:ls\n,after=# ' fw.elf  # type "ls" once the shell's prompt is printed
 build/uam-run --realtime fw.elf               # pace virtual time to the host clock
 build/uam-run --map -b mips-ref               # print the bus map
 ```
@@ -313,9 +315,27 @@ program; the fuzz harness builds its redzones on it ([`docs/fuzzing.md`](docs/fu
 
 Fixed console input (`string:TEXT`, `file:OUT,in=FILE`) reaches the guest when the run starts,
 after the board's power-on reset and any `--load-snapshot`, never while the board is being built.
-Firmware that drains its UART while booting discards input typed ahead like this, as real
-hardware does. To script a shell, save a snapshot at the prompt and resume from it with the
-input (`--load-snapshot shell.snap --console 'string:help\n'`).
+Firmware that drains its UART while booting, or an OS driver that clears the receive FIFO,
+discards input typed ahead like this, as real hardware does. To type at a prompt instead, add
+`,after=PATTERN` as the last option: each line of the input (through its `\n`) waits until the
+guest has printed PATTERN (`\n`, `\r`, `\t`, `\\`, `\xHH` escapes; the rest of the spec, commas
+included). Nothing is queued before the prompt, so nothing during boot can eat it, and the run stays
+deterministic: the guest's output is. A session with different prompts is a script,
+`--console script:FILE` (or `file:OUT,script=FILE`), one step per line:
+
+```
+# log in, then run a command
+expect login:\x20
+send root\n
+expect #\x20
+send /wmi_example\n
+```
+
+`expect TEXT` holds the following steps until the guest prints TEXT (only output after the step is
+reached counts); `send TEXT` queues TEXT. The text is everything after the keyword's single space,
+with the escapes above. Input still waiting at the end of the run is reported as a warning.
+Patterns match output of this run: after `--load-snapshot` at a prompt that is not printed again,
+use plain input (`--load-snapshot shell.snap --console 'string:help\n'`).
 
 ## Snapshots
 

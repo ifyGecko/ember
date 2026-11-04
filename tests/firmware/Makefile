@@ -1,4 +1,5 @@
-# Builds the bare-metal RV32IMAC self-test image, the network test image and the fuzz target.
+# Builds the bare-metal RV32IMAC self-test image, the network test image, the fuzz target
+# and the scripted-console test.
 # Uses any riscv64 GCC (rv64 toolchains build rv32 freestanding code fine).
 
 CROSS ?= $(shell for p in riscv64-unknown-elf- riscv64-linux-gnu- riscv32-unknown-elf-; do \
@@ -10,7 +11,7 @@ FW_CFLAGS     := $(ARCH_FLAGS) -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -f
               -fno-pic -fno-stack-protector -nostdlib -nostartfiles
 FW_LDFLAGS    := -static -T link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf $(OUT)/smptest.elf
+all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf $(OUT)/smptest.elf $(OUT)/consoletest.elf
 
 $(OUT)/selftest.elf: start.S selftest.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
@@ -27,6 +28,11 @@ $(OUT)/fuzztarget.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
 	@mkdir -p $(OUT)
 	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S fuzztarget.c -o $@
+
+$(OUT)/consoletest.elf: start.S consoletest.c link.ld
+	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
+	@mkdir -p $(OUT)
+	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S consoletest.c -o $@
 
 $(OUT)/smptest.elf: smpstart.S smptest.c ../smp/smp_test.h link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }

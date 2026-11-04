@@ -504,6 +504,11 @@ firmware-test: $(RUN) firmware
 	$(RUN) --jit --stats $(FIRMWARE) < /dev/null
 	$(RUN) -o cpus=4 $(dir $(FIRMWARE))smptest.elf < /dev/null
 	$(RUN) -o cpus=4 --jit $(dir $(FIRMWARE))smptest.elf < /dev/null
+	@# Scripted console input: queued at power-on it is eaten by the boot (the run
+	@# times out at the prompt); released by the prompt it reaches the shell.
+	$(RUN) -n 2000000 --uart-input 'exit\n' $(dir $(FIRMWARE))consoletest.elf; test $$? = 124
+	$(RUN) --console 'string:ping\nexit\n,after=sh# ' $(dir $(FIRMWARE))consoletest.elf
+	$(RUN) --jit --console script:tests/firmware/consoletest.script $(dir $(FIRMWARE))consoletest.elf
 
 mips-test: $(RUN) firmware-mips
 	$(RUN) -b mips-ref --stats $(FW_MIPS_BE) < /dev/null

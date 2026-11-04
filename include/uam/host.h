@@ -31,6 +31,22 @@ uam_chardev *uam_chardev_null_create(void);
 /* Output to `out` (NULL: discard); fixed input bytes (copied), delivered as
  * the frontend accepts them. Deterministic: no host fd. */
 uam_chardev *uam_chardev_buffer_create(FILE *out, const void *input, size_t len);
+/* Fixed input as a script, run in order: a SEND step queues its bytes for the
+ * guest; an EXPECT step holds every later step back until the guest's output,
+ * from the moment the step is reached, contains its bytes. Input then goes in
+ * when the guest has printed what it prints just before reading it (a shell
+ * prompt, "login: "), so nothing earlier in boot can consume or flush it: a
+ * firmware polling the console, an OS driver clearing the receive FIFO.
+ * Deterministic: the guest's output is. The bytes a match releases are handed
+ * to the frontend during the guest write that completed it. Steps are copied;
+ * an EXPECT of zero bytes is satisfied at once. */
+typedef enum { UAM_CHARDEV_SEND, UAM_CHARDEV_EXPECT } uam_chardev_step_kind;
+typedef struct uam_chardev_step {
+    uam_chardev_step_kind kind;
+    const void           *data;
+    size_t                len;
+} uam_chardev_step;
+uam_chardev *uam_chardev_script_create(FILE *out, const uam_chardev_step *steps, size_t n);
 /* stdin/stdout. raw: put a terminal in raw mode; Ctrl-A x quits, Ctrl-A Ctrl-A
  * sends Ctrl-A. Without raw, EOF on stdin just ends input. */
 uam_chardev *uam_chardev_stdio_create(bool raw);
@@ -41,7 +57,17 @@ uam_chardev *uam_chardev_socket_create(const char *spec);
 /* Parse a backend spec:
  *   null | stdio | stdio-raw | pty | tcp:[HOST:]PORT | unix:PATH
  *   file:OUT[,in=INPUT_FILE]     output file (- = stdout), input read from a file
- *   string:TEXT                  stdout + fixed input TEXT (\n, \r, \xHH escapes) */
+ *   file:OUT,script=SCRIPT_FILE  output file, input from an expect/send script
+ *   string:TEXT                  stdout + fixed input TEXT (\n, \r, \t, \\, \xHH escapes)
+ *   script:SCRIPT_FILE           stdout + input from an expect/send script
+ * string: and file:...,in= take a last option ,after=PATTERN (escapes as in
+ * TEXT; the rest of the spec, commas included): each line of the input
+ * (through its \n) waits for PATTERN in the output, typed at a prompt. Write
+ * a comma just before "after=" in TEXT as \x2c. A script file has one step
+ * per line, the text after the keyword's single space taken verbatim (with
+ * the same escapes); blank lines and lines starting with # are skipped:
+ *   expect TEXT                  wait for TEXT in the guest's output
+ *   send TEXT                    queue TEXT (write \n for Enter) */
 uam_chardev *uam_chardev_open(const char *spec);
 
 /* ---- netdev backends ---- */

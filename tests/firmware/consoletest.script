@@ -1,0 +1,7 @@
+# consoletest.elf's session, one step per line (uam/host.h): wait for the
+# prompt before each command, and for the reply before the next prompt.
+expect sh#\x20
+send ping\n
+expect pong
+expect sh#\x20
+send exit\r
