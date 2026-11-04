@@ -294,6 +294,37 @@ typedef struct m16_insn {
 bool mips16_decode(uint32_t pc, uint16_t ext, bool has_ext, uint16_t i, uint16_t i2,
                    m16_insn *d);
 
+/* mips_umips.c: one microMIPS instruction, decoded (umips_decode is pure, too). */
+typedef enum {
+    UM_RI, UM_W32, UM_NOP,
+    UM_BR,           /* conditional or not: cond, rs, rt; target has bit 0 */
+    UM_J,            /* J/JAL/JALS/JALX: target (bit 0 = the ISA it enters) */
+    UM_JR,           /* JR16/JRC/JALR16/JALRS16/JALR/JALRS through rs, link in rd */
+    UM_JRADDIUSP,    /* jr ra; sp += imm (compact) */
+    UM_ADDIUPC,      /* rd = (pc & ~3) + imm */
+    UM_LWM, UM_SWM, UM_LWP, UM_SWP,   /* regs[], at rs + imm */
+    UM_MOVEP,        /* regs[0] = rs, regs[1] = rt */
+    UM_LWXS,         /* rd = word at rs + (rt << 2) */
+} um_kind;
+typedef enum { UC_ALWAYS, UC_EQ, UC_NE, UC_LTZ, UC_GEZ, UC_LEZ, UC_GTZ, UC_FCC, UC_POS32 } um_cond;
+
+typedef struct um_insn {
+    um_kind  kind;
+    unsigned len;            /* 2 or 4 bytes */
+    uint32_t w;              /* UM_W32: the MIPS32 equivalent */
+    um_cond  cond;
+    unsigned rs, rt, rd, cc;
+    bool     tf, link, compact, short_slot;
+    uint32_t imm, target;
+    uint8_t  regs[16];
+    unsigned nregs;
+} um_insn;
+
+bool umips_is32(uint16_t first_halfword);
+/* pc: the instruction's address (bit 0 may be set); h0/h1: its halfwords (h1 unused
+ * for a 16-bit instruction). */
+void umips_decode(uint32_t pc, uint16_t h0, uint16_t h1, um_insn *d);
+
 /* mips16.c / mips_umips.c: one block in the compressed ISA (lc->pc has bit 0 set). */
 uam_status mips16_lift(uam_lift_ctx *lc);
 uam_status mips_umips_lift(uam_lift_ctx *lc);

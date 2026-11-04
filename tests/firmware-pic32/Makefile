@@ -3,6 +3,8 @@
 #   image              board options                  code
 #   selftest-mz        -o model=mz                    MIPS32
 #   selftest-mx        -o model=mx                    MIPS16e (handlers MIPS32)
+#   selftest-mm        -o model=mm                    microMIPS
+#   selftest-mz-um     -o model=mz -o bootisa=micromips  microMIPS (calls MIPS32 code too)
 
 CROSS ?= mipsel-linux-gnu-
 OUT   ?= ../../build/firmware-pic32
@@ -12,7 +14,7 @@ FW_CFLAGS  = -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin -fno-pi
              -fno-optimize-sibling-calls
 FW_LDFLAGS = -static -no-pie -Wl,-T,link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest-mz.elf $(OUT)/selftest-mx.elf
+all: $(OUT)/selftest-mz.elf $(OUT)/selftest-mx.elf $(OUT)/selftest-mm.elf $(OUT)/selftest-mz-um.elf
 
 SRC = start.S probe.S selftest.c link.ld
 
@@ -32,5 +34,17 @@ $(OUT)/selftest-mx.elf: $(SRC)
 	$(CROSS)gcc -march=m4k -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) $(OUT)/start-mx.o \
 	    $(OUT)/probe-mx.o $(OUT)/selftest-mx.o -o $@
 	$(CROSS)objdump -d $@ > $(OUT)/selftest-mx.dis
+
+$(OUT)/selftest-mm.elf: $(SRC)
+	@mkdir -p $(OUT)
+	$(CROSS)gcc -march=m14k -mmicromips -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) -DMODEL_MM \
+	    -DMODEL_NAME='"mm"' -DBOOT_UMIPS=1 start.S probe.S selftest.c -o $@
+	$(CROSS)objdump -d $@ > $(OUT)/selftest-mm.dis
+
+$(OUT)/selftest-mz-um.elf: $(SRC)
+	@mkdir -p $(OUT)
+	$(CROSS)gcc -march=mips32r2 -mmicromips -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) -DMODEL_MZ \
+	    -DMODEL_NAME='"mz microMIPS"' -DBOOT_UMIPS=1 start.S probe.S selftest.c -o $@
+	$(CROSS)objdump -d $@ > $(OUT)/selftest-mz-um.dis
 
 .PHONY: all

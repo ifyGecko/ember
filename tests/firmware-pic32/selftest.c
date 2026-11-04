@@ -459,7 +459,10 @@ static void t_ipl(void)
 static void t_shadow(void)
 {
     intc_reset();
-#ifdef VARIABLE_OFFSET
+#if defined(MODEL_MM)
+    IREG(R_PRISS) = 1u << 24;    /* level 6 -> shadow set 1 (mm has one) */
+    unsigned lvl = 6, want = 1;
+#elif defined(VARIABLE_OFFSET)
     IREG(R_PRISS) = 2u << 24;    /* level 6 -> shadow set 2 */
     unsigned lvl = 6, want = 2;
 #else

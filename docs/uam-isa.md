@@ -481,7 +481,9 @@ Later MIPS conventions (`isa/mips32`, for PIC32-class cores), again without new 
 - **MIPS16e** (`mips16.c`) recodes each instruction as the MIPS32 instruction that does the
   same (lifted by the MIPS32 lifter) where one exists; branches, jumps, ADDIUPC/LWPC and
   SAVE/RESTORE are lifted directly. JAL/JALX/JR/JALR's delay slot uses a continuation IMARK;
-  the decoder is a pure function, checked against objdump by `tests/isa-mips`.
+  the decoder is a pure function, checked against objdump by `tests/isa-mips`. **microMIPS**
+  (`mips_umips.c`) works the same way; its delay slots are 16 or 32 bits (the `S` forms and
+  JALRS need 16), and LWM/SWM/LWP/SWP, MOVEP, JRADDIUSP and LWXS are lifted directly.
 - **External interrupt controller.** The controller pushes its request (RIPL, vector,
   optional explicit offset, shadow set) with `uam_mips_eic_input`, which requests an exit;
   `irq_take` compares RIPL with Status.IPL.
