@@ -45,6 +45,16 @@ static void putc_(char c)
         ;
     SCON &= (uint8_t)~0x02;
 }
+#elif defined(__SDCC_z80)
+/* z80-ref: the 16550 on I/O ports 0-7 */
+__sfr __at(0x00) THR;
+__sfr __at(0x05) LSR;
+static void putc_(char c)
+{
+    while (!(LSR & 0x20))
+        ;
+    THR = (uint8_t)c;
+}
 #else
 #if defined(__riscv)
 #define UART0 0x10000000u

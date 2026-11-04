@@ -24,6 +24,7 @@
 #include "uam/isa/avr32.h"
 #include "uam/isa/mcs51.h"
 #include "uam/isa/m6502.h"
+#include "uam/isa/z80.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
 #include "uam/isa/riscv.h"
@@ -521,6 +522,36 @@ static prog m6502_prog(int n)
     return p;
 }
 
+/* Z80: bytes packed little-endian into the words; x is BC (with DE zero, so a 32-bit read
+ * of it is x). */
+static prog z80_prog(int n)
+{
+    prog p = { .name = "z80", .isa = &uam_isa_z80, .base = 0x1000, .phys = 0x1000, .be = false,
+               .xreg = 0, .no_exc = true };
+    const uint8_t lo = (uint8_t)n, hi = (uint8_t)(n >> 8);
+    const uint8_t b[24] = {
+        0x01, 0x00, 0x00,       /* ld bc,#0 */
+        0x11, 0x00, 0x00,       /* ld de,#0 */
+        0x03,                   /* loop: inc bc */
+        0x79, 0xFE, lo,         /* ld a,c; cp #lo */
+        0x20, 0xFA,             /* jr nz,loop */
+        0x78, 0xFE, hi,         /* ld a,b; cp #hi */
+        0x20, 0xF5,             /* jr nz,loop */
+        0x3E, 0x07,             /* ld a,#7 */
+        0x18, 0xFE,             /* jr . */
+    };
+    for (unsigned i = 0; i < 6; i++)
+        p.w[i] = (uint32_t)b[4 * i] | (uint32_t)b[4 * i + 1] << 8 | (uint32_t)b[4 * i + 2] << 16
+                 | (uint32_t)b[4 * i + 3] << 24;
+    p.n = 6;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 6;
+    p.site[2] = p.base + 8;
+    p.site[3] = p.base + 17;
+    p.done = p.base + 19;
+    return p;
+}
+
 typedef enum { BK_INTERP, BK_JIT, BK_JIT_NOCHAIN } backend;
 static const char *const bk_name[] = { "interp", "jit", "jit-nochain" };
 
@@ -974,12 +1005,12 @@ int main(void)
                             arm_prog(3, false, false), arm_prog(3, true, false),
                             arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3),
                             pic_prog(3), mcs51_prog(3), mips16_prog(3), umips_prog(3),
-                            m6502_prog(3) };
+                            m6502_prog(3), z80_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
                               arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300),
                               pic_prog(300), mcs51_prog(300), mips16_prog(300), umips_prog(300),
-                              m6502_prog(300) };
+                              m6502_prog(300), z80_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

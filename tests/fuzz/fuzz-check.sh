@@ -12,6 +12,8 @@
 #     the firmware's trap handler, which calls fuzz_panic (an oracle crash);
 #   - with RAW (FIRMWARE as a flat binary), the raw image loaded at the ELF's first
 #     segment and started at _start with --entry giving the same verdicts.
+# FUZZ_CHECK_ARGS: further runner options for every run (a board whose memory is all RAM
+# leaves a hole for the planted bad store with --ram).
 set -eu
 
 run=$1
@@ -48,7 +50,7 @@ printf 'ok'    > "$tmp/in/5-ok"
 fuzz() {
     frc=0
     # shellcheck disable=SC2086
-    "$run" -b "$board" $1 --cov-blocks --fuzz-begin "$begin" --fuzz-crash-pc "$panic" \
+    "$run" -b "$board" ${FUZZ_CHECK_ARGS:-} $1 --cov-blocks --fuzz-begin "$begin" --fuzz-crash-pc "$panic" \
         --fuzz-input uart0 --fuzz-iter-insns 200000 -n 10000000 $2 "$fw" \
         < /dev/null > "$tmp/raw" 2> "$tmp/err" || frc=$?
     grep '^replay: ' "$tmp/raw" | sed "s|$tmp/in/||"
@@ -138,7 +140,7 @@ fi
 if [ -n "${4:-}" ]; then
     lo=$(readelf -lW "$fw" | awk '$1 == "LOAD" { print $3; exit }')
     rc=0
-    "$run" -b "$board" --raw-base "$lo" --entry "$(sym _start)" --cov-blocks --fuzz-begin "$begin" \
+    "$run" -b "$board" ${FUZZ_CHECK_ARGS:-} --raw-base "$lo" --entry "$(sym _start)" --cov-blocks --fuzz-begin "$begin" \
         --fuzz-crash-pc "$panic" --fuzz-input uart0 --fuzz-iter-insns 200000 -n 10000000 \
         --fuzz-replay "$tmp/in" "$4" < /dev/null > "$tmp/raw.raw" 2> "$tmp/raw.err" || rc=$?
     grep '^replay: ' "$tmp/raw.raw" | sed "s|$tmp/in/||" > "$tmp/raw.out" || true

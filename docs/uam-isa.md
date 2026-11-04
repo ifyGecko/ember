@@ -682,6 +682,37 @@ The 6502 needed no new IR; these are conventions of its lifter (`isa/m6502`).
 - **WAI, STP, JAM.** WAI is `WAIT` (the ISA wakes on any request, masked or not); STP and the
   NMOS JAM opcodes are a `SYSWR` that stops the core and a `WAIT` it never wakes from.
 
+## 10i. Prefixes, flags whole and a register that counts (Z80)
+
+The Z80 needed no new IR; these are conventions of its lifter (`isa/z80`).
+
+- **Two spaces on one bus.** Memory is at bus 0 and the I/O ports at `UAM_Z80_IO_BASE`, so
+  IN/OUT are plain `LD`/`ST`. The port address is the 16 bits the Z80 puts out (A or B on the
+  high byte), ANDed with the board's decoding at lift time. Memory addresses wrap at 64 KiB,
+  so a 16-bit memory access is two byte accesses.
+- **Prefixes are part of the instruction.** DD and FD select IX or IY for HL (and IXH/IXL for
+  H and L, except in an instruction with an (IX+d) operand); an instruction is its prefixes
+  and opcode, one `IMARK`. A prefix that another prefix follows does nothing and is an
+  instruction of its own, lifted with the next as a continuation (`UAM_IMARK_CONT`), since the
+  Z80 takes no interrupt between them.
+- **Flags whole.** F is the byte the Z80 has (bits 3 and 5 included), computed whole by each
+  instruction that sets flags: from the result, or MEMPTR for BIT n,(HL), or the address of a
+  repeating block instruction while it repeats. MEMPTR is a register-file word that the
+  instructions setting it write.
+- **Q and R as register-file state.** Each instruction records in a byte whether it set the
+  flags (SCF and CCF take bits 3 and 5 from `(Q ^ F) | A`, Q being F or 0); the lifter writes
+  it only when it changes within the block. R is a counter byte each instruction adds its
+  opcode fetches to (one per prefix and opcode), with bit 7 kept apart.
+- **Register writes last.** Every instruction queues its register writes and commits them
+  after its loads, stores and system register accesses (the commit rule); conditional
+  CALL/RET use guarded stores, loads and writes.
+- **EI's shadow.** EI is a `SYSWR` that requests an exit and lifts the next instruction as a
+  continuation, so it runs before the interrupt. When the block ends at EI, the core's shadow
+  flag (set by EI, cleared by the next instruction's `SYSWR`) makes `irq_take` let one more
+  instruction run. RETN/RETI (IFF1 from IFF2), IM and LD A,I/R's IFF2 are system registers too.
+- **Repeating block instructions** do one iteration and `EXIT` to themselves while they repeat,
+  so each iteration is an instruction and an interrupt can come between them.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |

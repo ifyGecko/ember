@@ -15,7 +15,7 @@
 UART    = 0x00
 SCR     = 0x07          ; the 16550's scratch register: an I/O byte that reads back
 CTC0    = 0x10
-TEST    = 0xF0
+TEST    = 0xF0           ; the test finisher's port
 BUF     = 0xF100
 DST     = 0xF200
 IXBUF   = 0xF300

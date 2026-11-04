@@ -79,6 +79,11 @@ HAVE_SDAS6500 := $(if $(and $(shell command -v $(SDAS6500) 2>/dev/null),$(shell 
 M6502_SKIP    = @echo "$@: 6502 firmware skipped (no $(SDAS6500)/$(SDLD): install SDCC, or set SDAS6500=path)"
 M6502_SDCC_SKIP = @echo "$@: 6502 fuzz target skipped (no $(SDCC); set SDCC=path)"
 
+# The Z80 self-tests need SDCC's sdasz80 assembler, its fuzz target SDCC too.
+SDASZ80     ?= sdasz80
+HAVE_SDASZ80 := $(if $(shell command -v $(SDASZ80) 2>/dev/null),1)
+Z80_SKIP     = @echo "$@: Z80 firmware skipped (no $(SDASZ80): install SDCC, or set SDASZ80=path)"
+
 # ---- suzzer ------------------------------------------------------------------------------
 # SUZZER_DIR: an existing suzzer checkout to use in place; empty turns the integration off.
 # Not given: the choice remembered in $(BUILD)/suzzer.cfg (a checkout's path, or "off"), else
@@ -185,6 +190,7 @@ TEST_AVR  := $(BUILD)/test_avr
 TEST_PIC  := $(BUILD)/test_pic
 TEST_MCS51 := $(BUILD)/test_mcs51
 TEST_M6502 := $(BUILD)/test_m6502
+TEST_Z80   := $(BUILD)/test_z80
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -215,11 +221,13 @@ FW_MCS51  := $(BUILD)/firmware-mcs51
 MCS51_MODELS := 8051 8052 cip51
 FW_6502   := $(BUILD)/firmware-6502
 M6502_MODELS := nmos 2a03 65c02
+FW_Z80    := $(BUILD)/firmware-z80
+Z80_MODELS := nmos cmos
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test firmware-pic pic-test \
-        firmware-mcs51 mcs51-test firmware-pic32 pic32-test firmware-6502 6502-test \
+        firmware-mcs51 mcs51-test firmware-pic32 pic32-test firmware-6502 6502-test firmware-z80 z80-test \
         example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
         bench-test xbench install \
@@ -352,6 +360,9 @@ $(TEST_MCS51): $(BUILD)/obj/tests/unit/test_mcs51.o $(LIB)
 $(TEST_M6502): $(BUILD)/obj/tests/unit/test_m6502.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_Z80): $(BUILD)/obj/tests/unit/test_z80.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -422,6 +433,16 @@ else
 	$(M6502_SDCC_SKIP)
 endif
 
+firmware-z80:
+ifeq ($(HAVE_SDASZ80),1)
+	$(MAKE) -C tests/firmware-z80 SDAS=$(SDASZ80) OUT=$(abspath $(FW_Z80))
+ifeq ($(HAVE_SDCC),1)
+	$(MAKE) -C tests/firmware-z80 SDAS=$(SDASZ80) SDCC=$(SDCC) OUT=$(abspath $(FW_Z80)) fuzz
+endif
+else
+	$(Z80_SKIP)
+endif
+
 firmware-avr32:
 ifeq ($(HAVE_AVR32),1)
 	$(MAKE) -C tests/firmware-avr32 CROSS=$(AVR32_CROSS) OUT=$(abspath $(BUILD))/firmware-avr32
@@ -439,8 +460,8 @@ endif
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_JITDIFF) $(TEST_F80) \
-           $(SUZZER_UNIT)
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_JITDIFF) \
+           $(TEST_F80) $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
 	$(TEST_HOST)
@@ -457,6 +478,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_PIC)
 	$(TEST_MCS51)
 	$(TEST_M6502)
+	$(TEST_Z80)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
@@ -551,6 +573,18 @@ avr-test: $(RUN) firmware-avr
 	    $(RUN) -b avr-ref -o model=$$m --jit --stats $(FW_AVR)/selftest-$$m.elf < /dev/null; \
 	done
 
+# The Z80 self-test on both cores the board models.
+z80-test: $(RUN) firmware-z80
+ifeq ($(HAVE_SDASZ80),1)
+	@set -e; for m in $(Z80_MODELS); do \
+	    echo "$(RUN) -b z80-ref -o model=$$m [--jit] --stats $(FW_Z80)/selftest-$$m.bin"; \
+	    $(RUN) -b z80-ref -o model=$$m --stats $(FW_Z80)/selftest-$$m.bin < /dev/null; \
+	    $(RUN) -b z80-ref -o model=$$m --jit --stats $(FW_Z80)/selftest-$$m.bin < /dev/null; \
+	done
+else
+	$(Z80_SKIP)
+endif
+
 # The 8051 self-test on every core the board models.
 mcs51-test: $(RUN) firmware-mcs51
 ifeq ($(HAVE_AS31),1)
@@ -613,7 +647,7 @@ example-test: lib firmware-mips
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
 snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc firmware-avr firmware-avr32 firmware-pic \
-               firmware-mcs51 firmware-pic32 firmware-6502 \
+               firmware-mcs51 firmware-pic32 firmware-6502 firmware-z80 \
                example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
@@ -668,6 +702,13 @@ ifeq ($(HAVE_SDAS6500),1)
 else
 	$(M6502_SKIP)
 endif
+ifeq ($(HAVE_SDASZ80),1)
+	sh tests/snapshot/snapshot-check.sh $(RUN) z80-ref $(FW_Z80)/selftest-nmos.bin 1 5000 100000 180200 180400 \
+	    180600 180700
+	sh tests/snapshot/snapshot-check.sh $(RUN) z80-ref $(FW_Z80)/selftest-cmos.bin 777 180500 -- -o model=cmos
+else
+	$(Z80_SKIP)
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr32-ref $(FW_AVR32_A) 777 164500 165000 165300 165600 165900
@@ -686,7 +727,7 @@ endif
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
 cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
-          firmware-pic32 firmware-6502
+          firmware-pic32 firmware-6502 firmware-z80
 	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
 	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
@@ -716,6 +757,12 @@ ifeq ($(HAVE_SDAS6500),1)
 else
 	$(M6502_SKIP)
 endif
+ifeq ($(HAVE_SDASZ80),1)
+	@set -e; for m in $(Z80_MODELS); do \
+	    sh tests/cov/cov-check.sh $(RUN) z80-ref $(FW_Z80)/selftest-$$m.bin -- -o model=$$m; done
+else
+	$(Z80_SKIP)
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/cov/cov-check.sh $(RUN) avr32-ref $(FW_AVR32_A)
@@ -732,7 +779,7 @@ endif
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
 fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
-           firmware-pic32 firmware-6502
+           firmware-pic32 firmware-6502 firmware-z80
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -754,6 +801,12 @@ ifeq ($(HAVE_SDCC),1)
 	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) 6502-ref $(FW_6502)/fuzztarget.bin
 else
 	$(SDCC_SKIP)
+endif
+ifeq ($(HAVE_SDASZ80)$(HAVE_SDCC),11)
+	FUZZ_CHECK_NO_TRAPS=1 FUZZ_CHECK_ARGS="--ram 0xFF00" sh tests/fuzz/fuzz-check.sh $(RUN) z80-ref \
+	    $(FW_Z80)/fuzztarget.bin
+else
+	$(Z80_SKIP)
 endif
 	sh tests/fuzz/fuzz-check.sh $(RUN) pic32-ref $(BUILD)/firmware-pic32/fuzztarget-mz.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) pic32-ref $(BUILD)/firmware-pic32/fuzztarget-mx.elf
@@ -797,7 +850,7 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test \
+test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test z80-test \
       example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
       gdb-test runner-test bench-test
@@ -840,5 +893,6 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
-         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_f80.d \
+         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d \
+         $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d

@@ -23,7 +23,7 @@ ifneq ($(HAVE_AVR32),1)
 $(shell rm -f $(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf)
 endif
 ifneq ($(HAVE_SDCC),1)
-$(shell rm -f $(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin)
+$(shell rm -f $(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin $(OUT)/bench-z80.bin)
 endif
 
 DEFS   = $(if $(ROUNDS),-DBENCH_ROUNDS=$(ROUNDS)) $(if $(ONLY),-DBENCH_ONLY=$(ONLY))
@@ -44,7 +44,8 @@ ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host \
        $(OUT)/bench-pic32mx.elf $(OUT)/bench-pic32mm.elf $(OUT)/bench-pic32mz.elf \
        $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf) \
-       $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin)
+       $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin \
+                          $(OUT)/bench-z80.bin)
 
 all: $(ALL)
 
@@ -121,6 +122,17 @@ $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin: $(OUT)/bench-%.bin: bench.c $(FW)-
 	@mkdir -p $(OUT)/$*
 	$(SDCC) $(if $(filter 65c02,$*),-mmos65c02,-mmos6502) $(M6502_FLAGS) bench.c -o $(OUT)/$*/bench.ihx
 	python3 $(FW)-6502/ihx2bin.py $(OUT)/$*/bench.ihx $@
+
+# Z80 (z80-ref), only when SDCC is found: SDCC's z80 port with the Z80 self-test's start
+# code (crt0.s), which hands main's value to the test finisher.
+SDASZ80   ?= sdasz80
+Z80_FLAGS = -mz80 --std-c11 --no-std-crt0 --code-loc 0x0100 --data-loc 0x3000 $(DEFS)
+$(OUT)/bench-z80.bin: bench.c $(FW)-z80/crt0.s $(OUT)/.config
+	@mkdir -p $(OUT)/z80
+	$(SDASZ80) -o $(OUT)/z80/crt0.rel $(FW)-z80/crt0.s
+	$(SDCC) $(Z80_FLAGS) -c bench.c -o $(OUT)/z80/bench.rel
+	$(SDCC) $(Z80_FLAGS) $(OUT)/z80/crt0.rel $(OUT)/z80/bench.rel -o $(OUT)/z80/bench.ihx
+	makebin -p $(OUT)/z80/bench.ihx $@
 
 # PIC32 (pic32-ref, with the PIC32 self-test's start code and map): MIPS16e on mx,
 # microMIPS on mm, MIPS32 with the FPU enabled on mz.

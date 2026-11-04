@@ -4,8 +4,8 @@
  *
  * -o model= picks the core (uam/isa/z80.h): nmos (default) or cmos.
  *
- * Memory: RAM from 0 (--ram sets its size, at most 64 KiB); an image is loaded into it,
- * a raw binary at 0. Execution starts at 0.
+ * Memory: RAM from 0 (--ram sets its size, at most 64 KiB; nothing above it), into which an
+ * image is loaded (a raw binary at 0). Execution starts at 0.
  * I/O ports (the low byte decoded, as most Z80 systems do):
  *   0x00-0x07  16550 UART, the console ("uart0" input route)
  *   0x10-0x13  CTC channels 0-3 (uam/dev/z80_ctc.h)
@@ -144,6 +144,6 @@ static uam_status z80_ref_build(uam_machine *m, const uam_board_config *cfg)
 
 const uam_board uam_board_z80_ref = {
     .name = "z80-ref",
-    .description = "Z80 reference board (-o model=nmos|cmos; 64 KiB RAM, 16550, CTC, test finisher on I/O ports)",
+    .description = "Z80 reference board (-o model=nmos|cmos; 64 KiB RAM, a 16550, a CTC and a test finisher on I/O ports)",
     .build = z80_ref_build,
 };

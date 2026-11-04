@@ -224,6 +224,12 @@ equal the host's, and the JIT runs them at about 900 MIPS (the interpreter near 
 is short blocks of 8-bit loads, stores and flag updates, with SDCC's 32-bit arithmetic in
 zero-page pseudo-registers.
 
+The Z80 build (SDCC, `bench-z80.bin`) is in the checksum check too and out of the timed run
+for the same reason: about 137 million instructions per round, most of them SDCC's 64-bit
+arithmetic helpers (`tools/xbench.sh --variants z80 --rounds 4` times it). It runs near 420
+MIPS with the JIT and 20 MIPS interpreted: every instruction computes the whole flags byte,
+bits 3 and 5 included, and counts R.
+
 Each kernel on its own (`--per-kernel --rounds 1600`, medians of 3): time over the
 fastest guest's on that kernel.
 
