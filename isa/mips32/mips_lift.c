@@ -538,6 +538,17 @@ static lift_result lift_special(ml *L, uint32_t i)
         reg_w(L, RD(i), uam_select(L->b, 32, c, rs_r(L, i), reg_r(L, RD(i))));
         return LIFT_SEQ;
     }
+    case 0x01: { /* MOVF / MOVT rd, rs, cc: on an FPU condition code */
+        if (!mips_has_fpu(L->s))
+            break;
+        if (!(L->priv & MIPS_PRIV_CU1)) {
+            trap(L, NONE, EXC_CPU, imm(L, 1));
+            return LIFT_DONE;
+        }
+        uam_ref c = mips_fcc(L, RT(i) >> 2, RT(i) & 1);
+        reg_w(L, RD(i), uam_select(L->b, 32, c, rs_r(L, i), reg_r(L, RD(i))));
+        return LIFT_SEQ;
+    }
     case 0x0C: trap(L, NONE, EXC_SYS, imm(L, 0)); return LIFT_DONE;      /* SYSCALL */
     case 0x0D: trap(L, NONE, EXC_BP, imm(L, 0)); return LIFT_DONE;       /* BREAK */
     case 0x0F: uam_fence(L->b, UAM_FENCE_FULL); return LIFT_SEQ;         /* SYNC */
@@ -588,9 +599,10 @@ static lift_result lift_special(ml *L, uint32_t i)
         return LIFT_SEQ;
     }
     default:
-        trap(L, NONE, EXC_RI, imm(L, L->raw));
-        return LIFT_DONE;
+        break;
     }
+    trap(L, NONE, EXC_RI, imm(L, L->raw));
+    return LIFT_DONE;
 }
 
 static lift_result lift_special2(ml *L, uint32_t i)

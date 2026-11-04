@@ -194,6 +194,17 @@ _start:
     and     $8, $8, $9
     mtc0    $8, $12
     ehb
+#if defined(__mips_hard_float)
+    mfc0    $8, $12
+#if __mips_fpr == 64
+    li      $9, 0x24000000      /* CU1, FR = 1 */
+#else
+    li      $9, 0x20000000      /* CU1, FR = 0 */
+#endif
+    or      $8, $8, $9
+    mtc0    $8, $12
+    ehb
+#endif
     la      $8, __bss_start
     la      $9, __bss_end
 1:  beq     $8, $9, 2f

@@ -484,6 +484,12 @@ Later MIPS conventions (`isa/mips32`, for PIC32-class cores), again without new 
   the decoder is a pure function, checked against objdump by `tests/isa-mips`. **microMIPS**
   (`mips_umips.c`) works the same way; its delay slots are 16 or 32 bits (the `S` forms and
   JALRS need 16), and LWM/SWM/LWP/SWP, MOVEP, JRADDIUSP and LWXS are lifted directly.
+- **FPU** (`mips_fpu.c`): loads, stores and moves are inline (register offsets from FR at
+  lift time); each arithmetic, conversion or compare is one helper on the register file
+  that writes FCSR and, for an enabled exception, fails with the destination unchanged.
+  Results come from the host's IEEE arithmetic with the MIPS rules computed in software
+  (legacy NaNs and the default NaN, tininess before rounding, invalid conversions), so
+  they are the same on every host.
 - **External interrupt controller.** The controller pushes its request (RIPL, vector,
   optional explicit offset, shadow set) with `uam_mips_eic_input`, which requests an exit;
   `irq_take` compares RIPL with Status.IPL.

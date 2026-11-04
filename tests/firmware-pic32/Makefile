@@ -1,7 +1,8 @@
 # Builds the PIC32 self-test once per pic32-ref model and instruction set:
 #
 #   image              board options                  code
-#   selftest-mz        -o model=mz                    MIPS32
+#   selftest-mz        -o model=mz                    MIPS32, the FPU with FR = 1
+#   selftest-mz-fr0    -o model=mz                    MIPS32, the FPU with FR = 0
 #   selftest-mx        -o model=mx                    MIPS16e (handlers MIPS32)
 #   selftest-mm        -o model=mm                    microMIPS
 #   selftest-mz-um     -o model=mz -o bootisa=micromips  microMIPS (calls MIPS32 code too)
@@ -14,15 +15,22 @@ FW_CFLAGS  = -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin -fno-pi
              -fno-optimize-sibling-calls
 FW_LDFLAGS = -static -no-pie -Wl,-T,link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest-mz.elf $(OUT)/selftest-mx.elf $(OUT)/selftest-mm.elf $(OUT)/selftest-mz-um.elf
+all: $(OUT)/selftest-mz.elf $(OUT)/selftest-mz-fr0.elf $(OUT)/selftest-mx.elf $(OUT)/selftest-mm.elf $(OUT)/selftest-mz-um.elf
 
 SRC = start.S probe.S selftest.c link.ld
 
-$(OUT)/selftest-mz.elf: $(SRC)
+$(OUT)/fpvectors.h: gen_fpvectors.py
 	@mkdir -p $(OUT)
-	$(CROSS)gcc -march=mips32r2 -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) -DMODEL_MZ \
+	python3 -I gen_fpvectors.py $@
+
+$(OUT)/selftest-mz.elf: $(SRC) fptest.c $(OUT)/fpvectors.h
+	$(CROSS)gcc -march=mips32r2 -mhard-float -mfp64 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
 	    -DMODEL_NAME='"mz"' -DBOOT_UMIPS=0 start.S probe.S selftest.c -o $@
 	$(CROSS)objdump -d $@ > $(OUT)/selftest-mz.dis
+
+$(OUT)/selftest-mz-fr0.elf: $(SRC) fptest.c $(OUT)/fpvectors.h
+	$(CROSS)gcc -march=mips32r2 -mhard-float -mfp32 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
+	    -DMODEL_NAME='"mz FR=0"' -DBOOT_UMIPS=0 start.S probe.S selftest.c -o $@
 
 # MIPS16e: C and the probe in MIPS16e, the vectors (start.S) in MIPS32.
 $(OUT)/selftest-mx.elf: $(SRC)

@@ -178,8 +178,9 @@ program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored inter
 `-o model=mx|mm|mz` picks the core (mx: MIPS16e-capable, fixed mapping; mm: microMIPS-only; mz:
 MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets into microMIPS.
 MIPS32, MIPS16e and microMIPS firmware runs (mx and mz switch between their two ISAs through
-JALX and jumps to odd addresses; mm is microMIPS only); the FPU and the DSP ASE are configured
-but not yet lifted (a coprocessor-unusable or reserved-instruction exception). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+JALX and jumps to odd addresses; mm is microMIPS only), and mz has the FPU (MIPS32 encoding,
+FR = 0 and 1). Not yet lifted: FPU instructions in microMIPS encoding and the DSP ASE (a
+reserved-instruction exception). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -411,8 +412,8 @@ fuzz/              the persistent-mode fuzz harness, the replay frontend, the ru
                    options; fuzz/suzzer/: suzzer's formats (built only with a suzzer checkout)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c);
-                   mips16.c (MIPS16e), mips_umips.c (microMIPS); mips_fpu.c / mips_dsp.c (the
-                   FPU and the DSP ASE: config and decode hooks in place, lifting still to come)
+                   mips16.c (MIPS16e), mips_umips.c (microMIPS), mips_fpu.c (the FPU);
+                   mips_dsp.c (the DSP ASE: config and decode hooks in place, lifting to come)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
 isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_fpu.c), MMU

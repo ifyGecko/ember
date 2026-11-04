@@ -524,6 +524,10 @@ static void t_mapping(void)
     EQ(last_bad == 0x00101000u || last_code == 7, 1, "BadVAddr");
 }
 
+#if defined(MODEL_MZ) && defined(__mips_hard_float)
+#include "fptest.c"
+#endif
+
 int main(void);
 int main(void)
 {
@@ -543,6 +547,12 @@ int main(void)
     run("core-sources", t_core_sources);
     run("single-vector", t_single_vector);
     run("mapping", t_mapping);
+#if defined(MODEL_MZ) && defined(__mips_hard_float)
+    run("fpu-vectors", t_fpu_vectors);
+    run("fpu-trap", t_fpu_trap);
+    run("fpu-unusable", t_fpu_unusable);
+    run("fpu-c", t_fpu_c);
+#endif
     puts_(n_fail ? "SELFTEST FAIL\n" : "SELFTEST PASS\n");
     volatile uint8_t *fin = (volatile uint8_t *)FINISHER;
     if (n_fail)

@@ -185,6 +185,7 @@ FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 FW_PPC    := $(BUILD)/firmware-ppc/selftest.elf
 FW_PPC_BOOKE := $(BUILD)/firmware-ppc/selftest-booke.elf
 FW_PIC32  := $(BUILD)/firmware-pic32/selftest-mz.elf
+FW_PIC32_FR0 := $(BUILD)/firmware-pic32/selftest-mz-fr0.elf
 FW_PIC32_MX := $(BUILD)/firmware-pic32/selftest-mx.elf
 FW_PIC32_MM := $(BUILD)/firmware-pic32/selftest-mm.elf
 FW_PIC32_UM := $(BUILD)/firmware-pic32/selftest-mz-um.elf
@@ -489,13 +490,15 @@ ppc-test: $(RUN) firmware-ppc
 	$(RUN) -b ppc-ref -o model=booke --jit --stats $(FW_PPC_BOOKE) < /dev/null
 
 # PIC32: the self-test as MIPS32 on the mz model (TLB, shadow sets, the external
-# interrupt controller), as MIPS16e on mx, as microMIPS on mm and on mz reset into
+# interrupt controller, the FPU with FR = 1 and FR = 0), as MIPS16e on mx, as microMIPS on mm and on mz reset into
 # microMIPS; the MIPS16e and microMIPS decoders against objdump.
 pic32-test: $(RUN) firmware-pic32 $(MIPS16_DEC) $(UMIPS_DEC)
 	python3 -I tests/isa-mips/mips16-check.py $(MIPS16_DEC) $(BUILD)
 	python3 -I tests/isa-mips/umips-check.py $(UMIPS_DEC) $(BUILD)
 	$(RUN) -b pic32-ref -o model=mz --stats $(FW_PIC32) < /dev/null
 	$(RUN) -b pic32-ref -o model=mz --jit --stats $(FW_PIC32) < /dev/null
+	$(RUN) -b pic32-ref -o model=mz --stats $(FW_PIC32_FR0) < /dev/null
+	$(RUN) -b pic32-ref -o model=mz --jit --stats $(FW_PIC32_FR0) < /dev/null
 	$(RUN) -b pic32-ref -o model=mx --stats $(FW_PIC32_MX) < /dev/null
 	$(RUN) -b pic32-ref -o model=mx --jit --stats $(FW_PIC32_MX) < /dev/null
 	$(RUN) -b pic32-ref -o model=mm --stats $(FW_PIC32_MM) < /dev/null
@@ -617,6 +620,7 @@ else
 	$(AVR32_SKIP)
 endif
 	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32) 777 50000 120000 180000 -- -o model=mz
+	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32_FR0) 777 120000 200000 230000 -- -o model=mz
 	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32_MX) 777 9000 18000 27000 -- -o model=mx
 	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32_MM) 777 9000 18000 27000 -- -o model=mm
 	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32_UM) 777 9000 18000 27000 \
@@ -657,6 +661,7 @@ else
 	$(AVR32_SKIP)
 endif
 	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32) -- -o model=mz
+	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32_FR0) -- -o model=mz
 	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32_MX) -- -o model=mx
 	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32_MM) -- -o model=mm
 	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32_UM) -- -o model=mz -o bootisa=micromips
