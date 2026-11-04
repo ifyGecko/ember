@@ -5,7 +5,7 @@
 #   selftest-mz-fr0    -o model=mz                    MIPS32, the FPU with FR = 0
 #   selftest-mx        -o model=mx                    MIPS16e (handlers MIPS32)
 #   selftest-mm        -o model=mm                    microMIPS
-#   selftest-mz-um     -o model=mz -o bootisa=micromips  microMIPS (calls MIPS32 code too)
+#   selftest-mz-um     -o model=mz -o bootisa=micromips  microMIPS, the FPU (calls MIPS32 code too)
 
 CROSS ?= mipsel-linux-gnu-
 OUT   ?= ../../build/firmware-pic32
@@ -49,9 +49,8 @@ $(OUT)/selftest-mm.elf: $(SRC)
 	    -DMODEL_NAME='"mm"' -DBOOT_UMIPS=1 start.S probe.S selftest.c -o $@
 	$(CROSS)objdump -d $@ > $(OUT)/selftest-mm.dis
 
-$(OUT)/selftest-mz-um.elf: $(SRC)
-	@mkdir -p $(OUT)
-	$(CROSS)gcc -march=mips32r2 -mmicromips -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) -DMODEL_MZ \
+$(OUT)/selftest-mz-um.elf: $(SRC) fptest.c $(OUT)/fpvectors.h
+	$(CROSS)gcc -march=mips32r2 -mmicromips -mhard-float -mfp64 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
 	    -DMODEL_NAME='"mz microMIPS"' -DBOOT_UMIPS=1 start.S probe.S selftest.c -o $@
 	$(CROSS)objdump -d $@ > $(OUT)/selftest-mz-um.dis
 

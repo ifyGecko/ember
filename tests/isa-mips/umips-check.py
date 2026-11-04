@@ -26,6 +26,8 @@ for h in range(0x10000):
 R = random.getrandbits
 for lo in range(0x10000):                         # POOL32A: all low halfwords
     words.append((4, (0x00 << 26) | (R(10) << 16) | lo))
+for lo in range(0x10000):                         # POOL32F (the FPU): all low halfwords
+    words.append((4, (0x15 << 26) | (R(10) << 16) | lo))
 for op in (0x08, 0x18):                           # POOL32B / POOL32C: each sub-opcode
     for sub in range(16):
         for _ in range(64):
@@ -35,7 +37,7 @@ for sub in range(32):                             # POOL32I
         words.append((4, (0x10 << 26) | (sub << 21) | R(21)))
 for op in range(64):                              # every major opcode, random bits
     if op in (0x00, 0x15, 0x16) or not is32(op << 10):
-        continue                                  # (FPU POOL32F and 64-bit POOL32S elsewhere)
+        continue                                  # (POOL32A, POOL32F swept above; 64-bit POOL32S)
     for _ in range(NRAND):
         words.append((4, (op << 26) | R(26)))
 
@@ -166,9 +168,7 @@ OTHER_ASE = ("bposge64", "bc2f", "bc2t", "lwc2", "swc2", "ldc2", "sdc2", "mfc2",
              "sce", "cachee", "prefe", "lbe", "lbue", "lhe", "lhue", "lwe", "sbe", "she", "swe",
              "mfhc0", "mthc0", "hypcall", "mfgc0", "mtgc0", "tlbginv", "tlbginvf", "tlbgp", "tlbgr",
              "tlbgwi", "tlbgwr", "lwm", "swm", "yield", "dmfc0", "dmtc0", "mfhgc0", "mthgc0", "dmfgc0",
-             "dmtgc0", "sigrie", "lapc", "ginvi", "ginvt", "lwc1", "swc1", "ldc1", "sdc1", "lwxc1",
-             "swxc1", "ldxc1", "sdxc1", "luxc1", "suxc1", "prefx", "bc1f", "bc1t", "mfc1", "mtc1",
-             "cfc1", "ctc1", "mfhc1", "mthc1", "jalrc", "jalrc.hb", "jrcaddiusp",
+             "dmtgc0", "sigrie", "lapc", "ginvi", "ginvt", "jalrc", "jalrc.hb", "jrcaddiusp",
              "daddiu", "ldl", "ldr", "sdl", "sdr", "ldm", "sdm", "lsa", "fork", "mttr", "mftr",
              "mttc0", "mftc0", "mttgpr", "mftgpr", "mtthi", "mftlo", "mfthi", "mttlo", "mttc1",
              "mftc1", "mtthc1", "mfthc1", "mttacx", "mftacx", "mttdsp", "mftdsp", "dmt", "emt",
@@ -186,8 +186,10 @@ for a, d in sorted(dec.items()):
     k, (mn, ops) = KINDS[d["kind"]], o
     checked += 1
     if k == "RI":
-        if not mn.startswith(INVALID) and mn not in OTHER_ASE and not mn.endswith((".s", ".d", ".ps", ".w", ".l")) \
-                and not re.match(r"^(c\.|cvt|dsp|ext[rp]|ins[v]|mfhi|mflo|mthi|mtlo|madd|msub|mult|shilo|"
+        if not mn.startswith(INVALID) and mn not in OTHER_ASE and not mn.endswith(".ps") \
+                and mn not in ("alnv.ps", "pll.ps", "plu.ps", "pul.ps", "puu.ps", "cvt.ps.s", "cvt.s.pl",
+                               "cvt.s.pu", "bc1any2f", "bc1any2t", "bc1any4f", "bc1any4t", "dmfc1", "dmtc1") \
+                and not re.match(r"^(dsp|ext[rp]|ins[v]|mfhi|mflo|mthi|mtlo|madd|msub|mult|shilo|"
                                  r"mthlip|wrdsp|rddsp|bitrev|repl|precr|preceq|precequ|preceu|"
                                  r"absq|addq|addsc|addu|addwc|append|balign|cmp|dpa|dps|maq|modsub|"
                                  r"muleq|muleu|mulq|mulsa|packrl|pick|prepend|raddu|shll|shra|shrl|"

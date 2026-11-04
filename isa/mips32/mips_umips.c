@@ -439,6 +439,16 @@ static void decode32(uint32_t pcb, uint32_t i, um_insn *d)
         d->target = ((pcb + 4) & 0xF0000000u) | (bits(i, 25, 0) << 2);
         d->link = true;
         return;
+    case 0x15: { /* POOL32F: the FPU */
+        uint32_t w = mips_umips_fpu32(i);
+        if (w)
+            w32(d, w);
+        return;
+    }
+    case 0x27: w32(d, I_TYPE(0x31, rs, rt, imm)); return;   /* LWC1 ft, off(base) */
+    case 0x26: w32(d, I_TYPE(0x39, rs, rt, imm)); return;   /* SWC1 */
+    case 0x2F: w32(d, I_TYPE(0x35, rs, rt, imm)); return;   /* LDC1 */
+    case 0x2E: w32(d, I_TYPE(0x3D, rs, rt, imm)); return;   /* SDC1 */
     case 0x1E: /* ADDIUPC rs(25:23), imm23 << 2 */
         d->kind = UM_ADDIUPC;
         d->rd = m16_map[bits(i, 25, 23)];
@@ -459,8 +469,108 @@ void umips_decode(uint32_t pc, uint16_t h0, uint16_t h1, um_insn *d)
         decode32(pcb, ((uint32_t)h0 << 16) | h1, d);
 }
 
-/* Unused until the FPU and DSP ASE are lifted in microMIPS. */
-uint32_t mips_umips_fpu32(uint32_t i) { (void)i; return 0; }
+/*
+ * POOL32F (the FPU, major 0x15) recoded as MIPS32 COP1/COP1X, or 0 if reserved.
+ * Fields: a = 25:21, b = 20:16, c = 15:11, d = 10:6.
+ */
+#define C1(fmt, ft, fs, fd, fn) ((0x11u << 26) | ((uint32_t)(fmt) << 21) | ((uint32_t)(ft) << 16) | \
+                                 ((uint32_t)(fs) << 11) | ((uint32_t)(fd) << 6) | (uint32_t)(fn))
+#define C1X(r, t, s, d, fn)     ((0x13u << 26) | ((uint32_t)(r) << 21) | ((uint32_t)(t) << 16) | \
+                                 ((uint32_t)(s) << 11) | ((uint32_t)(d) << 6) | (uint32_t)(fn))
+enum { F_S = 16, F_D = 17, F_W = 20, F_L = 21 };
+
+uint32_t mips_umips_fpu32(uint32_t i)
+{
+    unsigned a = bits(i, 25, 21), b = bits(i, 20, 16), c = bits(i, 15, 11), d = bits(i, 10, 6);
+    switch (bits(i, 5, 0)) {
+    case 0x30: /* ADD SUB MUL DIV .fmt fd(c), fs(b), ft(a) */
+        if (bits(i, 10, 9))
+            return 0;
+        return C1(bits(i, 8, 8) ? F_D : F_S, a, b, c, bits(i, 7, 6));
+    case 0x01: case 0x09: case 0x21: case 0x29:   /* MADD MSUB .S/.D fd(c), fr(d), fs(b), ft(a) */
+    case 0x02: case 0x0A: case 0x22: case 0x2A: { /* NMADD NMSUB */
+        unsigned lo = bits(i, 5, 0), kind = ((lo & 2) ? 6 : 4) + ((lo >> 5) & 1);
+        return C1X(d, a, b, c, (kind << 3) | ((lo >> 3) & 1));
+    }
+    case 0x3C: /* C.cond.fmt cc(c[4:2]), fs(b), ft(a) */
+        if (bits(i, 12, 11))
+            return 0;
+        return C1(bits(i, 10, 10) ? F_D : F_S, a, b, bits(i, 15, 13) << 2, 0x30 | bits(i, 9, 6));
+    case 0x08: /* indexed loads/stores: index(a), base(b), fd/fs(c) */
+        switch (d) {
+        case 1: return C1X(b, a, 0, c, 0x00);  /* LWXC1 */
+        case 2: return C1X(b, a, c, 0, 0x08);  /* SWXC1 */
+        case 3: return C1X(b, a, 0, c, 0x01);  /* LDXC1 */
+        case 4: return C1X(b, a, c, 0, 0x09);  /* SDXC1 */
+        case 5: return C1X(b, a, 0, c, 0x05);  /* LUXC1 */
+        case 6: return C1X(b, a, c, 0, 0x0D);  /* SUXC1 */
+        default: return 0;
+        }
+    case 0x20: /* MOVF/MOVT.fmt fd(a), fs(b), cc(c[4:2]); PREFX hint(c), index(a)(base b) */
+        if (d == 6)
+            return C1X(b, a, c, 0, 0x0F);
+        if (bits(i, 12, 11) || bits(i, 8, 7) || bits(i, 10, 10))
+            return 0;                  /* format in 10:9: S, D (PS reserved) */
+        return C1(bits(i, 9, 9) ? F_D : F_S, (bits(i, 15, 13) << 2) | bits(i, 6, 6), b, a, 0x11);
+    case 0x38: /* MOVZ/MOVN.fmt fd(c), fs(b), rt(a) */
+        if (bits(i, 10, 9) || bits(i, 7, 6) > 1)
+            return 0;
+        return C1(bits(i, 8, 8) ? F_D : F_S, a, b, c, bits(i, 6, 6) ? 0x12 : 0x13);
+    case 0x3B: /* POOL32Fxf: fd/rt(a), fs(b) */
+        switch (d) {
+        case 0: /* moves to and from the FPU: rt(a), fs(b) */
+            switch (c) {
+            case 2: return C1(0x02, a, b, 0, 0);   /* CFC1 */
+            case 3: return C1(0x06, a, b, 0, 0);   /* CTC1 */
+            case 4: return C1(0x00, a, b, 0, 0);   /* MFC1 */
+            case 5: return C1(0x04, a, b, 0, 0);   /* MTC1 */
+            case 6: return C1(0x03, a, b, 0, 0);   /* MFHC1 */
+            case 7: return C1(0x07, a, b, 0, 0);   /* MTHC1 */
+            default: return 0;
+            }
+        case 1: /* MOV.fmt */
+            if (c != 0 && c != 4)
+                return 0;
+            return C1(c ? F_D : F_S, 0, b, a, 0x06);
+        case 4: /* CVT.L / CVT.W .fmt */
+            if (bits(c, 4, 4) || bits(c, 2, 1))
+                return 0;
+            return C1(bits(c, 3, 3) ? F_D : F_S, 0, b, a, (c & 1) ? 36 : 37);
+        case 5: /* MOVF/MOVT rt(a), rs(b), cc: MIPS32 SPECIAL MOVCI */
+            if (bits(c, 1, 1))
+                return 0;
+            return (b << 21) | ((((c >> 2) & 7) << 2 | (c & 1)) << 16) | (a << 11) | 0x01;
+        case 8: { /* RSQRT SQRT RECIP .fmt */
+            static const uint8_t fn[3] = { 22, 4, 21 };
+            if (bits(c, 4, 4) || (c & 7) > 2)
+                return 0;
+            return C1(bits(c, 3, 3) ? F_D : F_S, 0, b, a, fn[c & 7]);
+        }
+        case 12: { /* FLOOR CEIL TRUNC ROUND .W/.L .fmt */
+            static const uint8_t base[4] = { 3, 2, 1, 0 };   /* floor ceil trunc round -> MIPS32 order */
+            if (bits(c, 4, 4))
+                return 0;
+            return C1(bits(c, 3, 3) ? F_D : F_S, 0, b, a, ((c & 1) ? 12 : 8) + base[bits(c, 2, 1)]);
+        }
+        case 13: { /* ABS NEG CVT.D CVT.S, format in c[3:2] */
+            static const uint8_t f_absneg[2] = { F_S, F_D }, f_cvtd[3] = { F_S, F_W, F_L },
+                                 f_cvts[3] = { F_D, F_W, F_L };
+            unsigned op = c & 3, f = bits(c, 3, 2);
+            if (bits(c, 4, 4))
+                return 0;
+            switch (op) {
+            case 0: case 1: return f < 2 ? C1(f_absneg[f], 0, b, a, op ? 7 : 5) : 0;
+            case 2: return f < 3 ? C1(f_cvtd[f], 0, b, a, 33) : 0;
+            default: return f < 3 ? C1(f_cvts[f], 0, b, a, 32) : 0;
+            }
+        }
+        default:
+            return 0;
+        }
+    default:
+        return 0;
+    }
+}
 uint32_t mips_umips_dsp32(uint32_t i) { (void)i; return 0; }
 
 /* ---- lifting ----------------------------------------------------------- */
