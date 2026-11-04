@@ -194,16 +194,24 @@ It uses fixed-width types only, so every build prints the same checksums.
   guest's. `--per-kernel` times each kernel on its own and prints the ratio matrix with
   a geometric mean per guest; `--interp` uses the interpreter.
 
-Whole run, JIT, medians of 5 (main at a352e5b):
+Whole run, JIT, medians of 5 (main at 6835bab, on a faster host than the per-kernel table
+below):
 
 | Guest | Guest instructions | Time | MIPS | vs best |
 |---|---:|---:|---:|---:|
-| RV32 | 519M | 0.384 s | 1351 | 1.00 |
-| MIPS32 BE / LE | 540M | 0.407 / 0.409 s | 1327 / 1320 | 1.06 / 1.07 |
-| ARM | 451M | 0.465 s | 971 | 1.21 |
-| Thumb-2 LE / BE8 | 450M | 0.467 / 0.464 s | 965 / 971 | 1.22 / 1.21 |
-| PowerPC | 502M | 0.474 s | 1058 | 1.23 |
-| x86-64 | 454M | 0.657 s | 692 | 1.71 |
+| RV32 | 519M | 0.235 s | 2208 | 1.00 |
+| MIPS32 BE / LE | 540M | 0.258 / 0.254 s | 2093 / 2126 | 1.10 / 1.08 |
+| ARM | 451M | 0.327 s | 1381 | 1.39 |
+| Thumb-2 LE / BE8 | 450M | 0.326 / 0.325 s | 1382 / 1386 | 1.39 / 1.38 |
+| PowerPC | 502M | 0.305 s | 1645 | 1.30 |
+| x86-64 | 454M | 0.345 s | 1317 | 1.47 |
+| AVR32A / AVR32B | 488M / 484M | 0.346 / 0.414 s | 1410 / 1170 | 1.47 / 1.76 |
+| 8-bit AVR (AVRe+) | 4695M | 5.573 s | 843 | 23.71 |
+
+The 8-bit AVR does the same work in nine times the instructions (32- and 64-bit arithmetic
+on an 8-bit CPU), so its time measures the ISA more than the emulator; per instruction it
+runs at 843 MIPS. AVR32B pays for its MMU (a TLB lookup on every access). The AVR32 rows
+need an AVR32 toolchain (README, "Build and test"); without one they are skipped.
 
 Each kernel on its own (`--per-kernel --rounds 1600`, medians of 3): time over the
 fastest guest's on that kernel.
