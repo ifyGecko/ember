@@ -5,7 +5,8 @@ words of each 32-bit major opcode go through umips_decode (umips-dec.c) and GNU
 objdump. A recoded instruction must disassemble as what objdump calls the microMIPS
 one; branches, jumps, PC-relative and multi-register forms must agree on targets,
 registers and lists; reserved encodings must be ones objdump rejects or that belong to
-an extension the processor lacks (the FPU and DSP ASE are checked separately).
+an extension the processor lacks (the FPU's and DSP ASE's arithmetic is checked by
+the self-test's vectors).
 
 usage: umips-check.py DEC WORKDIR [n_random]
 """
@@ -67,7 +68,7 @@ for l in run([DEC], "\n".join(lines) + "\n").splitlines():
 
 src = os.path.join(here, "um.s")
 open(src, "w").write("".join(asm))
-run([CROSS + "as", "-march=mips32r2", "-mmicromips", "-mmcu", "-EL", src, "-o", src + ".o"])
+run([CROSS + "as", "-march=mips32r2", "-mmicromips", "-mmcu", "-mdspr2", "-EL", src, "-o", src + ".o"])
 LINE = re.compile(r"^\s*([0-9a-f]+):\t([0-9a-f ]+?)\s*\t(\S+)\s*(.*)$")
 def parse(txt):
     out = {}
@@ -84,7 +85,7 @@ KINDS = ["RI", "W32", "NOP", "BR", "J", "JR", "JRADDIUSP", "ADDIUPC", "LWM", "SW
 w32 = [(a, d["w"]) for a, d in sorted(dec.items()) if KINDS[d["kind"]] == "W32"]
 s32 = os.path.join(here, "um32.s")
 open(s32, "w").write("\t.set nomicromips\n\t.text\n" + "".join("\t.word 0x%08x\n" % w for _, w in w32))
-run([CROSS + "as", "-march=mips32r2", "-mmcu", "-EL", s32, "-o", s32 + ".o"])
+run([CROSS + "as", "-march=mips32r2", "-mmcu", "-mdspr2", "-EL", s32, "-o", s32 + ".o"])
 od32 = parse(run([CROSS + "objdump", "-d", s32 + ".o"]))
 eq32 = {a: od32.get(4 * k) for k, (a, _) in enumerate(w32)}
 
@@ -102,6 +103,8 @@ def same_imm(a, b):
         return a == b
 
 def norm(mn, ops):
+    if ops[:1] == ["$ac0"]:                       # the DSP spelling of the accumulator forms
+        ops = ops[1:]
     if mn == "addiu" and len(ops) == 3 and ops[1] == "zero":
         return "li", [ops[0], ops[2]]
     if mn == "move" and ops == ["zero", "zero"]:
@@ -189,13 +192,7 @@ for a, d in sorted(dec.items()):
         if not mn.startswith(INVALID) and mn not in OTHER_ASE and not mn.endswith(".ps") \
                 and mn not in ("alnv.ps", "pll.ps", "plu.ps", "pul.ps", "puu.ps", "cvt.ps.s", "cvt.s.pl",
                                "cvt.s.pu", "bc1any2f", "bc1any2t", "bc1any4f", "bc1any4t", "dmfc1", "dmtc1") \
-                and not re.match(r"^(dsp|ext[rp]|ins[v]|mfhi|mflo|mthi|mtlo|madd|msub|mult|shilo|"
-                                 r"mthlip|wrdsp|rddsp|bitrev|repl|precr|preceq|precequ|preceu|"
-                                 r"absq|addq|addsc|addu|addwc|append|balign|cmp|dpa|dps|maq|modsub|"
-                                 r"muleq|muleu|mulq|mulsa|packrl|pick|prepend|raddu|shll|shra|shrl|"
-                                 r"subq|subu|lbux|lhx|lwx|bposge32|precrq|precr_sra|dpaq|dpsq|dpax|"
-                                 r"dpsx|dpau|dpsu|mulsaq|cmpu|cmpgu|cmpgdu|adduh|addqh|subuh|subqh|"
-                                 r"mul\.|mulq_|mul_|bz\.|bnz\.)", mn):
+                and not re.match(r"^(bposge32|bz\.|bnz\.)", mn):
             fail("ri-but-valid:" + mn, a, "%s %s" % (mn, ",".join(ops)))
         continue
     if mn.startswith(INVALID):

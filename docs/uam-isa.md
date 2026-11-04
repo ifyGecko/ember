@@ -493,7 +493,9 @@ Later MIPS conventions (`isa/mips32`, for PIC32-class cores), again without new 
 - **DSP ASE** (`mips_dsp.c`): the encoding is checked at lift time (reserved, or DSP Disabled
   with Status.MX clear, tagged in `cpu->priv`); LWX/LHX/LBUX are inline loads; every other
   instruction is one helper on the register file, the accumulators (ac0 = HI/LO) and
-  DSPControl.
+  DSPControl. Its microMIPS encodings (all in POOL32A) are recoded to MIPS32 from a table,
+  `umips_dsp.h`, generated from the GNU assembler by `tests/isa-mips/gen-umips-dsp.py` (each
+  instruction assembled in both ISAs with one operand bit set at a time).
 - **External interrupt controller.** The controller pushes its request (RIPL, vector,
   optional explicit offset, shadow set) with `uam_mips_eic_input`, which requests an exit;
   `irq_take` compares RIPL with Status.IPL.

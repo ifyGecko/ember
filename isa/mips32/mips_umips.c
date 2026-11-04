@@ -465,8 +465,12 @@ void umips_decode(uint32_t pc, uint16_t h0, uint16_t h1, um_insn *d)
     *d = (um_insn){ .kind = UM_RI, .len = umips_is32(h0) ? 4 : 2 };
     if (d->len == 2)
         decode16(pcb, h0, d);
-    else
-        decode32(pcb, ((uint32_t)h0 << 16) | h1, d);
+    else {
+        uint32_t i = ((uint32_t)h0 << 16) | h1, w;
+        decode32(pcb, i, d);
+        if (d->kind == UM_RI && (w = mips_umips_dsp32(i)) != 0)
+            w32(d, w);
+    }
 }
 
 /*
@@ -571,7 +575,26 @@ uint32_t mips_umips_fpu32(uint32_t i)
         return 0;
     }
 }
-uint32_t mips_umips_dsp32(uint32_t i) { (void)i; return 0; }
+
+/*
+ * The DSP ASE (all in POOL32A) recoded as MIPS32, or 0 if not one: a table lookup,
+ * the table generated from the assembler (tests/isa-mips/gen-umips-dsp.py).
+ */
+#include "umips_dsp.h"
+
+uint32_t mips_umips_dsp32(uint32_t i)
+{
+    for (size_t k = 0; k < sizeof umips_dsp / sizeof umips_dsp[0]; k++) {
+        const struct umips_dsp *e = &umips_dsp[k];
+        if ((i & e->umask) != e->u)
+            continue;
+        uint32_t w = e->w;
+        for (unsigned b = 0; b < e->n; b++)
+            w |= ((i >> e->bit[b][0]) & 1u) << e->bit[b][1];
+        return w;
+    }
+    return 0;
+}
 
 /* ---- lifting ----------------------------------------------------------- */
 

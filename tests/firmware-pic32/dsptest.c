@@ -1,13 +1,19 @@
 /*
  * dsptest.c - DSP ASE checks for the PIC32 self-test (included by selftest.c in the
- * MIPS32 mz image). Each vector's instruction word is written into a trampoline in
- * RAM ("insn; jr ra; nop"), run with $4, $5, $6, ac1 and DSPControl set from the
- * vector, and all five compared afterwards.
+ * mz images). Each vector's instruction word is written into a trampoline in RAM
+ * ("insn; jr ra; nop", or in microMIPS "insn; jrc ra; nop16" with the vector's
+ * microMIPS word), run with $4, $5, $6, ac1 and DSPControl set from the vector, and
+ * all five compared afterwards.
  */
 #include "dspvectors.h"
 
 static volatile uint32_t tramp[4] __attribute__((aligned(16)));
 static volatile uint32_t dsp_io[6];   /* a b c acc_lo acc_hi ctl, in and out */
+#ifdef __mips_micromips
+#define TRAMP ((uintptr_t)tramp | 1)     /* entered in microMIPS */
+#else
+#define TRAMP ((uintptr_t)tramp)
+#endif
 
 static NATIVE void dsp_run(void)
 {
@@ -19,7 +25,7 @@ static NATIVE void dsp_run(void)
         "sw $4, 0(%0)\n\tsw $5, 4(%0)\n\tsw $6, 8(%0)\n\t"
         "mflo $8, $ac1\n\tsw $8, 12(%0)\n\tmfhi $8, $ac1\n\tsw $8, 16(%0)\n\t"
         "rddsp $8, 0x3f\n\tsw $8, 20(%0)"
-        :: "r"(dsp_io), "r"(tramp) : "$4", "$5", "$6", "$8", "$31", "memory");
+        :: "r"(dsp_io), "r"(TRAMP) : "$4", "$5", "$6", "$8", "$31", "memory");
 }
 
 static void t_dsp_vectors(void)
@@ -27,9 +33,14 @@ static void t_dsp_vectors(void)
     unsigned bad = 0;
     for (unsigned k = 0; k < sizeof(DSPV) / sizeof(DSPV[0]); k++) {
         const struct dspvec *v = &DSPV[k];
+#ifdef __mips_micromips
+        tramp[0] = v->um >> 16 | v->um << 16;   /* first halfword at the lower address */
+        tramp[1] = 0x0c0045bfu;                 /* jrc ra; nop16 */
+#else
         tramp[0] = v->w;
         tramp[1] = 0x03e00008u;   /* jr ra */
         tramp[2] = 0;
+#endif
         dsp_io[0] = v->a;
         dsp_io[1] = v->b;
         dsp_io[2] = v->c;
