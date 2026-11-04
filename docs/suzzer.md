@@ -95,6 +95,11 @@ With suzzer configured, `uam-run` (and every board built on `uam_run_main`) gain
 | `--fuzz-szr-timeout SEC` | give up when the brain sends nothing for SEC seconds (default: wait; TCP keepalive still notices a vanished host) |
 | `--cov-shm PATH`, `--cov-shm-ring N` | publish INIT and every ok iteration's map in an LCVS region for suzzer's readers |
 
+A PATH with a `/` after its first character is a file; any other is a POSIX shared-memory
+name (`/dev/shm` on Linux; on macOS at most 31 characters, and a region that is in the way
+with another size is made anew under the same name, since macOS sizes such an object only
+once).
+
 and `make test` adds `test_suzzer` (the format readers and the conformance vectors) and
 `suzzer-test`: the options end to end on RV32, MIPS32 BE/LE, ARMv7 Thumb-2 and 32-bit PowerPC (with lists
 from suzzer's own generators too, when rizin and rzpipe are installed), the LCVS region read back by

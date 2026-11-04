@@ -10,8 +10,8 @@
  * for its writer.
  *
  * PATH follows LIBCOV_SHM_PATH's rule: with a '/' after the first character it is a
- * file, otherwise a POSIX shared-memory name (/dev/shm). The region is left in place
- * at exit for readers that come late.
+ * file, otherwise a POSIX shared-memory name (/dev/shm on Linux; at most 31 characters
+ * on macOS). The region is left in place at exit for readers that come late.
  *
  * Ownership follows libcov's: the decision to take a region is made under an exclusive
  * flock, so two writers starting at once (ember or libcov) cannot both claim it, and an
@@ -106,6 +106,32 @@ static void unlock_close(int fd)
     close(fd);
 }
 
+/* Give the region's object `size` zeroed bytes (readers wait for the magic): truncating
+ * to 0 first does both. macOS sizes a POSIX shared-memory object only once, so there a
+ * second truncation fails: an object of the right size already is zeroed in place
+ * (*zero), any other is made anew under the same name, locked like the old one. */
+static bool size_region(int *fd, const char *shm_name, size_t size, bool *zero)
+{
+    *zero = false;
+    if (ftruncate(*fd, 0) == 0 && ftruncate(*fd, (off_t)size) == 0)
+        return true;
+    struct stat sb;
+    if (!shm_name || fstat(*fd, &sb) != 0)
+        return false;
+    if ((size_t)sb.st_size == size) {
+        *zero = true;
+        return true;
+    }
+    shm_unlink(shm_name);
+    int nfd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (nfd < 0)
+        return false;
+    flock(nfd, LOCK_EX);
+    unlock_close(*fd);
+    *fd = nfd;
+    return ftruncate(nfd, (off_t)size) == 0;
+}
+
 sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size, uint32_t scheme_flags,
                         char *err, size_t errlen)
 {
@@ -114,10 +140,11 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
         return NULL;
     }
     int fd;
-    if (looks_like_file(path)) {
+    char name[256];
+    const bool file = looks_like_file(path);
+    if (file) {
         fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     } else {
-        char name[256];
         snprintf(name, sizeof(name), "/%s", path + (path[0] == '/'));
         fd = shm_open(name, O_RDWR | O_CREAT, 0600);
     }
@@ -135,8 +162,8 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
     }
     const size_t slot_stride = sizeof(struct libcov_ring_slot_hdr) + map_size;
     const size_t size = sizeof(struct libcov_shm_header) + map_size + (size_t)ring_size * slot_stride;
-    /* Truncating to 0 first gives a zeroed region: readers wait for the magic. */
-    if (ftruncate(fd, 0) != 0 || ftruncate(fd, (off_t)size) != 0) {
+    bool zero;
+    if (!size_region(&fd, file ? NULL : name, size, &zero)) {
         snprintf(err, errlen, "%s: %s", path, strerror(errno));
         unlock_close(fd);
         return NULL;
@@ -149,6 +176,11 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
             munmap(base, size);
         unlock_close(fd);
         return NULL;
+    }
+    if (zero) {                              /* the magic first: readers stop trusting it */
+        memset(base, 0, sizeof(struct libcov_shm_header));
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        memset(base, 0, size);
     }
     l->base = base;
     l->size = size;
