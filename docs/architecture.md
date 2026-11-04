@@ -2,8 +2,8 @@
 
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU), the snapshot part of phase 3 and the JIT from
-phase 4. IR, interpreter and optimizer, an
-x86-64 JIT with block chaining, bus (priorities, device byte order, ROM devices, aliases,
+phase 4. IR, interpreter and optimizer, a
+JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), host
@@ -58,7 +58,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into) and the core services ISA modules may call (`uam_cpu_xlate_changed`, ...) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit_x86` |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception observer, the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `exec/interp`, `exec/jit` (code generators `jit_x86`, `jit_a64`) |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
@@ -125,7 +125,8 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
 include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
-src/exec/         interp.c tcache.c run.c cpu.c jit_x86.c coverage.c spin.c jit.h execops.h spin.h
+src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
+                  jit_impl.h execops.h spin.h
 analysis/         cov.c (the edge-coverage pass)
 src/loader/       loader.c
 src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches)
@@ -137,7 +138,7 @@ isa/mips32/       mips_lift.c mips_system.c mips.h (private)
 isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32) arm_system.c
                   arm.h (private)
 isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_booke.c ppc_system.c ppc.h (private)
-isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_helpers.c
+isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
 devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.c unimp.c
@@ -159,7 +160,7 @@ tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: refe
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
-                  test_smp.c test_ppc.c
+                  test_smp.c test_ppc.c test_f80.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -299,6 +300,18 @@ devices.
   `max_stall` timer events with no instruction retired, a waiting hart stops skipping time and
   blocks on host input, or the run ends as a livelock if no input source exists. Each of these
   decisions is made in virtual time.
+- **Hosts**: nothing a guest sees depends on the machine ember runs on. The interpreter is
+  plain C11. The JIT is one host-independent core (`exec/jit.c`: the runtime context and C
+  bridges, the deferred-write, cold-op, register-allocation and flag-fusion analyses, the code
+  arena, linking, profiling) and a code generator per host instruction set, behind
+  `exec/jit_impl.h`: `jit_x86.c` (x86-64) and `jit_a64.c` (little-endian AArch64), which emit
+  the same block layout, frame discipline and chaining protocol; `test_jitdiff` holds each to
+  the interpreter. Elsewhere `--jit` falls back to the interpreter. The arena is mapped
+  read-write-execute on Linux; on macOS it is a `MAP_JIT` mapping that the core opens for
+  writing only while it places a block or links a slot, and AArch64 code never touches `x18`.
+  The x87 model keeps its registers in the 80-bit format and computes on them in software
+  (`isa/x86/x86_f80.c`, bit-exact against a real x87 in `test_f80`), so x86 guests get the
+  same answers on every host; only the transcendentals use the host's `long double`.
 - **JIT block chaining** (`exec/jit.h`): a compiled block whose EXIT leads to another compiled
   block jumps straight into it instead of returning to the run loop, for as long as the run loop
   would have nothing to do in between: no exit request, deadline not reached, links current.
@@ -419,7 +432,7 @@ devices.
 3. Snapshots (*done*), coverage (*done*: IR passes, `UAM_OP_COV`, the coverage pass) and
    cmp-log passes, unknown-MMIO fuzz policy (*done*: per-register rules with an `input`
    policy), a persistent-mode fuzz harness (*done*, with a replay frontend).
-4. Board description format, more peripherals, ARMv7-M, JIT (*done*: x86-64 host, with block chaining; every IR op compiles, so no block falls back to the interpreter).
+4. Board description format, more peripherals, ARMv7-M, JIT (*done*: x86-64 and AArch64 hosts, with block chaining; every IR op compiles, so no block falls back to the interpreter).
 
 Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
 short-descriptor MMU, generic timer, a GIC, little-endian and BE8), x86-64, 32-bit PowerPC (FPU,
@@ -526,5 +539,12 @@ Implemented (`make test`):
   rewrites (overwritten register writes, flags read back, common subexpressions). Each run must agree on the result,
   registers, memory, icount and on the register file seen at every device, sysreg and helper
   access. `make jitdiff-soak` runs it at length; docs/jit-perf.md has the performance side.
+  It holds whichever code generator the host has: `make test` passes on x86-64 and on
+  AArch64.
+- `test_f80` checks the x87's software 80-bit format: on an x86-64 host bit for bit against
+  the host's x87 (arithmetic, square root, compares, conversions, FRNDINT and FISTP under
+  every rounding control, FSCALE, FPREM and FPREM1) over special values and random operands
+  of every class; on every host, a digest of its results must equal the one recorded on
+  x86-64. The x86 self-test's x87 group (110-118) checks the instructions end to end.
 
 Planned: riscv-tests / riscv-arch-test, golden text-form tests for the lifters.

@@ -20,7 +20,7 @@ model selects: the classic one of the 6xx/7xx/74xx - BATs, segments and the hash
 or Book E - IVORs, critical and machine-check classes, TCR/TSR timers and watchdog, TLB arrays
 with the MAS interface; implementation SPRs, DCRs and TLB interfaces left to the board) on the
 `ppc-ref` board - run by a
-reference interpreter or, with `--jit`, a native x86-64 JIT
+reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
 with block chaining (a block optimizer feeds both). Every reference board takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
@@ -28,6 +28,29 @@ once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--
 `--watch`), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
 pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
 dependencies beyond libc.
+
+## Hosts
+
+Ember builds and runs on any POSIX host with a C11 compiler (GCC or Clang) that has
+`__int128`; the interpreter needs nothing more. The JIT has a code generator for x86-64
+(`src/exec/jit_x86.c`) and one for little-endian AArch64 (`src/exec/jit_a64.c`), both on
+the host-independent core in `src/exec/jit.c`; on any other host `--jit` falls back to the
+interpreter. Guest behaviour does not depend on the host: the x87 model computes in
+software (`isa/x86/x86_f80.c`), and `make test` passes the same checks on both JIT hosts.
+
+- **Linux on x86-64 and on AArch64**: everything, tested.
+- **macOS** (Apple silicon and Intel): written for and not yet tested there. The code arena
+  is a `MAP_JIT` mapping that a thread switches between writable and executable
+  (`pthread_jit_write_protect_np`), and the AArch64 code generator leaves `x18`, the
+  platform register, alone. A binary signed with the hardened runtime needs the
+  `com.apple.security.cs.allow-jit` entitlement. The tap and tun network backends are
+  Linux-only; x87 transcendentals compute in the host's `long double`, a `double` on Apple
+  silicon (everything else in the x87 model is exact there too).
+
+To build for another host, point the build at its compiler, e.g.
+`make CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar BUILD=build-a64`, and run
+`make test` with the same variables on that host. The firmware images are
+host-independent.
 
 ## Build and test
 
@@ -303,8 +326,9 @@ include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
-src/exec/          interpreter, translation cache, run loop, x86-64 JIT (jit_x86.c), coverage,
-                   spin-loop skipping
+src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
+                   linking; code generators jit_x86.c and jit_a64.c), coverage, spin-loop
+                   skipping
 src/loader/        ELF / raw loaders
 src/machine/       machine lifecycle, resets, board registry, snapshots, guards
 src/host/          chardev/netdev/block-device backends, host loop, real-time pacing
@@ -321,8 +345,8 @@ isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_
                    (ppc_mmu.c: BATs, segments, hashed page table), operating environment
                    (ppc_system.c: MSR, SPRs, exceptions, decrementer, time base) and the Book E
                    model (ppc_booke.c: interrupts, timers, TLB arrays, MAS registers)
-isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87, MMX,
-                   SSE/SSE2) and system architecture (segmentation, call gates, hardware
+isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87 on a
+                   software 80-bit format (x86_f80.c), MMX, SSE/SSE2) and system architecture (segmentation, call gates, hardware
                    task switching, the I/O permission bitmap, paging, SMM with the Intel 64
                    or AMD64 save-state map, A20M#, CPUID/MSRs)
 devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
@@ -341,7 +365,8 @@ examples/          external-board: an out-of-tree board using the library
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
                    loops, stores next to code, MMIO rules, coverage, the fuzz harness,
-                   multiprocessor observers, suzzer's formats, the PowerPC board interface
+                   multiprocessor observers, suzzer's formats, the PowerPC board interface,
+                   the x87's software 80-bit format (against the host's x87 on x86-64)
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images
