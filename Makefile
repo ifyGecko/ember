@@ -185,6 +185,8 @@ FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 FW_PPC    := $(BUILD)/firmware-ppc/selftest.elf
 FW_PPC_BOOKE := $(BUILD)/firmware-ppc/selftest-booke.elf
 FW_PIC32  := $(BUILD)/firmware-pic32/selftest-mz.elf
+FW_PIC32_MX := $(BUILD)/firmware-pic32/selftest-mx.elf
+MIPS16_DEC := $(BUILD)/mips16-dec
 FW_AVR    := $(BUILD)/firmware-avr
 AVR_MODELS := e eplus xm xt rc
 FW_AVR32_A := $(BUILD)/firmware-avr32/selftest-a.elf
@@ -263,6 +265,11 @@ $(RUN): $(BUILD)/obj/tools/uam-run.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TRUN): $(BUILD)/obj/tests/boards/uam-test-run.o $(BUILD)/obj/tests/boards/test_boards.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+# The MIPS16e decoder's oracle harness sees the module's internal header.
+$(BUILD)/obj/tests/isa-mips/mips16-dec.o: UAM_COMPILE += -Iisa/mips32
+$(MIPS16_DEC): $(BUILD)/obj/tests/isa-mips/mips16-dec.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_IR): $(BUILD)/obj/tests/unit/test_ir.o $(LIB)
@@ -476,11 +483,14 @@ ppc-test: $(RUN) firmware-ppc
 	$(RUN) -b ppc-ref -o model=booke --stats $(FW_PPC_BOOKE) < /dev/null
 	$(RUN) -b ppc-ref -o model=booke --jit --stats $(FW_PPC_BOOKE) < /dev/null
 
-# PIC32: the MIPS32 self-test on the mz model (TLB, shadow sets, external
-# interrupt controller). The compressed ISAs, FPU and DSP are not yet lifted.
-pic32-test: $(RUN) firmware-pic32
+# PIC32: the self-test as MIPS32 on the mz model (TLB, shadow sets, the external
+# interrupt controller) and as MIPS16e on mx; the MIPS16e decoder against objdump.
+pic32-test: $(RUN) firmware-pic32 $(MIPS16_DEC)
+	python3 -I tests/isa-mips/mips16-check.py $(MIPS16_DEC) $(BUILD)
 	$(RUN) -b pic32-ref -o model=mz --stats $(FW_PIC32) < /dev/null
 	$(RUN) -b pic32-ref -o model=mz --jit --stats $(FW_PIC32) < /dev/null
+	$(RUN) -b pic32-ref -o model=mx --stats $(FW_PIC32_MX) < /dev/null
+	$(RUN) -b pic32-ref -o model=mx --jit --stats $(FW_PIC32_MX) < /dev/null
 
 # The 8-bit AVR self-test on every core family the board models.
 avr-test: $(RUN) firmware-avr
@@ -596,6 +606,7 @@ else
 	$(AVR32_SKIP)
 endif
 	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32) 777 50000 120000 180000 -- -o model=mz
+	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32_MX) 777 9000 18000 27000 -- -o model=mx
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
@@ -632,6 +643,7 @@ else
 	$(AVR32_SKIP)
 endif
 	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32) -- -o model=mz
+	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32_MX) -- -o model=mx
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.

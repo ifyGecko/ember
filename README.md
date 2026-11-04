@@ -177,9 +177,9 @@ image built with SDCC runs as a raw binary (`makebin -p`).
 program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored interrupt controller;
 `-o model=mx|mm|mz` picks the core (mx: MIPS16e-capable, fixed mapping; mm: microMIPS-only; mz:
 MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets into microMIPS.
-The MIPS16e and microMIPS instruction sets, the FPU and the DSP ASE are configured and decoded
-but not yet lifted (a reserved-instruction exception), so today only MIPS32 firmware runs,
-which the mz and mx models execute. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+MIPS32 and MIPS16e firmware runs (mx runs both, switching through JALX and
+JR to odd addresses); microMIPS, the FPU and the DSP ASE are configured but not yet lifted
+(a reserved-instruction or coprocessor-unusable exception). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -411,7 +411,7 @@ fuzz/              the persistent-mode fuzz harness, the replay frontend, the ru
                    options; fuzz/suzzer/: suzzer's formats (built only with a suzzer checkout)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c);
-                   mips16.c / mips_umips.c / mips_fpu.c / mips_dsp.c (the compressed ISAs, the
+                   mips16.c (MIPS16e); mips_umips.c / mips_fpu.c / mips_dsp.c (microMIPS, the
                    FPU and the DSP ASE: config and decode hooks in place, lifting still to come)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
@@ -483,7 +483,8 @@ tests/firmware-pic/ 8-bit PIC self-tests in gpasm assembly, one per core family 
 tests/firmware-mcs51/ 8051 self-test (as31), one build per core model (arithmetic vectors from
                    the instruction set's definitions: gen_vectors.py; CIP-51 code banks:
                    mkimage.py), and fuzz target (SDCC)
-tests/firmware-pic32/ bare-metal MIPS32 self-test for the pic32-ref board (mz model)
+tests/firmware-pic32/ self-test for the pic32-ref board (MIPS32 on mz, MIPS16e on mx)
+tests/isa-mips/    the MIPS16e decoder checked against objdump on every encoding
 tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
                    ROM tests (nasm)
 tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC

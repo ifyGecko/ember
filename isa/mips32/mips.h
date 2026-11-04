@@ -266,6 +266,34 @@ void    mips_ri(ml *L);                      /* Reserved Instruction, ends the b
 uam_ref mips_helper(ml *L, unsigned id, uam_ref a, uam_ref b, uam_ref c);
 uam_ref mips_fcc(ml *L, unsigned cc, bool tf);   /* FCSR condition code cc is tf */
 
+/* mips16.c: one MIPS16e instruction, decoded (mips16_decode is pure: tests use it). */
+typedef enum {
+    M16_RI,          /* reserved */
+    M16_W32,         /* the MIPS32 instruction w does the same */
+    M16_B, M16_BEQZ, M16_BNEZ,   /* branches (BTEQZ/BTNEZ: rx = T); target has bit 0 */
+    M16_JR,          /* JR/JALR/JRC/JALRC through rx */
+    M16_JAL,         /* JAL/JALX: target (bit 0 = the ISA it enters) */
+    M16_ADDIUPC, M16_LWPC,       /* rd = / = word at (pc & ~3) + imm */
+    M16_SAVE, M16_RESTORE,
+} m16_kind;
+
+typedef struct m16_insn {
+    m16_kind kind;
+    unsigned len;            /* 2 or 4 bytes */
+    uint32_t w;              /* M16_W32 */
+    unsigned rx, rd;
+    uint32_t imm, target;
+    bool     link, compact;
+    unsigned args, astatic, xsregs, framesize;   /* SAVE/RESTORE */
+    bool     ra, s0, s1;
+} m16_insn;
+
+/* pc: the instruction's address (bit 0 may be set); ext/has_ext: an EXTEND prefix;
+ * i2: the second halfword of JAL/JALX. Returns false if the encoding is JAL/JALX
+ * after an EXTEND (the caller treats it as reserved too). */
+bool mips16_decode(uint32_t pc, uint16_t ext, bool has_ext, uint16_t i, uint16_t i2,
+                   m16_insn *d);
+
 /* mips16.c / mips_umips.c: one block in the compressed ISA (lc->pc has bit 0 set). */
 uam_status mips16_lift(uam_lift_ctx *lc);
 uam_status mips_umips_lift(uam_lift_ctx *lc);

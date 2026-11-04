@@ -145,7 +145,9 @@ static uint32_t *reg_ptr(pic32_intc *c, uint32_t reg, uint32_t *val, uint32_t *w
         return &c->priss;
     }
     if (reg == (vo ? 0x020u : 0x010u)) {     /* INTSTAT */
-        *val = c->ripl ? (c->ripl << 8) | (vo ? (c->irq & 0xFFu) : (c->vector & 0x3Fu)) : 0;
+        /* the pending request, whatever is presented (single-vector mode presents
+         * vector 0): SIRQ is its source, VEC its vector */
+        *val = c->ripl ? (c->ripl << 8) | (vo ? (c->irq & 0xFFu) : (c->vec_of[c->irq] & 0x3Fu)) : 0;
         return NULL;
     }
     if (reg == (vo ? 0x030u : 0x020u)) {
