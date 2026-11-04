@@ -7,6 +7,11 @@
  *   0x7777             reset  -> finish(ctx, -1)
  * Reads return 0. The command may arrive in either half of the word (a
  * big-endian guest's store reaches the device byte-swapped).
+ *
+ * An 8-bit CPU cannot make that write, so single bytes command it too:
+ *   0x55 at offset 0   pass   -> finish(ctx, 0)
+ *   0x77 at offset 0   reset  -> finish(ctx, -1)
+ *   code at offset 1   fail   -> finish(ctx, code ? code : 1)
  */
 #ifndef UAM_DEV_TEST_FINISHER_H
 #define UAM_DEV_TEST_FINISHER_H

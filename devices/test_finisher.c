@@ -25,6 +25,15 @@ static uam_status test_read(uam_device *d, uint64_t off, unsigned size, uint64_t
 static uam_status test_write(uam_device *d, uint64_t off, unsigned size, uint64_t v)
 {
     finisher *t = UAM_CONTAINER_OF(d, finisher, dev);
+    if (size == 1) {   /* the byte commands, for 8-bit CPUs */
+        if (off == 0 && (v & 0xFF) == 0x55)
+            t->finish(t->ctx, 0);
+        else if (off == 0 && (v & 0xFF) == 0x77)
+            t->finish(t->ctx, -1);
+        else if (off == 1)
+            t->finish(t->ctx, (int64_t)((v & 0xFF) ? (v & 0xFF) : 1));
+        return UAM_OK;
+    }
     if (off != 0 || size != 4)
         return UAM_OK;
     /* The command is in the low 16 bits and the exit code in the high 16.
