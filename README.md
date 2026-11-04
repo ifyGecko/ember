@@ -8,7 +8,7 @@ with one module per concern.
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: six guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
+Status: seven guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
@@ -22,7 +22,11 @@ with the MAS interface; implementation SPRs, DCRs and TLB interfaces left to the
 `ppc-ref` board, and 8-bit AVR (every core family of the AVR Instruction Set Manual: AVRe,
 AVRe+, AVRxm (XMEGA, with its PMIC, DES and XCH/LAS/LAC/LAT), AVRxt (with its CPUINT) and
 the reduced core AVRrc, each with the memory layout of common devices of the family) on the
-`avr-ref` board - run by a
+`avr-ref` board, and AVR32 (both microarchitectures of the AVR32 Architecture Manual: AVR32A, the
+UC3 class, with events on the system stack and an MPU, and AVR32B, the AP7 class, with
+RSR/RAR per context, INT3 shadow registers, the P0-P4 segments, an ITLB and a DTLB and the
+SIMD instructions; the DSP instructions on both) on the `avr32-ref` board with an AVR32-style
+interrupt controller - run by a
 reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
 with block chaining (a block optimizer feeds both). Every reference board but `avr-ref` (an AVR
 has one processor) takes `-o cpus=N`:
@@ -60,7 +64,7 @@ host-independent.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC and AVR firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR and AVR32 firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
                      # (and suzzer interop, with a suzzer checkout)
@@ -90,6 +94,13 @@ The AVR self-tests (one per core family) and the AVR builds of the fuzz target a
 benchmark need `avr-gcc` and avr-libc (Debian: `gcc-avr`, `binutils-avr`, `avr-libc`), and
 `python3` for their flag vectors.
 
+The AVR32 self-tests, fuzz target and benchmark builds need `avr32-gcc`, from the AVR32 GNU
+toolchain (3.4.3, gcc 4.4; no distribution packages it). `make AVR32_CROSS=PREFIX test` points
+the build at it (default `avr32-` in PATH); without it the AVR32 firmware checks are skipped
+with a note. Its tools want `LC_ALL=C`, and its static binaries call the legacy vsyscall page,
+which current kernels no longer provide: they crash in `time`/`gettimeofday` unless the kernel
+emulates vsyscalls (`vsyscall=emulate`) or the two calls are patched into system calls.
+
 ## Run firmware
 
 ```bash
@@ -107,6 +118,8 @@ build/uam-run -b x86_64-ref --raw-base 0 --entry 0 flat.bin      # a flat image,
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
 build/uam-run -b avr-ref build/firmware-avr/selftest-eplus.elf   # 8-bit AVR (ATmega2560 layout)
 build/uam-run -b avr-ref -o model=xm build/firmware-avr/selftest-xm.elf  # XMEGA
+build/uam-run -b avr32-ref build/firmware-avr32/selftest-a.elf   # AVR32A (UC3 class)
+build/uam-run -b avr32-ref -o model=b build/firmware-avr32/selftest-b.elf  # AVR32B (AP7 class)
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
@@ -122,7 +135,10 @@ names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `
 with the memory layout of a common part of that core family, so firmware built for that part
 runs (`e` ATmega328P, `eplus` ATmega2560, `xm` ATxmega128A1U, `xt` ATmega4809, `rc`
 ATtiny40; boards/avr_ref.c has the map); its devices (a 16550, a timer, the test finisher) are
-generic, not those parts' peripherals, and `--ram` sets the size of its SRAM. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+generic, not those parts' peripherals, and `--ram` sets the size of its SRAM. `avr32-ref` takes
+`-o model=a|b` (default `a`: RAM at 0 and code memory at the reset address 0x80000000; `b`: code
+memory at physical 0, reset through P2 at 0xa0000000, RAM at physical 0x10000000), with its
+interrupt controller, a 16550 and the test finisher at 0xffff0800, 0xffff1400 and 0xffff1800. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -337,7 +353,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
                    cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
 include/uam/dev/   one header per device model
-include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h)
+include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
@@ -367,14 +383,21 @@ isa/avr8/          8-bit AVR lifter (avr_lift.c: every core family, the model's 
                    system side (avr_system.c: the CPU models, the data space on the bus,
                    interrupt entry, the AVRxm PMIC and AVRxt CPUINT, the core's I/O registers)
                    and the AVRxm DES instruction (avr_des.c)
+isa/avr32/         AVR32 decoder (avr32_dec.c, avr32_op.h), lifter (avr32_lift.c: the whole
+                   instruction set), DSP and SIMD (avr32_dsp.c), and system side
+                   (avr32_system.c: SR and the modes, events and autovectored interrupts for
+                   AVR32A and AVR32B, system registers, COUNT/COMPARE, the AVR32A MPU, the
+                   AVR32B segments and TLBs)
 devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
                    virtio_net; PC architecture: i8259, i8254, mc146818, lapic, ioapic, hpet,
                    i8042, acpi_pm, pc_misc (port 92, A20 gate, POST codes), i8237 DMA, fdc
                    (82077), ide (PIO + bus master), lpt, vga; pci (bridges, MSI/MSI-X,
                    expansion ROMs), ahci, nvme, cfi_flash; ipi; gptimer (a general-purpose
-                   timer for CPUs without one of their own)
+                   timer for CPUs without one of their own); avr32_intc (AVR32-style interrupt
+                   controller: groups with a level and an autovector each)
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
-                   x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR):
+                   x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR),
+                   avr32_ref.c (AVR32):
                    reference boards of generic
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
@@ -397,6 +420,7 @@ tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E buil
                    test and fuzz target
 tests/firmware-avr/ 8-bit AVR self-test, one build per core family (flag vectors from the
                    manual's equations: gen_vectors.py), and fuzz target
+tests/firmware-avr32/ AVR32 self-test (AVR32A and AVR32B builds) and fuzz target
 tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
                    ROM tests (nasm)
 tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC

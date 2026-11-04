@@ -14,6 +14,12 @@ ARM_CROSS    ?= arm-linux-gnueabi-
 PPC_CROSS    ?= powerpc64le-linux-gnu-
 X86_CROSS    ?= x86_64-linux-gnu-
 AVR_CROSS    ?= avr-
+AVR32_CROSS  ?= avr32-
+HAVE_AVR32   := $(if $(shell command -v $(AVR32_CROSS)gcc 2>/dev/null),1)
+# Without the toolchain, images from an earlier build would be tested as current: drop them.
+ifneq ($(HAVE_AVR32),1)
+$(shell rm -f $(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf)
+endif
 
 DEFS   = $(if $(ROUNDS),-DBENCH_ROUNDS=$(ROUNDS)) $(if $(ONLY),-DBENCH_ONLY=$(ONLY))
 COMMON = -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin -fno-pic \
@@ -30,7 +36,8 @@ X86_FLAGS  = -m64 -mno-red-zone -mgeneral-regs-only
 FW := ../firmware
 ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-arm.elf $(OUT)/bench-thumb.elf $(OUT)/bench-thumb-be.elf \
-       $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host
+       $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host \
+       $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf)
 
 all: $(ALL)
 
@@ -73,6 +80,17 @@ $(OUT)/bench-avr.elf: bench.c $(OUT)/.config
 	$(AVR_CROSS)gcc -mmcu=atmega2560 -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin \
 	    -fno-tree-loop-distribute-patterns $(DEFS) -Wl,--defsym=__DATA_REGION_LENGTH__=0xFE00 \
 	    -Wl,--defsym=__stack=0xFFFF bench.c -o $@
+
+# AVR32 (avr32-ref, models a and b), only when an AVR32 toolchain is found (AVR32_CROSS): its
+# gcc 4.4 lacks -fno-tree-loop-distribute-patterns, and wants the C locale.
+AVR32_FLAGS = -O2 -g -std=gnu99 -Wall -Wextra -ffreestanding -fno-builtin -mno-pic -fno-stack-protector \
+              -nostdlib -nostartfiles -static $(DEFS)
+$(OUT)/bench-avr32a.elf: bench.c $(FW)-avr32/start.S $(OUT)/.config
+	LC_ALL=C $(AVR32_CROSS)gcc -mpart=uc3a0512 $(AVR32_FLAGS) -Wl,-T,$(FW)-avr32/link-a.ld \
+	    $(FW)-avr32/start.S bench.c -lgcc -o $@
+$(OUT)/bench-avr32b.elf: bench.c $(FW)-avr32/start.S $(OUT)/.config
+	LC_ALL=C $(AVR32_CROSS)gcc -mpart=ap7000 $(AVR32_FLAGS) -Wl,-T,$(FW)-avr32/link-b.ld \
+	    $(FW)-avr32/start.S bench.c -lgcc -o $@
 
 $(OUT)/bench-ppc.elf: bench.c $(FW)-ppc/start.S $(OUT)/.config
 	$(PPC_CROSS)gcc $(PPC_FLAGS) $(COMMON) $(LDCOMMON) -Wl,-T,$(FW)-ppc/link.ld \

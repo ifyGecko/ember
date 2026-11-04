@@ -45,6 +45,8 @@ static void putc_(char c)
 #define UART0 0xf0000000u
 #elif defined(__AVR__)
 #define UART0 0x00E0u      /* avr-ref, model eplus; the finisher is at 0x00E8 */
+#elif defined(__AVR32__)
+#define UART0 0xffff1400u  /* avr32-ref */
 #else
 #error "no board for this ISA"
 #endif
@@ -97,6 +99,12 @@ __attribute__((naked, used, section(".fini8"))) static void avr_report(void)
     __asm__ volatile("cpi r24, 0x55\n\tbrne 1f\n\tcpi r25, 0x55\n\tbrne 1f\n\t"
                      "sts 0x00E8, r24\n1:\tori r24, 1\n\tsts 0x00E9, r24");
 }
+#endif
+
+#if defined(__AVR32__)
+/* The AVR32 start code's interrupt stubs call this; nothing here enables interrupts. */
+void irq_handler(unsigned level);
+void irq_handler(unsigned level) { (void)level; }
 #endif
 
 /* An exception is a failed run: report it and stop. */

@@ -22,14 +22,15 @@
 # with the interpreter and with the JIT.
 #
 # Builds go to DIR (default build/firmware-bench), DIR-kN per kernel, DIR-check.
-# Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr.
+# Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b
+# (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS).
 # Exits non-zero if any guest's console differs from the host build's.
 set -eu
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 runs=5 mode=--jit rounds= only= per_kernel=0 times=0 check=0 run=$here/build/uam-run
 base=$here/build/firmware-bench
-variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr"
+variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b"
 while [ $# -gt 0 ]; do
     case $1 in
     --runs) runs=$2; shift 2;;
@@ -67,8 +68,14 @@ run_all() {
         ppc)      board=ppc-ref    img=bench-ppc.elf;;
         x86)      board=x86_64-ref img=bench-x86.bin extra="--raw-base 0 --entry 0";;
         avr)      board=avr-ref    img=bench-avr.elf extra="--ram 0xFE00";;
+        avr32a)   board=avr32-ref  img=bench-avr32a.elf extra="-o model=a";;
+        avr32b)   board=avr32-ref  img=bench-avr32b.elf extra="-o model=b";;
         *) echo "xbench.sh: unknown variant $v" >&2; exit 2;;
         esac
+        if [ ! -f "$out/$img" ]; then
+            echo "xbench.sh: $v skipped (no $img: its toolchain was not found)" >&2
+            continue
+        fi
         # shellcheck disable=SC2086
         row=$("$here/tools/jitbench.sh" --runs "$runs" --label "$v$([ -n "$mode" ] || echo /interp)" -- \
               "$run" -b "$board" $extra $mode --stats "$out/$img")

@@ -533,6 +533,26 @@ The AVR needed no new IR either; these are conventions of its lifter (`isa/avr8`
 - **Skips** (CPSE, SBRC/SBRS, SBIC/SBIS) end the block with a guarded `EXIT` past the next
   instruction, whose length (one or two words) the lifter reads.
 
+## 10e. Two microarchitectures, one descriptor (AVR32)
+
+AVR32 needed no new IR; these are conventions of its lifter (`isa/avr32`).
+
+- **One descriptor, the model decides.** AVR32A and AVR32B share the instruction set; the CPU
+  model (`uam_avr32_configure`) says which a hart is, and with it how events save state, the
+  memory map, and whether SIMD exists. `cpu->priv` is 0 in application mode and 1 in the
+  privileged modes, so a privileged instruction in application mode lifts to its exception.
+- **Flags as bytes.** C, Z, N, V, Q, L and T are a byte each in the register file; the rest of
+  SR (mode, masks, debug) is in the ISA's state, so a mode change goes through a system
+  register write or a helper and requests an exit.
+- **The PC is not a register.** R15 reads fold to the instruction's address; writes to it are
+  computed `EXIT`s.
+- **Interrupts from outside.** The handler of an interrupt is EVBA plus an autovector that the
+  board's interrupt controller supplies when the CPU takes it (`uam_avr32_set_autovector`);
+  COUNT==COMPARE is an output line of the CPU that the board routes back in, as on the
+  hardware. COUNT counts scheduler ticks.
+- **Translation without side effects.** AVR32B's TLB lookup is `isa->translate`; a miss or a
+  protection fault becomes the event, and the TLB entries' Accessed bits are set by tlbw only.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |

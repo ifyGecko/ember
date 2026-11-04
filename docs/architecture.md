@@ -1,14 +1,15 @@
 # UAM Firmware Emulator — Architecture
 
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
-MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family), the
+MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
+and AVR32B), the
 snapshot part of phase 3 and the JIT from
 phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), 8-bit AVR
-(`avr-ref`), host
+(`avr-ref`), AVR32 (`avr32-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -47,7 +48,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -125,7 +126,7 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
                   mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
                   i8237.h ide.h fdc.h vga.h lpt.h
-include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h
+include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
@@ -142,6 +143,7 @@ isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32)
                   arm.h (private)
 isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_booke.c ppc_system.c ppc.h (private)
 isa/avr8/         avr_lift.c avr_system.c avr_des.c avr.h (private)
+isa/avr32/        avr32_dec.c avr32_op.h avr32_lift.c avr32_dsp.c avr32_system.c avr32.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
@@ -185,6 +187,7 @@ tests/firmware-arm/   start.S selftest.c fuzztarget.c link.ld  (ARMv7: ARM and T
 tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (32-bit PowerPC)
 tests/firmware-avr/   selftest.c gen_vectors.py fuzztarget.c  (8-bit AVR, one build per core
                       family, with avr-libc's start-up code)
+tests/firmware-avr32/ start.S selftest.c fuzztarget.c link-a.ld link-b.ld  (AVR32A and AVR32B)
                       start-booke.S link-booke.ld  (the self-test for the Book E model)
 tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bios-check.py
                       (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
@@ -237,7 +240,9 @@ devices.
   configuration, boot flash or a BIOS ROM; no chipset, storage or display), and `avr-ref`
   (8-bit AVR, `-o model=` one of the five core families with the memory layout of a common part
   of it: program memory, SRAM, 32 general-purpose I/O registers, a NS16550A UART, the
-  general-purpose timer and a test finisher). Real devices are
+  general-purpose timer and a test finisher), and `avr32-ref` (AVR32A or, with `-o model=b`,
+  AVR32B: RAM, code memory at the reset address, an AVR32-style interrupt controller fed by
+  COUNT/COMPARE and the UART, a NS16550A UART and a test finisher). Real devices are
   built out of tree on the library (`examples/external-board/`). Ember's own tests also use
   generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
   virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
@@ -322,6 +327,25 @@ devices.
   a message. Not modelled: the instruction an AVRe core runs after RETI before the next
   interrupt (after SEI it does run one), configuration change protection, the watchdog,
   fuses, and instruction timing.
+- **AVR32** (`isa/avr32`, `uam/isa/avr32.h`): one big-endian descriptor for both
+  microarchitectures of the AVR32 Architecture Manual, the CPU model (`uam_avr32_configure`)
+  choosing which, the MPU regions or TLB sizes, the INT3 shadow registers and SIMD. The whole
+  instruction set is lifted, 16- and 32-bit forms (a decoder generated from the opcode
+  table, checked against the AVR32 binutils' disassembler), DSP and saturating arithmetic
+  with Q through helpers, and on AVR32B the SIMD instructions. The system side: SR and the
+  eight execution modes with their SP banking; events and interrupts as the manual has them
+  for each class (AVR32A: SR and PC, and for interrupts R8-R12 and LR, on the system stack;
+  AVR32B: RSR/RAR per context and the INT3 shadow), handlers at EVBA plus an offset, for
+  interrupts the autovector the board's interrupt controller answers
+  (`uam_avr32_set_autovector`); scall/rets/rete/retd, the breakpoint into debug mode, the
+  system registers, CONFIG0/1, COUNT/COMPARE, whose request is an output line of the CPU
+  (`uam_avr32_compare_line`) that the board routes to its interrupt controller; the AVR32A
+  MPU (regions, subregions, access permissions) and the AVR32B segments P0-P4 with an ITLB
+  and a DTLB (tlbr/tlbw/tlbs) through `isa->translate`. The interrupt controller
+  (`uam/dev/avr32_intc.h`) is a generic one: groups of request lines with a level and an
+  autovector each. Not modelled: caches (`cache` does nothing), the Java and secure states
+  (their instructions raise the events), coprocessors (coprocessor-absent), the on-chip debug
+  registers; TLB Accessed bits are set by tlbw, not by translation (which has no side effects).
 
 ## 6. Analysis and fuzzing
 
@@ -487,7 +511,10 @@ Implemented (`make test`):
   the ALU instructions define against vectors from the manual's equations, the multiplies,
   every pointer addressing mode, LPM/ELPM, skips over two-word instructions, the core's
   registers through the data space, the timer interrupt with SLEEP, XCH/LAS/LAC/LAT and DES
-  against the FIPS 46 example on AVRxm); and a multiprocessor self-test on four processors of each
+  against the FIPS 46 example on AVRxm); the AVR32 self-test on AVR32A and AVR32B (the ALU and
+  wide arithmetic, every load/store form, bit operations, multiply/divide, atomics, conditional
+  execution, DSP, SIMD on B, breakpoint, scall, user mode, exceptions, CONFIG, the COMPARE
+  interrupt and priorities, the MPU or MMU), built when an AVR32 toolchain is found; and a multiprocessor self-test on four processors of each
   architecture (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
   `tests/firmware-x86/legacy.asm` (task switches, gates, the I/O bitmap, virtual-8086 mode,
   A20, MMX) and `biosrom.asm`, a BIOS-style ROM from the reset vector through VGA, floppy (DMA),
@@ -531,7 +558,7 @@ Implemented (`make test`):
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
   the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and
-  ARMv7 (ARM and Thumb-2), 32-bit PowerPC and 8-bit AVR
+  ARMv7 (ARM and Thumb-2), 32-bit PowerPC, 8-bit AVR and AVR32
   under the interpreter and the JIT with and without chaining, block mode, rejected sites,
   coverage off, and the exception observer on an illegal instruction on each ISA that has
   exceptions.
@@ -556,9 +583,10 @@ Implemented (`make test`):
   routes, resets, the frontend protocol, abort, and the replay frontend.
   `tests/fuzz/fuzz-check.sh` does the same through `uam-run --fuzz-replay` on C firmware
   (`fuzztarget.h`) on every stock board (Thumb-2 code on `arm-ref`), including replaying a
-  crash file on its own. AVR is not in `test_fuzz` (its targets and its exception-policy and
-  interrupt checks assume an ISA with exceptions); `fuzz-check.sh` covers it, without the
-  exception-policy step (`FUZZ_CHECK_NO_TRAPS`).
+  crash file on its own. Neither AVR is in `test_fuzz`: 8-bit AVR has no exceptions for its
+  exception-policy and interrupt checks, and AVR32 has no hand-assembled target there yet.
+  `fuzz-check.sh` covers both (8-bit AVR without the exception-policy step,
+  `FUZZ_CHECK_NO_TRAPS`; AVR32A with an AVR32 toolchain).
 - suzzer formats: `test_suzzer` reproduces every conformance vector of the configured suzzer (N=1..4 and 8,
   rotation off and on) byte for byte through `UAM_OP_COV` on every backend, checks the map-size rule against suzzer's table, and
   covers the LCV3/LCVB1 readers (every rejection of suzzer's reader checklist), base
@@ -573,7 +601,8 @@ Implemented (`make test`):
   the suzzer tests are skipped.
 - The external-board example is built and run against the library.
 - Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
-  board (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR) and natively, and
+  board (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, and AVR32A and
+  AVR32B with an AVR32 toolchain) and natively, and
   requires each guest's checksums, under the interpreter and the JIT, to equal the host
   build's (docs/jit-perf.md, "Parity across ISAs").
 - `test_jitdiff` checks the JIT against the interpreter block by block: every pure op at
