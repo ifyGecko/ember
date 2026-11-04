@@ -3,9 +3,14 @@
  *
  * Covers the integer user ISA (SPECIAL, SPECIAL2, SPECIAL3, REGIMM, immediate
  * and memory forms, including the unaligned LWL/LWR/SWL/SWR group) plus the
- * CP0 control instructions (MFC0/MTC0, EI/DI, ERET, WAIT, TLBR/TLBWI/TLBWR/TLBP).
- * FPU (COP1) and COP2/COP3 are reported as coprocessor-unusable exceptions,
- * with the coprocessor number as tval (it becomes Cause.CE).
+ * CP0 control instructions (MFC0/MTC0, EI/DI, ERET, WAIT, TLBR/TLBWI/TLBWR/TLBP,
+ * RDPGPR/WRPGPR), JALX into a compressed ISA, and the MCU ASE's IRET, ASET and
+ * ACLR. The FPU (mips_fpu.c) and the DSP ASE (mips_dsp.c) are lifted when the
+ * processor has them; otherwise COP1 is a coprocessor-unusable exception and
+ * COP2/COP3 always are, with the coprocessor number as tval (it becomes
+ * Cause.CE). Blocks whose pc has bit 0 set run MIPS16e (mips16.c) or microMIPS
+ * (mips_umips.c); those decoders recode most of their instructions as MIPS32
+ * words and lift them here (mips_lift32), with the next pc taken from ml.npc.
  *
  * Branch delay slots are handled structurally (docs/uam-isa.md, UAM_IMARK_CONT):
  * a branch computes its condition and target into temporaries, then the delay
@@ -18,8 +23,6 @@
  */
 #include "mips.h"
 
-#define NONE UAM_REF_NONE
-
 /* Instruction fields. */
 #define OP(i)     ((i) >> 26)
 #define RS(i)     (((i) >> 21) & 0x1F)
@@ -29,16 +32,6 @@
 #define FUNCT(i)  ((i) & 0x3F)
 #define IMM(i)    ((i) & 0xFFFF)
 #define SIMM(i)   ((uint32_t)(int32_t)(int16_t)(i))
-
-typedef enum { LIFT_SEQ, LIFT_DONE } lift_result;
-
-typedef struct ml {
-    uam_lift_ctx *lc;
-    uam_builder  *b;
-    uint32_t      pc;
-    unsigned      endian; /* UAM_ACC_LE / UAM_ACC_BE for data accesses */
-    uint32_t      raw;
-} ml;
 
 /* ---- operand helpers --------------------------------------------------- */
 
@@ -56,6 +49,29 @@ static uam_ref boolv(ml *L, uam_ref c) { return uam_unop(L->b, UAM_OP_ZEXT, 32, 
 static void trap(ml *L, uam_ref guard, uint32_t exccode, uam_ref tval)
 {
     uam_trap(L->b, guard, UAM_TRAP_EXCEPTION, imm(L, exccode), tval);
+}
+
+/* Exported for the other decoders. */
+uam_ref mips_imm(ml *L, uint32_t v) { return imm(L, v); }
+uam_ref mips_reg_r(ml *L, unsigned r) { return reg_r(L, r); }
+void    mips_reg_w(ml *L, unsigned r, uam_ref v) { reg_w(L, r, v); }
+uam_ref mips_bin(ml *L, uam_opcode op, uam_ref a, uam_ref b) { return bin(L, op, a, b); }
+void    mips_trap(ml *L, uam_ref guard, uint32_t exccode, uam_ref tval) { trap(L, guard, exccode, tval); }
+void    mips_ri(ml *L) { trap(L, NONE, EXC_RI, imm(L, L->raw)); }
+
+uam_ref mips_helper(ml *L, unsigned id, uam_ref a, uam_ref b, uam_ref c)
+{
+    return uam_helper(L->b, &L->lc->cpu->isa->helpers, id, a, b, c, NONE);
+}
+
+/* DSP ASE instructions need Status.MX; without it they raise DSP Disabled. True
+ * if the instruction may proceed (else the trap has been emitted). */
+static bool dsp_enabled(ml *L)
+{
+    if (L->priv & MIPS_PRIV_MX)
+        return true;
+    trap(L, NONE, EXC_DSPDIS, imm(L, 0));
+    return false;
 }
 
 /* ---- memory ------------------------------------------------------------ */
@@ -198,21 +214,22 @@ static void shift_var(ml *L, uint32_t i, uam_opcode op, bool rotate)
     reg_w(L, RD(i), rotate ? bin(L, UAM_OP_ROTR, v, amt) : bin(L, op, v, amt));
 }
 
-/* {HI,LO} = a*b (signed or unsigned), full 64-bit. */
-static void mul_full(ml *L, uam_ref a, uam_ref b, bool sign)
+/* {HI,LO} of accumulator ac (0 unless the DSP ASE is present) = a*b (signed or
+ * unsigned), full 64-bit. */
+static void mul_full(ml *L, unsigned ac, uam_ref a, uam_ref b, bool sign)
 {
     uam_ref lo = bin(L, UAM_OP_MUL, a, b);
     uam_ref hi = bin(L, sign ? UAM_OP_MULHS : UAM_OP_MULHU, a, b);
-    uam_put(L->b, 32, MIPS_LO_OFF, lo, NONE);
-    uam_put(L->b, 32, MIPS_HI_OFF, hi, NONE);
+    uam_put(L->b, 32, MIPS_ACLO_OFF(ac), lo, NONE);
+    uam_put(L->b, 32, MIPS_ACHI_OFF(ac), hi, NONE);
 }
 
 /* {HI,LO} = {HI,LO} +/- a*b. */
-static void mul_acc(ml *L, uam_ref a, uam_ref b, bool sign, bool sub)
+static void mul_acc(ml *L, unsigned ac, uam_ref a, uam_ref b, bool sign, bool sub)
 {
     uam_ref plo = bin(L, UAM_OP_MUL, a, b);
     uam_ref phi = bin(L, sign ? UAM_OP_MULHS : UAM_OP_MULHU, a, b);
-    uam_ref lo = uam_get(L->b, 32, MIPS_LO_OFF), hi = uam_get(L->b, 32, MIPS_HI_OFF);
+    uam_ref lo = uam_get(L->b, 32, MIPS_ACLO_OFF(ac)), hi = uam_get(L->b, 32, MIPS_ACHI_OFF(ac));
     uam_ref nlo, carry, nhi;
     if (sub) {
         nlo = bin(L, UAM_OP_SUB, lo, plo);
@@ -223,8 +240,19 @@ static void mul_acc(ml *L, uam_ref a, uam_ref b, bool sign, bool sub)
         carry = bin(L, UAM_OP_CARRY, lo, plo);
         nhi = bin(L, UAM_OP_ADD, bin(L, UAM_OP_ADD, hi, phi), boolv(L, carry));
     }
-    uam_put(L->b, 32, MIPS_LO_OFF, nlo, NONE);
-    uam_put(L->b, 32, MIPS_HI_OFF, nhi, NONE);
+    uam_put(L->b, 32, MIPS_ACLO_OFF(ac), nlo, NONE);
+    uam_put(L->b, 32, MIPS_ACHI_OFF(ac), nhi, NONE);
+}
+
+/* The accumulator a DSP ASE form names (field at bit `shift`), or 0 without the
+ * ASE (the bits are then ignored, as before). ~0u if the DSP is disabled (the trap
+ * has been emitted). */
+static unsigned acc_field(ml *L, uint32_t i, unsigned shift)
+{
+    unsigned ac = mips_has_dsp(L->s) ? (i >> shift) & 3u : 0;
+    if (ac && !dsp_enabled(L))
+        return ~0u;
+    return ac;
 }
 
 static void div_op(ml *L, uint32_t i, bool sign)
@@ -274,15 +302,18 @@ static void lift_bshfl(ml *L, uint32_t i)
 
 /* ---- control transfers ------------------------------------------------- */
 
-static bool is_control(uint32_t i)
+static bool is_control(const mips_state *s, uint32_t i)
 {
     switch (OP(i)) {
     case 0:  return FUNCT(i) == 0x08 || FUNCT(i) == 0x09;         /* JR, JALR */
-    case 1:  return RT(i) <= 3 || (RT(i) >= 16 && RT(i) <= 19);   /* REGIMM branches */
+    case 1:  return RT(i) <= 3 || (RT(i) >= 16 && RT(i) <= 19)    /* REGIMM branches */
+                    || (RT(i) == 0x1C && mips_has_dsp(s));        /* BPOSGE32 */
     case 2: case 3:                                               /* J, JAL */
     case 4: case 5: case 6: case 7:                               /* BEQ BNE BLEZ BGTZ */
     case 20: case 21: case 22: case 23:                           /* *L (likely) */
         return true;
+    case 0x1D: return mips_compressed(s);                         /* JALX */
+    case 0x11: return RS(i) == 8 && mips_has_fpu(s);              /* BC1F/BC1T (+likely) */
     default: return false;
     }
 }
@@ -290,9 +321,9 @@ static bool is_control(uint32_t i)
 static lift_result lift_insn(ml *L, uint32_t i);
 
 /* True if `i` is a legal, non-control instruction usable in a delay slot. */
-static bool is_simple_delay(uint32_t i)
+static bool is_simple_delay(const mips_state *s, uint32_t i)
 {
-    if (is_control(i))
+    if (is_control(s, i))
         return false;
     if (OP(i) == 0 && (FUNCT(i) == 0x0C || FUNCT(i) == 0x0D))
         return false; /* SYSCALL, BREAK terminate the block */
@@ -320,13 +351,15 @@ static lift_result finish_branch(ml *L, uam_ref cond, uam_ref target, bool likel
     uam_imark_cont(L->b, dpc, 4);
     if (st != UAM_OK)
         trap(L, NONE, MIPS_TRAP_SLOT_FETCH, imm(L, dpc)); /* precise cause decided at delivery */
-    else if (!is_simple_delay((uint32_t)raw))
+    else if (!is_simple_delay(L->s, (uint32_t)raw))
         trap(L, NONE, EXC_RI, imm(L, (uint32_t)raw));
     else {
         ml slot = *L;
         slot.pc = dpc;
+        slot.npc = dpc + 4;
         slot.raw = (uint32_t)raw;
-        lift_insn(&slot, (uint32_t)raw); /* guaranteed simple -> LIFT_SEQ */
+        if (lift_insn(&slot, (uint32_t)raw) == LIFT_DONE)
+            return LIFT_DONE;                                     /* the slot always traps */
         if (likely && !uam_ref_is_none(cond))
             uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);          /* taken */
         else if (uam_ref_is_none(cond))
@@ -337,6 +370,21 @@ static lift_result finish_branch(ml *L, uam_ref cond, uam_ref target, bool likel
         }
     }
     return LIFT_DONE;
+}
+
+/* The condition of BPOSGE32: DSPControl.pos >= 32. */
+static uam_ref pos_ge32(ml *L)
+{
+    uam_ref pos = bin(L, UAM_OP_AND, uam_get(L->b, 32, MIPS_DSPCTL_OFF), imm(L, 0x3F));
+    return bin(L, UAM_OP_ULE, imm(L, 32), pos);
+}
+
+/* The condition of BC1F/BC1T on condition code cc (FCSR bit 23, then 25..31). */
+uam_ref mips_fcc(ml *L, unsigned cc, bool tf)
+{
+    uam_ref f = uam_get(L->b, 32, MIPS_FCSR_OFF);
+    uam_ref bit = bin(L, UAM_OP_AND, f, imm(L, cc ? 1u << (24 + cc) : 1u << 23));
+    return bin(L, tf ? UAM_OP_NE : UAM_OP_EQ, bit, imm(L, 0));
 }
 
 static lift_result lift_control(ml *L, uint32_t i)
@@ -351,11 +399,28 @@ static lift_result lift_control(ml *L, uint32_t i)
         uint32_t tgt = ((L->pc + 4) & 0xF0000000u) | ((i & 0x03FFFFFFu) << 2);
         return finish_branch(L, NONE, imm(L, tgt), false);
     }
+    if (op == 0x1D) { /* JALX: to the compressed ISA */
+        reg_w(L, 31, imm(L, L->pc + 8));
+        uint32_t tgt = ((L->pc + 4) & 0xF0000000u) | ((i & 0x03FFFFFFu) << 2) | 1u;
+        return finish_branch(L, NONE, imm(L, tgt), false);
+    }
+    if (op == 0x11) { /* BC1F / BC1T / BC1FL / BC1TL */
+        if (!(L->priv & MIPS_PRIV_CU1)) {
+            trap(L, NONE, EXC_CPU, imm(L, 1));
+            return LIFT_DONE;
+        }
+        return finish_branch(L, mips_fcc(L, RT(i) >> 2, RT(i) & 1), imm(L, btgt), RT(i) & 2);
+    }
     if (op == 0) { /* JR / JALR */
         uam_ref t = rs_r(L, i);
         if (FUNCT(i) == 0x09)
             reg_w(L, RD(i) ? RD(i) : 31, imm(L, L->pc + 8));
         return finish_branch(L, NONE, t, false);
+    }
+    if (op == 1 && RT(i) == 0x1C) { /* BPOSGE32 */
+        if (!dsp_enabled(L))
+            return LIFT_DONE;
+        return finish_branch(L, pos_ge32(L), imm(L, btgt), false);
     }
     if (op == 1) { /* REGIMM: BLTZ/BGEZ (+AL, +likely) */
         bool ge = RT(i) & 1;
@@ -390,8 +455,16 @@ static lift_result lift_cop0(ml *L, uint32_t i)
     }
     if (rs == 4) { /* MTC0 rt, rd, sel */
         uam_syswr(L->b, 32, CP0(RD(i), i & 7), rt_r(L, i), NONE);
-        uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP); /* may change interrupt state */
+        uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP); /* may change interrupt state */
         return LIFT_DONE;
+    }
+    if (rs == 0x0A) { /* RDPGPR rd, rt: rd = rt of the previous shadow set */
+        reg_w(L, RD(i), mips_helper(L, MIPS_HELPER_RDPGPR, imm(L, RT(i)), NONE, NONE));
+        return LIFT_SEQ;
+    }
+    if (rs == 0x0E) { /* WRPGPR rd, rt: rd of the previous shadow set = rt */
+        mips_helper(L, MIPS_HELPER_WRPGPR, imm(L, RD(i)), rt_r(L, i), NONE);
+        return LIFT_SEQ;
     }
     if (rs == 0x0B && RD(i) == 12) { /* DI / EI (MFMC0) */
         bool ei = (i >> 5) & 1;
@@ -400,7 +473,7 @@ static lift_result lift_cop0(ml *L, uint32_t i)
                         : bin(L, UAM_OP_AND, old, imm(L, ~ST_IE));
         uam_syswr(L->b, 32, CP0_STATUS, nv, NONE);
         reg_w(L, RT(i), old);
-        uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP);
+        uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP);
         return LIFT_DONE;
     }
     if (i & (1u << 25)) { /* CO=1: ERET/WAIT/TLB */
@@ -411,22 +484,32 @@ static lift_result lift_cop0(ml *L, uint32_t i)
                      uam_helper(L->b, &L->lc->cpu->isa->helpers, MIPS_HELPER_ERET, NONE, NONE, NONE, NONE),
                      UAM_EXIT_EXC_RETURN);
             return LIFT_DONE;
+        case 0x38: /* IRET (MCU ASE) */
+            if (!mips_has_mcu(L->s))
+                break;
+            uam_exit(L->b, NONE, mips_helper(L, MIPS_HELPER_IRET, NONE, NONE, NONE),
+                     UAM_EXIT_EXC_RETURN);
+            return LIFT_DONE;
         case 0x20: /* WAIT */
-            uam_wait(L->b, imm(L, L->pc + 4));
+            uam_wait(L->b, imm(L, L->npc));
             return LIFT_DONE;
         case 0x01: /* TLBR */
         case 0x08: /* TLBP */
+            if (CFG0_MT(L->s->cfg.config0) != 1)
+                break; /* no TLB */
             uam_helper(L->b, &L->lc->cpu->isa->helpers,
                        FUNCT(i) == 0x01 ? MIPS_HELPER_TLBR : MIPS_HELPER_TLBP,
                        NONE, NONE, NONE, NONE);
             return LIFT_SEQ;
         case 0x02: /* TLBWI */
         case 0x06: /* TLBWR */
+            if (CFG0_MT(L->s->cfg.config0) != 1)
+                break; /* no TLB */
             /* A mapping changed: end the block so the next fetch translates afresh. */
             uam_helper(L->b, &L->lc->cpu->isa->helpers,
                        FUNCT(i) == 0x02 ? MIPS_HELPER_TLBWI : MIPS_HELPER_TLBWR,
                        NONE, NONE, NONE, NONE);
-            uam_exit(L->b, NONE, imm(L, L->pc + 4), UAM_EXIT_JUMP);
+            uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP);
             return LIFT_DONE;
         default:
             break;
@@ -435,9 +518,6 @@ static lift_result lift_cop0(ml *L, uint32_t i)
     trap(L, NONE, EXC_RI, imm(L, L->raw));
     return LIFT_DONE;
 }
-
-/* ERET is the only MIPS helper; it is registered at index 0. The uam_helper()
- * call above passes id 0 implicitly via the table lookup below. */
 
 static lift_result lift_special(ml *L, uint32_t i)
 {
@@ -461,12 +541,27 @@ static lift_result lift_special(ml *L, uint32_t i)
     case 0x0C: trap(L, NONE, EXC_SYS, imm(L, 0)); return LIFT_DONE;      /* SYSCALL */
     case 0x0D: trap(L, NONE, EXC_BP, imm(L, 0)); return LIFT_DONE;       /* BREAK */
     case 0x0F: uam_fence(L->b, UAM_FENCE_FULL); return LIFT_SEQ;         /* SYNC */
-    case 0x10: reg_w(L, RD(i), uam_get(L->b, 32, MIPS_HI_OFF)); return LIFT_SEQ; /* MFHI */
-    case 0x11: uam_put(L->b, 32, MIPS_HI_OFF, rs_r(L, i), NONE); return LIFT_SEQ; /* MTHI */
-    case 0x12: reg_w(L, RD(i), uam_get(L->b, 32, MIPS_LO_OFF)); return LIFT_SEQ; /* MFLO */
-    case 0x13: uam_put(L->b, 32, MIPS_LO_OFF, rs_r(L, i), NONE); return LIFT_SEQ; /* MTLO */
-    case 0x18: mul_full(L, rs_r(L, i), rt_r(L, i), true); return LIFT_SEQ;  /* MULT */
-    case 0x19: mul_full(L, rs_r(L, i), rt_r(L, i), false); return LIFT_SEQ; /* MULTU */
+    case 0x10: case 0x12: { /* MFHI / MFLO rd(, ac) */
+        unsigned ac = acc_field(L, i, 21);
+        if (ac == ~0u)
+            return LIFT_DONE;
+        reg_w(L, RD(i), uam_get(L->b, 32, FUNCT(i) == 0x10 ? MIPS_ACHI_OFF(ac) : MIPS_ACLO_OFF(ac)));
+        return LIFT_SEQ;
+    }
+    case 0x11: case 0x13: { /* MTHI / MTLO rs(, ac) */
+        unsigned ac = acc_field(L, i, 11);
+        if (ac == ~0u)
+            return LIFT_DONE;
+        uam_put(L->b, 32, FUNCT(i) == 0x11 ? MIPS_ACHI_OFF(ac) : MIPS_ACLO_OFF(ac), rs_r(L, i), NONE);
+        return LIFT_SEQ;
+    }
+    case 0x18: case 0x19: { /* MULT / MULTU (ac,) rs, rt */
+        unsigned ac = acc_field(L, i, 11);
+        if (ac == ~0u)
+            return LIFT_DONE;
+        mul_full(L, ac, rs_r(L, i), rt_r(L, i), FUNCT(i) == 0x18);
+        return LIFT_SEQ;
+    }
     case 0x1A: div_op(L, i, true); return LIFT_SEQ;                     /* DIV */
     case 0x1B: div_op(L, i, false); return LIFT_SEQ;                    /* DIVU */
     case 0x20: alu_trapping(L, i, false); return LIFT_SEQ;              /* ADD */
@@ -501,11 +596,14 @@ static lift_result lift_special(ml *L, uint32_t i)
 static lift_result lift_special2(ml *L, uint32_t i)
 {
     switch (FUNCT(i)) {
-    case 0x00: mul_acc(L, rs_r(L, i), rt_r(L, i), true, false); return LIFT_SEQ;  /* MADD */
-    case 0x01: mul_acc(L, rs_r(L, i), rt_r(L, i), false, false); return LIFT_SEQ; /* MADDU */
+    case 0x00: case 0x01: case 0x04: case 0x05: { /* MADD MADDU MSUB MSUBU (ac,) rs, rt */
+        unsigned ac = acc_field(L, i, 11);
+        if (ac == ~0u)
+            return LIFT_DONE;
+        mul_acc(L, ac, rs_r(L, i), rt_r(L, i), !(FUNCT(i) & 1), FUNCT(i) & 4);
+        return LIFT_SEQ;
+    }
     case 0x02: reg_w(L, RD(i), bin(L, UAM_OP_MUL, rs_r(L, i), rt_r(L, i))); return LIFT_SEQ; /* MUL */
-    case 0x04: mul_acc(L, rs_r(L, i), rt_r(L, i), true, true); return LIFT_SEQ;   /* MSUB */
-    case 0x05: mul_acc(L, rs_r(L, i), rt_r(L, i), false, true); return LIFT_SEQ;  /* MSUBU */
     case 0x20: reg_w(L, RD(i), uam_unop(L->b, UAM_OP_CLZ, 32, rs_r(L, i))); return LIFT_SEQ; /* CLZ */
     case 0x21: reg_w(L, RD(i), uam_unop(L->b, UAM_OP_CLZ, 32, notv(L, rs_r(L, i)))); return LIFT_SEQ; /* CLO */
     default: trap(L, NONE, EXC_RI, imm(L, L->raw)); return LIFT_DONE;
@@ -526,9 +624,47 @@ static lift_result lift_special3(ml *L, uint32_t i)
             reg_w(L, RT(i), imm(L, hw == 1 ? 32 : hw == 3 ? 1 : 0)); /* SYNCI_Step / CCRes / 0 */
         return LIFT_SEQ;
     }
-    default: trap(L, NONE, EXC_RI, imm(L, L->raw)); return LIFT_DONE;
+    default:
+        if (mips_has_dsp(L->s))
+            return mips_lift_dsp(L, i);
+        trap(L, NONE, EXC_RI, imm(L, L->raw));
+        return LIFT_DONE;
     }
 }
+
+/* REGIMM instructions that do not branch: the immediate traps, and the MCU ASE's
+ * ASET/ACLR (atomic set/clear of one bit of a byte). */
+static lift_result lift_regimm(ml *L, uint32_t i)
+{
+    unsigned rt = RT(i);
+    if (rt >= 8 && rt <= 14 && rt != 13) { /* TGEI TGEIU TLTI TLTIU TEQI - TNEI */
+        uam_ref a = rs_r(L, i), b = imm(L, SIMM(i)), c;
+        switch (rt) {
+        case 8:  c = bin(L, UAM_OP_SLE, b, a); break;
+        case 9:  c = bin(L, UAM_OP_ULE, b, a); break;
+        case 10: c = bin(L, UAM_OP_SLT, a, b); break;
+        case 11: c = bin(L, UAM_OP_ULT, a, b); break;
+        case 12: c = bin(L, UAM_OP_EQ, a, b); break;
+        default: c = bin(L, UAM_OP_NE, a, b); break;
+        }
+        trap(L, c, EXC_TR, imm(L, 0));
+        return LIFT_SEQ;
+    }
+    if (rt == 7 && mips_has_mcu(L->s)) {
+        bool set = i & 0x8000u;
+        uint32_t bit = 1u << ((i >> 12) & 7);
+        uam_ref addr = bin(L, UAM_OP_ADD, rs_r(L, i), imm(L, (uint32_t)uam_sext(i & 0xFFF, 12)));
+        uam_ref v = uam_ld(L->b, 8, L->endian, addr, NONE);
+        v = set ? uam_binop(L->b, UAM_OP_OR, 8, v, imm(L, bit))
+                : uam_binop(L->b, UAM_OP_AND, 8, v, imm(L, ~bit & 0xFF));
+        uam_st(L->b, 8, L->endian, addr, v, NONE);
+        return LIFT_SEQ;
+    }
+    trap(L, NONE, EXC_RI, imm(L, L->raw));
+    return LIFT_DONE;
+}
+
+lift_result mips_lift32(ml *L, uint32_t i) { return lift_insn(L, i); }
 
 static lift_result lift_insn(ml *L, uint32_t i)
 {
@@ -537,6 +673,7 @@ static lift_result lift_insn(ml *L, uint32_t i)
     case 0x1C: return lift_special2(L, i);
     case 0x1F: return lift_special3(L, i);
     case 0x10: return lift_cop0(L, i);
+    case 0x01: return lift_regimm(L, i);
 
     case 0x08: addi_trapping(L, i); return LIFT_SEQ; /* ADDI */
     case 0x09: reg_w(L, RT(i), bin(L, UAM_OP_ADD, rs_r(L, i), imm(L, SIMM(i)))); return LIFT_SEQ; /* ADDIU */
@@ -574,6 +711,8 @@ static lift_result lift_insn(ml *L, uint32_t i)
 
     case 0x11: case 0x13:                       /* COP1, COP1X (FPU) */
     case 0x31: case 0x35: case 0x39: case 0x3D: /* LWC1/LDC1/SWC1/SDC1 */
+        if (mips_has_fpu(L->s))
+            return mips_lift_fpu(L, i);
         trap(L, NONE, EXC_CPU, imm(L, 1));      /* tval = coprocessor number (Cause.CE) */
         return LIFT_DONE;
     case 0x12:                                  /* COP2 */
@@ -589,8 +728,24 @@ static lift_result lift_insn(ml *L, uint32_t i)
 
 uam_status mips_lift(uam_lift_ctx *lc)
 {
-    ml L = { .lc = lc, .b = lc->b, .endian = mips_st(lc->cpu)->endian };
+    const mips_state *s = mips_st(lc->cpu);
     uint32_t pc = (uint32_t)lc->pc;
+    if (pc & 1) {
+        if (mips_has_m16(s))
+            return mips16_lift(lc);
+        if (mips_has_umips(s))
+            return mips_umips_lift(lc);
+        /* MIPS32 only: the fetch below fails (misaligned), an address error. */
+    }
+    ml L = { .lc = lc, .b = lc->b, .s = s, .endian = s->endian, .priv = lc->cpu->priv };
+
+    if (mips_compressed(s) && ((pc & 2) || !mips_has_mips32(s))) {
+        /* No MIPS32 instruction here: misaligned, or a microMIPS-only processor. */
+        uam_imark(lc->b, pc, 4);
+        uam_trap(lc->b, NONE, UAM_TRAP_EXCEPTION, uam_imm(lc->b, MIPS_TRAP_FETCH_ADDR),
+                 uam_imm(lc->b, pc));
+        return UAM_OK;
+    }
 
     for (uint32_t n = 0;; n++) {
         if (n >= lc->max_insns) {
@@ -612,7 +767,8 @@ uam_status mips_lift(uam_lift_ctx *lc)
          * block if only one slot of budget is left, or if the slot cannot be
          * fetched as part of this block (another page, or a fetch fault). A
          * block that starts at the branch reports a slot fault precisely. */
-        if (is_control(i) && n > 0) {
+        bool ctl = is_control(s, i);
+        if (ctl && n > 0) {
             uint64_t slot;
             if (n + 2 > lc->max_insns || lc->fetch(lc, pc + 4, 4, &slot) != UAM_OK) {
                 uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
@@ -622,8 +778,9 @@ uam_status mips_lift(uam_lift_ctx *lc)
 
         uam_imark(lc->b, pc, 4);
         L.pc = pc;
+        L.npc = pc + 4;
         L.raw = i;
-        lift_result r = is_control(i) ? lift_control(&L, i) : lift_insn(&L, i);
+        lift_result r = ctl ? lift_control(&L, i) : lift_insn(&L, i);
         if (r == LIFT_DONE)
             return UAM_OK;
         pc += 4;

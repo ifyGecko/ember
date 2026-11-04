@@ -18,6 +18,18 @@
  * uninitialised TLB an access to 0x0000-0x1fff hits entry 0 and raises a
  * TLB-invalid exception, while other mapped addresses raise a TLB refill.
  *
+ * With Config.MT = 3 (fixed mapping translation, no TLB) kuseg maps to
+ * physical va + 0x40000000 (unmapped while ERL=1), kseg0/kseg1 as above and
+ * kseg2/kseg3 to themselves.
+ *
+ * Interrupts run in one of three modes: compatibility (Cause.IP masked by
+ * Status.IM, one interrupt vector), vectored (Config3.VInt with IntCtl.VS != 0:
+ * one vector per IP line, the highest pending line wins) and external (Config3.VEIC:
+ * the controller's request, taken when its priority level exceeds Status.IPL,
+ * at the vector it names). With shadow register sets (SRSCtl.HSS > 0) an
+ * exception or interrupt taken with EXL = 0 and BEV = 0 switches to the set
+ * SRSCtl.ESS, SRSMap or the controller names, and ERET switches back.
+ *
  * The CPU identity (PRId, Config*, TLB size, writable Status bits) comes from
  * a uam_mips_config chosen by the board (default: uam_mips_ref).
  */
@@ -63,6 +75,48 @@ const uam_mips_config uam_mips_ref = {
     .tlb_entries = 16,
 };
 
+/* MIPS32r2 + MIPS16e, fixed mapping, no caches, one shadow set, EIC (PIC32MX class). */
+const uam_mips_config uam_mips_m16_ref = {
+    .name        = "mips32r2-mips16e-ref",
+    .prid        = 0x00FF0100u,
+    .config0     = (1u << 31) | (1u << 10) | (3u << 7) | 0x2u,     /* M, AR=1, MT=3 (FMT), K0 */
+    .config1     = (1u << 31) | CFG1_CA | (1u << 1),                /* M, CA (MIPS16e), EP */
+    .config2     = 1u << 31,
+    .config3     = CFG3_VINT | CFG3_VEIC,
+    .status_rw   = 0x1278FF17u,
+    .tlb_entries = 0,
+    .shadow_sets = 1,
+};
+
+/* microMIPS32 only, fixed mapping, MCU ASE, one shadow set, EIC (PIC32MM class). */
+const uam_mips_config uam_mips_umips_ref = {
+    .name        = "micromips32-ref",
+    .prid        = 0x00FF0200u,
+    .config0     = (1u << 31) | (1u << 10) | (3u << 7) | 0x2u,
+    .config1     = (1u << 31) | (1u << 1),
+    .config2     = 1u << 31,
+    .config3     = CFG3_VINT | CFG3_VEIC | (1u << CFG3_ISA_SHIFT) | CFG3_ISAONEXC | CFG3_MCU,
+    .status_rw   = 0x1278FF17u,
+    .tlb_entries = 0,
+    .shadow_sets = 1,
+};
+
+/* MIPS32r2 + microMIPS (MIPS32 at reset), 16-entry TLB, caches, the FPU with 64-bit
+ * registers, DSP ASE rev 2, MCU ASE, seven shadow sets, EIC (PIC32MZ EF class). */
+const uam_mips_config uam_mips_mz_ref = {
+    .name        = "mips32r2-mz-ref",
+    .prid        = 0x00FF0300u,
+    .config0     = (1u << 31) | (1u << 10) | (1u << 7) | 0x2u,
+    .config1     = (1u << 31) | (3u << 19) | (1u << 16) | (3u << 10) | (1u << 7) | (1u << 1) | CFG1_FP,
+    .config2     = 1u << 31,
+    .config3     = CFG3_VINT | CFG3_VEIC | CFG3_DSPP | CFG3_DSP2P | (2u << CFG3_ISA_SHIFT) | CFG3_MCU,
+    .status_rw   = 0x1278FF17u | ST_CU1 | ST_FR | ST_MX,
+    .tlb_entries = 16,
+    .shadow_sets = 7,
+    /* F64, L, W, D, S; processor id 0x01 */
+    .fir         = (1u << 22) | (1u << 21) | (1u << 20) | (1u << 17) | (1u << 16) | (0x01u << 8),
+};
+
 static bool is_mips(const uam_cpu *cpu)
 {
     return cpu->isa == &uam_isa_mips32be || cpu->isa == &uam_isa_mips32le;
@@ -72,7 +126,16 @@ uam_status uam_mips_configure(uam_cpu *cpu, const uam_mips_config *cfg)
 {
     if (!cpu || !cfg || !is_mips(cpu) || !cpu->isa_state)
         return UAM_ERR_INVALID;
-    if (cfg->tlb_entries < 1 || cfg->tlb_entries > MIPS_TLB_MAX)
+    bool tlb = CFG0_MT(cfg->config0) == 1;
+    if (tlb ? cfg->tlb_entries < 1 || cfg->tlb_entries > MIPS_TLB_MAX : cfg->tlb_entries != 0)
+        return UAM_ERR_INVALID;
+    if (CFG0_MT(cfg->config0) != 1 && CFG0_MT(cfg->config0) != 3)
+        return UAM_ERR_INVALID;     /* a TLB or fixed mapping */
+    if (cfg->shadow_sets >= MIPS_SRS_MAX)
+        return UAM_ERR_INVALID;
+    if ((cfg->config1 & CFG1_CA) && (cfg->config3 & CFG3_ISA_MASK))
+        return UAM_ERR_INVALID;     /* MIPS16e and microMIPS exclude each other */
+    if ((cfg->config3 & CFG3_DSP2P) && !(cfg->config3 & CFG3_DSPP))
         return UAM_ERR_INVALID;
     mips_st(cpu)->cfg = *cfg;
     return UAM_OK;
@@ -98,7 +161,11 @@ static unsigned effective_mode(const mips_state *s)
 static void mode_update(uam_cpu *cpu)
 {
     mips_state *s = mips_st(cpu);
-    cpu->priv = effective_mode(s);
+    unsigned p = effective_mode(s);
+    if (s->c.status & ST_CU1) p |= MIPS_PRIV_CU1;
+    if (s->c.status & ST_FR)  p |= MIPS_PRIV_FR;
+    if (s->c.status & ST_MX)  p |= MIPS_PRIV_MX;
+    cpu->priv = p;
     bool erl = s->c.status & ST_ERL;
     if (erl != s->erl_seen) {
         s->erl_seen = erl;
@@ -109,7 +176,7 @@ static void mode_update(uam_cpu *cpu)
 /* CP0 and privileged instructions are usable in kernel mode or with CU0. */
 static bool cp0_usable(uam_cpu *cpu)
 {
-    return cpu->priv == MIPS_KERNEL || (mips_st(cpu)->c.status & ST_CU0);
+    return MIPS_PRIV_MODE(cpu->priv) == MIPS_KERNEL || (mips_st(cpu)->c.status & ST_CU0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -126,7 +193,9 @@ uint32_t mips_count_now(uam_cpu *cpu)
 static void timer_fire(void *ctx)
 {
     uam_cpu *cpu = ctx;
-    mips_st(cpu)->c.timer_ip = true;
+    mips_state *s = mips_st(cpu);
+    s->c.timer_ip = true;
+    uam_signal_set(&s->timer_line, 1);
     uam_cpu_request_exit(cpu);
 }
 
@@ -156,11 +225,26 @@ static uint32_t cause_ip(const mips_state *s)
 
 static uint32_t cause_read(const mips_state *s)
 {
+    if (mips_has_eic(s)) {
+        /* IP7:2 are the controller's RIPL; TI shows the timer, which goes to it. */
+        uint32_t c = s->c.cause & ~(CAUSE_IP_MASK | CAUSE_TI);
+        c |= (s->c.cause & (0x3u << CAUSE_IP_SHIFT)) | ((s->eic.ripl & 0x3F) << CAUSE_RIPL_SHIFT);
+        return c | (s->c.timer_ip ? CAUSE_TI : 0);
+    }
     return (s->c.cause & ~CAUSE_IP_MASK) | (cause_ip(s) << CAUSE_IP_SHIFT);
+}
+
+/* Vectored interrupts are in effect: VInt, IntCtl.VS != 0, Cause.IV, BEV clear. */
+static bool vectored(const mips_state *s)
+{
+    return (s->cfg.config3 & CFG3_VINT) && (s->c.intctl & 0x3E0u) && (s->c.cause & CAUSE_IV)
+        && !(s->c.status & ST_BEV);
 }
 
 static bool int_pending(const mips_state *s)
 {
+    if (mips_has_eic(s))
+        return s->eic.ripl > ((s->c.status & ST_IPL_MASK) >> ST_IPL_SHIFT);
     uint32_t im = (s->c.status & ST_IM_MASK) >> ST_IM_SHIFT;
     return (cause_ip(s) & im) != 0;
 }
@@ -168,6 +252,26 @@ static bool int_pending(const mips_state *s)
 static bool ints_enabled(const mips_state *s)
 {
     return (s->c.status & ST_IE) && !(s->c.status & (ST_EXL | ST_ERL));
+}
+
+uam_signal *uam_mips_timer_line(uam_cpu *cpu)
+{
+    return cpu && is_mips(cpu) && cpu->isa_state ? &mips_st(cpu)->timer_line : NULL;
+}
+
+uam_signal *uam_mips_swint_line(uam_cpu *cpu, unsigned n)
+{
+    return cpu && is_mips(cpu) && cpu->isa_state && n < 2 ? &mips_st(cpu)->swint_line[n] : NULL;
+}
+
+void uam_mips_eic_input(void *ctx, unsigned ripl, unsigned vector, uint32_t offset,
+                        unsigned shadow_set)
+{
+    uam_cpu *cpu = ctx;
+    mips_state *s = mips_st(cpu);
+    s->eic = (mips_eic){ .ripl = ripl & 0x3F, .vector = vector, .offset = offset,
+                         .ss = shadow_set & 0xF };
+    uam_cpu_request_exit(cpu);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -224,10 +328,13 @@ static uam_status mips_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind ki
 {
     const mips_state *s = mips_st(cpu);
     uint32_t va = (uint32_t)vaddr;
-    unsigned mode = kind == UAM_XLATE_DEBUG ? MIPS_KERNEL : cpu->priv;
+    unsigned mode = kind == UAM_XLATE_DEBUG ? MIPS_KERNEL : MIPS_PRIV_MODE(cpu->priv);
+    bool fmt = CFG0_MT(s->cfg.config0) == 3;
 
     out->fixed = true;
-    if (kind == UAM_XLATE_FETCH && (va & 3)) {
+    /* Instructions are word-aligned, or halfword-aligned with a compressed ISA
+     * (whose blocks fetch at pc & ~1; the lifter checks MIPS32 alignment). */
+    if (kind == UAM_XLATE_FETCH && (va & (mips_compressed(s) ? 1u : 3u))) {
         out->fault = MIPS_XF_ADDR;
         return UAM_ERR_XLATE;
     }
@@ -239,6 +346,11 @@ static uam_status mips_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind ki
             out->fixed = false;
             return UAM_OK;
         }
+        if (fmt) {
+            out->paddr = (uint32_t)(va + 0x40000000u);
+            out->fixed = false;                   /* also changes with ERL */
+            return UAM_OK;
+        }
         return tlb_translate(s, va, kind, out);
     }
     if (va >= 0xC0000000u && va < 0xE0000000u) { /* sseg / kseg2 */
@@ -246,14 +358,23 @@ static uam_status mips_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind ki
             out->fault = MIPS_XF_ADDR;
             return UAM_ERR_XLATE;
         }
+        if (fmt) {
+            out->paddr = va;
+            return UAM_OK;
+        }
         return tlb_translate(s, va, kind, out);
     }
     if (mode != MIPS_KERNEL) {                    /* kseg0, kseg1, kseg3 */
         out->fault = MIPS_XF_ADDR;
         return UAM_ERR_XLATE;
     }
-    if (va >= 0xE0000000u)                        /* kseg3 */
+    if (va >= 0xE0000000u) {                      /* kseg3 */
+        if (fmt) {
+            out->paddr = va;
+            return UAM_OK;
+        }
         return tlb_translate(s, va, kind, out);
+    }
     out->paddr = va & 0x1FFFFFFFu;                /* kseg0 / kseg1 */
     return UAM_OK;
 }
@@ -264,6 +385,8 @@ static uint32_t tlb_random(uam_cpu *cpu)
 {
     const mips_state *s = mips_st(cpu);
     uint32_t n = s->cfg.tlb_entries, wired = s->c.wired < n ? s->c.wired : 0;
+    if (!n)
+        return 0;
     return n - 1 - (uint32_t)(cpu->icount % (n - wired));
 }
 
@@ -350,9 +473,14 @@ static uint64_t helper_tlbp(void *env, uint64_t a, uint64_t b, uint64_t c, uam_s
 
 enum vec { VEC_GENERAL, VEC_REFILL, VEC_INTERRUPT };
 
+static uint32_t exc_base(const mips_state *s)
+{
+    return (s->c.status & ST_BEV) ? 0xBFC00200u : (s->c.ebase & 0xFFFFF000u);
+}
+
 static uint32_t exc_vector(const mips_state *s, enum vec v)
 {
-    uint32_t base = (s->c.status & ST_BEV) ? 0xBFC00200u : (s->c.ebase & 0xFFFFF000u);
+    uint32_t base = exc_base(s);
     switch (v) {
     case VEC_REFILL:    return base + ((s->c.status & ST_EXL) ? 0x180 : 0x000);
     case VEC_INTERRUPT: return base + ((s->c.cause & CAUSE_IV) ? 0x200 : 0x180);
@@ -360,25 +488,53 @@ static uint32_t exc_vector(const mips_state *s, enum vec v)
     }
 }
 
-/*
- * The common entry sequence. EPC and Cause.BD are only written when EXL was
- * clear; an exception in a delay slot (cont) reports the branch in EPC.
- */
-static void enter_exception(uam_cpu *cpu, uint32_t exccode, uint32_t pc, bool cont,
-                            uint32_t parent_pc, enum vec v)
+/* The GPR set `css` becomes current: the register file holds the current set. */
+static void srs_switch(uam_cpu *cpu, unsigned css)
 {
     mips_state *s = mips_st(cpu);
-    uint32_t vector = exc_vector(s, v);  /* depends on the old EXL */
+    unsigned old = s->c.srsctl & 0xFu;
+    if (css == old)
+        return;
+    memcpy(s->c.srs[old], cpu->regfile, 32 * 4);
+    memcpy(cpu->regfile, s->c.srs[css], 32 * 4);
+    s->c.srsctl = (s->c.srsctl & ~0xFu) | css;
+}
+
+/*
+ * The common entry sequence. EPC and Cause.BD are only written when EXL was
+ * clear; an exception in a delay slot (cont) reports the branch in EPC. With
+ * shadow sets the set `ss` (SRSCtl.ESS for exceptions) becomes current, the
+ * old one recorded in PSS. Handlers run in microMIPS when Config3.ISAOnExc says so.
+ */
+static void enter_exception_at(uam_cpu *cpu, uint32_t exccode, uint32_t pc, bool cont,
+                               uint32_t parent_pc, uint32_t vector, unsigned ss)
+{
+    mips_state *s = mips_st(cpu);
     if (!(s->c.status & ST_EXL)) {
         s->c.epc = cont ? parent_pc : pc;
         s->c.cause = cont ? (s->c.cause | CAUSE_BD) : (s->c.cause & ~CAUSE_BD);
+        if (s->cfg.shadow_sets && !(s->c.status & ST_BEV)) {
+            unsigned css = s->c.srsctl & 0xFu;
+            s->c.srsctl = (s->c.srsctl & ~(0xFu << 6)) | (css << 6);
+            srs_switch(cpu, ss <= s->cfg.shadow_sets ? ss : 0);
+        }
     }
     s->c.cause = (s->c.cause & ~(CAUSE_EXC_MASK | CAUSE_CE_MASK))
                | ((exccode << CAUSE_EXC_SHIFT) & CAUSE_EXC_MASK);
     s->c.status |= ST_EXL;
     cpu->resv.valid = false;
-    cpu->pc = vector;
+    cpu->pc = vector | (mips_has_umips(s) && (s->c.config3 & CFG3_ISAONEXC) ? 1u : 0u);
     mode_update(cpu);
+}
+
+static unsigned srs_ess(const mips_state *s) { return (s->c.srsctl >> 12) & 0xFu; }
+
+static void enter_exception(uam_cpu *cpu, uint32_t exccode, uint32_t pc, bool cont,
+                            uint32_t parent_pc, enum vec v)
+{
+    mips_state *s = mips_st(cpu);
+    uint32_t vector = exc_vector(s, v);  /* depends on the old EXL */
+    enter_exception_at(cpu, exccode, pc, cont, parent_pc, vector, srs_ess(s));
 }
 
 /* BadVAddr, Context.BadVPN2 and EntryHi.VPN2 for TLB exceptions. */
@@ -426,6 +582,9 @@ static void mips_take_exception(uam_cpu *cpu, const uam_exception *e)
                 code = xlate_exception(s, xl.fault, false, va, &v);
             else
                 code = EXC_IBE;
+        } else if (code == MIPS_TRAP_FETCH_ADDR) {
+            code = EXC_ADEL;
+            s->c.badvaddr = va;
         } else if (code == EXC_CPU) {
             ce = va & 3;            /* tval carries the coprocessor number */
         }
@@ -438,8 +597,13 @@ static void mips_take_exception(uam_cpu *cpu, const uam_exception *e)
     case UAM_EXC_STORE_FAULT:      code = EXC_DBE; break;
     case UAM_EXC_LOAD_MISALIGNED:  code = EXC_ADEL; s->c.badvaddr = va; break;
     case UAM_EXC_STORE_MISALIGNED: code = EXC_ADES; s->c.badvaddr = va; break;
-    case UAM_EXC_SYSREG:           /* CP0 access or a privileged helper (ERET, */
-    case UAM_EXC_HELPER:           /* TLB ops) outside kernel mode without CU0 */
+    case UAM_EXC_HELPER: {
+        unsigned hf = s->hfault;
+        s->hfault = MIPS_HF_NONE;
+        code = hf == MIPS_HF_FPE ? EXC_FPE : hf == MIPS_HF_RI ? EXC_RI : EXC_CPU;
+        break;                     /* EXC_CPU: a privileged helper (ERET, TLB ops, */
+    }                              /* RDPGPR) outside kernel mode without CU0 */
+    case UAM_EXC_SYSREG:           /* CP0 access outside kernel mode without CU0 */
         code = EXC_CPU;
         break;
     default:
@@ -451,6 +615,17 @@ static void mips_take_exception(uam_cpu *cpu, const uam_exception *e)
     s->c.cause |= ce << CAUSE_CE_SHIFT;
 }
 
+/* The vector number and shadow set of the interrupt to take (vectored mode): the
+ * highest pending, unmasked IP line. */
+static unsigned vi_vector(const mips_state *s)
+{
+    uint32_t p = cause_ip(s) & ((s->c.status & ST_IM_MASK) >> ST_IM_SHIFT);
+    unsigned n = 7;
+    while (n && !(p & (1u << n)))
+        n--;
+    return n;
+}
+
 static bool mips_irq_take(uam_cpu *cpu)
 {
     mips_state *s = mips_st(cpu);
@@ -458,15 +633,33 @@ static bool mips_irq_take(uam_cpu *cpu)
         return false;
     /* Interrupts are only taken between blocks, never inside a branch/delay
      * slot pair (UAM_IMARK_CONT), so EPC is simply the next pc. */
-    enter_exception(cpu, EXC_INT, (uint32_t)cpu->pc, false, 0, VEC_INTERRUPT);
+    uint32_t pc = (uint32_t)cpu->pc;
+    uint32_t spacing = ((s->c.intctl >> 5) & 0x1Fu) * 32u;
+    bool iv = (s->c.cause & CAUSE_IV) && !(s->c.status & ST_BEV);
+    if (mips_has_eic(s)) {
+        uint32_t vector = !iv ? exc_vector(s, VEC_INTERRUPT)
+                        : s->eic.offset != UAM_MIPS_EIC_NO_OFFSET ? exc_base(s) + s->eic.offset
+                        : exc_base(s) + 0x200 + s->eic.vector * spacing;
+        enter_exception_at(cpu, EXC_INT, pc, false, 0, vector, s->eic.ss);
+    } else if (vectored(s)) {
+        unsigned vn = vi_vector(s);
+        enter_exception_at(cpu, EXC_INT, pc, false, 0, exc_base(s) + 0x200 + vn * spacing,
+                           (s->c.srsmap >> (4 * vn)) & 0xFu);
+    } else {
+        enter_exception(cpu, EXC_INT, pc, false, 0, VEC_INTERRUPT);
+    }
     return true;
 }
 
 /* MIPS has no fixed priority among interrupt lines (the handler reads Cause.IP): report
- * every pending, enabled line (IP0..IP7, bit i = line i; IP7 includes the CP0 timer). */
+ * every pending, enabled line (IP0..IP7, bit i = line i; IP7 includes the CP0 timer).
+ * With an external controller: bit `vector` (63 for higher vectors) of a request
+ * above Status.IPL. */
 static uint64_t mips_irq_lines(uam_cpu *cpu)
 {
     const mips_state *s = mips_st(cpu);
+    if (mips_has_eic(s))
+        return int_pending(s) ? UINT64_C(1) << (s->eic.vector < 63 ? s->eic.vector : 63) : 0;
     return cause_ip(s) & ((s->c.status & ST_IM_MASK) >> ST_IM_SHIFT);
 }
 
@@ -493,7 +686,39 @@ static void mips_irq_input(uam_cpu *cpu, unsigned line, int level)
 
 static uint32_t config1_value(const mips_state *s)
 {
-    return (s->cfg.config1 & ~(0x3Fu << 25)) | ((s->cfg.tlb_entries - 1) << 25);
+    uint32_t mmu = s->cfg.tlb_entries ? s->cfg.tlb_entries - 1 : 0;
+    return (s->cfg.config1 & ~(0x3Fu << 25)) | (mmu << 25);
+}
+
+static bool has_tlb(const mips_state *s) { return CFG0_MT(s->cfg.config0) == 1; }
+
+/* The CP0 registers of the TLB, absent with fixed mapping. */
+static bool tlb_reg(uint32_t id)
+{
+    switch (id) {
+    case CP0_INDEX: case CP0_RANDOM: case CP0_ENTRYLO0: case CP0_ENTRYLO1: case CP0_CONTEXT:
+    case CP0_PAGEMASK: case CP0_WIRED: case CP0_ENTRYHI:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t srsctl_read(const mips_state *s)
+{
+    uint32_t v = s->c.srsctl & ((0xFu << 12) | (0xFu << 6) | 0xFu);
+    v |= (uint32_t)s->cfg.shadow_sets << 26;
+    if (mips_has_eic(s))
+        v |= (s->eic.ss & 0xFu) << 18;
+    return v;
+}
+
+static uint32_t intctl_read(const mips_state *s)
+{
+    uint32_t v = s->c.intctl;
+    if ((s->cfg.config3 & (CFG3_VINT | CFG3_VEIC)) && !mips_has_eic(s))
+        v |= 7u << 29;      /* IPTI: the timer is on IP7 */
+    return v;
 }
 
 static uam_status mips_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
@@ -501,6 +726,10 @@ static uam_status mips_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     mips_state *s = mips_st(cpu);
     if (!cp0_usable(cpu))
         return UAM_ERR_ILLEGAL;
+    if (!has_tlb(s) && tlb_reg(id)) {
+        *val = 0;
+        return UAM_OK;
+    }
     switch (id) {
     case CP0_INDEX:    *val = s->c.index; break;
     case CP0_RANDOM:   *val = tlb_random(cpu); break;
@@ -520,13 +749,14 @@ static uam_status mips_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     case CP0_EBASE:    /* bit 31 reads 1; CPUNum (bits 9..0) is the processor number */
         *val = s->c.ebase | (1u << 31) | (cpu->hartid & 0x3FFu);
         break;
-    case CP0_INTCTL:   *val = s->c.intctl; break;
-    case CP0_SRSCTL:   *val = 0; break;
+    case CP0_INTCTL:   *val = intctl_read(s); break;
+    case CP0_SRSCTL:   *val = srsctl_read(s); break;
+    case CP0_SRSMAP:   *val = s->c.srsmap; break;
     case CP0_PRID:     *val = s->cfg.prid; break;
     case CP0_CONFIG:   *val = s->c.config; break;
     case CP0_CONFIG1:  *val = config1_value(s); break;
     case CP0_CONFIG2:  *val = s->cfg.config2; break;
-    case CP0_CONFIG3:  *val = s->cfg.config3; break;
+    case CP0_CONFIG3:  *val = s->c.config3; break;
     default:           *val = 0; break; /* unimplemented CP0 regs read as zero */
     }
     return UAM_OK;
@@ -539,6 +769,8 @@ static uam_status mips_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     uint32_t n = s->cfg.tlb_entries;
     if (!cp0_usable(cpu))
         return UAM_ERR_ILLEGAL;
+    if (!has_tlb(s) && tlb_reg(id))
+        return UAM_OK;
     switch (id) {
     case CP0_INDEX: {
         uint32_t m = 1;
@@ -568,6 +800,8 @@ static uam_status mips_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
         /* Only IV and software interrupt bits IP1:0 are writable. */
         s->c.cause = (s->c.cause & ~(CAUSE_IV | (0x3u << CAUSE_IP_SHIFT)))
                    | (v & (CAUSE_IV | (0x3u << CAUSE_IP_SHIFT)));
+        uam_signal_set(&s->swint_line[0], (s->c.cause >> CAUSE_IP_SHIFT) & 1);
+        uam_signal_set(&s->swint_line[1], (s->c.cause >> (CAUSE_IP_SHIFT + 1)) & 1);
         uam_cpu_request_exit(cpu); /* a software interrupt may now be pending */
         break;
     case CP0_EPC:      s->c.epc = v; break;
@@ -579,10 +813,26 @@ static uam_status mips_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
     case CP0_COMPARE:
         s->c.compare = v;
         s->c.timer_ip = false; /* writing Compare clears the timer interrupt */
+        uam_signal_set(&s->timer_line, 0);
         timer_update(cpu);
         break;
     case CP0_EBASE:    s->c.ebase = (s->c.ebase & 0xC00FF000u) | (v & 0x3FFFF000u); break;
     case CP0_INTCTL:   s->c.intctl = v & 0x000003E0u; break;
+    case CP0_SRSCTL:
+        if (s->cfg.shadow_sets) {
+            uint32_t ess = (v >> 12) & 0xFu, pss = (v >> 6) & 0xFu;
+            if (ess <= s->cfg.shadow_sets && pss <= s->cfg.shadow_sets)
+                s->c.srsctl = (s->c.srsctl & 0xFu) | (ess << 12) | (pss << 6);
+        }
+        break;
+    case CP0_SRSMAP:
+        if (s->cfg.shadow_sets && (s->cfg.config3 & CFG3_VINT))
+            s->c.srsmap = v;
+        break;
+    case CP0_CONFIG3:
+        if (mips_umips(s) >= 2)
+            s->c.config3 = (s->c.config3 & ~CFG3_ISAONEXC) | (v & CFG3_ISAONEXC);
+        break;
     case CP0_CONFIG:   s->c.config = (s->c.config & ~0x7u) | (v & 0x7u); break; /* K0 */
     default:
         break; /* read-only and unimplemented registers ignore writes */
@@ -610,27 +860,92 @@ static uint64_t helper_eret(void *env, uint64_t a, uint64_t b, uint64_t c, uam_s
     } else {
         s->c.status &= ~ST_EXL;
         pc = s->c.epc;
+        if (s->cfg.shadow_sets && !(s->c.status & ST_BEV))
+            srs_switch(cpu, (s->c.srsctl >> 6) & 0xFu);   /* back to the previous set */
     }
     cpu->resv.valid = false;
     mode_update(cpu);
-    return pc;
+    return pc;   /* bit 0 is the ISA mode to return to */
 }
 
-#define PRIV_HELPER(nm, f)                                                     \
-    { .name = nm, .n_args = 0, .result_width = 0,                              \
-      .effect = UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE | UAM_HELPER_MAY_FAULT, \
-      .fn = f }
+/* RDPGPR / WRPGPR: a register of the previous shadow set (SRSCtl.PSS). */
+static uint64_t helper_rdpgpr(void *env, uint64_t rt, uint64_t b, uint64_t c, uam_status *st)
+{
+    (void)b; (void)c;
+    uam_cpu *cpu = env;
+    const mips_state *s = mips_st(cpu);
+    if (!cp0_usable(cpu)) {
+        *st = UAM_ERR_ILLEGAL;
+        return 0;
+    }
+    unsigned pss = (s->c.srsctl >> 6) & 0xFu, r = (unsigned)rt & 31;
+    if (!r)
+        return 0;
+    return pss == (s->c.srsctl & 0xFu) ? uam_cpu_reg_read(cpu, MIPS_REG_OFF(r), 32)
+                                       : s->c.srs[pss][r];
+}
+
+static uint64_t helper_wrpgpr(void *env, uint64_t rd, uint64_t v, uint64_t c, uam_status *st)
+{
+    (void)c;
+    uam_cpu *cpu = env;
+    mips_state *s = mips_st(cpu);
+    if (!cp0_usable(cpu)) {
+        *st = UAM_ERR_ILLEGAL;
+        return 0;
+    }
+    unsigned pss = (s->c.srsctl >> 6) & 0xFu, r = (unsigned)rd & 31;
+    if (!r)
+        return 0;
+    if (pss == (s->c.srsctl & 0xFu))
+        uam_cpu_reg_write(cpu, MIPS_REG_OFF(r), 32, (uint32_t)v);
+    else
+        s->c.srs[pss][r] = (uint32_t)v;
+    return 0;
+}
+
+#define ALL_EFFECTS (UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE | UAM_HELPER_MAY_FAULT)
+
+#define PRIV_HELPER(nm, f) { .name = nm, .n_args = 0, .result_width = 0, .effect = ALL_EFFECTS, .fn = f }
 
 const uam_helper_desc mips_helpers[MIPS_HELPER__COUNT] = {
     [MIPS_HELPER_ERET] = {
         .name = "mips_eret", .n_args = 0, .result_width = 32,
-        .effect = UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE | UAM_HELPER_MAY_FAULT,
+        .effect = ALL_EFFECTS,
         .fn = helper_eret,
     },
     [MIPS_HELPER_TLBR]  = PRIV_HELPER("mips_tlbr", helper_tlbr),
     [MIPS_HELPER_TLBWI] = PRIV_HELPER("mips_tlbwi", helper_tlbwi),
     [MIPS_HELPER_TLBWR] = PRIV_HELPER("mips_tlbwr", helper_tlbwr),
     [MIPS_HELPER_TLBP]  = PRIV_HELPER("mips_tlbp", helper_tlbp),
+    [MIPS_HELPER_RDPGPR] = {
+        .name = "mips_rdpgpr", .n_args = 1, .arg_width = { 32 }, .result_width = 32,
+        .effect = UAM_HELPER_READS_STATE | UAM_HELPER_MAY_FAULT, .fn = helper_rdpgpr,
+    },
+    [MIPS_HELPER_WRPGPR] = {
+        .name = "mips_wrpgpr", .n_args = 2, .arg_width = { 32, 32 }, .result_width = 0,
+        .effect = ALL_EFFECTS, .fn = helper_wrpgpr,
+    },
+    [MIPS_HELPER_IRET] = {   /* without interrupt chaining or auto-prologue, IRET is ERET */
+        .name = "mips_iret", .n_args = 0, .result_width = 32,
+        .effect = ALL_EFFECTS, .fn = helper_eret,
+    },
+    [MIPS_HELPER_FPU] = {
+        .name = "mips_fpu", .n_args = 1, .arg_width = { 32 }, .result_width = 0,
+        .effect = ALL_EFFECTS, .fn = mips_fpu_op,
+    },
+    [MIPS_HELPER_CFC1] = {
+        .name = "mips_cfc1", .n_args = 1, .arg_width = { 32 }, .result_width = 32,
+        .effect = UAM_HELPER_READS_STATE, .fn = mips_cfc1,
+    },
+    [MIPS_HELPER_CTC1] = {
+        .name = "mips_ctc1", .n_args = 2, .arg_width = { 32, 32 }, .result_width = 0,
+        .effect = ALL_EFFECTS, .fn = mips_ctc1,
+    },
+    [MIPS_HELPER_DSP] = {
+        .name = "mips_dsp", .n_args = 1, .arg_width = { 32 }, .result_width = 0,
+        .effect = UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE, .fn = mips_dsp_op,
+    },
 };
 
 /* ------------------------------------------------------------------------ */
@@ -645,6 +960,9 @@ static uam_status mips_init(uam_cpu *cpu)
     cpu->isa_state = s;
     s->cfg = uam_mips_ref;
     uam_timer_init(&s->timer, timer_fire, cpu);
+    uam_signal_init(&s->timer_line);
+    uam_signal_init(&s->swint_line[0]);
+    uam_signal_init(&s->swint_line[1]);
     return UAM_OK;
 }
 
@@ -670,11 +988,20 @@ static void mips_reset(uam_cpu *cpu, uint64_t entry)
     s->c.status = ST_BEV | ST_ERL;
     s->c.ebase = 0x80000000u;
     s->c.config = (s->cfg.config0 & ~(1u << 15)) | ((s->endian & UAM_ACC_BE) ? (1u << 15) : 0);
+    s->c.config3 = s->cfg.config3;
     s->c.index = 0;
+    s->eic = (mips_eic){ .offset = UAM_MIPS_EIC_NO_OFFSET };
+    s->hfault = MIPS_HF_NONE;
+    uam_signal_set(&s->timer_line, 0);
+    uam_signal_set(&s->swint_line[0], 0);
+    uam_signal_set(&s->swint_line[1], 0);
     for (size_t i = 0; i < cpu->regfile_size; i++)
         cpu->regfile[i] = 0;
     s->erl_seen = !(s->c.status & ST_ERL); /* force mode_update to report the ERL state */
     mode_update(cpu);
+    /* A processor whose reset ISA is microMIPS (Config3.ISA 1 or 3) starts there. */
+    if (mips_umips(s) == 1 || mips_umips(s) == 3)
+        entry |= 1;
     cpu->pc = entry;
     cpu->waiting = false;
     cpu->resv.valid = false;
@@ -683,9 +1010,11 @@ static void mips_reset(uam_cpu *cpu, uint64_t entry)
 static void mips_dump_state(uam_cpu *cpu, FILE *out)
 {
     mips_state *s = mips_st(cpu);
-    fprintf(out, "pc=%08llx icount=%llu endian=%s mode=%s\n", (unsigned long long)cpu->pc,
+    unsigned mode = MIPS_PRIV_MODE(cpu->priv);
+    fprintf(out, "pc=%08llx icount=%llu endian=%s mode=%s%s\n", (unsigned long long)cpu->pc,
             (unsigned long long)cpu->icount, (s->endian & UAM_ACC_BE) ? "big" : "little",
-            cpu->priv == MIPS_KERNEL ? "kernel" : cpu->priv == MIPS_USER ? "user" : "supervisor");
+            mode == MIPS_KERNEL ? "kernel" : mode == MIPS_USER ? "user" : "supervisor",
+            !(cpu->pc & 1) ? "" : mips_has_m16(s) ? " isa=mips16e" : " isa=micromips");
     for (unsigned i = 0; i < 32; i++)
         fprintf(out, "%-3s=%08llx%s", mips_regs[i].name,
                 (unsigned long long)uam_cpu_reg_read(cpu, MIPS_REG_OFF(i), 32),
@@ -697,6 +1026,25 @@ static void mips_dump_state(uam_cpu *cpu, FILE *out)
             s->c.status, cause_read(s), s->c.epc, s->c.badvaddr, mips_count_now(cpu),
             s->c.compare);
     fprintf(out, "entryhi=%08x index=%08x wired=%u\n", s->c.entryhi, s->c.index, s->c.wired);
+    if (s->cfg.shadow_sets || mips_has_eic(s))
+        fprintf(out, "srsctl=%08x intctl=%08x ripl=%u vector=%u\n", srsctl_read(s),
+                intctl_read(s), s->eic.ripl, s->eic.vector);
+    if (mips_has_fpu(s)) {
+        fprintf(out, "fcsr=%08llx\n", (unsigned long long)uam_cpu_reg_read(cpu, MIPS_FCSR_OFF, 32));
+        for (unsigned i = 0; i < 32; i++)
+            fprintf(out, "f%-2u=%016llx%s", i,
+                    (unsigned long long)uam_cpu_reg_read(cpu, MIPS_FPR_OFF(i), 64),
+                    (i % 4 == 3) ? "\n" : "  ");
+    }
+    if (mips_has_dsp(s))
+        fprintf(out, "dspcontrol=%08llx ac1=%08llx:%08llx ac2=%08llx:%08llx ac3=%08llx:%08llx\n",
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_DSPCTL_OFF, 32),
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_ACHI_OFF(1), 32),
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_ACLO_OFF(1), 32),
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_ACHI_OFF(2), 32),
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_ACLO_OFF(2), 32),
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_ACHI_OFF(3), 32),
+                (unsigned long long)uam_cpu_reg_read(cpu, MIPS_ACLO_OFF(3), 32));
 }
 
 /* ------------------------------------------------------------------------ */
@@ -729,6 +1077,16 @@ static void mips_save(uam_cpu *cpu, uam_state_writer *w)
         uam_state_put_u32(w, e->lo[1]);
     }
     uam_state_put_timer(w, &s->timer);
+    uam_state_put_u32(w, c->srsctl);
+    uam_state_put_u32(w, c->srsmap);
+    uam_state_put_u32(w, c->config3);
+    for (unsigned k = 0; k <= s->cfg.shadow_sets; k++)
+        for (unsigned i = 0; i < 32; i++)
+            uam_state_put_u32(w, c->srs[k][i]);
+    uam_state_put_u32(w, s->eic.ripl);
+    uam_state_put_u32(w, s->eic.vector);
+    uam_state_put_u32(w, s->eic.offset);
+    uam_state_put_u32(w, s->eic.ss);
 }
 
 static void mips_restore(uam_cpu *cpu, uam_state_reader *r)
@@ -758,6 +1116,20 @@ static void mips_restore(uam_cpu *cpu, uam_state_reader *r)
         e->lo[1] = uam_state_get_u32(r);
     }
     uam_state_get_timer(r, &s->timer);
+    c->srsctl = uam_state_get_u32(r);
+    c->srsmap = uam_state_get_u32(r);
+    c->config3 = uam_state_get_u32(r);
+    for (unsigned k = 0; k <= s->cfg.shadow_sets; k++)
+        for (unsigned i = 0; i < 32; i++)
+            c->srs[k][i] = uam_state_get_u32(r);
+    s->eic.ripl = uam_state_get_u32(r);
+    s->eic.vector = uam_state_get_u32(r);
+    s->eic.offset = uam_state_get_u32(r);
+    s->eic.ss = uam_state_get_u32(r);
+    /* The outputs' levels follow the state; their sinks restore their own. */
+    s->timer_line.level = c->timer_ip;
+    s->swint_line[0].level = (c->cause >> CAUSE_IP_SHIFT) & 1;
+    s->swint_line[1].level = (c->cause >> (CAUSE_IP_SHIFT + 1)) & 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -815,7 +1187,14 @@ static bool mips_gdb_read(uam_cpu *cpu, unsigned n, uint64_t *v)
     else if (n == 35) *v = s->c.badvaddr;
     else if (n == 36) *v = cause_read(s);
     else if (n == 37) *v = (uint32_t)cpu->pc;
-    else if (n < GDB_MIPS_NREGS) *v = 0;   /* no FPU */
+    else if (n < GDB_MIPS_NREGS && !mips_has_fpu(s)) *v = 0;   /* no FPU */
+    else if (n < 70) {
+        unsigned f = n - 38;
+        *v = (cpu->priv & MIPS_PRIV_FR) ? uam_cpu_reg_read(cpu, MIPS_FPR_OFF(f), 32)
+                                        : uam_cpu_reg_read(cpu, MIPS_FPR_OFF(f & ~1u) + 4 * (f & 1), 32);
+    }
+    else if (n == 70) *v = uam_cpu_reg_read(cpu, MIPS_FCSR_OFF, 32);
+    else if (n == 71) *v = s->cfg.fir;
     else return false;
     return true;
 }
@@ -823,6 +1202,16 @@ static bool mips_gdb_read(uam_cpu *cpu, unsigned n, uint64_t *v)
 static bool mips_gdb_write(uam_cpu *cpu, unsigned n, uint64_t v)
 {
     mips_state *s = mips_st(cpu);
+    if (n >= 38 && n < 70 && mips_has_fpu(s)) {
+        unsigned f = n - 38;
+        uam_cpu_reg_write(cpu, (cpu->priv & MIPS_PRIV_FR) ? MIPS_FPR_OFF(f)
+                                                          : MIPS_FPR_OFF(f & ~1u) + 4 * (f & 1), 32, v);
+        return true;
+    }
+    if (n == 70 && mips_has_fpu(s)) {
+        uam_cpu_reg_write(cpu, MIPS_FCSR_OFF, 32, v);
+        return true;
+    }
     if (n == 0 || (n >= 38 && n < GDB_MIPS_NREGS) || n == 35 || n == 36)
         return true;                         /* read-only / not modelled: ignored */
     if (n < 32)       uam_cpu_reg_write(cpu, MIPS_REG_OFF(n), 32, v);
@@ -841,6 +1230,7 @@ static const uam_gdb_arch mips_gdb = {
     .target_xml = mips_target_xml,
     .n_regs = GDB_MIPS_NREGS,
     .reg_bytes = 4,
+    .pc_state_bits = 1,   /* the ISA mode (MIPS16e / microMIPS) */
     .read_reg = mips_gdb_read,
     .write_reg = mips_gdb_write,
 };

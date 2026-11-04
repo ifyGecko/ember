@@ -110,7 +110,8 @@ ANALYSIS_SRC := analysis/cov.c
 LOADER_SRC  := src/loader/loader.c
 MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c src/machine/guard.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
-MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
+MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c isa/mips32/mips16.c \
+               isa/mips32/mips_umips.c isa/mips32/mips_fpu.c isa/mips32/mips_dsp.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c
 PPC_SRC     := isa/ppc32/ppc_lift.c isa/ppc32/ppc_fpu.c isa/ppc32/ppc_mmu.c isa/ppc32/ppc_booke.c \
                isa/ppc32/ppc_system.c
@@ -128,9 +129,10 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_f
                devices/ioapic.c devices/pci.c devices/ata_core.c devices/ahci.c devices/ide.c devices/nvme.c \
                devices/cfi_flash.c devices/pc_misc.c devices/acpi_pm.c devices/ipi.c devices/i8237.c devices/vga.c devices/fdc.c devices/lpt.c \
                devices/i8042.c devices/hpet.c devices/gptimer.c devices/avr32_intc.c \
-               devices/mcs51_timer.c devices/mcs51_serial.c devices/mcs51_port.c
+               devices/mcs51_timer.c devices/mcs51_serial.c devices/mcs51_port.c devices/pic32_intc.c
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c \
-               boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/stock.c boards/mmio_rules.c
+               boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c \
+               boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
@@ -182,6 +184,7 @@ FW_THUMB_BE := $(BUILD)/firmware-arm/selftest-thumb-be.elf
 FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 FW_PPC    := $(BUILD)/firmware-ppc/selftest.elf
 FW_PPC_BOOKE := $(BUILD)/firmware-ppc/selftest-booke.elf
+FW_PIC32  := $(BUILD)/firmware-pic32/selftest-mz.elf
 FW_AVR    := $(BUILD)/firmware-avr
 AVR_MODELS := e eplus xm xt rc
 FW_AVR32_A := $(BUILD)/firmware-avr32/selftest-a.elf
@@ -194,7 +197,7 @@ EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test firmware-pic pic-test \
-        firmware-mcs51 mcs51-test \
+        firmware-mcs51 mcs51-test firmware-pic32 pic32-test \
         example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
         bench-test xbench install \
@@ -353,6 +356,9 @@ firmware-x86:
 firmware-ppc:
 	$(MAKE) -C tests/firmware-ppc OUT=$(abspath $(BUILD))/firmware-ppc
 
+firmware-pic32:
+	$(MAKE) -C tests/firmware-pic32 OUT=$(abspath $(BUILD))/firmware-pic32
+
 firmware-avr:
 	$(MAKE) -C tests/firmware-avr OUT=$(abspath $(FW_AVR))
 
@@ -470,6 +476,12 @@ ppc-test: $(RUN) firmware-ppc
 	$(RUN) -b ppc-ref -o model=booke --stats $(FW_PPC_BOOKE) < /dev/null
 	$(RUN) -b ppc-ref -o model=booke --jit --stats $(FW_PPC_BOOKE) < /dev/null
 
+# PIC32: the MIPS32 self-test on the mz model (TLB, shadow sets, external
+# interrupt controller). The compressed ISAs, FPU and DSP are not yet lifted.
+pic32-test: $(RUN) firmware-pic32
+	$(RUN) -b pic32-ref -o model=mz --stats $(FW_PIC32) < /dev/null
+	$(RUN) -b pic32-ref -o model=mz --jit --stats $(FW_PIC32) < /dev/null
+
 # The 8-bit AVR self-test on every core family the board models.
 avr-test: $(RUN) firmware-avr
 	@set -e; for m in $(AVR_MODELS); do \
@@ -528,7 +540,7 @@ example-test: lib firmware-mips
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
 snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc firmware-avr firmware-avr32 firmware-pic \
-               firmware-mcs51 \
+               firmware-mcs51 firmware-pic32 \
                example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
@@ -583,10 +595,12 @@ ifeq ($(HAVE_AVR32),1)
 else
 	$(AVR32_SKIP)
 endif
+	sh tests/snapshot/snapshot-check.sh $(RUN) pic32-ref $(FW_PIC32) 777 50000 120000 180000 -- -o model=mz
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
-cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51
+cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
+          firmware-pic32
 	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
 	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
@@ -617,6 +631,7 @@ ifeq ($(HAVE_AVR32),1)
 else
 	$(AVR32_SKIP)
 endif
+	sh tests/cov/cov-check.sh $(RUN) pic32-ref $(FW_PIC32) -- -o model=mz
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
@@ -682,7 +697,8 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test example-test snapshot-test cov-test fuzz-test \
+test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test \
+      example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
       gdb-test runner-test bench-test
 

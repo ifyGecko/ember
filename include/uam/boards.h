@@ -20,6 +20,7 @@ extern const uam_board uam_board_avr_ref;     /* "avr-ref": 8-bit AVR (-o model=
 extern const uam_board uam_board_avr32_ref;   /* "avr32-ref": AVR32A (UC3 class) or AVR32B (AP7 class) */
 extern const uam_board uam_board_pic_ref;     /* "pic-ref": 8-bit PIC (-o model=) */
 extern const uam_board uam_board_mcs51_ref;   /* "mcs51-ref": 8051 (-o model=) */
+extern const uam_board uam_board_pic32_ref;   /* "pic32-ref": PIC32MX, PIC32MM or PIC32MZ class MIPS */
 
 /* Register every stock board with uam_board_register(). */
 void uam_boards_register_stock(void);
