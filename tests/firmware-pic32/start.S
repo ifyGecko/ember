@@ -205,6 +205,13 @@ _start:
     mtc0    $8, $12
     ehb
 #endif
+#if defined(__mips_dsp)
+    mfc0    $8, $12
+    li      $9, 0x01000000      /* MX: the DSP ASE */
+    or      $8, $8, $9
+    mtc0    $8, $12
+    ehb
+#endif
     la      $8, __bss_start
     la      $9, __bss_end
 1:  beq     $8, $9, 2f

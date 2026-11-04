@@ -1,8 +1,8 @@
 # Builds the PIC32 self-test once per pic32-ref model and instruction set:
 #
 #   image              board options                  code
-#   selftest-mz        -o model=mz                    MIPS32, the FPU with FR = 1
-#   selftest-mz-fr0    -o model=mz                    MIPS32, the FPU with FR = 0
+#   selftest-mz        -o model=mz                    MIPS32, the FPU with FR = 1, the DSP ASE
+#   selftest-mz-fr0    -o model=mz                    MIPS32, the FPU with FR = 0, the DSP ASE
 #   selftest-mx        -o model=mx                    MIPS16e (handlers MIPS32)
 #   selftest-mm        -o model=mm                    microMIPS
 #   selftest-mz-um     -o model=mz -o bootisa=micromips  microMIPS, the FPU (calls MIPS32 code too)
@@ -23,13 +23,17 @@ $(OUT)/fpvectors.h: gen_fpvectors.py
 	@mkdir -p $(OUT)
 	python3 -I gen_fpvectors.py $@
 
-$(OUT)/selftest-mz.elf: $(SRC) fptest.c $(OUT)/fpvectors.h
-	$(CROSS)gcc -march=mips32r2 -mhard-float -mfp64 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
+$(OUT)/dspvectors.h: gen_dspvectors.py
+	@mkdir -p $(OUT)
+	python3 -I gen_dspvectors.py $@
+
+$(OUT)/selftest-mz.elf: $(SRC) fptest.c dsptest.c $(OUT)/fpvectors.h $(OUT)/dspvectors.h
+	$(CROSS)gcc -march=mips32r2 -mhard-float -mfp64 -mdspr2 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
 	    -DMODEL_NAME='"mz"' -DBOOT_UMIPS=0 start.S probe.S selftest.c -o $@
 	$(CROSS)objdump -d $@ > $(OUT)/selftest-mz.dis
 
-$(OUT)/selftest-mz-fr0.elf: $(SRC) fptest.c $(OUT)/fpvectors.h
-	$(CROSS)gcc -march=mips32r2 -mhard-float -mfp32 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
+$(OUT)/selftest-mz-fr0.elf: $(SRC) fptest.c dsptest.c $(OUT)/fpvectors.h $(OUT)/dspvectors.h
+	$(CROSS)gcc -march=mips32r2 -mhard-float -mfp32 -mdspr2 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
 	    -DMODEL_NAME='"mz FR=0"' -DBOOT_UMIPS=0 start.S probe.S selftest.c -o $@
 
 # MIPS16e: C and the probe in MIPS16e, the vectors (start.S) in MIPS32.

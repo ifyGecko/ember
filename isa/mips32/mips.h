@@ -340,6 +340,7 @@ uint64_t mips_ctc1(void *env, uint64_t fs, uint64_t v, uint64_t c, uam_status *s
 
 /* mips_dsp.c: the DSP ASE in MIPS32 encoding (SPECIAL3 and REGIMM BPOSGE32 aside). */
 lift_result mips_lift_dsp(ml *L, uint32_t i);
+int         mips_dsp_rev(uint32_t i);   /* 0 reserved, 1 rev 1, 2 rev 2 (tests use it) */
 uint64_t    mips_dsp_op(void *env, uint64_t insn, uint64_t b, uint64_t c, uam_status *st);
 
 /* mips_system.c */

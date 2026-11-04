@@ -527,6 +527,9 @@ static void t_mapping(void)
 #if defined(MODEL_MZ) && defined(__mips_hard_float)
 #include "fptest.c"
 #endif
+#if defined(MODEL_MZ) && defined(__mips_dsp)
+#include "dsptest.c"
+#endif
 
 int main(void);
 int main(void)
@@ -552,6 +555,12 @@ int main(void)
     run("fpu-trap", t_fpu_trap);
     run("fpu-unusable", t_fpu_unusable);
     run("fpu-c", t_fpu_c);
+#endif
+#if defined(MODEL_MZ) && defined(__mips_dsp)
+    run("dsp-vectors", t_dsp_vectors);
+    run("dsp-disabled", t_dsp_disabled);
+    run("dsp-loads", t_dsp_loads);
+    run("dsp-c", t_dsp_c);
 #endif
     puts_(n_fail ? "SELFTEST FAIL\n" : "SELFTEST PASS\n");
     volatile uint8_t *fin = (volatile uint8_t *)FINISHER;

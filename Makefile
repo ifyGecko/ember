@@ -191,6 +191,7 @@ FW_PIC32_MM := $(BUILD)/firmware-pic32/selftest-mm.elf
 FW_PIC32_UM := $(BUILD)/firmware-pic32/selftest-mz-um.elf
 MIPS16_DEC := $(BUILD)/mips16-dec
 UMIPS_DEC  := $(BUILD)/umips-dec
+DSP_DEC    := $(BUILD)/dsp-dec
 FW_AVR    := $(BUILD)/firmware-avr
 AVR_MODELS := e eplus xm xt rc
 FW_AVR32_A := $(BUILD)/firmware-avr32/selftest-a.elf
@@ -276,6 +277,8 @@ $(BUILD)/obj/tests/isa-mips/%-dec.o: UAM_COMPILE += -Iisa/mips32
 $(MIPS16_DEC): $(BUILD)/obj/tests/isa-mips/mips16-dec.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 $(UMIPS_DEC): $(BUILD)/obj/tests/isa-mips/umips-dec.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+$(DSP_DEC): $(BUILD)/obj/tests/isa-mips/dsp-dec.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_IR): $(BUILD)/obj/tests/unit/test_ir.o $(LIB)
@@ -490,11 +493,12 @@ ppc-test: $(RUN) firmware-ppc
 	$(RUN) -b ppc-ref -o model=booke --jit --stats $(FW_PPC_BOOKE) < /dev/null
 
 # PIC32: the self-test as MIPS32 on the mz model (TLB, shadow sets, the external
-# interrupt controller, the FPU with FR = 1 and FR = 0), as MIPS16e on mx, as microMIPS on mm and on mz reset into
-# microMIPS; the MIPS16e and microMIPS decoders against objdump.
-pic32-test: $(RUN) firmware-pic32 $(MIPS16_DEC) $(UMIPS_DEC)
+# interrupt controller, the FPU with FR = 1 and FR = 0, the DSP ASE), as MIPS16e on mx, as microMIPS on mm and on mz reset into
+# microMIPS; the MIPS16e, microMIPS and DSP decoders against binutils.
+pic32-test: $(RUN) firmware-pic32 $(MIPS16_DEC) $(UMIPS_DEC) $(DSP_DEC)
 	python3 -I tests/isa-mips/mips16-check.py $(MIPS16_DEC) $(BUILD)
 	python3 -I tests/isa-mips/umips-check.py $(UMIPS_DEC) $(BUILD)
+	python3 -I tests/isa-mips/dsp-check.py $(DSP_DEC) $(BUILD)
 	$(RUN) -b pic32-ref -o model=mz --stats $(FW_PIC32) < /dev/null
 	$(RUN) -b pic32-ref -o model=mz --jit --stats $(FW_PIC32) < /dev/null
 	$(RUN) -b pic32-ref -o model=mz --stats $(FW_PIC32_FR0) < /dev/null

@@ -179,7 +179,8 @@ program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored inter
 MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets into microMIPS.
 MIPS32, MIPS16e and microMIPS firmware runs (mx and mz switch between their two ISAs through
 JALX and jumps to odd addresses; mm is microMIPS only), and mz has the FPU (FR = 0 and 1, in
-either ISA). Not yet lifted: the DSP ASE (a reserved-instruction exception). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+either ISA) and the DSP ASE revision 2 (MIPS32 encoding; its microMIPS encoding is not lifted
+yet, a reserved-instruction exception). `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -411,8 +412,8 @@ fuzz/              the persistent-mode fuzz harness, the replay frontend, the ru
                    options; fuzz/suzzer/: suzzer's formats (built only with a suzzer checkout)
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c);
-                   mips16.c (MIPS16e), mips_umips.c (microMIPS), mips_fpu.c (the FPU);
-                   mips_dsp.c (the DSP ASE: config and decode hooks in place, lifting to come)
+                   mips16.c (MIPS16e), mips_umips.c (microMIPS), mips_fpu.c (the FPU),
+                   mips_dsp.c (the DSP ASE)
 isa/arm/           ARM lifters (arm_lift.c: A32 and the shared emitters, arm_thumb.c: T16/T32)
                    and privileged architecture (arm_system.c: modes, exceptions, CP15, MMU, timer)
 isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_fpu.c), MMU
@@ -485,7 +486,7 @@ tests/firmware-mcs51/ 8051 self-test (as31), one build per core model (arithmeti
                    mkimage.py), and fuzz target (SDCC)
 tests/firmware-pic32/ self-test for the pic32-ref board (MIPS32 and microMIPS on mz, MIPS16e
                    on mx, microMIPS on mm)
-tests/isa-mips/    the MIPS16e and microMIPS decoders checked against objdump
+tests/isa-mips/    the MIPS16e, microMIPS and DSP decoders checked against binutils
 tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
                    ROM tests (nasm)
 tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC

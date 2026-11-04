@@ -490,6 +490,10 @@ Later MIPS conventions (`isa/mips32`, for PIC32-class cores), again without new 
   Results come from the host's IEEE arithmetic with the MIPS rules computed in software
   (legacy NaNs and the default NaN, tininess before rounding, invalid conversions), so
   they are the same on every host.
+- **DSP ASE** (`mips_dsp.c`): the encoding is checked at lift time (reserved, or DSP Disabled
+  with Status.MX clear, tagged in `cpu->priv`); LWX/LHX/LBUX are inline loads; every other
+  instruction is one helper on the register file, the accumulators (ac0 = HI/LO) and
+  DSPControl.
 - **External interrupt controller.** The controller pushes its request (RIPL, vector,
   optional explicit offset, shadow set) with `uam_mips_eic_input`, which requests an exit;
   `irq_take` compares RIPL with Status.IPL.
