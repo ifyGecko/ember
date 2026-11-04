@@ -508,6 +508,31 @@ PowerPC needed no new IR either; these are conventions of its lifter (`isa/ppc32
 - **No delay slots, no IT state**: every branch ends its block with guarded `EXIT`s;
   `bc` decrements CTR with a `PUT` before them.
 
+## 10d. Two address spaces and registers in memory (8-bit AVR)
+
+The AVR needed no new IR either; these are conventions of its lifter (`isa/avr8`).
+
+- **A Harvard machine on one bus.** Program memory and the data space are separate address
+  spaces with overlapping addresses. The board puts program memory at bus address 0 and the
+  data space at 0x800000, as the GNU tools do in ELF files; `isa->translate` adds the base to
+  loads and stores and leaves fetches alone, so the IR addresses the data space with plain
+  `LD`/`ST`, and LPM/ELPM read program memory with `PHYS` loads. The pc is a byte address
+  (twice the AVR's word PC). A debugger or loader (`UAM_XLATE_DEBUG`) uses bus addresses.
+- **Registers that are also memory.** On some cores data addresses 0-31 are the register
+  file, and SREG, SP, RAMPx and EIND (and the AVRxm/AVRxt interrupt controllers' registers)
+  are I/O registers in the data space. An access with a constant address (IN, OUT, SBI, CBI,
+  LDS, STS) becomes a `GET`/`PUT` or a `SYSRD`/`SYSWR`. An access through a pointer computes
+  whether its address is one of those registers, and does a guarded `HELPER` for them and a
+  guarded `LD`/`ST` for the rest of the data space; a guard that is false leaves 0, so the
+  two results are ORed.
+- **Flags as bytes.** SREG is one byte per flag in the register file, as on ARM and PowerPC;
+  the half-carry is bit 4 of `a ^ b ^ result` for additions and subtractions alike.
+- **SEI's shadow.** SEI sets SREG.I with a `SYSWR` that requests an exit and lifts the next
+  instruction as a continuation (`UAM_IMARK_CONT`), so that instruction runs before any
+  interrupt, as the core promises (`sei; sleep` sleeps).
+- **Skips** (CPSE, SBRC/SBRS, SBIC/SBIS) end the block with a guarded `EXIT` past the next
+  instruction, whose length (one or two words) the lifter reads.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |

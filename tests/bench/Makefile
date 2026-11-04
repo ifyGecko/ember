@@ -13,6 +13,7 @@ MIPSEL_CROSS ?= mipsel-linux-gnu-
 ARM_CROSS    ?= arm-linux-gnueabi-
 PPC_CROSS    ?= powerpc64le-linux-gnu-
 X86_CROSS    ?= x86_64-linux-gnu-
+AVR_CROSS    ?= avr-
 
 DEFS   = $(if $(ROUNDS),-DBENCH_ROUNDS=$(ROUNDS)) $(if $(ONLY),-DBENCH_ONLY=$(ONLY))
 COMMON = -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin -fno-pic \
@@ -29,7 +30,7 @@ X86_FLAGS  = -m64 -mno-red-zone -mgeneral-regs-only
 FW := ../firmware
 ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-arm.elf $(OUT)/bench-thumb.elf $(OUT)/bench-thumb-be.elf \
-       $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-host
+       $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host
 
 all: $(ALL)
 
@@ -65,6 +66,13 @@ $(OUT)/bench-thumb.elf: bench.c $(FW)-arm/start.S $(OUT)/.config
 $(OUT)/bench-thumb-be.elf: bench.c $(FW)-arm/start.S $(OUT)/.config
 	$(ARM_CROSS)gcc -mthumb -mbig-endian -Wl,--be8 $(ARM_FLAGS) $(COMMON) $(LDCOMMON) \
 	    -Wl,-T,$(FW)-arm/link.ld $(FW)-arm/start.S bench.c -o $@
+
+# AVR (avr-ref, model eplus): the data does not fit a part's SRAM, so the board runs with
+# --ram 0xFE00 (SRAM up to the end of the 64 KiB data space) and the stack starts there.
+$(OUT)/bench-avr.elf: bench.c $(OUT)/.config
+	$(AVR_CROSS)gcc -mmcu=atmega2560 -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin \
+	    -fno-tree-loop-distribute-patterns $(DEFS) -Wl,--defsym=__DATA_REGION_LENGTH__=0xFE00 \
+	    -Wl,--defsym=__stack=0xFFFF bench.c -o $@
 
 $(OUT)/bench-ppc.elf: bench.c $(FW)-ppc/start.S $(OUT)/.config
 	$(PPC_CROSS)gcc $(PPC_FLAGS) $(COMMON) $(LDCOMMON) -Wl,-T,$(FW)-ppc/link.ld \

@@ -3,7 +3,7 @@
 #   make                 build $(BUILD)/uam-run and the libraries
 #   make lib             only the libraries (for out-of-tree projects)
 #   make test            unit tests, firmware self-tests (RISC-V, MIPS BE/LE, ARM and Thumb LE/BE8,
-#                        x86-64 real/protected/long mode, 32-bit PowerPC),
+#                        x86-64 real/protected/long mode, 32-bit PowerPC, 8-bit AVR in five core families),
 #                        external-board example,
 #                        snapshot round trips through the runner, coverage maps across backends,
 #                        the fuzz harness on planted-bug firmware
@@ -28,6 +28,7 @@
 #                     loader, machine
 #   libuam-riscv.a    RISC-V ISA module          libuam-mips.a   MIPS32 ISA module
 #   libuam-arm.a      ARM (AArch32) ISA module   libuam-ppc.a    32-bit PowerPC ISA module
+#   libuam-avr.a      8-bit AVR ISA module
 #   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref, ...)
 #   libuam-fuzz.a     the fuzz harness and its frontends (fuzz/)
 #   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main; uses libuam-fuzz)
@@ -89,6 +90,7 @@ MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c
 ARM_SRC     := isa/arm/arm_lift.c isa/arm/arm_thumb.c isa/arm/arm_system.c
 PPC_SRC     := isa/ppc32/ppc_lift.c isa/ppc32/ppc_fpu.c isa/ppc32/ppc_mmu.c isa/ppc32/ppc_booke.c \
                isa/ppc32/ppc_system.c
+AVR_SRC     := isa/avr8/avr_lift.c isa/avr8/avr_system.c isa/avr8/avr_des.c
 X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_f80.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
                isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
@@ -98,8 +100,8 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_f
                devices/gic.c devices/i8259.c devices/i8254.c devices/mc146818.c devices/lapic.c \
                devices/ioapic.c devices/pci.c devices/ata_core.c devices/ahci.c devices/ide.c devices/nvme.c \
                devices/cfi_flash.c devices/pc_misc.c devices/acpi_pm.c devices/ipi.c devices/i8237.c devices/vga.c devices/fdc.c devices/lpt.c \
-               devices/i8042.c devices/hpet.c
-BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c \
+               devices/i8042.c devices/hpet.c devices/gptimer.c
+BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c boards/avr_ref.c \
                boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
@@ -110,13 +112,13 @@ HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/b
                src/debug/gdbstub.c src/runner/runner.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
-LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
+LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
 obj = $(1:%.c=$(BUILD)/obj/%.o)
 LIB_OBJ  := $(call obj,$(LIB_SRC))
 
 LIB        := $(BUILD)/libuam.a
 MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mips.a \
-               $(BUILD)/libuam-arm.a $(BUILD)/libuam-x86.a $(BUILD)/libuam-ppc.a \
+               $(BUILD)/libuam-arm.a $(BUILD)/libuam-x86.a $(BUILD)/libuam-ppc.a $(BUILD)/libuam-avr.a \
                $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
                $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
@@ -136,6 +138,7 @@ TEST_SMP  := $(BUILD)/test_smp
 TEST_PPC  := $(BUILD)/test_ppc
 TEST_JITDIFF := $(BUILD)/test_jitdiff
 TEST_F80  := $(BUILD)/test_f80
+TEST_AVR  := $(BUILD)/test_avr
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -148,10 +151,12 @@ FW_THUMB_BE := $(BUILD)/firmware-arm/selftest-thumb-be.elf
 FW_X86    := $(BUILD)/firmware-x86/selftest.bin
 FW_PPC    := $(BUILD)/firmware-ppc/selftest.elf
 FW_PPC_BOOKE := $(BUILD)/firmware-ppc/selftest-booke.elf
+FW_AVR    := $(BUILD)/firmware-avr
+AVR_MODELS := e eplus xm xt rc
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
-        firmware-x86 x86-test firmware-ppc ppc-test \
+        firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test \
         example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
         bench-test xbench install \
@@ -192,6 +197,7 @@ $(BUILD)/libuam-mips.a:    $(call obj,$(MIPS_SRC))
 $(BUILD)/libuam-arm.a:     $(call obj,$(ARM_SRC))
 $(BUILD)/libuam-x86.a:     $(call obj,$(X86_SRC))
 $(BUILD)/libuam-ppc.a:     $(call obj,$(PPC_SRC))
+$(BUILD)/libuam-avr.a:     $(call obj,$(AVR_SRC))
 $(BUILD)/libuam-devices.a: $(call obj,$(DEV_SRC))
 $(BUILD)/libuam-boards.a:  $(call obj,$(BOARD_SRC))
 $(BUILD)/libuam-fuzz.a:    $(call obj,$(FUZZ_SRC))
@@ -257,6 +263,9 @@ $(TEST_JITDIFF): $(BUILD)/obj/tests/unit/test_jitdiff.o $(LIB)
 $(TEST_F80): $(BUILD)/obj/tests/unit/test_f80.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_AVR): $(BUILD)/obj/tests/unit/test_avr.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
 	@mkdir -p $(dir $@)
@@ -297,10 +306,13 @@ firmware-x86:
 firmware-ppc:
 	$(MAKE) -C tests/firmware-ppc OUT=$(abspath $(BUILD))/firmware-ppc
 
+firmware-avr:
+	$(MAKE) -C tests/firmware-avr OUT=$(abspath $(FW_AVR))
+
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_JITDIFF) $(TEST_F80) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_JITDIFF) $(TEST_F80) \
            $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -314,6 +326,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_FUZZ)
 	$(TEST_SMP)
 	$(TEST_PPC)
+	$(TEST_AVR)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
@@ -382,6 +395,14 @@ ppc-test: $(RUN) firmware-ppc
 	$(RUN) -b ppc-ref -o model=booke --stats $(FW_PPC_BOOKE) < /dev/null
 	$(RUN) -b ppc-ref -o model=booke --jit --stats $(FW_PPC_BOOKE) < /dev/null
 
+# The 8-bit AVR self-test on every core family the board models.
+avr-test: $(RUN) firmware-avr
+	@set -e; for m in $(AVR_MODELS); do \
+	    echo "$(RUN) -b avr-ref -o model=$$m [--jit] --stats $(FW_AVR)/selftest-$$m.elf"; \
+	    $(RUN) -b avr-ref -o model=$$m --stats $(FW_AVR)/selftest-$$m.elf < /dev/null; \
+	    $(RUN) -b avr-ref -o model=$$m --jit --stats $(FW_AVR)/selftest-$$m.elf < /dev/null; \
+	done
+
 # The gdb stub over the remote protocol, on a four-processor machine.
 gdb-test: $(RUN) firmware-x86
 	python3 tests/gdb/gdb-check.py $(RUN) $(dir $(FW_X86))smp.bin $(dir $(FW_X86))smp.lst
@@ -394,7 +415,8 @@ example-test: lib firmware-mips
 
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
-snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc example-test
+snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc firmware-avr \
+               example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
 	sh tests/snapshot/snapshot-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL) 5000
@@ -420,10 +442,13 @@ snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 f
 	    -- -o cpus=4 --quantum 97
 	sh tests/snapshot/snapshot-check.sh $(RUN) ppc-ref $(FW_PPC_BOOKE) 1 8000 8400 9500 11900 13000 14850 \
 	    -- -o model=booke
+	sh tests/snapshot/snapshot-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-eplus.elf 1 5000 100000 200000 280000
+	sh tests/snapshot/snapshot-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-xm.elf 777 150000 260000 -- -o model=xm
+	sh tests/snapshot/snapshot-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-rc.elf 300 7000 14000 -- -o model=rc
 
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
-cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
+cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr
 	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
 	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
@@ -432,10 +457,12 @@ cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
 	sh tests/cov/cov-check.sh $(RUN) armeb-ref $(FW_ARM_BE)
 	sh tests/cov/cov-check.sh $(RUN) ppc-ref $(FW_PPC)
 	sh tests/cov/cov-check.sh $(RUN) ppc-ref $(FW_PPC_BOOKE) -- -o model=booke
+	@set -e; for m in $(AVR_MODELS); do \
+	    sh tests/cov/cov-check.sh $(RUN) avr-ref $(FW_AVR)/selftest-$$m.elf -- -o model=$$m; done
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
-fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
+fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -446,6 +473,7 @@ fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
 	    $(BUILD)/firmware-arm/fuzztarget-be.bin
 	sh tests/fuzz/fuzz-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf \
 	    $(BUILD)/firmware-ppc/fuzztarget.bin
+	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) avr-ref $(FW_AVR)/fuzztarget.elf
 
 # suzzer's formats and the SZR1 executor through the runner (lists written by
 # tests/suzzer/mk_lists.py, and by suzzer's own generators when rizin is installed): the
@@ -481,7 +509,7 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test ppc-test example-test snapshot-test cov-test fuzz-test \
+test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
       gdb-test runner-test bench-test
 
@@ -522,4 +550,5 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
+         $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d

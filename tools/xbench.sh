@@ -22,14 +22,14 @@
 # with the interpreter and with the JIT.
 #
 # Builds go to DIR (default build/firmware-bench), DIR-kN per kernel, DIR-check.
-# Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86.
+# Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr.
 # Exits non-zero if any guest's console differs from the host build's.
 set -eu
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 runs=5 mode=--jit rounds= only= per_kernel=0 times=0 check=0 run=$here/build/uam-run
 base=$here/build/firmware-bench
-variants="rv32 mips mipsel arm thumb thumb-be ppc x86"
+variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr"
 while [ $# -gt 0 ]; do
     case $1 in
     --runs) runs=$2; shift 2;;
@@ -66,6 +66,7 @@ run_all() {
         thumb-be) board=armeb-ref  img=bench-thumb-be.elf;;
         ppc)      board=ppc-ref    img=bench-ppc.elf;;
         x86)      board=x86_64-ref img=bench-x86.bin extra="--raw-base 0 --entry 0";;
+        avr)      board=avr-ref    img=bench-avr.elf extra="--ram 0xFE00";;
         *) echo "xbench.sh: unknown variant $v" >&2; exit 2;;
         esac
         # shellcheck disable=SC2086

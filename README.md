@@ -8,7 +8,7 @@ with one module per concern.
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: five guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
+Status: six guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, R4K-style TLB, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards, and ARMv7-A (ARM and Thumb-2 with interworking, banked modes, CP15 with
 the short-descriptor MMU, generic timer; little-endian and BE8) on the `arm-ref` / `armeb-ref`
@@ -19,9 +19,13 @@ PowerPC (the user instruction set with the FPU, and either privileged architectu
 model selects: the classic one of the 6xx/7xx/74xx - BATs, segments and the hashed page table -
 or Book E - IVORs, critical and machine-check classes, TCR/TSR timers and watchdog, TLB arrays
 with the MAS interface; implementation SPRs, DCRs and TLB interfaces left to the board) on the
-`ppc-ref` board - run by a
+`ppc-ref` board, and 8-bit AVR (every core family of the AVR Instruction Set Manual: AVRe,
+AVRe+, AVRxm (XMEGA, with its PMIC, DES and XCH/LAS/LAC/LAT), AVRxt (with its CPUINT) and
+the reduced core AVRrc, each with the memory layout of common devices of the family) on the
+`avr-ref` board - run by a
 reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
-with block chaining (a block optimizer feeds both). Every reference board takes `-o cpus=N`:
+with block chaining (a block optimizer feeds both). Every reference board but `avr-ref` (an AVR
+has one processor) takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
@@ -56,7 +60,7 @@ host-independent.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS, ARM, x86 and PowerPC firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC and AVR firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
                      # (and suzzer interop, with a suzzer checkout)
@@ -82,6 +86,10 @@ builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works t
 
 The x86 self-tests are assembled with `nasm`; the BIOS boot and gdb stub checks need `python3`.
 
+The AVR self-tests (one per core family) and the AVR builds of the fuzz target and the
+benchmark need `avr-gcc` and avr-libc (Debian: `gcc-avr`, `binutils-avr`, `avr-libc`), and
+`python3` for their flag vectors.
+
 ## Run firmware
 
 ```bash
@@ -97,7 +105,9 @@ build/uam-run -b x86_64-ref --image flash=fw.rom -o cpus=4       # a PC: boot fl
 build/uam-run -b x86_64-ref --image bios=bios.rom                # a legacy BIOS ROM (also below 1 MiB)
 build/uam-run -b x86_64-ref --raw-base 0 --entry 0 flat.bin      # a flat image, entered in real mode
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
-build/uam-run --jit path/to/firmware.elf       # native x86-64 execution (else interpreter)
+build/uam-run -b avr-ref build/firmware-avr/selftest-eplus.elf   # 8-bit AVR (ATmega2560 layout)
+build/uam-run -b avr-ref -o model=xm build/firmware-avr/selftest-xm.elf  # XMEGA
+build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
 build/uam-run --cov-blocks --cov-out cov.map fw.elf  # block-edge coverage map (64 KiB by default)
@@ -106,9 +116,13 @@ build/uam-run --help
 ```
 
 Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
-names the boards. Every reference board takes `--ram SIZE` and `-o cpus=N` (`--quantum N`:
-instructions each processor runs before the next, default 4096); `ppc-ref` takes
-`-o model=classic|booke`. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
+names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `-o cpus=N`
+(`--quantum N`: instructions each processor runs before the next, default 4096); `ppc-ref` takes
+`-o model=classic|booke`. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
+with the memory layout of a common part of that core family, so firmware built for that part
+runs (`e` ATmega328P, `eplus` ATmega2560, `xm` ATxmega128A1U, `xt` ATmega4809, `rc`
+ATtiny40; boards/avr_ref.c has the map); its devices (a 16550, a timer, the test finisher) are
+generic, not those parts' peripherals, and `--ram` sets the size of its SRAM. `x86_64-ref` takes the images `flash` (a CFI boot flash of up to
 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -323,7 +337,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
                    cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
 include/uam/dev/   one header per device model
-include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h)
+include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
@@ -349,13 +363,19 @@ isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x
                    software 80-bit format (x86_f80.c), MMX, SSE/SSE2) and system architecture (segmentation, call gates, hardware
                    task switching, the I/O permission bitmap, paging, SMM with the Intel 64
                    or AMD64 save-state map, A20M#, CPUID/MSRs)
+isa/avr8/          8-bit AVR lifter (avr_lift.c: every core family, the model's instructions),
+                   system side (avr_system.c: the CPU models, the data space on the bus,
+                   interrupt entry, the AVRxm PMIC and AVRxt CPUINT, the core's I/O registers)
+                   and the AVRxm DES instruction (avr_des.c)
 devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
                    virtio_net; PC architecture: i8259, i8254, mc146818, lapic, ioapic, hpet,
                    i8042, acpi_pm, pc_misc (port 92, A20 gate, POST codes), i8237 DMA, fdc
                    (82077), ide (PIO + bus master), lpt, vga; pci (bridges, MSI/MSI-X,
-                   expansion ROMs), ahci, nvme, cfi_flash; ipi
+                   expansion ROMs), ahci, nvme, cfi_flash; ipi; gptimer (a general-purpose
+                   timer for CPUs without one of their own)
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
-                   x86_64_ref.c (x86-64), ppc_ref.c (PowerPC): reference boards of generic
+                   x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR):
+                   reference boards of generic
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
@@ -366,7 +386,8 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
                    loops, stores next to code, MMIO rules, coverage, the fuzz harness,
                    multiprocessor observers, suzzer's formats, the PowerPC board interface,
-                   the x87's software 80-bit format (against the host's x87 on x86-64)
+                   the x87's software 80-bit format (against the host's x87 on x86-64), the
+                   AVR interrupt controllers and the general-purpose timer
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images
@@ -374,6 +395,8 @@ tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
 tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
 tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E builds), multiprocessor
                    test and fuzz target
+tests/firmware-avr/ 8-bit AVR self-test, one build per core family (flag vectors from the
+                   manual's equations: gen_vectors.py), and fuzz target
 tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
                    ROM tests (nasm)
 tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC

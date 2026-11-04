@@ -177,7 +177,8 @@ watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: o
 device interrupt arrives as IRQ, through the GIC), on PowerPC the external interrupt sources
 0..7 that were high (on `ppc-ref`: 0 the UART, 1 the IPI doorbell), 8 soft reset, 9 machine
 check and 10 the Book E critical input; the timers have no line. On x86-64 they are the
-processor's pins that were high (`UAM_X86_IRQ_*`: 0 INTR, 1 NMI, 2 SMI, 3 INIT, 4 A20M#).
+processor's pins that were high (`UAM_X86_IRQ_*`: 0 INTR, 1 NMI, 2 SMI, 3 INIT, 4 A20M#). On
+8-bit AVR a line is an interrupt vector (1..63; on `avr-ref`: 1 the UART, 2 the timer).
 The interrupt is reported once the CPU has taken it
 (`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
 detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
@@ -358,7 +359,7 @@ suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
-`mips32le`, `armv7`, `armv7be`, `ppc32` or `x86-64`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+`mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64` or `avr`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|

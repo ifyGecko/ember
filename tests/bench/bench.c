@@ -43,6 +43,8 @@ static void putc_(char c)
 #define UART0 0x1c000000u
 #elif defined(__powerpc__)
 #define UART0 0xf0000000u
+#elif defined(__AVR__)
+#define UART0 0x00E0u      /* avr-ref, model eplus; the finisher is at 0x00E8 */
 #else
 #error "no board for this ISA"
 #endif
@@ -86,6 +88,16 @@ void *memset(void *d, int c, size_t n)
         *dp++ = (uint8_t)c;
     return d;
 }
+
+#if defined(__AVR__)
+/* avr-libc's exit runs the .fini sections with main's return value in r25:r24: hand it
+ * to the test finisher (0x5555 passes; anything else fails with its low byte). */
+__attribute__((naked, used, section(".fini8"))) static void avr_report(void)
+{
+    __asm__ volatile("cpi r24, 0x55\n\tbrne 1f\n\tcpi r25, 0x55\n\tbrne 1f\n\t"
+                     "sts 0x00E8, r24\n1:\tori r24, 1\n\tsts 0x00E9, r24");
+}
+#endif
 
 /* An exception is a failed run: report it and stop. */
 uint32_t trap_handler(void *frame);

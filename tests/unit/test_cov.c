@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "uam/isa/arm.h"
+#include "uam/isa/avr.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
 #include "uam/isa/riscv.h"
@@ -223,6 +224,7 @@ typedef struct prog {
     uint64_t      done;
     uint64_t      illegal;    /* an illegal instruction word for this ISA */
     uint32_t      xreg;       /* register offset of x */
+    bool          no_exc;     /* the ISA has no exceptions (AVR): no exception-observer test */
 } prog;
 
 /* RV32 encodings */
@@ -352,6 +354,29 @@ static prog ppc_prog(int n)
     p.site[2] = p.base + 12;
     p.site[3] = p.base + 20;
     p.done = p.base + 24;
+    return p;
+}
+
+/* 8-bit AVR (the default model, AVRe+): two instructions per little-endian word; x is
+ * r25:r24 (with r27:r26 zero, so a 32-bit read of it is x), n is r23:r22. */
+static prog avr_prog(int n)
+{
+    prog p = { .name = "avr", .isa = &uam_isa_avr, .base = 0x1000, .phys = 0x1000, .be = false,
+               .xreg = 24, .no_exc = true };
+    const uint32_t lo = (uint32_t)n & 0xFF, hi = ((uint32_t)n >> 8) & 0xFF;
+#define AVR_LDI(d, k) (0xE000u | ((k) & 0xF0) << 4 | ((d) - 16) << 4 | ((k) & 0xF))
+    p.w[0] = AVR_LDI(24, 0) | AVR_LDI(25, 0) << 16;                /* x = 0 */
+    p.w[1] = AVR_LDI(22, lo) | AVR_LDI(23, hi) << 16;              /* n */
+    p.w[2] = 0x9601u | 0x1786u << 16;                              /* adiw r24,1; cp r24,r22 */
+    p.w[3] = 0x0797u | 0xF7E1u << 16;                              /* cpc r25,r23; brne loop */
+    p.w[4] = AVR_LDI(18, 7) | 0xCFFFu << 16;                       /* y = 7; rjmp . */
+#undef AVR_LDI
+    p.n = 5;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 8;
+    p.site[2] = p.base + 14;
+    p.site[3] = p.base + 16;
+    p.done = p.base + 18;
     return p;
 }
 
@@ -771,6 +796,8 @@ static uam_hook_action exc_obs(void *ctx, uam_cpu *cpu, const uam_exception *e)
 
 static void test_exc_hook(const prog *p)
 {
+    if (p->no_exc)
+        return;
     for (int bk = 0; bk < 3; bk++) {
         exc_seen s = { .act = UAM_HOOK_STOP };
         run_cfg c = { .mode = COV_NONE, .exc_hook = exc_obs, .exc_ctx = &s, .illegal_at_s3 = true };
@@ -802,10 +829,10 @@ int main(void)
 
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
-                            arm_prog(3, true, true), ppc_prog(3) };
+                            arm_prog(3, true, true), ppc_prog(3), avr_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
-                              arm_prog(300, true, true), ppc_prog(300) };
+                              arm_prog(300, true, true), ppc_prog(300), avr_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

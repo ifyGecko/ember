@@ -96,10 +96,12 @@ if [ $rc -ne 20 ] || [ "$a" != "$b" ]; then
     fail=1
 fi
 
-# Exceptions the policy lets through reach the firmware's handler.
+# Exceptions the policy lets through reach the firmware's handler (not on an architecture
+# without exceptions: FUZZ_CHECK_NO_TRAPS=1, 8-bit AVR).
 rc=0
-fuzz "" "--fuzz-crash-exc none --fuzz-replay $tmp/in/2-store" > "$tmp/none.out" || rc=$?
-if [ $rc -ne 21 ] || ! grep -q "crash-oracle pc=$panic" "$tmp/none.out"; then
+[ -n "${FUZZ_CHECK_NO_TRAPS:-}" ] ||
+    fuzz "" "--fuzz-crash-exc none --fuzz-replay $tmp/in/2-store" > "$tmp/none.out" || rc=$?
+if [ -z "${FUZZ_CHECK_NO_TRAPS:-}" ] && { [ $rc -ne 21 ] || ! grep -q "crash-oracle pc=$panic" "$tmp/none.out"; }; then
     echo "fuzz-check: $board: --fuzz-crash-exc none: exit $rc (expected 21):" >&2
     cat "$tmp/none.out" >&2
     fail=1
