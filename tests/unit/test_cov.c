@@ -228,6 +228,7 @@ typedef struct prog {
     uint64_t      illegal;    /* an illegal instruction word for this ISA */
     uint32_t      xreg;       /* register offset of x */
     bool          no_exc;     /* the ISA has no exceptions (AVR): no exception-observer test */
+    const uam_mips_config *mips_cfg; /* a MIPS core other than uam_mips_ref */
 } prog;
 
 /* RV32 encodings */
@@ -295,6 +296,52 @@ static prog mips_prog(int n, bool be)
     p.site[3] = p.base + 20;
     p.delay = p.base + 16;
     p.done = p.base + 24;
+    return p;
+}
+
+/* Two 16-bit instructions per little-endian word, the first lowest. */
+#define HW2(a, b) ((uint32_t)(a) | (uint32_t)(b) << 16)
+
+/* MIPS16e (pc bit 0 set): x = a0, n = a1, y = a2; CMP sets T, BTNEZ branches on it. */
+static prog mips16_prog(int n)
+{
+    enum { A0 = 4 };
+    const uint16_t ext = (uint16_t)(0xF000 | (((unsigned)n >> 5) & 0x3F) << 5 | (((unsigned)n >> 11) & 0x1F));
+    prog p = { .name = "mips16e", .isa = &uam_isa_mips32le, .base = 0x80001001u, .phys = 0x1000,
+               .be = false, .xreg = A0 * 4, .mips_cfg = &uam_mips_m16_ref,
+               .illegal = HW2(0xF800, 0x17FF) /* op 0x1F: reserved; then the B to itself */ };
+    p.w[0] = HW2(0x6C00, ext);                         /* li a0,0 ; extend */
+    p.w[1] = HW2(0x6D00 | (n & 0x1F), 0x4C01);         /* li a1,n ; addiu a0,1 */
+    p.w[2] = HW2(0xECAA, 0x61FD);                      /* cmp a0,a1 ; btnez loop */
+    p.w[3] = HW2(0x6E07, 0x17FF);                      /* li a2,7 ; b . */
+    p.n = 4;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 6;
+    p.site[2] = p.base + 10;
+    p.site[3] = p.base + 12;
+    p.done = p.base + 14;
+    return p;
+}
+
+/* microMIPS (pc bit 0 set): BNE has a delay slot (a 16-bit nop); so has B16. */
+static prog umips_prog(int n)
+{
+    enum { A0 = 4 };
+    prog p = { .name = "micromips", .isa = &uam_isa_mips32le, .base = 0x80001001u, .phys = 0x1000,
+               .be = false, .xreg = A0 * 4, .mips_cfg = &uam_mips_umips_ref,
+               .illegal = HW2(0xA400, 0xCFFF) /* 16-bit major 0x29: reserved; then b16 . */ };
+    p.w[0] = HW2(0xEE00, 0x30A0);                      /* li16 a0,0 ; addiu a1,zero,... */
+    p.w[1] = HW2((uint16_t)n, 0x4C82);                 /* ...n ; addiu a0,a0,1 */
+    p.w[2] = HW2(0xB4A4, 0xFFFD);                      /* bne a0,a1,loop */
+    p.w[3] = HW2(0x0C00, 0xEF07);                      /* (slot: nop16) ; li16 a2,7 */
+    p.w[4] = HW2(0xCFFF, 0x0C00);                      /* b16 . ; (slot) */
+    p.n = 5;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 6;
+    p.site[2] = p.base + 8;
+    p.site[3] = p.base + 14;
+    p.delay = p.base + 12;
+    p.done = p.base + 16;
     return p;
 }
 
@@ -493,6 +540,8 @@ static void run_prog(const prog *p, backend bk, const run_cfg *cfg, run_out *out
     memset(out, 0, sizeof(*out));
     uam_machine m;
     CHECK(uam_machine_init(&m, p->isa) == UAM_OK, "%s: machine init", p->name);
+    if (p->mips_cfg)
+        CHECK(uam_mips_configure(&m.cpu, p->mips_cfg) == UAM_OK, "%s: configure", p->name);
     CHECK(uam_bus_map_ram(&m.bus, "ram", 0, 1 << 20) == UAM_OK, "map ram");
     for (unsigned i = 0; i < p->n; i++)
         put_word(&m, p, p->phys + 4 * i, p->w[i]);
@@ -900,11 +949,11 @@ int main(void)
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
                             arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3),
-                            pic_prog(3), mcs51_prog(3) };
+                            pic_prog(3), mcs51_prog(3), mips16_prog(3), umips_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
                               arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300),
-                              pic_prog(300), mcs51_prog(300) };
+                              pic_prog(300), mcs51_prog(300), mips16_prog(300), umips_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

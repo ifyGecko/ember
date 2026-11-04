@@ -215,6 +215,8 @@ _start:
     nop
 2:  jal     main
     nop
+    lui     $8, 0xbf82          /* main's return value to the test finisher (0x5555 passes) */
+    sw      $2, 0x100($8)
 3:  b       3b
     nop
     .end _start

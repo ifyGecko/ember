@@ -15,7 +15,7 @@ FW_CFLAGS  = -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin -fno-pi
              -fno-optimize-sibling-calls
 FW_LDFLAGS = -static -no-pie -Wl,-T,link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest-mz.elf $(OUT)/selftest-mz-fr0.elf $(OUT)/selftest-mx.elf $(OUT)/selftest-mm.elf $(OUT)/selftest-mz-um.elf
+all: $(OUT)/fuzztarget-mz.elf $(OUT)/fuzztarget-mx.elf $(OUT)/selftest-mz.elf $(OUT)/selftest-mz-fr0.elf $(OUT)/selftest-mx.elf $(OUT)/selftest-mm.elf $(OUT)/selftest-mz-um.elf
 
 SRC = start.S probe.S selftest.c link.ld
 
@@ -53,5 +53,16 @@ $(OUT)/selftest-mz-um.elf: $(SRC) fptest.c $(OUT)/fpvectors.h
 	$(CROSS)gcc -march=mips32r2 -mmicromips -mhard-float -mfp64 $(FW_CFLAGS) $(FW_LDFLAGS) -I$(OUT) -DMODEL_MZ \
 	    -DMODEL_NAME='"mz microMIPS"' -DBOOT_UMIPS=1 start.S probe.S selftest.c -o $@
 	$(CROSS)objdump -d $@ > $(OUT)/selftest-mz-um.dis
+
+# The fuzz target (tests/fuzz): MIPS32 on mz, MIPS16e on mx (handlers MIPS32).
+$(OUT)/fuzztarget-mz.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
+	@mkdir -p $(OUT)
+	$(CROSS)gcc -march=mips32r2 -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) start.S fuzztarget.c -o $@
+$(OUT)/fuzztarget-mx.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
+	@mkdir -p $(OUT)
+	$(CROSS)gcc -march=m4k -msoft-float $(FW_CFLAGS) -c start.S -o $(OUT)/fz-start-mx.o
+	$(CROSS)gcc -march=m4k -msoft-float -mips16 $(FW_CFLAGS) -c fuzztarget.c -o $(OUT)/fz-mx.o
+	$(CROSS)gcc -march=m4k -msoft-float $(FW_CFLAGS) $(FW_LDFLAGS) $(OUT)/fz-start-mx.o \
+	    $(OUT)/fz-mx.o -o $@
 
 .PHONY: all

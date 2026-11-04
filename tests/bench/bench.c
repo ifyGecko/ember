@@ -48,6 +48,8 @@ static void putc_(char c)
 #else
 #if defined(__riscv)
 #define UART0 0x10000000u
+#elif defined(__mips__) && defined(BENCH_PIC32)
+#define UART0 0xbf820000u  /* pic32-ref */
 #elif defined(__mips__)
 #define UART0 0xbfd003f8u
 #elif defined(__arm__)
@@ -112,8 +114,9 @@ __attribute__((naked, used, section(".fini8"))) static void avr_report(void)
 }
 #endif
 
-#if defined(__AVR32__)
-/* The AVR32 start code's interrupt stubs call this; nothing here enables interrupts. */
+#if defined(__AVR32__) || defined(BENCH_PIC32)
+/* The AVR32 and PIC32 start code's interrupt stubs call this; nothing here enables
+ * interrupts. */
 void irq_handler(unsigned level);
 void irq_handler(unsigned level) { (void)level; }
 #endif

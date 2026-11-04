@@ -668,7 +668,8 @@ endif
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
-fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51
+fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
+           firmware-pic32
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -690,6 +691,8 @@ ifeq ($(HAVE_SDCC),1)
 else
 	$(SDCC_SKIP)
 endif
+	sh tests/fuzz/fuzz-check.sh $(RUN) pic32-ref $(BUILD)/firmware-pic32/fuzztarget-mz.elf
+	sh tests/fuzz/fuzz-check.sh $(RUN) pic32-ref $(BUILD)/firmware-pic32/fuzztarget-mx.elf
 ifeq ($(HAVE_AVR32),1)
 	sh tests/fuzz/fuzz-check.sh $(RUN) avr32-ref $(BUILD)/firmware-avr32/fuzztarget-a.elf
 else

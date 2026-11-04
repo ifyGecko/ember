@@ -331,6 +331,12 @@ them. suzzer's lists instead give every site its even address and mark Thumb sit
 boundary marker whose closest site at or below it is a Thumb site (a marker inside a Thumb
 function). A Thumb marker needs `--cov-sites` next to `--cov-boundary` for that.
 
+**MIPS16e and microMIPS** (`pic32-ref`) follow the same convention: code in either compressed
+ISA runs at its address with bit 0 set, so `--fuzz-begin` and the other pcs take e.g.
+`0x9d000741` for MIPS16e code at `0x9d000740`. Unlike ARM, the ELF symbol of such a function
+is even (readelf marks it `[MIPS16]` or `[MICROMIPS]`): set bit 0 yourself, as
+`tests/fuzz/fuzz-check.sh` does.
+
 A site that is a branch delay slot cannot be instrumented. The run stops with an error naming
 the patch-list record and module. This is a policy, not a technical limit: suzzer's generator
 never places a site in a delay slot (libcov's trap-based sites cannot work there), so such a

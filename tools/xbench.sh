@@ -23,6 +23,7 @@
 #
 # Builds go to DIR (default build/firmware-bench), DIR-kN per kernel, DIR-check.
 # Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b
+#   pic32mx pic32mm pic32mz
 # (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS), and
 # with --check also mcs51 (when SDCC built it): the 8051 needs some 450 million
 # instructions a round, ~400 times RV32's, so timing it takes --variants mcs51 (and a
@@ -51,7 +52,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$variants" ]; then
-    variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b"
+    variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b pic32mx pic32mm pic32mz"
     [ $check = 0 ] || variants="$variants mcs51"
 fi
 
@@ -79,6 +80,9 @@ run_all() {
         avr32a)   board=avr32-ref  img=bench-avr32a.elf extra="-o model=a";;
         avr32b)   board=avr32-ref  img=bench-avr32b.elf extra="-o model=b";;
         mcs51)    board=mcs51-ref  img=bench-mcs51.bin;;
+        pic32mx)  board=pic32-ref  img=bench-pic32mx.elf extra="-o model=mx --ram 0x20000";;
+        pic32mm)  board=pic32-ref  img=bench-pic32mm.elf extra="-o model=mm --ram 0x20000";;
+        pic32mz)  board=pic32-ref  img=bench-pic32mz.elf extra="-o model=mz --ram 0x20000";;
         *) echo "xbench.sh: unknown variant $v" >&2; exit 2;;
         esac
         if [ ! -f "$out/$img" ]; then

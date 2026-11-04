@@ -22,13 +22,16 @@ trap 'rm -rf "$tmp"' EXIT
 
 # Symbols from the ELF file, or for an image with no ELF from FIRMWARE.syms ("name hex").
 sym() {
+    # The name is the last field (MIPS adds a [MIPS16] / [MICROMIPS] column); code in
+    # those ISAs runs at the odd address (the ISA mode in pc bit 0), as Thumb's does.
     if [ -f "$fw.syms" ]; then
-        v=$(awk -v n="$1" '$1 == n { print $2; exit }' "$fw.syms")
+        v=$(awk -v n="$1" '$1 == n { print $2, 0; exit }' "$fw.syms")
     else
-        v=$(readelf -sW "$fw" | awk -v n="$1" '$8 == n { print $2; exit }')
+        v=$(readelf -sW "$fw" | awk -v n="$1" '$NF == n { print $2, ($0 ~ /\[(MIPS16|MICROMIPS)\]/); exit }')
     fi
     [ -n "$v" ] || { echo "fuzz-check: no symbol $1 in $fw" >&2; exit 1; }
-    printf '0x%x\n' "0x$v"   # readelf pads with zeros; the runner prints pcs without
+    set -- $v
+    printf '0x%x\n' $(( 0x$1 | $2 ))   # readelf pads with zeros; the runner prints pcs without
 }
 begin=$(sym fuzz_iteration)
 panic=$(sym fuzz_panic)

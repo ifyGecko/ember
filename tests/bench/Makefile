@@ -42,6 +42,7 @@ FW := ../firmware
 ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-arm.elf $(OUT)/bench-thumb.elf $(OUT)/bench-thumb-be.elf \
        $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host \
+       $(OUT)/bench-pic32mx.elf $(OUT)/bench-pic32mm.elf $(OUT)/bench-pic32mz.elf \
        $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf) \
        $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin)
 
@@ -111,6 +112,18 @@ $(OUT)/bench-mcs51.bin: bench.c $(OUT)/.config
 	$(SDCC) $(MCS51_FLAGS) -c bench.c -o $(OUT)/mcs51/bench.rel
 	$(SDCC) $(MCS51_FLAGS) $(OUT)/mcs51/bench.rel $(OUT)/mcs51/mullonglong.rel -o $(OUT)/mcs51/bench.ihx
 	makebin -p $(OUT)/mcs51/bench.ihx $@
+
+# PIC32 (pic32-ref, with the PIC32 self-test's start code and map): MIPS16e on mx,
+# microMIPS on mm, MIPS32 with the FPU enabled on mz.
+PIC32 = -DBENCH_PIC32 -mabi=32 -mno-abicalls -G0 -EL $(COMMON) $(LDCOMMON) -Wl,-T,pic32.ld \
+        -fno-optimize-sibling-calls
+$(OUT)/bench-pic32mx.elf: bench.c $(FW)-pic32/start.S pic32.ld $(OUT)/.config
+	$(MIPSEL_CROSS)gcc -march=m4k -msoft-float $(PIC32) -c $(FW)-pic32/start.S -o $(OUT)/pic32mx-start.o
+	$(MIPSEL_CROSS)gcc -march=m4k -msoft-float -mips16 $(PIC32) $(OUT)/pic32mx-start.o bench.c -o $@
+$(OUT)/bench-pic32mm.elf: bench.c $(FW)-pic32/start.S pic32.ld $(OUT)/.config
+	$(MIPSEL_CROSS)gcc -march=m14k -mmicromips -msoft-float $(PIC32) $(FW)-pic32/start.S bench.c -o $@
+$(OUT)/bench-pic32mz.elf: bench.c $(FW)-pic32/start.S pic32.ld $(OUT)/.config
+	$(MIPSEL_CROSS)gcc -march=mips32r2 -mhard-float -mfp64 $(PIC32) $(FW)-pic32/start.S bench.c -o $@
 
 $(OUT)/bench-ppc.elf: bench.c $(FW)-ppc/start.S $(OUT)/.config
 	$(PPC_CROSS)gcc $(PPC_FLAGS) $(COMMON) $(LDCOMMON) -Wl,-T,$(FW)-ppc/link.ld \
