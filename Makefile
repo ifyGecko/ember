@@ -35,6 +35,7 @@
 #   libuam-avr.a      8-bit AVR ISA module       libuam-avr32.a  AVR32 (A and B) ISA module
 #   libuam-pic.a      8-bit PIC ISA module
 #   libuam-mcs51.a    8051 (MCS-51) ISA module   libuam-m6502.a  6502 (NMOS, 2A03, 65C02) ISA module
+#   libuam-z80.a      Z80 ISA module
 #   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref, ...)
 #   libuam-fuzz.a     the fuzz harness and its frontends (fuzz/)
 #   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main; uses libuam-fuzz)
@@ -128,6 +129,7 @@ AVR32_SRC   := isa/avr32/avr32_lift.c isa/avr32/avr32_dec.c isa/avr32/avr32_dsp.
 PIC_SRC     := isa/pic8/pic_lift.c isa/pic8/pic_system.c
 MCS51_SRC   := isa/mcs51/mcs51_lift.c isa/mcs51/mcs51_system.c
 M6502_SRC   := isa/m6502/m6502_lift.c isa/m6502/m6502_system.c
+Z80_SRC     := isa/z80/z80_lift.c isa/z80/z80_system.c
 X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_f80.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
                isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
@@ -138,9 +140,10 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_f
                devices/ioapic.c devices/pci.c devices/ata_core.c devices/ahci.c devices/ide.c devices/nvme.c \
                devices/cfi_flash.c devices/pc_misc.c devices/acpi_pm.c devices/ipi.c devices/i8237.c devices/vga.c devices/fdc.c devices/lpt.c \
                devices/i8042.c devices/hpet.c devices/gptimer.c devices/avr32_intc.c \
-               devices/mcs51_timer.c devices/mcs51_serial.c devices/mcs51_port.c devices/pic32_intc.c
+               devices/mcs51_timer.c devices/mcs51_serial.c devices/mcs51_port.c devices/pic32_intc.c \
+               devices/z80_ctc.c
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c \
-               boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c boards/m6502_ref.c \
+               boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c boards/m6502_ref.c boards/z80_ref.c \
                boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
@@ -151,14 +154,14 @@ HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/b
                src/debug/gdbstub.c src/runner/runner.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
-LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(PIC_SRC) $(MCS51_SRC) $(M6502_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
+LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(PIC_SRC) $(MCS51_SRC) $(M6502_SRC) $(Z80_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
 obj = $(1:%.c=$(BUILD)/obj/%.o)
 LIB_OBJ  := $(call obj,$(LIB_SRC))
 
 LIB        := $(BUILD)/libuam.a
 MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mips.a \
                $(BUILD)/libuam-arm.a $(BUILD)/libuam-x86.a $(BUILD)/libuam-ppc.a $(BUILD)/libuam-avr.a \
-               $(BUILD)/libuam-avr32.a $(BUILD)/libuam-pic.a $(BUILD)/libuam-mcs51.a $(BUILD)/libuam-m6502.a \
+               $(BUILD)/libuam-avr32.a $(BUILD)/libuam-pic.a $(BUILD)/libuam-mcs51.a $(BUILD)/libuam-m6502.a $(BUILD)/libuam-z80.a \
                $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
                $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
@@ -262,6 +265,7 @@ $(BUILD)/libuam-avr32.a:   $(call obj,$(AVR32_SRC))
 $(BUILD)/libuam-pic.a:     $(call obj,$(PIC_SRC))
 $(BUILD)/libuam-mcs51.a:   $(call obj,$(MCS51_SRC))
 $(BUILD)/libuam-m6502.a:   $(call obj,$(M6502_SRC))
+$(BUILD)/libuam-z80.a:     $(call obj,$(Z80_SRC))
 $(BUILD)/libuam-devices.a: $(call obj,$(DEV_SRC))
 $(BUILD)/libuam-boards.a:  $(call obj,$(BOARD_SRC))
 $(BUILD)/libuam-fuzz.a:    $(call obj,$(FUZZ_SRC))
