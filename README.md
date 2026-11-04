@@ -26,13 +26,16 @@ the reduced core AVRrc, each with the memory layout of common devices of the fam
 UC3 class, with events on the system stack and an MPU, and AVR32B, the AP7 class, with
 RSR/RAR per context, INT3 shadow registers, the P0-P4 segments, an ITLB and a DTLB and the
 SIMD instructions; the DSP instructions on both) on the `avr32-ref` board with an AVR32-style
-interrupt controller, and the 8051 (the MCS-51 instruction set, with the core's differences as
-CPU models: the 8051 and 8052, and a CIP-51-style core with extended interrupts, SFR paging
-and code banking) on the `mcs51-ref` board with the 8051's own timers, serial port and ports -
-run by a
+interrupt controller, and 8-bit PIC (the baseline, mid-range, enhanced mid-range and PIC18
+instruction sets as CPU models of one module, with PIC18's extended instruction set as an
+option; the core's own registers, hardware stack and interrupt gating, the peripherals left to
+the board) on the `pic-ref` board, and the 8051 (the MCS-51 instruction set, with the
+core's differences as CPU models: the 8051 and 8052, and a CIP-51-style core with extended
+interrupts, SFR paging and code banking) on the `mcs51-ref` board with the 8051's own timers,
+serial port and ports - run by a
 reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
-with block chaining (a block optimizer feeds both). Every reference board but `avr-ref` and
-`mcs51-ref` (an AVR or an 8051 has one processor) takes `-o cpus=N`:
+with block chaining (a block optimizer feeds both). Every reference board but `avr-ref`,
+`pic-ref` and `mcs51-ref` (an AVR, a PIC and an 8051 have one processor) takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
@@ -67,7 +70,7 @@ host-independent.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32 and 8051 firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC and 8051 firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
                      # (and suzzer interop, with a suzzer checkout)
@@ -104,6 +107,10 @@ with a note. Its tools want `LC_ALL=C`, and its static binaries call the legacy 
 which current kernels no longer provide: they crash in `time`/`gettimeofday` unless the kernel
 emulates vsyscalls (`vsyscall=emulate`) or the two calls are patched into system calls.
 
+The PIC self-tests (one per core family, and PIC18's extended instruction set) and the PIC
+fuzz target are assembled with `gpasm` from gputils (Debian: `gputils`) and need `python3`;
+without gpasm they are skipped with a note (`GPASM=path` names another). There is no PIC build
+of the benchmark: its data (about 20 KiB) does not fit an 8-bit PIC's data space.
 The 8051 self-tests (one per core model) are assembled with `as31` (Debian: `as31`); the
 8051 fuzz target and benchmark build need SDCC (Debian: `sdcc`). Without either, its checks
 are skipped with a note (`AS31=`, `SDCC=` point the build at them).
@@ -127,6 +134,8 @@ build/uam-run -b avr-ref build/firmware-avr/selftest-eplus.elf   # 8-bit AVR (AT
 build/uam-run -b avr-ref -o model=xm build/firmware-avr/selftest-xm.elf  # XMEGA
 build/uam-run -b avr32-ref build/firmware-avr32/selftest-a.elf   # AVR32A (UC3 class)
 build/uam-run -b avr32-ref -o model=b build/firmware-avr32/selftest-b.elf  # AVR32B (AP7 class)
+build/uam-run -b pic-ref build/firmware-pic/selftest-pic18.elf  # PIC18
+build/uam-run -b pic-ref -o model=enhanced build/firmware-pic/selftest-enhanced.elf  # PIC16F1xxx
 build/uam-run -b mcs51-ref build/firmware-mcs51/selftest-8052.bin  # an 8052 (raw image at 0)
 build/uam-run -b mcs51-ref -o model=cip51 build/firmware-mcs51/selftest-cip51.bin  # CIP-51 style
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
@@ -149,6 +158,12 @@ generic, not those parts' peripherals, and `--ram` sets the size of its SRAM. `a
 `-o model=a|b` (default `a`: RAM at 0 and code memory at the reset address 0x80000000; `b`: code
 memory at physical 0, reset through P2 at 0xa0000000, RAM at physical 0x10000000), with its
 interrupt controller, a 16550 and the test finisher at 0xffff0800, 0xffff1400 and 0xffff1800.
+`pic-ref` takes `-o model=baseline|mid|enhanced|pic18` (default `pic18`; the program memory and
+data space of a PIC16F59, PIC16F877, PIC16F19197 and PIC18F4620) and `-o xinst=1` (PIC18's
+extended instruction set); its data space is RAM wherever the core has no register, with a
+16550, a timer and the test finisher (boards/pic_ref.c has the map). gpasm writes Intel hex:
+tests/firmware-pic/hex2elf.py turns a hex file and its listing into an ELF image with the
+listing's labels as symbols.
 `mcs51-ref` takes `-o model=8051|8052|cip51` (default `8052`): 64 KiB of program memory (128
 KiB banked from 0x8000 on `cip51`, with PSBANK at SFR 0xB1 and SFR paging), external data RAM
 below 0xFF00 (`--ram` sets its size) with the test finisher at 0xFF00, and in the SFR space the
@@ -369,7 +384,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
-                   mcs51.h)
+                   pic.h mcs51.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
@@ -404,6 +419,10 @@ isa/avr32/         AVR32 decoder (avr32_dec.c, avr32_op.h), lifter (avr32_lift.c
                    (avr32_system.c: SR and the modes, events and autovectored interrupts for
                    AVR32A and AVR32B, system registers, COUNT/COMPARE, the AVR32A MPU, the
                    AVR32B segments and TLBs)
+isa/pic8/          8-bit PIC lifter (pic_lift.c: the baseline, mid-range, enhanced mid-range and
+                   PIC18 instruction sets) and system side (pic_system.c: the CPU models, the
+                   data space on the bus, the core's registers, the hardware stack, interrupt
+                   entry with PIC18's priorities and the enhanced core's context save)
 isa/mcs51/         8051 lifter (mcs51_lift.c: the MCS-51 instruction set, register banks and
                    the data pointer as translation state) and system side (mcs51_system.c:
                    the CPU models, interrupt levels and extended sources, SFR page saving,
@@ -419,7 +438,7 @@ devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, uni
                    mcs51_port (ports and plain SFR registers)
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR),
-                   avr32_ref.c (AVR32), mcs51_ref.c (8051):
+                   avr32_ref.c (AVR32), pic_ref.c (8-bit PIC), mcs51_ref.c (8051):
                    reference boards of generic
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
@@ -432,8 +451,9 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    loops, stores next to code, MMIO rules, coverage, the fuzz harness,
                    multiprocessor observers, suzzer's formats, the PowerPC board interface,
                    the x87's software 80-bit format (against the host's x87 on x86-64), the
-                   AVR interrupt controllers and the general-purpose timer, the 8051's
-                   interrupt system, SFR pages, code banks and its timer and serial devices
+                   AVR interrupt controllers and the general-purpose timer, the PIC stacks and
+                   interrupt priorities, the 8051's interrupt system, SFR pages, code banks
+                   and its timer and serial devices
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images
@@ -444,6 +464,9 @@ tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E buil
 tests/firmware-avr/ 8-bit AVR self-test, one build per core family (flag vectors from the
                    manual's equations: gen_vectors.py), and fuzz target
 tests/firmware-avr32/ AVR32 self-test (AVR32A and AVR32B builds) and fuzz target
+tests/firmware-pic/ 8-bit PIC self-tests in gpasm assembly, one per core family and one for
+                   PIC18's extended instructions (flag vectors from the data sheets'
+                   definitions: gen_vectors.py), fuzz target, hex2elf.py
 tests/firmware-mcs51/ 8051 self-test (as31), one build per core model (arithmetic vectors from
                    the instruction set's definitions: gen_vectors.py; CIP-51 code banks:
                    mkimage.py), and fuzz target (SDCC)

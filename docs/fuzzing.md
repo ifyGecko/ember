@@ -180,8 +180,10 @@ check and 10 the Book E critical input; the timers have no line. On x86-64 they 
 processor's pins that were high (`UAM_X86_IRQ_*`: 0 INTR, 1 NMI, 2 SMI, 3 INIT, 4 A20M#). On
 8-bit AVR a line is an interrupt vector (1..63; on `avr-ref`: 1 the UART, 2 the timer); on
 AVR32 0..3 are INT0..INT3 and 4 NMI (on `avr32-ref` COUNT/COMPARE and the UART reach the
-levels their interrupt controller groups are given); on the 8051 a line is an interrupt source
-(vector 0x03 + 8n; on `mcs51-ref`: 0 INT0, 1 Timer 0, 2 INT1, 3 Timer 1, 4 the serial port).
+levels their interrupt controller groups are given); on 8-bit PIC 0 is the (PIC18 with IPEN:
+high-priority) peripheral line and 1 the low-priority one (on `pic-ref`: 0 the timer, 1 the
+UART); on the 8051 a line is an interrupt source (vector 0x03 + 8n; on `mcs51-ref`: 0 INT0,
+1 Timer 0, 2 INT1, 3 Timer 1, 4 the serial port).
 The interrupt is reported once the CPU has taken it
 (`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
 detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
@@ -362,7 +364,7 @@ suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
-`mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64`, `avr`, `avr32` or `mcs51`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+`mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64`, `avr`, `avr32`, `pic` or `mcs51`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|

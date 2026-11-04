@@ -20,6 +20,7 @@
 
 #include "uam/isa/arm.h"
 #include "uam/isa/avr.h"
+#include "uam/isa/pic.h"
 #include "uam/isa/avr32.h"
 #include "uam/isa/mcs51.h"
 #include "uam/isa/mips32.h"
@@ -401,6 +402,29 @@ static prog avr32_prog(int n)
     p.site[1] = p.base + 8;
     p.site[2] = p.base + 12;
     p.site[3] = p.base + 20;
+    p.done = p.base + 24;
+    return p;
+}
+
+/* 8-bit PIC (the default model, PIC18): two instructions per little-endian word; x is FSR0
+ * (with FSR1 zero, so a 32-bit read of it is x), counted with INCF on FSR0L/FSR0H. */
+static prog pic_prog(int n)
+{
+    prog p = { .name = "pic18", .isa = &uam_isa_pic, .base = 0x1000, .phys = 0x1000, .be = false,
+               .xreg = 12, .no_exc = true };
+    const uint32_t lo = (uint32_t)n & 0xFF, hi = ((uint32_t)n >> 8) & 0xFF;
+    p.w[0] = 0xEE00u | 0xF000u << 16;                  /* lfsr 0,0 */
+    p.w[1] = 0x2AE9u | 0xB4D8u << 16;                  /* loop: incf FSR0L; btfsc STATUS,Z */
+    p.w[2] = 0x2AEAu | (0x0E00u | lo) << 16;           /* incf FSR0H; movlw lo */
+    p.w[3] = 0x62E9u | 0xD7FAu << 16;                  /* cpfseq FSR0L; bra loop */
+    p.w[4] = (0x0E00u | hi) | 0x62EAu << 16;           /* movlw hi; cpfseq FSR0H */
+    p.w[5] = 0xD7F7u | 0x0E07u << 16;                  /* bra loop; movlw 7 */
+    p.w[6] = 0xD7FFu;                                  /* bra . */
+    p.n = 7;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 4;
+    p.site[2] = p.base + 10;
+    p.site[3] = p.base + 22;
     p.done = p.base + 24;
     return p;
 }
@@ -876,11 +900,11 @@ int main(void)
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
                             arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3),
-                            mcs51_prog(3) };
+                            pic_prog(3), mcs51_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
                               arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300),
-                              mcs51_prog(300) };
+                              pic_prog(300), mcs51_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

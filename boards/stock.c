@@ -18,6 +18,7 @@ void uam_boards_register_stock(void)
     uam_board_register(&uam_board_ppc_ref);
     uam_board_register(&uam_board_avr_ref);
     uam_board_register(&uam_board_avr32_ref);
+    uam_board_register(&uam_board_pic_ref);
     uam_board_register(&uam_board_mcs51_ref);
 }
 

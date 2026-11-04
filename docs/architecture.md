@@ -2,14 +2,14 @@
 
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
-and AVR32B, the 8051 in three core models), the
+and AVR32B, 8-bit PIC in four core families, the 8051 in three core models), the
 snapshot part of phase 3 and the JIT from
 phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), 8-bit AVR
-(`avr-ref`), AVR32 (`avr32-ref`), the 8051 (`mcs51-ref`), host
+(`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), the 8051 (`mcs51-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -48,7 +48,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/mcs51` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -79,7 +79,8 @@ Arrows point to what a module may include. Anything not listed is forbidden.
 ir            ← nothing (pure data + algorithms over it)
 isa/*         → ir, isa.h, state.h      (x86 and PowerPC page-table walks also bus.h:
                                          physical reads and accessed/referenced/changed bits;
-                                         AVR interrupt entry: the return address it pushes)
+                                         AVR interrupt entry: the return address it pushes;
+                                         PIC: a named INDF reached through a banked operand)
 exec/*        → ir, isa.h, bus.h, sched.h, pass.h, cov.h (it wires passes in)
 analysis/*    → ir, pass.h, cov.h        (never an ISA or a device)
 core (bus, sched, signal, chardev, netdev, state) → their own headers only
@@ -127,7 +128,7 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
                   i8237.h ide.h fdc.h vga.h lpt.h gptimer.h avr32_intc.h mcs51_timer.h
                   mcs51_serial.h mcs51_port.h
-include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h mcs51.h
+include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
@@ -145,6 +146,7 @@ isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32)
 isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_booke.c ppc_system.c ppc.h (private)
 isa/avr8/         avr_lift.c avr_system.c avr_des.c avr.h (private)
 isa/avr32/        avr32_dec.c avr32_op.h avr32_lift.c avr32_dsp.c avr32_system.c avr32.h (private)
+isa/pic8/         pic_lift.c pic_system.c pic.h (private)
 isa/mcs51/        mcs51_lift.c mcs51_system.c mcs51.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
@@ -170,7 +172,7 @@ tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: refe
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
-                  test_smp.c test_ppc.c test_avr.c test_mcs51.c test_f80.c
+                  test_smp.c test_ppc.c test_avr.c test_pic.c test_mcs51.c test_f80.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -192,6 +194,8 @@ tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.
 tests/firmware-avr/   selftest.c gen_vectors.py fuzztarget.c  (8-bit AVR, one build per core
                       family, with avr-libc's start-up code)
 tests/firmware-avr32/ start.S selftest.c fuzztarget.c link-a.ld link-b.ld  (AVR32A and AVR32B)
+tests/firmware-pic/   selftest-{baseline,mid,enhanced,pic18,xinst}.asm gen_vectors.py
+                      fuzztarget.asm hex2elf.py  (8-bit PIC, gpasm)
 tests/firmware-mcs51/ selftest.asm model-*.asm gen_vectors.py bank.asm mkimage.py fuzztarget.c
                       (the 8051: as31 self-tests per core model, an SDCC fuzz target)
                       start-booke.S link-booke.ld  (the self-test for the Book E model)
@@ -248,7 +252,10 @@ devices.
   of it: program memory, SRAM, 32 general-purpose I/O registers, a NS16550A UART, the
   general-purpose timer and a test finisher), and `avr32-ref` (AVR32A or, with `-o model=b`,
   AVR32B: RAM, code memory at the reset address, an AVR32-style interrupt controller fed by
-  COUNT/COMPARE and the UART, a NS16550A UART and a test finisher), and `mcs51-ref` (the
+  COUNT/COMPARE and the UART, a NS16550A UART and a test finisher), and `pic-ref` (8-bit PIC,
+  `-o model=` one of the four core families with the program memory and data space of a
+  common part of it, `-o xinst=1` for PIC18's extended instructions: a data space of RAM, a
+  NS16550A UART, the general-purpose timer and a test finisher), and `mcs51-ref` (the
   8051, `-o model=8051|8052|cip51`: program memory (banked on `cip51`), external data RAM, the
   8051's own Timer 0/1, serial port and ports in the SFR space, on `cip51` across SFR pages,
   and a test finisher in external data). Real devices are
@@ -355,6 +362,31 @@ devices.
   autovector each. Not modelled: caches (`cache` does nothing), the Java and secure states
   (their instructions raise the events), coprocessors (coprocessor-absent), the on-chip debug
   registers; TLB Accessed bits are set by tlbw, not by translation (which has no side effects).
+- **8-bit PIC** (`isa/pic8`, `uam/isa/pic.h`): one descriptor for the baseline (12-bit),
+  mid-range and enhanced mid-range (14-bit) and PIC18 (16-bit) instruction sets; the CPU
+  model (`uam_pic_configure`) names the family, the program memory size, the baseline's banks
+  and the configuration options XINST (PIC18's extended instruction set and indexed literal
+  offset addressing) and STVREN. Program memory is at bus 0 as the PIC tools' hex files lay
+  it out (two bytes per 12/14-bit word; the pc is that byte address), the data space at
+  0x800000 through `isa->translate`. The core's registers at their fixed addresses belong to
+  the hart (INDF, PCL, STATUS, FSR, PCLATH, INTCON; by family BSR, WREG, STKPTR, TOS, the
+  enhanced shadow registers, TBLPTR, TABLAT, PROD, PCLATU, RCON), everything else is the
+  board's; banked and indirect operands split at run time (uam-isa.md section 10f), and the
+  enhanced core maps its FSRs over the linear view of the GPRs and over program memory. The
+  hardware stack (2, 8 or 16 levels, PIC18 31 with STKFUL/STKUNF) is hart state, in the gdb
+  view and snapshots; with STVREN its overflow and underflow, and the RESET instruction,
+  reset the core and call the board's hook (`uam_pic_set_reset_hook`), which on `pic-ref`
+  resets the board. Interrupts: the core holds GIE/PEIE (PIC18 with IPEN GIEH/GIEL, two
+  vectors, high preempting low) and INTCON's three enable/flag pairs (`uam_pic_intcon_set`);
+  every other source is a peripheral whose flag and enable are the board's, which drives the
+  peripheral line(s). Entry saves the enhanced core's context in its shadow registers and
+  PIC18's W/STATUS/BSR in the fast register stack. TBLWT reaches the board's flash
+  controller (`uam_pic_set_tblwt`). A PIC has no exceptions: an undefined opcode stops into
+  the debugger, an access nothing answers halts the core with a message. Not modelled: the
+  watchdog (CLRWDT and SLEEP set TO and PD only), the priorities of INTCON's own sources on
+  PIC18 (INTCON2's TMR0IP/RBIP: high here), the vectored interrupt controllers and 14-bit
+  data addresses of the newest PIC18 parts, the enhanced baseline (PIC12F529-class), the
+  debug-executive opcodes, instruction timing.
 - **8051** (`isa/mcs51`, `uam/isa/mcs51.h`): one descriptor for every core running the MCS-51
   instruction set. What derivatives share is the ISA module (the instruction set, the four
   address spaces, the register banks, the core SFRs ACC, B, PSW, SP, DPL/DPH, IE, IP, PCON);
@@ -366,7 +398,7 @@ devices.
   external data and the SFRs at their own bus bases, the internal RAM in the hart (direct
   addresses become GET/PUT, indirect ones helpers). Blocks are translated for one register
   bank and data pointer (`cpu->priv`), so R0-R7 and DPTR are fixed offsets; a PSW or DPS write
-  ends the block (uam-isa.md section 10f). Interrupt input n is source n, vector 0x03 + 8n;
+  ends the block (uam-isa.md section 10g). Interrupt input n is source n, vector 0x03 + 8n;
   levels in progress end with RETI, a higher level preempts, the lowest source wins a tie;
   with SFR paging the core saves the page on entry and restores it on RETI. Code banking maps
   the window above `bank_from` onto flash blocks through `isa->translate` (fetch and MOVC
@@ -544,7 +576,11 @@ Implemented (`make test`):
   against the FIPS 46 example on AVRxm); the AVR32 self-test on AVR32A and AVR32B (the ALU and
   wide arithmetic, every load/store form, bit operations, multiply/divide, atomics, conditional
   execution, DSP, SIMD on B, breakpoint, scall, user mode, exceptions, CONFIG, the COMPARE
-  interrupt and priorities, the MPU or MMU), built when an AVR32 toolchain is found; the 8051
+  interrupt and priorities, the MPU or MMU), built when an AVR32 toolchain is found; the 8-bit
+  PIC self-tests on each core family (every flag the ALU instructions define against vectors
+  from the data sheets' definitions, banks, every indirect mode, the stack, computed gotos,
+  table reads, interrupts and their context saves, RESET and stack resets) and on PIC18's
+  extended instructions, built when gputils is found; the 8051
   self-test on each core model (ADD/ADDC/SUBB/DA/MUL/DIV/RLC/RRC/CJNE flags against vectors
   worked bit by bit from the instruction set's definitions, register banks, the stack and
   calls, every bit instruction, MOVC/MOVX, Timer 0/1 modes, interrupts with priorities and

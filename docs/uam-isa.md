@@ -553,7 +553,46 @@ AVR32 needed no new IR; these are conventions of its lifter (`isa/avr32`).
 - **Translation without side effects.** AVR32B's TLB lookup is `isa->translate`; a miss or a
   protection fault becomes the event, and the TLB entries' Accessed bits are set by tlbw only.
 
-## 10f. Four address spaces and banked registers (8051)
+## 10f. Banks, a hardware stack and four instruction sets (8-bit PIC)
+
+The 8-bit PIC needed no new IR; these are conventions of its lifter (`isa/pic8`).
+
+- **One descriptor, four instruction sets.** The baseline (12-bit), mid-range and enhanced
+  mid-range (14-bit) and PIC18 (16-bit) families share a data-space model and differ in
+  encodings; the CPU model (`uam_pic_configure`) picks the decoder.
+- **Program memory as the tools lay it out.** Program memory is at bus address 0 as gpasm's
+  hex files have it: a 12- or 14-bit word in two little-endian bytes (the pc is twice the word
+  PC, the upper bits of each word ignored on fetch), PIC18 byte addressed. The data space is
+  at 0x800000 through `isa->translate`, as on the AVR; program-memory reads (TBLRD, an enhanced
+  FSR at 0x8000 and above) are `PHYS` loads.
+- **Operands resolved at lift time where the hardware fixes them.** A file-register operand
+  becomes a data address. The core's registers mirrored in every bank (INDF, PCL, STATUS,
+  FSR, PCLATH, INTCON, and the enhanced core's 0x00-0x0B) and PIC18's access bank are
+  constant addresses: GET/PUT, or SYSRD/SYSWR for INTCON, RCON, STKPTR and TOS (an INTCON
+  write may enable an interrupt, so it requests an exit). A banked operand (RP bits, BSR,
+  baseline FSR<7:5>) or an indirect one is computed at run time; where it can reach a core
+  register, a guarded `HELPER` handles those and a guarded `LD`/`ST` the rest, the results
+  ORed as on the AVR. A named INDF (PIC18: POSTINC, POSTDEC, PREINC, PLUSW) is an indirect
+  access with its FSR update; through an FSR, INDF-class registers read 0. The enhanced FSR
+  map (traditional, linear, program memory) is computed in IR, its unimplemented ranges by a
+  false guard.
+- **Register writes last, flags after the destination.** Every instruction queues its
+  register writes and commits them after its loads, stores and helpers (the commit rule). The
+  data sheets' rule that an instruction setting flags overrides its own write of STATUS
+  follows: the flags are queued after the destination.
+- **PCL writes and run-time redirects.** A constant write to PCL is a computed `EXIT` (with
+  PCLATH, PCLATU, or baseline STATUS PA). A run-time core write returns `pc | 1` when it hit
+  PCL, and the instruction ends with a guarded `EXIT` on that bit. GOTO/CALL targets that take
+  page bits from PCLATH or PA exit directly when the page is the one the code is in (the
+  common case, so the cache can chain) and indirectly otherwise.
+- **A stack outside memory.** The hardware return stack is ISA state, pushed and popped by
+  helpers whose result also says whether an overflow or underflow reset the core (STVREN);
+  then the instruction leaves for the reset vector. Interrupt entry, the enhanced core's
+  context save and PIC18's fast register stack are in `irq_take`.
+- **Skips** end the block with a guarded `EXIT` one word on: a PIC18 skip over a two-word
+  instruction lands on its second word, which executes as a NOP, as on the hardware.
+
+## 10g. Four address spaces and banked registers (8051)
 
 The 8051 needed no new IR; these are conventions of its lifter (`isa/mcs51`).
 
