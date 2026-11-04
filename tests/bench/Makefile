@@ -23,7 +23,7 @@ ifneq ($(HAVE_AVR32),1)
 $(shell rm -f $(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf)
 endif
 ifneq ($(HAVE_SDCC),1)
-$(shell rm -f $(OUT)/bench-mcs51.bin)
+$(shell rm -f $(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin)
 endif
 
 DEFS   = $(if $(ROUNDS),-DBENCH_ROUNDS=$(ROUNDS)) $(if $(ONLY),-DBENCH_ONLY=$(ONLY))
@@ -44,7 +44,7 @@ ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host \
        $(OUT)/bench-pic32mx.elf $(OUT)/bench-pic32mm.elf $(OUT)/bench-pic32mz.elf \
        $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf) \
-       $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin)
+       $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin)
 
 all: $(ALL)
 
@@ -112,6 +112,15 @@ $(OUT)/bench-mcs51.bin: bench.c $(OUT)/.config
 	$(SDCC) $(MCS51_FLAGS) -c bench.c -o $(OUT)/mcs51/bench.rel
 	$(SDCC) $(MCS51_FLAGS) $(OUT)/mcs51/bench.rel $(OUT)/mcs51/mullonglong.rel -o $(OUT)/mcs51/bench.ihx
 	makebin -p $(OUT)/mcs51/bench.ihx $@
+
+# 6502 (6502-ref, models nmos and 65c02), only when SDCC is found: code and constants from
+# the ROM at 0x8000 (GSINIT is the first code area SDCC's start code links), data in RAM
+# from 0x0200, the image the ROM's 32 KiB.
+M6502_FLAGS = --std-c11 --code-loc 0x8000 -Wl-bGSINIT=0x8000 $(DEFS)
+$(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin: $(OUT)/bench-%.bin: bench.c $(FW)-6502/ihx2bin.py $(OUT)/.config
+	@mkdir -p $(OUT)/$*
+	$(SDCC) $(if $(filter 65c02,$*),-mmos65c02,-mmos6502) $(M6502_FLAGS) bench.c -o $(OUT)/$*/bench.ihx
+	python3 $(FW)-6502/ihx2bin.py $(OUT)/$*/bench.ihx $@
 
 # PIC32 (pic32-ref, with the PIC32 self-test's start code and map): MIPS16e on mx,
 # microMIPS on mm, MIPS32 with the FPU enabled on mz.

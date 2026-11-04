@@ -25,9 +25,9 @@
 # Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b
 #   pic32mx pic32mm pic32mz
 # (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS), and
-# with --check also mcs51 (when SDCC built it): the 8051 needs some 450 million
-# instructions a round, ~400 times RV32's, so timing it takes --variants mcs51 (and a
-# small --rounds).
+# with --check also mcs51, 6502 and 65c02 (when SDCC built them): the 8051 needs some 450
+# million instructions a round and the 6502 some 180 million, hundreds of times RV32's, so
+# timing them takes --variants (and a small --rounds).
 # Exits non-zero if any guest's console differs from the host build's.
 set -eu
 
@@ -53,7 +53,7 @@ done
 
 if [ -z "$variants" ]; then
     variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b pic32mx pic32mm pic32mz"
-    [ $check = 0 ] || variants="$variants mcs51"
+    [ $check = 0 ] || variants="$variants mcs51 6502 65c02"
 fi
 
 tmp=$(mktemp -d)
@@ -80,6 +80,8 @@ run_all() {
         avr32a)   board=avr32-ref  img=bench-avr32a.elf extra="-o model=a";;
         avr32b)   board=avr32-ref  img=bench-avr32b.elf extra="-o model=b";;
         mcs51)    board=mcs51-ref  img=bench-mcs51.bin;;
+        6502)     board=6502-ref   img=bench-6502.bin;;
+        65c02)    board=6502-ref   img=bench-65c02.bin extra="-o model=65c02";;
         pic32mx)  board=pic32-ref  img=bench-pic32mx.elf extra="-o model=mx --ram 0x20000";;
         pic32mm)  board=pic32-ref  img=bench-pic32mm.elf extra="-o model=mm --ram 0x20000";;
         pic32mz)  board=pic32-ref  img=bench-pic32mz.elf extra="-o model=mz --ram 0x20000";;

@@ -58,6 +58,8 @@ static void putc_(char c)
 #define UART0 0xf0000000u
 #elif defined(__AVR__)
 #define UART0 0x00E0u      /* avr-ref, model eplus; the finisher is at 0x00E8 */
+#elif defined(__SDCC_mos6502) || defined(__SDCC_mos65c02)
+#define UART0 0x7F00u      /* 6502-ref; the finisher is at 0x7F10 */
 #elif defined(__AVR32__)
 #define UART0 0xffff1400u  /* avr32-ref */
 #else
@@ -85,6 +87,7 @@ static void puthex(uint32_t v)
 }
 
 #if !defined(BENCH_HOST)
+#if !defined(__SDCC_mos6502) && !defined(__SDCC_mos65c02)   /* SDCC's 6502 start code brings its own */
 /* The compiler may call these for copies and clears. */
 void *memcpy(void *d, const void *s, size_t n);
 void *memcpy(void *d, const void *s, size_t n)
@@ -103,6 +106,7 @@ void *memset(void *d, int c, size_t n)
         *dp++ = (uint8_t)c;
     return d;
 }
+#endif
 
 #if defined(__AVR__)
 /* avr-libc's exit runs the .fini sections with main's return value in r25:r24: hand it
@@ -397,7 +401,8 @@ static const struct kernel {
     { "fmt",    k_fmt },
 };
 
-#if defined(__SDCC_mcs51)
+#if defined(__SDCC_mcs51) || defined(__SDCC_mos6502) || defined(__SDCC_mos65c02)
+#define BENCH_SDCC
 #define main bench_main   /* SDCC's start code ignores main's value: see below */
 #endif
 int main(void)
@@ -425,16 +430,21 @@ int main(void)
     return 0x5555;
 }
 
-#if defined(__SDCC_mcs51)
+#if defined(BENCH_SDCC)
 #undef main
-/* Hand bench's value to mcs51-ref's test finisher (external data 0xFF00: 0x55 passes,
- * a byte at 0xFF01 fails). */
+/* Hand bench's value to the board's test finisher (0x55 at its first byte passes, a byte
+ * at the next fails): mcs51-ref's in external data at 0xFF00, 6502-ref's at 0x7F10. */
+#if defined(__SDCC_mcs51)
+#define FINISHER ((volatile __xdata uint8_t *)0xFF00)
+#else
+#define FINISHER ((volatile uint8_t *)0x7F10)
+#endif
 void main(void)
 {
     if (bench_main() == 0x5555)
-        *(volatile __xdata uint8_t *)0xFF00 = 0x55;
+        FINISHER[0] = 0x55;
     else
-        *(volatile __xdata uint8_t *)0xFF01 = 1;
+        FINISHER[1] = 1;
     for (;;)
         ;
 }

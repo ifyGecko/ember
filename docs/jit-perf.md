@@ -218,6 +218,11 @@ the timed run: SDCC's reentrant 8051 code needs about 450 million instructions p
 some 350 times what RV32 needs, which a 400-round run would take minutes to show
 (`tools/xbench.sh --variants mcs51 --rounds 4` times it). Its rate is near 400 MIPS: the
 stack and @Ri accesses that code is made of go through helpers into the internal RAM.
+The 6502 builds (SDCC, `bench-6502.bin` for the NMOS model and `bench-65c02.bin`) are the same:
+in the check, not the timed run, at about 180 million instructions a round. Their checksums
+equal the host's, and the JIT runs them at about 900 MIPS (the interpreter near 27): the code
+is short blocks of 8-bit loads, stores and flag updates, with SDCC's 32-bit arithmetic in
+zero-page pseudo-registers.
 
 Each kernel on its own (`--per-kernel --rounds 1600`, medians of 3): time over the
 fastest guest's on that kernel.

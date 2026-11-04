@@ -2,14 +2,16 @@
 
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
-and AVR32B, 8-bit PIC in four core families, the 8051 in three core models), the
+and AVR32B, 8-bit PIC in four core families, the 8051 in three core models, the 6502 in
+three core models), the
 snapshot part of phase 3 and the JIT from
 phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), 8-bit AVR
-(`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), the 8051 (`mcs51-ref`), host
+(`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), the 8051 (`mcs51-ref`), the 6502
+(`6502-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -48,7 +50,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51`, `isa/m6502` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -128,7 +130,7 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
                   i8237.h ide.h fdc.h vga.h lpt.h gptimer.h avr32_intc.h mcs51_timer.h
                   mcs51_serial.h mcs51_port.h
-include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h
+include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h m6502.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
@@ -148,6 +150,7 @@ isa/avr8/         avr_lift.c avr_system.c avr_des.c avr.h (private)
 isa/avr32/        avr32_dec.c avr32_op.h avr32_lift.c avr32_dsp.c avr32_system.c avr32.h (private)
 isa/pic8/         pic_lift.c pic_system.c pic.h (private)
 isa/mcs51/        mcs51_lift.c mcs51_system.c mcs51.h (private)
+isa/m6502/        m6502_lift.c m6502_system.c m6502.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
@@ -157,7 +160,7 @@ devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.
                   ipi.c i8237.c fdc.c vga.c lpt.c gptimer.c avr32_intc.c mcs51_timer.c
                   mcs51_serial.c mcs51_port.c
 boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c avr_ref.c avr32_ref.c
-                  mcs51_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+                  mcs51_ref.c m6502_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
@@ -172,7 +175,8 @@ tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: refe
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
-                  test_smp.c test_ppc.c test_avr.c test_pic.c test_mcs51.c test_f80.c
+                  test_smp.c test_ppc.c test_avr.c test_pic.c test_mcs51.c test_m6502.c
+                  test_f80.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -198,6 +202,8 @@ tests/firmware-pic/   selftest-{baseline,mid,enhanced,pic18,xinst}.asm gen_vecto
                       fuzztarget.asm hex2elf.py  (8-bit PIC, gpasm)
 tests/firmware-mcs51/ selftest.asm model-*.asm gen_vectors.py bank.asm mkimage.py fuzztarget.c
                       (the 8051: as31 self-tests per core model, an SDCC fuzz target)
+tests/firmware-6502/  selftest.s nmos.s model-*.s gen_vectors.py ihx2bin.py fuzztarget.c
+                      (the 6502: sdas6500 self-tests per core model, an SDCC fuzz target)
                       start-booke.S link-booke.ld  (the self-test for the Book E model)
 tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bios-check.py
                       (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
@@ -261,7 +267,9 @@ devices.
   NS16550A UART, the general-purpose timer and a test finisher), and `mcs51-ref` (the
   8051, `-o model=8051|8052|cip51`: program memory (banked on `cip51`), external data RAM, the
   8051's own Timer 0/1, serial port and ports in the SFR space, on `cip51` across SFR pages,
-  and a test finisher in external data). Real devices are
+  and a test finisher in external data), and `6502-ref` (the 6502, `-o model=nmos|2a03|65c02`:
+  RAM, ROM with the vectors, and in an I/O page a NS16550A UART, two general-purpose timers
+  (one on IRQ, one on NMI) and a test finisher). Real devices are
   built out of tree on the library (`examples/external-board/`). Ember's own tests also use
   generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
   virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
@@ -411,6 +419,26 @@ devices.
   stops into the debugger, an access nothing answers halts the core. Not modelled: the
   instruction after RETI before the next interrupt (after an IE/IP write one runs), power-down
   (it idles like IDL), instruction timing (one tick per instruction) and Timer 2.
+- **6502** (`isa/m6502`, `uam/isa/m6502.h`): one descriptor for the cores running the 6502
+  instruction set. What they share is the ISA module (the registers, the one 64 KiB space with
+  the zero page and the stack in page 1, the addressing modes, the vectors); how they differ
+  is the CPU model (`uam_m6502_configure`): NMOS or CMOS (the 65C02's instructions and modes,
+  its undefined opcodes as NOPs, the JMP (abs) fix, valid decimal N and Z, D cleared on
+  interrupts, one store per read-modify-write), decimal mode (off on the 2A03), the Rockwell
+  and WDC bit operations, WAI and STP, and the NMOS's XAA/LXA constant. The NMOS model has the
+  undefined opcodes: the combined instructions, NOPs with operands, the JAMs and the unstable
+  ones, and stores the byte it read before the result of a read-modify-write. Presets are the
+  NMOS 6502, the 2A03, the WDC W65C02S and the Rockwell R65C02; everything else is the board's
+  (a 6502 has no on-chip peripheral). Address a is bus address a. Blocks are translated for one
+  value of D on models with decimal mode (`cpu->priv`), so ADC and SBC are binary or decimal
+  at lift time (decimal through pure helpers); SED, CLD and PLP end the block (uam-isa.md
+  section 10h). Input lines 0-29 are wired-OR into IRQ, line 30 is the edge-triggered NMI and
+  31 set overflow; as on the chip, the interrupt poll after CLI, SEI and PLP sees I as it was
+  (one more instruction runs after CLI; an IRQ pending at SEI is still taken). WAI waits for a
+  request, STP and the NMOS JAMs stop the core until reset. A 6502 has no exceptions: an
+  access nothing answers halts the core. Not modelled: instruction timing (one tick per
+  instruction), the dummy reads of indexed modes, an NMI hijacking BRK, and the branch that
+  delays an interrupt by one instruction.
 
 ## 6. Analysis and fuzzing
 

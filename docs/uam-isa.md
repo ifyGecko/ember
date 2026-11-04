@@ -654,6 +654,34 @@ The 8051 needed no new IR; these are conventions of its lifter (`isa/mcs51`).
   fetches and MOVC loads onto the bank each selects; those translations are not fixed, and a
   bank change calls `uam_cpu_xlate_changed`.
 
+## 10h. Decimal mode as translation state and the interrupt poll (6502)
+
+The 6502 needed no new IR; these are conventions of its lifter (`isa/m6502`).
+
+- **One space, 16-bit arithmetic.** Address a is bus address a. Effective addresses are
+  computed in 16 bits and zero-extended, so indexing wraps at 64 KiB as on the chip; the
+  zero-page modes add in 8 bits (zp,X wraps within the page, and a zero-page pointer at 0xFF
+  takes its high byte from 0x00). The stack is `LD`/`ST` at 0x100 | S.
+- **Flags one byte each.** C, Z, V and N are register-file bytes (0 or 1); I and D, whose
+  changes have effects beyond the bit, are one byte only the system code writes (a `SYSWR`).
+  P is assembled when PHP, BRK or an interrupt pushes it, with B and bit 5 set as each does.
+- **D as translation state.** On a model with decimal mode, a block is lifted for the value
+  of D in effect, which the ISA keeps in `cpu->priv`: ADC and SBC lift to binary IR, or to a
+  pure `HELPER` that applies the model's decimal rules (the NMOS and 65C02 flags differ). SED,
+  CLD and PLP are a `SYSWR` that updates D and ends the block; SED or CLD that leaves D as
+  translated lifts to nothing. On the 2A03 D is a flag only and blocks run on.
+- **The interrupt poll.** The chip polls IRQ before an instruction's last cycle, so after CLI
+  (or a PLP clearing I) one more instruction runs before a pending IRQ, and after SEI (or a
+  PLP setting I) a request already pending is still taken, with I set in the pushed P. The
+  lifter ends the block after those instructions; the `SYSWR` records the old I, and at the
+  boundary `irq_take` either lets the pending IRQ in as if I were still clear, or declines it
+  and requests an exit, which the executor honours after the next instruction. RTI's `SYSWR`
+  takes effect at once.
+- **Read-modify-write on NMOS.** An NMOS INC, DEC, shift or combined instruction on memory is
+  `LD`, `ST` of the byte read, `ST` of the result: a device register sees both stores.
+- **WAI, STP, JAM.** WAI is `WAIT` (the ISA wakes on any request, masked or not); STP and the
+  NMOS JAM opcodes are a `SYSWR` that stops the core and a `WAIT` it never wakes from.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |

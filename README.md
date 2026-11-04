@@ -34,10 +34,12 @@ option; the core's own registers, hardware stack and interrupt gating, the perip
 the board) on the `pic-ref` board, and the 8051 (the MCS-51 instruction set, with the
 core's differences as CPU models: the 8051 and 8052, and a CIP-51-style core with extended
 interrupts, SFR paging and code banking) on the `mcs51-ref` board with the 8051's own timers,
-serial port and ports - run by a
+serial port and ports, and the 6502 (the NMOS 6502 with its undefined opcodes, the 2A03 without
+decimal mode and the WDC 65C02 as CPU models of one module) on the `6502-ref` board - run by a
 reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
 with block chaining (a block optimizer feeds both). Every reference board but `avr-ref`,
-`pic-ref` and `mcs51-ref` (an AVR, a PIC and an 8051 have one processor) takes `-o cpus=N`:
+`pic-ref`, `mcs51-ref` and `6502-ref` (an AVR, a PIC, an 8051 and a 6502 have one processor) takes
+`-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
@@ -72,7 +74,7 @@ host-independent.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC and 8051 firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, 8051 and 6502 firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
                      # (and suzzer interop, with a suzzer checkout)
@@ -117,6 +119,9 @@ of the benchmark: its data (about 20 KiB) does not fit an 8-bit PIC's data space
 The 8051 self-tests (one per core model) are assembled with `as31` (Debian: `as31`); the
 8051 fuzz target and benchmark build need SDCC (Debian: `sdcc`). Without either, its checks
 are skipped with a note (`AS31=`, `SDCC=` point the build at them).
+The 6502 self-tests (one per core model) are assembled with SDCC's `sdas6500` and linked with
+its `sdld`; the 6502 fuzz target and benchmark build need `sdcc` (all in Debian's `sdcc`).
+Without them those checks are skipped with a note (`SDAS6500=`, `SDLD=`, `SDCC=`).
 
 ## Run firmware
 
@@ -141,6 +146,8 @@ build/uam-run -b pic-ref build/firmware-pic/selftest-pic18.elf  # PIC18
 build/uam-run -b pic-ref -o model=enhanced build/firmware-pic/selftest-enhanced.elf  # PIC16F1xxx
 build/uam-run -b mcs51-ref build/firmware-mcs51/selftest-8052.bin  # an 8052 (raw image at 0)
 build/uam-run -b mcs51-ref -o model=cip51 build/firmware-mcs51/selftest-cip51.bin  # CIP-51 style
+build/uam-run -b 6502-ref build/firmware-6502/selftest-nmos.bin  # NMOS 6502 (raw ROM image at 0x8000)
+build/uam-run -b 6502-ref -o model=65c02 build/firmware-6502/selftest-65c02.bin  # WDC 65C02
 build/uam-run -b pic32-ref -o model=mz build/firmware-pic32/selftest-mz.elf  # PIC32 (MIPS32, TLB, EIC)
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
@@ -151,7 +158,7 @@ build/uam-run --help
 ```
 
 Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
-names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref` and `mcs51-ref`,
+names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `mcs51-ref` and `6502-ref`,
 `-o cpus=N`
 (`--quantum N`: instructions each processor runs before the next, default 4096); `ppc-ref` takes
 `-o model=classic|booke`. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
@@ -180,6 +187,11 @@ MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets
 MIPS32, MIPS16e and microMIPS firmware runs (mx and mz switch between their two ISAs through
 JALX and jumps to odd addresses; mm is microMIPS only), and mz has the FPU (FR = 0 and 1, in
 either ISA) and the DSP ASE revision 2 (again in either ISA).
+`6502-ref` takes `-o model=nmos|2a03|65c02` (default `nmos`): RAM from 0 to 0x7EFF (`--ram` sets
+its size), an I/O page at 0x7F00 with a 16550 (the console, IRQ line 0), the test finisher at
+0x7F10 and two general-purpose timers at 0x7F20 (IRQ line 1) and 0x7F30 (the NMI), and ROM from
+0x8000 with the vectors at its top; a raw image is loaded at 0x8000 and the core starts at its
+reset vector.
 `x86_64-ref` takes the images `flash` (a CFI boot flash of up to 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
@@ -395,7 +407,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
-                   pic.h mcs51.h)
+                   pic.h mcs51.h m6502.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
@@ -440,6 +452,9 @@ isa/mcs51/         8051 lifter (mcs51_lift.c: the MCS-51 instruction set, regist
                    the data pointer as translation state) and system side (mcs51_system.c:
                    the CPU models, interrupt levels and extended sources, SFR page saving,
                    code banking, the core SFRs)
+isa/m6502/         6502 lifter (m6502_lift.c: the NMOS and 65C02 opcode maps, decimal mode as
+                   translation state) and system side (m6502_system.c: the CPU models, the
+                   interrupt poll's latency, NMI and IRQ entry, decimal arithmetic)
 devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
                    virtio_net; PC architecture: i8259, i8254, mc146818, lapic, ioapic, hpet,
                    i8042, acpi_pm, pc_misc (port 92, A20 gate, POST codes), i8237 DMA, fdc
@@ -451,7 +466,8 @@ devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, uni
                    mcs51_port (ports and plain SFR registers)
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR),
-                   avr32_ref.c (AVR32), pic_ref.c (8-bit PIC), mcs51_ref.c (8051):
+                   avr32_ref.c (AVR32), pic_ref.c (8-bit PIC), mcs51_ref.c (8051),
+                   m6502_ref.c (6502):
                    reference boards of generic
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
@@ -466,7 +482,8 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    the x87's software 80-bit format (against the host's x87 on x86-64), the
                    AVR interrupt controllers and the general-purpose timer, the PIC stacks and
                    interrupt priorities, the 8051's interrupt system, SFR pages, code banks
-                   and its timer and serial devices
+                   and its timer and serial devices, the 6502's arithmetic over every input,
+                   its interrupt poll and models
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images
@@ -483,6 +500,8 @@ tests/firmware-pic/ 8-bit PIC self-tests in gpasm assembly, one per core family 
 tests/firmware-mcs51/ 8051 self-test (as31), one build per core model (arithmetic vectors from
                    the instruction set's definitions: gen_vectors.py; CIP-51 code banks:
                    mkimage.py), and fuzz target (SDCC)
+tests/firmware-6502/ 6502 self-test (sdas6500), one build per core model (instruction vectors
+                   from the instruction definitions: gen_vectors.py), and fuzz target (SDCC)
 tests/firmware-pic32/ self-test for the pic32-ref board (MIPS32 and microMIPS on mz, MIPS16e
                    on mx, microMIPS on mm)
 tests/isa-mips/    the MIPS16e, microMIPS and DSP decoders checked against binutils
