@@ -1,5 +1,5 @@
 /*
- * test_codestore.c - Stores to a page that holds translated code (src/exec/jit_x86.c,
+ * test_codestore.c - Stores to a page that holds translated code (src/exec/jit_*.c,
  * emit_code_probe): the JIT keeps them inline only when they touch no 64-byte line
  * that holds code, and the result must equal the interpreter's.
  *

@@ -1,7 +1,15 @@
 # JIT performance: measuring it, and where it stands
 
-This note is about the x86-64 backend (`src/exec/jit_x86.c`). It covers the tools for
-measuring the JIT, a log of what each change bought, and how the guest ISAs compare.
+This note is about the native backend: its host-independent core (`src/exec/jit.c`: the
+analyses, the arena, linking) and its code generators, `src/exec/jit_x86.c` for x86-64 and
+`src/exec/jit_a64.c` for AArch64. It covers the tools for measuring the JIT, a log of what
+each change bought, and how the guest ISAs compare. The log was measured on x86-64 and names
+x86-64 registers; the AArch64 code generator emits the same design op for op (one
+compare and an untaken branch per instruction, the same register allocation, flag fusion,
+deferred writes, data-TLB probes, code-page store stubs and chaining), so every step there
+applies to both. When the core was split out of `jit_x86.c`, the x86-64 code stayed
+identical: every block of every self-test has the same size and region offsets in the op
+map.
 Ember's own reference measure is the cross-ISA benchmark in `tests/bench` ("Parity
 across ISAs" below): every change is judged on all guests at once with it.
 

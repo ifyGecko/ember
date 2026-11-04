@@ -111,7 +111,7 @@ The condition is checked when the link is made (§4.4). It is exact, so everythi
 
 **After the window:** every carried byte is overwritten, so the carry is dead. S never consults it again.
 
-**Leaving native code** (an exit that does not chain, a stop stub, a fault): either B's carried writes were materialized at a soft point of S, or the code that leaves materializes them first. The run loop, hooks, snapshots, gdb and the other CPUs never see a pending carry. Nothing outside `jit_x86.c` changes.
+**Leaving native code** (an exit that does not chain, a stop stub, a fault): either B's carried writes were materialized at a soft point of S, or the code that leaves materializes them first. The run loop, hooks, snapshots, gdb and the other CPUs never see a pending carry. Nothing outside the JIT changes: the analysis goes into its core (`jit.c`, `jit_defer_analyze`), the materializer and its calls into each code generator (`jit_x86.c`, `jit_a64.c`).
 
 ### 4.2 Analysis (extends `defer_analyze`)
 
@@ -149,12 +149,12 @@ The condition is checked when the link is made (§4.4). It is exact, so everythi
 - stores 0 to `jc->carry`;
 - returns with `ret`.
 
-It uses only rax, rcx, rdx and the flags, as step 9's replays do. Both of its uses already treat those as scratch: S's stop stubs and load/store slow paths, and B's exit.
+It uses only rax, rcx, rdx and the flags (on AArch64 x0, x1, x2, x16, x17 and the flags), as step 9's replays do. Both of its uses already treat those as scratch: S's stop stubs and load/store slow paths, and B's exit.
 
 **Clearing on an exit path.** An exit always leaves `jc->carry` either cleared (by the materializer) or set to its own stub. So a block that inherited a carry and leaves through an exit needs no separate clear: its window ends at or before the exit, and the inherited carry is dead by then.
 
 **In S (any block with a non-empty carry-safe set), before its own replays at each soft point inside the window:**
-- `mov rax,[rbx+carry]; test rax,rax; jz 1f; call rax; 1:`
+- `mov rax,[rbx+carry]; test rax,rax; jz 1f; call rax; 1:` (on AArch64 `ldr x16,[x19,#carry]; cbz x16,1f; blr x16; 1:`)
 - This sits on the cold paths only: the IMARK stop stubs, and the load/store slow paths before the bridge call. The load/store address in rdx is reloaded after the replays, as step 9 already does.
 
 **At S's window end, if it is not an exit:** one `mov qword [rbx+carry], 0`. This is the only fast-path cost a successor pays.

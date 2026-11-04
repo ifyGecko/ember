@@ -79,7 +79,7 @@ Why the two backends agree: at every hard point, both have performed every write
 
 ### 4.1 Where it lives: inside the JIT, not in the IR
 
-The whole analysis runs in `jit_x86.c` on the final block, just before code emission. Consequences:
+The whole analysis runs in the JIT's host-independent core (`jit.c`, written for `jit_x86.c` and since shared with `jit_a64.c`) on the final block, just before code emission. Consequences:
 
 - **Unchanged:** no IR change, no new opcode or flag, and no change to the interpreter, verifier, printer, optimizer or user passes. The interpreter stays the literal reference.
 - **Ordering:** it sees the block after user passes and hook marking, so BREAK IMARKs and inserted instructions are already there.
@@ -111,7 +111,7 @@ An IR-level alternative (a `uam_finalize` pass that writes stub lists into the b
 
 - **Deferred PUTs and cold ops:** not emitted in the main stream.
 - **Stub contents:** a soft point's stub emits, in program order:
-  1. the cold ops its pending writes need (transitively), each computed into `rax` and stored to its `jc->temps` slot, so a later cold op reads its operands from the slot;
+  1. the cold ops its pending writes need (transitively), each computed into the result register (`rax`; `x0` on AArch64) and stored to its `jc->temps` slot, so a later cold op reads its operands from the slot;
   2. the pending writes, each guarded if the original was.
 
   It uses only scratch registers, so it fits before the existing bridge call or stop-stub code.
@@ -162,10 +162,10 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
 
 ## 9. As implemented
 
-- **Where:** `defer_analyze` and `cold_analyze` in `src/exec/jit_x86.c`, run on each block before register allocation; the replays are emitted by `emit_replays`.
+- **Where:** `jit_defer_analyze` and `cold_analyze` in `src/exec/jit.c`, run on each block before register allocation; each code generator emits the replays with its own `emit_replays` (`jit_x86.c`, `jit_a64.c`).
 - **IMARK stop stubs** stay at the end of the block. Each records, at its IMARK, which register holds each temp its replay reads, and the stub is emitted with those locations, so stubs and load/store slow paths share one replay emitter.
 - **Hard points** also include loads and stores that never take the inline path (exclusive, physical, unprivileged, or a constant address that crosses a page or is misaligned): they always call C, so a replay there would run every time.
-- **Recomputed ops** use rax, rcx and rdx. On a load/store slow path the address in rdx is loaded again after them; the store value in r11 is untouched. Only inline pure ops are sunk: one that needs the C evaluator stays on the fast path.
+- **Recomputed ops** use rax, rcx and rdx (on AArch64 x0, x1, x2, x16 and x17). On a load/store slow path the address in rdx (x2) is loaded again after them; the store value in r11 (x3) is untouched. Only inline pure ops are sunk: one that needs the C evaluator stays on the fast path.
 - **D2 stub cap:** a soft point that would recompute more than 32 ops keeps all of them on the fast path (the writes stay deferred), and the analysis repeats until no list is over the cap. Keeping ops on the fast path only shortens the other lists.
 - **No `--stats` counters:** they would change `uam_exec_stats`, and with it the library ABI, for a debugging aid. The op map (`UAM_JIT_OPMAP`, `tools/jitprof.py`) labels replay code as its own region kind, `replay`; `UAM_JIT_NODEFER=1` still turns the step off for bisecting.
 - **Tests:** test_jitdiff level D (deferral shapes under every stop condition) and the mutation checks listed in the D1 and D2 commits. The end-to-end runs earned their place: the first D2 build skipped a stop stub's replay when it read no temps (only constants pending, as in a MIPS `li` overwritten in a branch delay slot), which VxWorks hit within 1e7 instructions while every unit test passed; level D's pattern 8 now covers it.
@@ -191,7 +191,7 @@ You asked whether my changes, or anything else in ember, lean toward one archite
 | 7 flag fusion | yes | any compare feeding a guard or select: MIPS/RV branches, ARM conditions, x86 jcc, PPC bc |
 | 8 dispatch, bus sub-page cache, constant-address probe | yes | sub-page cache: any small MMIO register block on any SoC (x86 I/O ports are one case); constant address: MIPS `lui`+`lw`, x86 absolute operands, ARM literal-pool targets |
 
-One host-side fact, unchanged: the JIT targets x86-64 hosts only. That concerns the machine ember runs on, not the guests it runs. Other hosts use the interpreter.
+One host-side fact: at the time the JIT targeted x86-64 hosts only; an AArch64 code generator has since joined it on the same core. That concerns the machine ember runs on, not the guests it runs. Other hosts use the interpreter.
 
 ### 8.2 Audit of the generic layers
 

@@ -79,8 +79,8 @@ HAVE_SUZZER := $(if $(SUZZER_DIR),1,)
 IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c src/ir/pass.c
 CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
                src/core/state.c
-EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit_x86.c \
-               src/exec/coverage.c src/exec/spin.c
+EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit.c \
+               src/exec/jit_x86.c src/exec/jit_a64.c src/exec/coverage.c src/exec/spin.c
 ANALYSIS_SRC := analysis/cov.c
 LOADER_SRC  := src/loader/loader.c
 MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c src/machine/guard.c

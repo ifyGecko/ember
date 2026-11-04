@@ -1,5 +1,5 @@
 /*
- * test_jitdiff.c - Differential test of the JIT (src/exec/jit_x86.c) against the
+ * test_jitdiff.c - Differential test of the JIT (src/exec/jit*.c) against the
  * reference interpreter (src/exec/interp.c), op by op and on random blocks.
  *
  * The interpreter running the unoptimized block is the reference. Each block also

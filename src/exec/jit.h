@@ -7,7 +7,8 @@
  * contract: the interpreter remains the reference, blocks it cannot compile run
  * interpreted, and a host without a code generator disables it transparently.
  *
- * Design (see jit_x86.c): one compiled function per block, emitting inline host code
+ * Design (jit_impl.h: jit.c is the host-independent core, jit_x86.c and jit_a64.c the
+ * code generators): one compiled function per block, emitting inline host code
  * for the hot opcodes (IMARK, GET, PUT, LD, plain ST, EXIT, COV and the common integer,
  * compare, select and conversion ops) and calling shared C for the rest - rare pure
  * ops go through the same evaluator as the interpreter (ir_eval.h), and memory accesses

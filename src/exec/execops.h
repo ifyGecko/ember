@@ -1,7 +1,7 @@
 /*
  * execops.h - Memory-access semantics shared by every execution backend.
  *
- * The interpreter (interp.c) and the JIT's memory bridges (jit_x86.c) both go through
+ * The interpreter (interp.c) and the JIT's memory bridges (jit.c) both go through
  * these inline helpers, so a load or store means exactly one thing no matter which
  * backend runs the block. They perform address translation (isa->translate, honouring
  * alignment and UAM_ACC_PHYS) and the bus access, and maintain the exclusive-access
