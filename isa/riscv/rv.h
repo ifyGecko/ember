@@ -62,8 +62,10 @@ typedef struct rv_state {
     uint32_t mcause;
     uint32_t mtval;
     uint32_t mcounteren;
-    uint32_t mcountinhibit;
-    uint64_t counter_bias; /* written mcycle/minstret value minus icount */
+    uint32_t mcountinhibit; /* CY (bit 0) and IR (bit 2); the rest read 0 */
+    /* mcycle (0) and minstret (1): the value minus icount while the counter runs, the
+     * value itself while mcountinhibit stops it. */
+    uint64_t counter_base[2];
 } rv_state;
 
 static inline rv_state *rv_st(uam_cpu *cpu) { return (rv_state *)cpu->isa_state; }

@@ -117,6 +117,8 @@ static uint32_t AMOADD_W(unsigned rd, unsigned rs2, unsigned rs1) { return AMO(0
 #define C_J_SELF 0xA001u         /* c.j . */
 #define C_RSVD   0x0004u         /* c.addi4spn with nzuimm = 0: reserved */
 #define C_FLW    0x6000u         /* c.flw fs0,0(s0): no F */
+#define C_LUI_X0 0x6005u         /* c.lui zero,0x1: a HINT */
+#define C_LUI_X0_0 0x6001u       /* c.lui zero,0: nzimm = 0, reserved */
 
 /* ---- the machine ------------------------------------------------------------------- */
 
@@ -314,6 +316,28 @@ static void test_csrs(void)
     EQ64(csrr(c, CSR_MINSTRET), 110, "minstret counts instructions");
     EQ64(csrr(c, CSR_INSTRET), 110, "instret shadows it");
     EQ64(csrr(c, CSR_MINSTRETH), 0, "minstreth");
+    /* two counters, each stopped by its own mcountinhibit bit (CY: bit 0, IR: bit 2) */
+    csrw(c, CSR_MCYCLEH, 0);
+    csrw(c, CSR_MCYCLE, 0x1000);
+    EQ64(csrr(c, CSR_MINSTRET), 110, "writing mcycle leaves minstret");
+    csrw(c, CSR_MCOUNTINHIBIT, 0xFFFFFFFFu);
+    EQ64(csrr(c, CSR_MCOUNTINHIBIT), 5, "mcountinhibit: CY and IR (TM and the hpm bits read 0)");
+    csrw(c, CSR_MCOUNTINHIBIT, 1);
+    run(&m, CODE, 10);
+    EQ64(csrr(c, CSR_MCYCLE), 0x1000, "CY stops mcycle");
+    EQ64(csrr(c, CSR_CYCLE), 0x1000, "and cycle");
+    EQ64(csrr(c, CSR_MINSTRET), 120, "not minstret");
+    csrw(c, CSR_MCYCLE, 0x2000);
+    EQ64(csrr(c, CSR_MCYCLE), 0x2000, "a stopped counter is writable");
+    csrw(c, CSR_MCOUNTINHIBIT, 4);
+    run(&m, CODE, 10);
+    EQ64(csrr(c, CSR_MCYCLE), 0x200A, "mcycle counts on from the value written");
+    EQ64(csrr(c, CSR_MINSTRET), 120, "IR stops minstret");
+    EQ64(csrr(c, CSR_INSTRET), 120, "and instret");
+    csrw(c, CSR_MCOUNTINHIBIT, 0);
+    run(&m, CODE, 5);
+    EQ64(csrr(c, CSR_MINSTRET), 125, "minstret counts again");
+    EQ64(csrr(c, CSR_MCYCLE), 0x200F, "mcycle too");
     uam_machine_fini(&m);
 }
 
@@ -402,6 +426,17 @@ static void test_traps(bool jit)
     put16(&m, CODE + 0x422, C_J_SELF);
     run(&m, CODE + 0x420, 4);
     expect_trap(&m, TVEC, 2, CODE + 0x420, C_FLW, "c.flw without F");
+    /* c.lui x0, nzimm: a HINT, it does nothing; c.lui with nzimm = 0 is reserved */
+    put16(&m, CODE + 0x430, C_LUI_X0);
+    put16(&m, CODE + 0x432, C_J_SELF);
+    csrw(c, CSR_MCAUSE, 0x55);
+    run(&m, CODE + 0x430, 4);
+    EQ64(c->pc, CODE + 0x432, "c.lui x0 is a HINT: it runs");
+    EQ64(csrr(c, CSR_MCAUSE), 0x55, "and traps nothing");
+    put16(&m, CODE + 0x440, C_LUI_X0_0);
+    put16(&m, CODE + 0x442, C_J_SELF);
+    run(&m, CODE + 0x440, 4);
+    expect_trap(&m, TVEC, 2, CODE + 0x440, C_LUI_X0_0, "c.lui with nzimm = 0");
     /* a trap drops the LR reservation: lr; ecall (handler: mepc += 4; mret); sc fails */
     const uint32_t handler[] = { CSRRS(T0, CSR_MEPC, ZERO), ADDI(T0, T0, 4), CSRRW(ZERO, CSR_MEPC, T0), MRET };
     const uint32_t lrsc[] = { LR_W(A0, A1), SC_W(A2, A3, A1) };
@@ -683,6 +718,18 @@ static void test_plic(void)
     uam_plic_input(p, 34, 1);
     uam_plic_input(p, 34, 0);
     EQ64(dev_rd(p, 0x200004, 4), 34, "a request that fell before its claim stays pending");
+    /* a complete naming a source the context does not enable is ignored */
+    dev_wr(p, 0x201004, 4, 34);                                  /* context 1 never enabled 34 */
+    uam_plic_input(p, 34, 1);
+    EQ64(dev_rd(p, 0x1004, 4) >> 2 & 1, 0, "complete from a context without the source: still in service");
+    dev_wr(p, 0x2004, 4, 1u << 1);                               /* context 0 disables 34 */
+    dev_wr(p, 0x200004, 4, 34);
+    EQ64(dev_rd(p, 0x1004, 4) >> 2 & 1, 0, "nor from one that no longer enables it");
+    dev_wr(p, 0x2004, 4, 1u << 1 | 1u << 2);
+    dev_wr(p, 0x200004, 4, 34);
+    EQ64(dev_rd(p, 0x1004, 4) >> 2 & 1, 1, "the context that enables it completes it (high: pending again)");
+    uam_plic_input(p, 34, 0);
+    EQ64(dev_rd(p, 0x200004, 4), 34, "and it is claimed again");
     dev_wr(p, 0x200004, 4, 40);                                  /* out of range: ignored */
     EQ64(dev_rd(p, 0x202000, 4), 0, "no third context");
     /* reset: priorities and enables cleared, a still-high input stays pending */
@@ -772,7 +819,8 @@ static void test_snapshot(void)
         { CSR_MSTATUS, MS_MPIE, MS_MPIE | MS_MPP }, { CSR_MIE, 0x888, 0x888 }, { CSR_MTVEC, TVEC | 1, TVEC | 1 },
         { CSR_MSCRATCH, 0x5C, 0x5C }, { CSR_MEPC, 0x80001234u, 0x80001234u }, { CSR_MCAUSE, 2, 2 },
         { CSR_MTVAL, 0x7777, 0x7777 }, { CSR_MCOUNTEREN, 3, 3 }, { CSR_MCYCLEH, 0x12, 0x12 },
-        { CSR_MCYCLE, 0x3456789Au, 0x3456789Au },
+        { CSR_MCYCLE, 0x3456789Au, 0x3456789Au }, { CSR_MCOUNTINHIBIT, 4, 4 },
+        { CSR_MINSTRET, 0x777, 0x777 },
     };
     uam_machine m;
     machine(&m, false);

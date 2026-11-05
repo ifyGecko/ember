@@ -6,7 +6,8 @@
  * priority pending source enabled for the context with priority > threshold
  * (ties go to the lowest id), clears its pending bit and marks it in
  * service. A complete ends service; if the input is still high, the source
- * becomes pending again.
+ * becomes pending again. A complete naming a source the context does not
+ * enable is ignored.
  */
 #include <stdlib.h>
 
@@ -137,7 +138,9 @@ static uam_status plic_write(uam_device *d, uint64_t off, unsigned size, uint64_
             return UAM_OK;
         if (r == 0) {
             p->threshold[c] = v32 & 7;
-        } else if (r == 4 && v32 > 0 && v32 < p->n_sources) { /* complete */
+        } else if (r == 4 && v32 > 0 && v32 < p->n_sources
+                   && bit(&p->enable[c * WORDS(p->n_sources)], v32)) {
+            /* complete; one of a source the context does not enable is ignored */
             set_bit(p->in_service, v32, false);
             if (bit(p->level, v32))
                 set_bit(p->pending, v32, true);

@@ -125,8 +125,8 @@ uint32_t rv_expand_compressed(uint16_t c)
                            | CB(c, 4, 3) << 7 | CB(c, 2, 2) << 5;
                 int32_t nz = (int32_t)uam_sext(v, 10);
                 return nz ? enc_i(0x13, 2, 0, 2, nz) : 0;
-            } else { /* C.LUI */
-                if (imm6 == 0 || rd == 0)
+            } else { /* C.LUI (rd = x0: a HINT, LUI x0 does nothing) */
+                if (imm6 == 0)
                     return 0;
                 return 0x37 | rd << 7 | ((uint32_t)imm6 & 0xFFFFF) << 12;
             }

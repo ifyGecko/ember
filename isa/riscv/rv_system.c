@@ -146,9 +146,37 @@ static void rv_irq_input(uam_cpu *cpu, unsigned line, int level)
                        | (1u << ('A' - 'A')) | (1u << ('C' - 'A')))
 #define MIE_MASK ((1u << UAM_RV_IRQ_MSI) | (1u << UAM_RV_IRQ_MTI) | (1u << UAM_RV_IRQ_MEI))
 
-static uint64_t counter(uam_cpu *cpu)
+#define COUNTINHIBIT_MASK 0x5u   /* CY, IR: there are no hpm counters, TM is hard-wired 0 */
+
+/* mcountinhibit's bit for counter n (0: mcycle, 1: minstret). */
+static uint32_t inhibit_bit(unsigned n) { return n ? 4u : 1u; }
+
+/* Counter n: one cycle per instruction, unless mcountinhibit stops it. */
+static uint64_t counter(uam_cpu *cpu, unsigned n)
 {
-    return cpu->icount + rv_st(cpu)->counter_bias;
+    const rv_state *s = rv_st(cpu);
+    return (s->mcountinhibit & inhibit_bit(n)) ? s->counter_base[n]
+                                               : cpu->icount + s->counter_base[n];
+}
+
+static void set_counter(uam_cpu *cpu, unsigned n, uint64_t v)
+{
+    rv_state *s = rv_st(cpu);
+    s->counter_base[n] = (s->mcountinhibit & inhibit_bit(n)) ? v : v - cpu->icount;
+}
+
+static void set_countinhibit(uam_cpu *cpu, uint32_t v)
+{
+    rv_state *s = rv_st(cpu);
+    uint64_t c[2] = { counter(cpu, 0), counter(cpu, 1) };
+    s->mcountinhibit = v & COUNTINHIBIT_MASK;
+    set_counter(cpu, 0, c[0]);
+    set_counter(cpu, 1, c[1]);
+}
+
+static unsigned counter_of(uint32_t csr)
+{
+    return csr == CSR_MINSTRET || csr == CSR_INSTRET || csr == CSR_MINSTRETH || csr == CSR_INSTRETH;
 }
 
 static uam_status rv_sysreg_read(uam_cpu *cpu, uint32_t csr, uint64_t *val)
@@ -170,10 +198,10 @@ static uam_status rv_sysreg_read(uam_cpu *cpu, uint32_t csr, uint64_t *val)
     case CSR_MCOUNTEREN: *val = s->mcounteren; break;
     case CSR_MCOUNTINHIBIT: *val = s->mcountinhibit; break;
     case CSR_MCYCLE: case CSR_MINSTRET: case CSR_CYCLE: case CSR_INSTRET:
-        *val = (uint32_t)counter(cpu);
+        *val = (uint32_t)counter(cpu, counter_of(csr));
         break;
     case CSR_MCYCLEH: case CSR_MINSTRETH: case CSR_CYCLEH: case CSR_INSTRETH:
-        *val = (uint32_t)(counter(cpu) >> 32);
+        *val = (uint32_t)(counter(cpu, counter_of(csr)) >> 32);
         break;
     case CSR_MVENDORID: case CSR_MARCHID: case CSR_MIMPID: case CSR_MCONFIGPTR:
         *val = 0;
@@ -220,15 +248,15 @@ static uam_status rv_sysreg_write(uam_cpu *cpu, uint32_t csr, uint64_t v64)
     case CSR_MCAUSE:     s->mcause = v; break;
     case CSR_MTVAL:      s->mtval = v; break;
     case CSR_MCOUNTEREN: s->mcounteren = v; break;
-    case CSR_MCOUNTINHIBIT: s->mcountinhibit = v; break;
+    case CSR_MCOUNTINHIBIT: set_countinhibit(cpu, v); break;
     case CSR_MCYCLE: case CSR_MINSTRET: {
-        uint64_t c = counter(cpu);
-        s->counter_bias = ((c & ~UINT64_C(0xFFFFFFFF)) | v) - cpu->icount;
+        unsigned n = counter_of(csr);
+        set_counter(cpu, n, (counter(cpu, n) & ~UINT64_C(0xFFFFFFFF)) | v);
         break;
     }
     case CSR_MCYCLEH: case CSR_MINSTRETH: {
-        uint64_t c = counter(cpu);
-        s->counter_bias = (((uint64_t)v << 32) | (c & 0xFFFFFFFFu)) - cpu->icount;
+        unsigned n = counter_of(csr);
+        set_counter(cpu, n, ((uint64_t)v << 32) | (counter(cpu, n) & 0xFFFFFFFFu));
         break;
     }
     default:
@@ -368,7 +396,8 @@ static void rv_save(uam_cpu *cpu, uam_state_writer *w)
                               s->mcause, s->mtval, s->mcounteren, s->mcountinhibit };
     for (size_t i = 0; i < UAM_ARRAY_LEN(csrs); i++)
         uam_state_put_u32(w, csrs[i]);
-    uam_state_put_u64(w, s->counter_bias);
+    uam_state_put_u64(w, s->counter_base[0]);
+    uam_state_put_u64(w, s->counter_base[1]);
 }
 
 static void rv_restore(uam_cpu *cpu, uam_state_reader *r)
@@ -378,7 +407,9 @@ static void rv_restore(uam_cpu *cpu, uam_state_reader *r)
                                &s->mcause, &s->mtval, &s->mcounteren, &s->mcountinhibit };
     for (size_t i = 0; i < UAM_ARRAY_LEN(csrs); i++)
         *csrs[i] = uam_state_get_u32(r);
-    s->counter_bias = uam_state_get_u64(r);
+    s->counter_base[0] = uam_state_get_u64(r);
+    s->counter_base[1] = uam_state_get_u64(r);
+    s->mcountinhibit &= COUNTINHIBIT_MASK;
 }
 
 const uam_isa uam_isa_rv32 = {
