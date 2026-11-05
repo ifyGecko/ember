@@ -3,7 +3,9 @@
  *
  * CPUID describes exactly what this module implements: x86-64 with SSE2,
  * CMPXCHG16B, POPCNT, RDRAND, NX, 1 GiB pages, RDTSCP, PAT and MTRRs (with
- * the SMM range registers). SMRAM protection MSRs: AMD's HWCR, SMM_ADDR and
+ * the SMM range registers), DE (CR4.DE: DR4/DR5 #UD) and MCE (#MC, which the
+ * SMM code-fetch check raises). CR4's valid bits follow what CPUID reports,
+ * the board's hook included (x86_cr4_valid). SMRAM protection MSRs: AMD's HWCR, SMM_ADDR and
  * SMM_MASK with the AMD64 map; Intel's MSR_SMM_MCA_CAP and
  * MSR_SMM_FEATURE_CONTROL with UAM_X86_FEAT_SMM_CODE_CHK.
  * Vendor, signature, brand, topology and physical-address width come from

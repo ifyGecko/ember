@@ -4,7 +4,8 @@ catch-all windows / --unknown-mmio zero) into the next blocker.
 
 Prints, in order:
   1. how the run ended (stop reason, pc, instruction count, exit-code meaning) and stats;
-     an x86 triple fault (the hart shut down) is called out here
+     an x86 shutdown (triple fault, machine check, RSM with an invalid saved state) is
+     called out here
   2. the first N distinct events in time order: first access to each unmodelled offset
      (unimp windows; x86 I/O ports by port number and name) or address (unknown-mmio),
      exceptions, resets, errors - read these top-down, the first one is usually the blocker

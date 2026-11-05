@@ -121,8 +121,10 @@ and, when the pin moved, the skills' end-to-end test against it:
    never reaches the CPU), 126 fetch-fault loop, internal error, or a reset nothing handles,
    127 breakpoint or debug trap, 129 a `--guard` hit, 2 setup error (`abi:` = rebuild with
    `build-ember.sh`). On
-   x86 an `x86: triple fault` line means the processor shut down (the run then ends idle,
-   125 or 128): the *first* exception before it is the blocker.
+   x86 an `x86: ... hart shut down` line means the processor shut down (the run then ends
+   idle, 125 or 128): after a triple fault the *first* exception before it is the blocker;
+   it also follows a machine check (SMM code fetch outside SMRAM) or an RSM with an
+   invalid saved state, which the line names.
 3. **Explain it from the firmware**: decompile/disassemble the code at the fault or polling
    site with Ghidra MCP (or, without it, ember-dev-recon's `scripts/ghidra-query.sh`
    `decompile`/`disasm`). Use ember's probes (`--log-pc`, `--break -d`, `-n N -d`,

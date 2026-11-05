@@ -502,7 +502,8 @@ isa/ppc32/         32-bit PowerPC lifter (ppc_lift.c), floating-point unit (ppc_
 isa/x86/           x86-64 lifter (real, protected, virtual-8086 and long mode; x87 on a
                    software 80-bit format (x86_f80.c), MMX, SSE/SSE2) and system architecture (segmentation, call gates, hardware
                    task switching, the I/O permission bitmap, paging, SMM with the Intel 64
-                   or AMD64 save-state map, A20M#, CPUID/MSRs)
+                   or AMD64 save-state map, SMRAM protection (SMRR, AMD TSeg/ASeg,
+                   SMMLOCK) and per-access SMRAM decode (the SMM view), A20M#, CPUID/MSRs)
 isa/avr8/          8-bit AVR lifter (avr_lift.c: every core family, the model's instructions),
                    system side (avr_system.c: the CPU models, the data space on the bus,
                    interrupt entry, the AVRxm PMIC and AVRxt CPUINT, the core's I/O registers)

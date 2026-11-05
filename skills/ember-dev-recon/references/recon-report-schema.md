@@ -203,7 +203,8 @@ questions* and *Tooling notes* stay. Method: `uefi-recon.md`.
 - CMOS offsets read (port 0x70/0x72 index values): <...>; straps / board-ID inputs: <register, active value>
 
 ### SMM
-- modules: <...>; SMRAM: <A-seg / TSEG: register <- value>; SMRR: <0x1F2/0x1F3 values>; SMBASE relocation by <fn>
+- modules: <...>; SMRAM: <A-seg / TSEG: register <- value>; SMRR: <0x1F2/0x1F3 values>; SMBASE relocation by <fn> (APs started before it: <yes/no>)
+- AMD: SMM_ADDR/SMM_MASK <values or 'programmed by the PSP'>, HWCR.SMMLOCK set by <fn>; Intel: SMM_Code_Chk_En (0x4E0) <enabled by fn / not used>
 - SMI sources: <APM 0xB2, SMI_EN @PMBASE+0x30 <- ...>; locks: <SMI_LOCK, D_LCK, ...>
 
 ### Memory init

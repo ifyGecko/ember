@@ -76,6 +76,10 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    take the plain data address: "Per ISA"). A `--guard` is armed
    during boot: guard only what the boot does not write (`:r` otherwise), or the boot
    stops at it and never reaches the begin pc.
+   **An x86 SMM handler** also wants SMM code-fetch confinement (`uam_x86_set_smm_confine`,
+   `-o smm-confine=1` on `x86_64-ref`): a call-out of SMRAM becomes a `fetch` crash at its
+   first instruction; SMRAM decoded through the SMM view is addressed at
+   `p:0x400000000000+ADDR` ("Per ISA").
 5. **Smoke-test with replay**: a directory of hand-made inputs whose verdicts you can
    predict (an empty input, a valid request, an oversized one, one that reaches a known bad
    path if there is one). `--fuzz-replay` must give exactly those verdicts, twice, and with

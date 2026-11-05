@@ -189,11 +189,13 @@ answers.
 ### 7.4 MSRs
 `index rd N wr N values-written functions`. Split the table:
 - **ember implements**: TSC 0x10, PLATFORM_ID 0x17, APIC_BASE 0x1B, FEATURE_CONTROL 0x3A,
-  TSC_ADJUST 0x3B, BIOS_SIGN_ID 0x8B, SMBASE 0x9E (in SMM), MTRRCAP 0xFE, SMRR 0x1F2/0x1F3
-  (in SMM), SYSENTER 0x174-0x176, MCG 0x179/0x17A, MISC_ENABLE 0x1A0, the MTRRs (0x200-0x21F,
-  0x250, 0x258/0x259, 0x268-0x26F, 0x2FF; storage), PAT 0x277, EFER and the syscall/segment
-  MSRs 0xC0000080-0xC0000103, and AMD's SMM_BASE 0xC0010111 (with the AMD64 SMM save-state
-  map). x2APIC 0x800-0x8FF and TSC_DEADLINE 0x6E0 go to the local APIC.
+  TSC_ADJUST 0x3B, BIOS_SIGN_ID 0x8B, SMBASE 0x9E (read-only, in SMM; Intel), MTRRCAP 0xFE
+  (the board may answer it), SMRR 0x1F2/0x1F3 (in SMM; Intel), SYSENTER 0x174-0x176, MCG
+  0x179/0x17A, MISC_ENABLE 0x1A0, the MTRRs (0x200-0x21F, 0x250, 0x258/0x259, 0x268-0x26F,
+  0x2FF; storage), PAT 0x277, EFER and the syscall/segment MSRs 0xC0000080-0xC0000103; with
+  the AMD64 SMM save-state map AMD's HWCR 0xC0010015 (SMMLOCK), SMM_BASE 0xC0010111,
+  SMM_ADDR/SMM_MASK 0xC0010112/0xC0010113 (TSeg, ASeg); when the board offers them, Intel's
+  SMM_MCA_CAP 0x17D, SMM_FEATURE_CONTROL 0x4E0, SMM_DELAYED/SMM_BLOCKED 0x4E2/0x4E3 (in SMM). x2APIC 0x800-0x8FF and TSC_DEADLINE 0x6E0 go to the local APIC.
 - **everything else** (platform info, power and thermal, uncore, vendor MSRs) goes to the
   board's `board_rdmsr`/`board_wrmsr`, then to the MSR policy: writes remembered and read
   back, unknown reads 0 (`-o msr=gp`: #GP). Mark each such MSR with what the code does with
@@ -235,9 +237,14 @@ being written to a BAR (PMBASE + 0x30 = SMI_EN on ICH9; SMBus base + 0..7).
 
 SMM modules (`SMM`, `SMM+DXE`, `SMM_CORE`, `MM_STANDALONE`), and from the code: SMRAM (A/B
 segment and TSEG: the host-bridge registers and values written), the SMRR MSRs (0x1F2/0x1F3),
-SMBASE relocation (who sends the SMIs, the new bases), the SMI sources (APM 0xB2, SMI_EN /
-SMI_STS in the PM block, GBL_SMI_EN, EOS) and the lock bits set (SMI_LOCK, D_LCK). The build
-phase models these in the host bridge and the LPC/PM device (`q35_mch.c`, `ich9_lpc.c`).
+SMBASE relocation (who sends the SMIs, the new bases; whether the APs have been started by
+then - a processor waiting for its startup IPI holds an SMI), the SMI sources (APM 0xB2,
+SMI_EN / SMI_STS in the PM block, GBL_SMI_EN, EOS) and the lock bits set (SMI_LOCK, D_LCK).
+On AMD: SMM_ADDR/SMM_MASK (0xC0010112/3: TSeg, ASeg, TClose/AClose) and HWCR.SMMLOCK - or,
+when no code writes them, that the security processor programs them (the board presets
+them: `uam_x86_preset_amd_smm`). On Intel: whether the SMM code enables SMM_Code_Chk_En
+(MSR 0x4E0). The build phase models SMRAM in the host bridge through the SMM view (SMRAM
+windows per processor) and the SMI sources in the LPC/PM device (`q35_mch.c`, `ich9_lpc.c`).
 
 ## 10. Console and progress markers
 

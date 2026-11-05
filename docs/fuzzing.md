@@ -169,6 +169,12 @@ protection: firmware with a TLB takes these routinely), `trap` (illegal instruct
 system calls and breakpoints), `sysreg`, `all`, `none`. The default is
 `fetch,load,store,align`. Exceptions outside the policy are delivered to the firmware as
 usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that end there.
+For x86 SMM handlers, SMM code-fetch confinement (`uam_x86_set_smm_confine`; `-o
+smm-confine=1` on `x86_64-ref`) turns an SMM instruction fetch outside SMRAM - a call-out
+through a corrupted or NULL pointer - into a `fetch` crash at the first instruction outside.
+SMRAM that a board decodes through the SMM view is addressed as SMM sees it, at
+`UAM_X86_SMM_VIEW` (0x400000000000) + address: `p:0x400000000000+ADDR` for `mem:`,
+`--guard` and `--dump-mem`.
 
 `--fuzz-crash-irq N` (repeatable, 0..63) makes taking an interrupt from line N a crash: a
 watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the
