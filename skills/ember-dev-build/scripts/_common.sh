@@ -29,35 +29,56 @@ resolve_src() {    # $1 = explicit --ember-src value, $2 = project dir
 # Is this checkout the project's own clone (safe to reset), or someone's working copy?
 project_owned_src() { [[ "$1" == "$2/ember-src" ]]; }   # $1 = src, $2 = project dir
 
+# The ember changes a project carries are patches/NNNN-*.patch, `git format-patch` files: one
+# commit each, with its message and author. In the clone they are applied as commits on top
+# of the pinned commit (build-ember.sh), so a patch upstream is `git am` of the same file.
+patch_files() { local p; for p in "$1"/patches/*.patch; do [[ -f "$p" ]] && echo "$p"; done; }
+
 # Files our patches touch in the ember checkout ("+++ b/<path>" lines).
 owned_paths() {    # $1 = project dir
     local p
-    for p in "$1"/patches/*.patch; do
-        [[ -f "$p" ]] && sed -n 's#^+++ b/##p' "$p"
-    done
+    while read -r p; do sed -n 's#^+++ b/##p' "$p"; done < <(patch_files "$1")
 }
 
-# Refuse to reset a checkout that holds tracked edits this project does not own (the
-# user's own work on ember, or another project's patches), or - for a checkout that is not
-# the project's own clone - one whose HEAD is not the pinned commit, since resetting would
-# move the user's branch. Untracked files are never touched, so they are not checked.
+# Content ids of the patches, in order, and of the clone's commits since the pin.
+patch_ids()  { patch_files "$1" | while read -r p; do cat "$p"; done | git patch-id --stable | awk '{print $1}'; }
+commit_ids() { git -C "$1" format-patch --stdout --no-signature "$2..HEAD" | git patch-id --stable | awk '{print $1}'; }
+
+# Where the clone stands against ember.commit + patches/:
+#   applied      HEAD is the pin plus exactly the patches, as commits; no tracked edits
+#   uncommitted  tracked files edited and not committed
+#   unexported   HEAD is the pin plus commits that differ from patches/ (regen-patches.sh)
+#   elsewhere    HEAD does not descend from the pin
+clone_state() {    # $1 = src, $2 = project dir, $3 = pinned commit
+    local pin
+    pin="$(git -C "$1" rev-parse --verify -q "$3^{commit}" 2>/dev/null || true)"
+    if [[ -n "$(git -C "$1" diff --name-only HEAD 2>/dev/null)" ]]; then echo uncommitted
+    elif [[ -z "$pin" ]] || ! git -C "$1" merge-base --is-ancestor "$pin" HEAD 2>/dev/null; then echo elsewhere
+    elif [[ "$(commit_ids "$1" "$pin")" == "$(patch_ids "$2")" ]]; then echo applied
+    else echo unexported
+    fi
+}
+
+# Refuse to reset a checkout that holds ember work not captured in patches/ (tracked edits,
+# or commits since the pin that regen-patches.sh has not exported), or - for a checkout that
+# is not the project's own clone - one that is not at the pin (plus our patches), since the
+# reset would move a working copy someone else made. Untracked files are never touched.
 guard_checkout() { # $1 = src, $2 = project dir, $3 = force (0/1), $4 = pinned commit
-    local foreign head pinned
-    foreign="$(git -C "$1" diff --name-only HEAD 2>/dev/null \
-               | sort -u | grep -vxF -f <(owned_paths "$2" | sort -u; echo /dev/null) || true)"
-    if [[ -n "$foreign" ]]; then
-        echo "The ember checkout $1 has tracked changes this project does not own:" >&2
-        echo "$foreign" | head -20 | sed 's/^/    /' >&2
-        [[ "$3" -eq 1 ]] && { echo "--force given: they will be discarded." >&2; return; }
-        _die "refusing to reset it. Commit/stash them, use a separate checkout (--ember-src, or a clone in the project), or pass --force."
-    fi
-    if ! project_owned_src "$1" "$2"; then
-        head="$(git -C "$1" rev-parse HEAD 2>/dev/null || true)"
-        pinned="$(git -C "$1" rev-parse --verify -q "$4^{commit}" 2>/dev/null || true)"
-        if [[ -n "$head" && "$head" != "$pinned" && "$3" -ne 1 ]]; then
-            _die "$1 is at ${head:0:12}, not the pinned ${4:0:12}; checking out would move a working copy you did not create. Re-pin (echo $head > ember.commit), use a project clone, or pass --force."
-        fi
-    fi
+    local state; state="$(clone_state "$1" "$2" "$4")"
+    case "$state" in
+        uncommitted)
+            echo "The ember checkout $1 has tracked edits not captured in patches/:" >&2
+            git -C "$1" diff --name-only HEAD | head -20 | sed 's/^/    /' >&2
+            [[ "$3" -eq 1 ]] && { echo "--force given: they will be discarded." >&2; return; }
+            _die "refusing to reset it. Commit the change in $1 and run regen-patches.sh (or regen-patches.sh -m MESSAGE), or pass --force to discard it." ;;
+        unexported)
+            [[ "$3" -eq 1 ]] && { echo "--force given: commits not in patches/ will be dropped." >&2; return; }
+            _die "$1 has commits since ${4:0:12} that are not in patches/; run regen-patches.sh to export them, or pass --force to drop them." ;;
+        elsewhere)
+            if ! project_owned_src "$1" "$2" && [[ "$3" -ne 1 ]]; then
+                _die "$1 is at $(git -C "$1" rev-parse --short HEAD), not the pinned ${4:0:12}; checking out would move a working copy you did not create. Use the project's own clone, or pass --force."
+            fi ;;
+    esac
 }
 
 # Board name (from run.sh "-b NAME") and the ISA recorded by new-emulation.sh.

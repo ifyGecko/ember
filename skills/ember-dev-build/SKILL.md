@@ -58,7 +58,7 @@ of working around it**:
 ```bash
 scripts/new-emulation.sh <board> --dir <project-dir> --recon RECON.md \
     --isa ISA [--model M] [--ram-base A --ram-size N --image-base A --entry A] \
-    [--ember-src <existing checkout> | --ember-upstream <url|path>] [--ember-commit <sha>]
+    [--ember-upstream <url|path> | --ember-src <dedicated clone>] [--ember-commit <sha>]
 ```
 - `--dir .` scaffolds into the current session directory (next to `RECON.md`). Existing files
   are never overwritten.
@@ -75,17 +75,26 @@ scripts/new-emulation.sh <board> --dir <project-dir> --recon RECON.md \
   ending at 4 GiB (`FLASH=bios.bin ./run.sh`, or `CODE=` + `VARS=` for an OVMF split),
   catch-alls over every unmodelled I/O port; the chipset is what you add
   (`references/pc-platform.md`).
-- By default the project builds in its own ember clone (`<project>/ember-src`, from
-  `--ember-upstream`, `$EMBER_UPSTREAM` or `~/ember`). `--ember-src` builds in an existing
-  checkout instead (recorded in `ember.src`, guarded against resets).
-- `--ember-commit` pins the commit (default: HEAD). Record why in the project README.
+- **Pin and clone (rule):** the project builds against its own local clone of ember
+  (`<project>/ember-src`, from `--ember-upstream`, `$EMBER_UPSTREAM` or `~/ember`), pinned to
+  the **latest ember commit** (upstream's HEAD, the default; `--ember-commit` for anything
+  else, with the reason in the README). `--ember-src` only names another clone dedicated to
+  the project, never an ember working copy. When ember moves on, `scripts/repin.sh` moves the
+  pin to the new latest commit and carries the patches along.
+- **Every change to ember is a local git patch file (rule):** if the emulation needs ember
+  itself changed, the change is committed in the clone (one commit per change, with the
+  message it would carry upstream) and exported by `scripts/regen-patches.sh` as a
+  `git format-patch` file in `patches/`, which `build-ember.sh` applies to the clone at the pin
+  as a commit. Nothing else changes ember. A change general enough for ember then lands
+  upstream with `git am` of that file (`references/organization.md`, rules 2 and 4).
 - The build helpers are **copied into `<project>/scripts/`**, so the project builds without
   this skill.
 
 ```bash
-scripts/build-ember.sh      # full: guard -> pinned checkout -> patches -> libuam (out of tree) -> build/<board>-run
+scripts/build-ember.sh      # full: guard -> clone at the pin -> patches as commits -> libuam (out of tree) -> build/<board>-run
 scripts/rebuild.sh          # fast: after editing emulation/ files (layering checked, new files picked up)
-scripts/regen-patches.sh    # only after editing ember itself (rare; see organization.md rule 4)
+scripts/regen-patches.sh    # after committing a change to ember in ember-src: export patches/ (rule 4)
+scripts/repin.sh            # move to the latest ember commit, rebasing patches/ onto it
 ```
 Before writing code against a new pin, run the API checklist in `references/board-skeleton.md`
 and, when the pin moved, the skills' end-to-end test against it:
@@ -149,8 +158,11 @@ HLE hooks and `--mmio-rule`s kept). Use the template in `references/iteration-lo
 `RECON.md` plus the `iter-XX.md` files are the durable record of the effort.
 
 ## Guardrails
-- Never commit into the ember checkout; never leave edits there that aren't captured in
-  `patches/` (`rebuild.sh` refuses). Prefer landing a real ember fix upstream and re-pinning.
+- Never change ember except through `patches/`: no edits in ember's own checkout, no
+  uncommitted or unexported changes left in the clone (`rebuild.sh` refuses). Each patch is
+  one commit with an upstream-quality message, so a general fix is `git am`-ready.
+- Build against the project's own clone pinned to the latest ember commit; re-pin with
+  `repin.sh` rather than drifting behind.
 - One device per file. The board file only wires. Devices include only ember's device-side
   headers; what they need from the machine comes in as parameters (`check-layering.sh`).
   A chipset device that moves decode windows receives the `uam_bus *` and the regions it owns.

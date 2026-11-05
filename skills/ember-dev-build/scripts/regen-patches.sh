@@ -1,60 +1,67 @@
 #!/usr/bin/env bash
-# regen-patches.sh - capture edits to ember's own files back into patches/.
+# regen-patches.sh - export the project's ember changes as patches/NNNN-<subject>.patch.
 #
-# Patches are the exception: an ember board, its devices and its hooks are written against
-# ember's public headers and never need one. Use a patch only when ember itself lacks a
-# capability the target needs (an ISA instruction, a CPU model field, a bus or runner
-# feature). Because ember is a project you can commit to, the better fix is usually to land
-# the change in ember and re-pin ember.commit; a patch is the stopgap until then.
+# Every change the emulation needs in ember itself lives as a `git format-patch` file in
+# patches/, applied by build-ember.sh as a commit on top of the pinned commit in the
+# project's ember clone. A patch keeps its commit message and author, so when the change is
+# general enough for ember, landing it upstream is `git -C <ember> am <patch>`.
 #
-# After editing tracked files in the checkout (git -C <ember> diff to review), run this so
-# the build stays reproducible from ember.commit + patches/. Produces one patch per modified
-# tracked file: patches/NNNN-<flattened-path>.patch. New files ember needs go in with
-# --add PATH (repeatable, relative to the checkout); untracked files are otherwise ignored.
+# Board, device and hook code is written against ember's public headers and never needs a
+# patch; a patch is for a capability ember lacks (an ISA instruction, a CPU-model field, a
+# bus or runner feature). One patch per logical change, with a message written for ember's
+# history: what changed and why, in ember's own terms (no board or firmware names).
 #
-# Usage: regen-patches.sh [--proj DIR] [--ember-src DIR] [--add PATH ...]
+# Workflow: edit ember's files in the clone (git -C <clone> diff to review), commit each
+# change there (git -C <clone> commit -a, plus git add for new files), then run this. Or let
+# -m commit the pending edits as one change: tracked edits plus each --add PATH (new files,
+# relative to the clone). Untracked files are never captured otherwise.
+#
+# Usage: regen-patches.sh [--proj DIR] [--ember-src DIR] [-m MESSAGE] [--add PATH ...]
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
-P=""; S=""; ADD=()
+P=""; S=""; MSG=""; ADD=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --proj) P="$2"; shift 2;; --ember-src) S="$2"; shift 2;;
+        -m|--message) MSG="$2"; shift 2;;
         --add) ADD+=("$2"); shift 2;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0;;
         *) _die "unknown argument: $1";;
     esac
 done
 PROJ="$(resolve_proj "$P")"; SRC="$(resolve_src "$S" "$PROJ")"
 [[ -d "$SRC/.git" ]] || _die "not a git checkout: $SRC"
 COMMIT="$(head -1 "$PROJ/ember.commit")"
+PIN="$(git -C "$SRC" rev-parse --verify -q "$COMMIT^{commit}")" || _die "pinned commit $COMMIT not in $SRC"
+git -C "$SRC" merge-base --is-ancestor "$PIN" HEAD \
+    || _die "$SRC is not on top of the pinned ${COMMIT:0:12} (run build-ember.sh, or repin.sh to move the pin)"
 
-mapfile -t changed < <(git -C "$SRC" diff --name-only --diff-filter=M "$COMMIT")
-# Previously captured new files stay captured while they still exist.
-while read -r f; do
-    [[ -n "$f" && -f "$SRC/$f" ]] || continue
-    git -C "$SRC" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || ADD+=("$f")
-done < <(owned_paths "$PROJ")
-mapfile -t added < <(printf '%s\n' "${ADD[@]+"${ADD[@]}"}" | sed '/^$/d' | sort -u)
+edited="$(git -C "$SRC" diff --name-only HEAD)"
+if [[ -n "$edited" || ${#ADD[@]} -gt 0 ]]; then
+    [[ -n "$MSG" ]] || _die "uncommitted ember edits: $(echo $edited ${ADD[@]+"${ADD[@]}"}) - commit them in $SRC (one commit per change, the message it would carry upstream), or pass -m MESSAGE to commit them as one"
+    for f in ${ADD[@]+"${ADD[@]}"}; do [[ -e "$SRC/$f" ]] || _die "--add $f: no such file in $SRC"; done
+    git -C "$SRC" add -u
+    [[ ${#ADD[@]} -eq 0 ]] || git -C "$SRC" add -- "${ADD[@]}"
+    git -C "$SRC" commit -q -m "$MSG" || _die "commit failed (is git user.name/user.email set? the patch carries them as its author)"
+    echo "regen-patches: committed $(git -C "$SRC" rev-parse --short HEAD) $(git -C "$SRC" log -1 --format=%s)"
+elif [[ -n "$MSG" ]]; then
+    _die "-m given but there are no ember edits to commit"
+fi
 
-if [[ ${#changed[@]} -eq 0 && ${#added[@]} -eq 0 ]]; then
-    echo "regen-patches: no edits to ember files; nothing to capture."
-    rm -f "$PROJ/patches"/*.patch
+untracked="$(git -C "$SRC" ls-files --others --exclude-standard | head -10)"
+[[ -z "$untracked" ]] || echo "regen-patches: note: untracked files in $SRC are not captured: $(echo $untracked) (commit them, or --add PATH)" >&2
+
+mkdir -p "$PROJ/patches"
+rm -f "$PROJ"/patches/*.patch
+n="$(git -C "$SRC" rev-list --count "$PIN..HEAD")"
+if [[ "$n" -eq 0 ]]; then
+    echo "regen-patches: no ember changes since ${COMMIT:0:12}; patches/ is empty."
     exit 0
 fi
-mkdir -p "$PROJ/patches"
-rm -f "$PROJ/patches"/*.patch
-i=1
-emit() {   # $1 = path, $2 = diff text
-    local out
-    out="$(printf '%s/patches/%04d-%s.patch' "$PROJ" "$i" "$(echo "$1" | sed 's#[/.]#-#g')")"
-    printf '%s\n' "$2" > "$out"
-    echo "  wrote $(basename "$out")  ($(grep -c '^[+-][^+-]' "$out") changed lines)"
-    i=$((i+1))
-}
-for f in "${changed[@]}"; do
-    emit "$f" "$(git -C "$SRC" diff "$COMMIT" -- "$f")"
+# --zero-commit and no signature: the files depend only on the changes, not on the clone.
+git -C "$SRC" format-patch -q --zero-commit --no-signature -o "$PROJ/patches" "$PIN..HEAD"
+for p in "$PROJ"/patches/*.patch; do
+    echo "  $(basename "$p")  ($(grep -c '^[+-][^+-]' "$p") changed lines)"
 done
-for f in "${added[@]}"; do
-    [[ -f "$SRC/$f" ]] || _die "--add $f: no such file in $SRC"
-    emit "$f" "$(cd "$SRC" && git diff --no-index -- /dev/null "$f" || true)"
-done
-echo "regen-patches: captured $((i-1)) file(s). Review them, then commit the project."
+echo "regen-patches: exported $n change(s) against ${COMMIT:0:12}. Review them, journal why ember needed them, then commit the project."
+echo "  upstream, if general enough: git -C <ember> am $PROJ/patches/NNNN-*.patch"

@@ -239,8 +239,10 @@ iteration.
 
 ## (5) Rebuild, re-run, commit, journal
 - Edited `emulation/` files (new files are picked up automatically): `scripts/rebuild.sh`.
-- Changed ember itself (rare): `scripts/regen-patches.sh`, review the patch, then
-  `scripts/build-ember.sh`.
+- Changed ember itself (rare): commit the change in `ember-src` with the message it would
+  carry upstream (or `scripts/regen-patches.sh -m "..."`), run `scripts/regen-patches.sh`,
+  review `patches/`, then `scripts/build-ember.sh` (organization.md, rule 4).
+- ember has moved on: `scripts/repin.sh` to the latest commit, re-run, journal the move.
 - Commit the emulation repo with a message naming the blocker cleared, so each iteration is
   bisectable. Because runs are deterministic, `git bisect run` with a fixed `-n` and a grep
   on the console works for regressions.
@@ -271,7 +273,8 @@ ended still blocked, say so and carry the problem forward.
 <device or data change, mapped to the RECON.md MMIO row; why this over alternatives>
 
 ## 4. How it was implemented
-- files touched (emulation/, tools/, patches/ if any - and why the public API was not enough)
+- files touched (emulation/, tools/, patches/ if any - each patch's subject, and why the public
+  API was not enough; whether it is general enough to propose upstream)
 - register semantics added
 - re-run result: <next blocker or milestone, with quoted output and instruction count>
 - Ghidra renames/comments made; HLE hooks and `--mmio-rule`s kept (if any) and why

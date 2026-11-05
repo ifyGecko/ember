@@ -33,7 +33,9 @@
 #      installed, OVMF boots to the UEFI shell on the same board
 #   5. layering: a device may include uam/state.h and uam/blockdev.h; check-layering.sh
 #      rejects one including uam/machine.h. Guardrails: rebuild.sh rejects uncaptured ember
-#      edits, build-ember.sh refuses a dirty working copy
+#      edits; regen-patches.sh exports them as a format-patch file that build-ember.sh applies
+#      as a commit on the pin and `git am` lands upstream; repin.sh rebases it onto a newer
+#      upstream and drops it once upstream has it; build-ember.sh refuses a dirty working copy
 #
 # Usage: skills/tests/run-tests.sh [EMBER_GIT_SOURCE]   (default: $EMBER_UPSTREAM or ~/ember)
 # Needs: git, cc, python3; mips-linux-gnu-gcc (step 3); gcc with -m32 support (step 4);
@@ -354,11 +356,37 @@ rm -f "$P/emulation/ok_dev.c"
 printf '#include "uam/machine.h"\nint bad_dev_x;\n' > "$P/emulation/bad_dev.c"
 if "$P/scripts/rebuild.sh" >/dev/null 2>&1; then bad "layering violation rejected"; else ok "layering violation rejected"; fi
 rm -f "$P/emulation/bad_dev.c" "$P/build/obj/bad_dev."*
+# Every ember change is a git format-patch file applied to the clone at the pin as a commit.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-skills-test}" GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-skills-test@localhost}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-skills-test}" GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-skills-test@localhost}"
+PIN="$(head -1 "$P/ember.commit")"
 echo "/* stray */" >> "$P/ember-src/src/core/common.c"
 if "$P/scripts/rebuild.sh" >/dev/null 2>&1; then bad "uncaptured ember edit rejected"; else ok "uncaptured ember edit rejected"; fi
-check "regen-patches captures it" "$P/scripts/regen-patches.sh"
+if "$P/scripts/regen-patches.sh" >/dev/null 2>&1; then bad "regen-patches wants a commit message"; else ok "regen-patches wants a commit message"; fi
+check "regen-patches -m commits and exports it" "$P/scripts/regen-patches.sh" -m "core: a test change"
+PF="$(ls "$P"/patches/*.patch 2>/dev/null | head -1)"
+[[ "$(ls "$P"/patches/*.patch 2>/dev/null | wc -l)" -eq 1 ]] && grep -q '^Subject: \[PATCH\] core: a test change$' "$PF" \
+    && ok "one format-patch file with the message" || bad "one format-patch file with the message"
+check "rebuild accepts the exported patch" "$P/scripts/rebuild.sh"
 check "full build re-applies the patch" "$P/scripts/build-ember.sh"
-[[ "$(git -C "$P/ember-src" diff --name-only)" == "src/core/common.c" ]] && ok "patch applied in clean checkout" || bad "patch applied in clean checkout"
+[[ "$(git -C "$P/ember-src" log --format=%s "$PIN..HEAD")" == "core: a test change" && -z "$(git -C "$P/ember-src" status --porcelain -uno)" ]] \
+    && grep -q "stray" "$P/ember-src/src/core/common.c" \
+    && ok "patch applied as a commit on the pin" || bad "patch applied as a commit on the pin"
+git clone -q "$UP" "$T/upx"; git -C "$T/upx" checkout -q -B main "$PIN"
+git -C "$T/upx" am -q "$PF" && [[ "$(git -C "$T/upx" log -1 --format=%s)" == "core: a test change" ]] \
+    && ok "the patch lands upstream with git am" || bad "the patch lands upstream with git am"
+# Re-pin to a newer upstream: the patch is rebased; once upstream has taken it, it drops out.
+git -C "$T/upx" reset -q --hard "$PIN"; echo "repin test" > "$T/upx/REPIN-TEST"
+git -C "$T/upx" add REPIN-TEST; git -C "$T/upx" commit -q -m "upstream moves on"
+git -C "$P/ember-src" remote set-url origin "$T/upx"
+check "repin.sh moves to the latest commit" "$P/scripts/repin.sh" --no-build
+[[ "$(head -1 "$P/ember.commit")" == "$(git -C "$T/upx" rev-parse HEAD)" && "$(ls "$P"/patches/*.patch | wc -l)" -eq 1 ]] \
+    && ok "pin moved, patch carried" || bad "pin moved, patch carried"
+git -C "$T/upx" am -q "$PF"
+check "repin.sh onto an upstream that took the patch" "$P/scripts/repin.sh" --no-build
+[[ "$(head -1 "$P/ember.commit")" == "$(git -C "$T/upx" rev-parse HEAD)" ]] && ! ls "$P"/patches/*.patch >/dev/null 2>&1 \
+    && ok "a patch taken upstream drops out" || bad "a patch taken upstream drops out"
+git -C "$P/ember-src" remote set-url origin "$UP"
 git clone -q "$UP" "$T/wc"; echo "/* user work */" >> "$T/wc/Makefile"
 "$SK/scripts/new-emulation.sh" wc-test --dir "$T/wcp" --ember-src "$T/wc" >/dev/null
 if "$T/wcp/scripts/build-ember.sh" >/dev/null 2>&1; then bad "dirty working copy protected"; else ok "dirty working copy protected"; fi

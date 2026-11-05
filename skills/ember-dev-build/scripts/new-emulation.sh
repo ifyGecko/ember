@@ -28,13 +28,13 @@
 #                      x86_64                an x86-64 PC (uam_isa_x86_64): the board comes from
 #                                            templates/board-pc.c.in - ember's generic PC devices,
 #                                            boot flash ending at 4 GiB, chipset left to add
-#   --ember-src      build against this existing ember checkout in place (recorded in
-#                    ember.src). It is checked out at ember.commit by build-ember.sh, which
-#                    refuses if that would discard or move someone's work.
-#   --ember-upstream clone source for a project-local checkout (<dir>/ember-src, the default).
-#                    Default: $EMBER_UPSTREAM, else ~/ember if it is a git checkout.
-#   --ember-commit   commit/tag to pin. Default: the checkout's / upstream's HEAD. Record WHY
-#                    in the README.
+#   --ember-upstream clone source for the project's own ember clone (<dir>/ember-src, the
+#                    default and the rule). Default: $EMBER_UPSTREAM, else ~/ember.
+#   --ember-src      use this existing clone instead (recorded in ember.src): only a clone
+#                    dedicated to this project, never someone's ember working copy. Reset to
+#                    ember.commit by build-ember.sh, which refuses to discard or move work.
+#   --ember-commit   commit/tag to pin. Default and rule: the latest ember commit (upstream's
+#                    HEAD). Anything older needs a reason in the README.
 #   --ram-base ...   numbers from RECON.md for the generated board (all optional; the board
 #                    file marks them for review either way; addresses are bus addresses, so
 #                    a Harvard ISA's data RAM includes its data-space base). Defaults follow
@@ -583,13 +583,17 @@ else
         [[ -n "$COMMIT" ]] || die "could not resolve HEAD of $UPSTREAM; pass --ember-commit"
     fi
 fi
+LATEST="$(if [[ -n "$SRC" ]]; then git -C "$SRC" rev-parse HEAD; else git ls-remote "$UPSTREAM" HEAD | awk '$2 == "HEAD" {print $1; exit}'; fi 2>/dev/null || true)"
+if [[ -n "$LATEST" && "$COMMIT" != "$LATEST"* ]]; then
+    echo "note: pinning $COMMIT, not the latest ember commit ${LATEST:0:12}; record why in README.md" >&2
+fi
 echo "$COMMIT" > "$PROJ/ember.commit"
 mkdir -p "$PROJ/emulation" "$PROJ/patches" "$PROJ/scripts" "$PROJ/tools"
 touch "$PROJ/patches/.keep" "$PROJ/tools/.keep"
 
 # --- project-local copies of the helpers ---------------------------------------------
 cp "$HERE"/_common.sh "$HERE"/build-ember.sh "$HERE"/rebuild.sh "$HERE"/regen-patches.sh \
-   "$HERE"/check-layering.sh "$HERE"/log_summary.py "$HERE"/gdb_trace_calls.py "$PROJ/scripts/"
+   "$HERE"/repin.sh "$HERE"/check-layering.sh "$HERE"/log_summary.py "$HERE"/gdb_trace_calls.py "$PROJ/scripts/"
 chmod +x "$PROJ"/scripts/*.sh "$PROJ"/scripts/*.py
 
 subst() {  # template -> file
@@ -686,17 +690,20 @@ project links against ember's library, built from a pinned commit.
 | \`iter-XX.md\` | bring-up journal, one per iteration |
 | \`emulation/\` | our C sources: \`${CNAME}_board.c\` (wiring only), one file per hardware component, \`main.c\` |
 | \`ember.commit\` | pinned ember commit; \`ember.upstream\` / \`ember.src\`: where ember comes from |
-| \`patches/\` | edits to ember itself (normally empty; see the build skill's organization rules) |
-| \`scripts/\` | build-ember.sh, rebuild.sh, regen-patches.sh, check-layering.sh, log_summary.py, gdb_trace_calls.py |
+| \`patches/\` | every change to ember itself, as \`git format-patch\` files applied as commits on the pin (normally empty) |
+| \`scripts/\` | build-ember.sh, rebuild.sh, regen-patches.sh, repin.sh, check-layering.sh, log_summary.py, gdb_trace_calls.py |
 | \`tools/\` | generators for data the firmware reads (flash, NVRAM, calibration) |
 | \`run.sh\` | the runner invocation under construction |
 
-## Why this ember.commit
-TODO: record why \`$COMMIT\` was chosen.
+## ember.commit
+\`$COMMIT\`: the latest ember commit when the project was created. Move it to the latest
+with \`scripts/repin.sh\` (it rebases patches/ onto the new commit), and note each move here.
 
 ## Build
-    scripts/build-ember.sh    # full: pristine ember at ember.commit -> patches -> libuam -> build/$BOARD-run
+    scripts/build-ember.sh    # full: ember-src reset to ember.commit -> patches/ as commits -> libuam -> build/$BOARD-run
     scripts/rebuild.sh        # fast: after editing emulation/ files
+    scripts/regen-patches.sh  # after committing a change to ember in ember-src: export it to patches/
+    scripts/repin.sh          # move to the latest ember commit, carrying patches/ along
 ## Run
     IMAGE=/path/to/firmware timeout -k 5 300 ./run.sh -n 200000000 > build/console.txt 2> build/emu.log < /dev/null
     python3 scripts/log_summary.py build/emu.log
