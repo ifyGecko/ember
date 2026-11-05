@@ -139,12 +139,17 @@ static void free_guard(uam_machine *m, guard *g)
 }
 
 /* The physical pieces of g's range: one per page for a virtual range, merged where
- * consecutive pages are physically contiguous. */
+ * consecutive pages are physically contiguous. A guard watches loads and stores, so a
+ * virtual range is translated as data is: where data and code live in different
+ * spaces (AVR, PIC) the debug view is the code space. A store-only guard takes the
+ * store translation, any other the load one; if that is refused (privilege,
+ * protection) the debug view, which ignores both, decides. */
 static bool split(uam_machine *m, guard *g, char *err, size_t errlen)
 {
     const uam_guard_spec *s = &g->spec;
     uam_cpu *cpu = uam_machine_cpu(m, 0);
     const bool virt = !s->phys && cpu->isa->translate;
+    const uam_xlate_kind kind = s->dir == UAM_GUARD_WRITE ? UAM_XLATE_STORE : UAM_XLATE_LOAD;
     uint64_t cap = virt ? s->len / UAM_PAGE_SIZE + 2 : 1;
     g->pieces = calloc(cap, sizeof(*g->pieces));
     if (!g->pieces) {
@@ -158,7 +163,8 @@ static bool split(uam_machine *m, guard *g, char *err, size_t errlen)
             if (chunk > room)
                 chunk = room;
             uam_xlate xl = { 0 };
-            if (cpu->isa->translate(cpu, va, UAM_XLATE_DEBUG, &xl) != UAM_OK) {
+            if (cpu->isa->translate(cpu, va, kind, &xl) != UAM_OK
+                && cpu->isa->translate(cpu, va, UAM_XLATE_DEBUG, &xl) != UAM_OK) {
                 set_err(err, errlen, "processor 0 does not map virtual 0x%llx",
                         (unsigned long long)va);
                 return false;

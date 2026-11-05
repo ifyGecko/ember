@@ -72,8 +72,8 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    on flat memory an overflow faults nowhere, so without one it is an ok. On a `mem:` route
    use its redzones (`after:r`, plus `extent=@OFF:SZ` when the input carries its own
    length field, `before=N` for underflows); on a device route, `--guard` the firmware's
-   own buffer (`references/harness.md`, "Redzones" and "Guards"; on 8-bit AVR and PIC use
-   `--guard` at the data-space bus address, not redzones: "Per ISA"). A `--guard` is armed
+   own buffer (`references/harness.md`, "Redzones" and "Guards"; on 8-bit AVR and PIC both
+   take the plain data address: "Per ISA"). A `--guard` is armed
    during boot: guard only what the boot does not write (`:r` otherwise), or the boot
    stops at it and never reaches the begin pc.
 5. **Smoke-test with replay**: a directory of hand-made inputs whose verdicts you can

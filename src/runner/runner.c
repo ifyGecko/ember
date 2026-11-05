@@ -267,7 +267,7 @@ static void usage(FILE *out)
         "                          ADDR: one byte), r/w/rw the accesses it catches (default\n"
         "                          rw); fault makes the access a bus fault for the guest\n"
         "                          instead, log only reports it. ADDR is virtual, translated\n"
-        "                          as processor 0 maps it when the run starts; p: physical\n"
+        "                          as processor 0 maps data when the run starts; p: physical\n"
         "      --watch SPEC        --guard SPEC,log: report each access to it on stderr\n"
         "      --dump-mem [p:]ADDR+LEN[=FILE]  when the run stops (--break, -n, ...), hex-dump\n"
         "                          LEN bytes of guest memory at ADDR to stderr, or write them\n"

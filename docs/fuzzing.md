@@ -203,8 +203,10 @@ Guards are ember's, not the harness's (`uam/guard.h`): they work in any run, fuz
 
 The range is `[ADDR-BEFORE, ADDR+AFTER)` around the anchor ADDR: `0x1000+16` is the 16 bytes
 from 0x1000, `0x1000-16` the 16 in front of it, `0x1000-16+16` both, a bare `0x1000` one
-byte. ADDR is virtual, translated as processor 0 maps it when the run starts (after
-`--load-snapshot`), a page at a time; `p:` makes it physical. Any data access that overlaps the
+byte. ADDR is virtual, translated as processor 0 maps its data accesses when the run starts
+(after `--load-snapshot`), a page at a time; `p:` makes it physical. On the 8-bit AVR and PIC,
+whose data space sits at 0x800000 on the bus, ADDR is therefore the data address the firmware
+uses, as for a `mem:` route; a bus address needs `p:`. Any data access that overlaps the
 range hits it, in the directions given (default `rw`). What a hit does:
 
 | Action | The access | The run |

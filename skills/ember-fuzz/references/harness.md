@@ -260,16 +260,15 @@ and no class but the bus faults.
 - Encodings the core does not have stop into the debugger on 8-bit AVR (also `BREAK`),
   PIC and the 8051 (its one undefined opcode, 0xA5): crash (oracle) with that pc. The
   6502's `STP` and NMOS `JAM` stop the core until reset: a hang.
-- Addresses are bus addresses where the spaces share ember's bus. 8-bit AVR and PIC data
-  space is at 0x800000 + data address (an avr-gcc data symbol already has that value);
-  8051 external data (MOVX) at 0x1000000 + address; Z80 I/O ports at 0x10000 + port. The
-  8051's internal RAM is not on the bus: it cannot be guarded or written by a `mem:` route.
-- **8-bit AVR and PIC: use `--guard`, not `mem:` redzones.** The `mem:` route writes the
-  input through the store translation (`mem:ADDR` with the plain data address lands in data
-  space), but its redzones are placed without it, in program memory: on `avr-ref` a
-  `before=4:w` zone in front of the fuzz target's buffer misses the firmware's writes
-  there. Guard the buffer with `--guard 0x800000+ADDR...` (or `p:`) instead, and keep the
-  route without redzones.
+- Addresses. 8-bit AVR and PIC data space is at bus address 0x800000 + data address. A
+  `mem:` route, its redzones and a `--guard` without `p:` take the plain data address, as
+  the firmware uses it (an avr-gcc data symbol minus 0x800000), and ember adds the base;
+  `p:`, `--dump-mem` and MMIO rules take the bus address (an avr-gcc data symbol already
+  has that value). Passing the symbol value to `mem:` or an
+  unprefixed `--guard` lands at 0x1000000 + address, outside the data space. The 8051's
+  external data (MOVX) is at 0x1000000 + address and the Z80's I/O ports at 0x10000 + port,
+  bus addresses everywhere. The 8051's internal RAM is not on the bus: it cannot be guarded
+  or written by a `mem:` route.
 
 `--fuzz-crash-irq` lines, as each ISA reports them (ember's `docs/fuzzing.md` has the
 reference boards' wiring):
@@ -302,8 +301,8 @@ The range is `[ADDR-BEFORE, ADDR+AFTER)` around the anchor ADDR: `0x1000+16` is 
 from 0x1000, `0x1000-16` the 16 in front of it, `0x1000-16+16` both, a bare `0x1000` one
 byte. Numbers are C literals; BEFORE and AFTER take a K/M suffix. ADDR is virtual,
 translated as processor 0 maps it when the run starts (after `--load-snapshot`), a page at a
-time; `p:` makes it physical. The translation is the debugger's, which on the Harvard
-8-bit cores is the bus address ("Per ISA": AVR and PIC data at 0x800000 + address). Any
+time; `p:` makes it physical. The translation is a data access's, so on the 8-bit AVR and
+PIC ADDR is the data address and ember adds the 0x800000 base ("Per ISA"). Any
 data access that overlaps the range hits it, in the directions given (default `rw`). The
 name defaults to the text before the first `,`.
 

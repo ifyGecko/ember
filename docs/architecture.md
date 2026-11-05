@@ -593,7 +593,8 @@ devices.
   faulting instruction (`UAM_STOP_GUARD`, resumable: the instruction runs again), refused as a
   bus fault the guest takes, or allowed and logged. A guard is one bus watch per physically
   contiguous piece (`UAM_WATCH_FAULT` for the refusing actions); a virtual range is translated
-  as processor 0 maps it when the guard is added. The precise stop comes from the executor: the
+  as processor 0 maps its data accesses when the guard is added (the AVR and PIC data space,
+  not their program memory). The precise stop comes from the executor: the
   watch callback requests it (`uam_exec_request_fault_stop`), the access faults, and the run
   loop returns at the fault's pc instead of delivering the exception, the same on the
   interpreter and the JIT and on any processor. Instruction fetches, debug accesses and DMA are

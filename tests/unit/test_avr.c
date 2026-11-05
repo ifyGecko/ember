@@ -4,7 +4,8 @@
  * the stack, SREG.I, the vector size, the hardware acknowledge), the AVRxm PMIC (levels
  * and their enables, preemption, NMI, round robin, IVSEL, RETI ending the highest level)
  * and the AVRxt CPUINT (LVL1VEC, the compact vector table), the wake rule, the CPU
- * models (uam_avr_configure), and the general-purpose timer (uam/dev/gptimer.h).
+ * models (uam_avr_configure), the general-purpose timer (uam/dev/gptimer.h), and guards
+ * at data-space addresses.
  *
  * Each test runs on a bare machine: program memory as RAM at 0, the data space at
  * UAM_AVR_DATA_BASE.
@@ -14,6 +15,7 @@
 
 #include "uam/bus.h"
 #include "uam/dev/gptimer.h"
+#include "uam/guard.h"
 #include "uam/isa/avr.h"
 #include "uam/machine.h"
 
@@ -298,9 +300,40 @@ static void test_gptimer(void)
     uam_machine_fini(&m);
 }
 
+/* A guard's address is a data-space address, as the firmware stores to it (and as the
+ * fuzz harness writes a mem: route's input): it must not land in program memory. */
+static void test_guard(void)
+{
+    uam_machine m;
+    machine(&m, &uam_avr_e_ref);
+    put16(&m, 0x400, 0xE50A);              /* LDI r16, 0x5A */
+    put16(&m, 0x402, 0x9300);              /* STS 0x0201, r16 */
+    put16(&m, 0x404, 0x0201);
+    put16(&m, 0x406, RJMP_SELF);
+    char err[256] = "";
+    CHECK(uam_machine_add_guard_text(&m, "0x200+4:w,log", UAM_GUARD_STOP, err, sizeof(err)) > 0,
+          "%s", err);
+    FILE *quiet = fopen("/dev/null", "w");
+    uam_machine_set_guard_log(&m, quiet);
+    step(&m, 3);
+    EQ64(uam_machine_guard_hits(&m), 1, "guard: the data store hit it");
+    const uam_guard_hit *h = uam_machine_guard_last_hit(&m);
+    CHECK(h != NULL, "guard: a hit recorded");
+    if (h) {
+        EQ64(h->addr, 0x201, "guard: data address");
+        EQ64(h->paddr, UAM_AVR_DATA_BASE + 0x201, "guard: in the data space");
+        EQ64(h->val, 0x5A, "guard: value");
+    }
+    EQ64(data(&m, 0x201), 0x5A, "guard: a log guard lets the store happen");
+    uam_machine_fini(&m);
+    if (quiet)
+        fclose(quiet);
+}
+
 int main(void)
 {
     test_classic();
+    test_guard();
     test_pmic();
     test_cpuint();
     test_configure();

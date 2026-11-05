@@ -18,8 +18,10 @@
  * passed to the guard observer if there is one.
  *
  * Guards sit on the physical bus. A virtual range is translated as processor 0 maps
- * it when the guard is added, a page at a time; a later change of mapping does not
- * move it. Instruction fetches, debug accesses (gdb, --dump-mem) and DMA
+ * its data accesses when the guard is added (the store mapping for a write-only guard,
+ * else the load one, else the debug view), a page at a time; a later change of mapping
+ * does not move it. On AVR and PIC a virtual address is therefore a data-space
+ * address, as the firmware uses it; p: reaches the bus directly. Instruction fetches, debug accesses (gdb, --dump-mem) and DMA
  * (uam_bus_dma_*) are exempt. Every access to a guarded page goes through the bus's
  * slow path (the JIT's direct memory access is off for that page). Guards are
  * configuration, not machine state: snapshots neither save nor restore them, and
