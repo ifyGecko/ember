@@ -29,6 +29,10 @@
  * matches, INTSET); profiling and write-error lines are external inputs too. CCOUNT counts
  * one per tick of virtual time.
  *
+ * Privilege. The MMU option's rings are not modelled: a hart has one ring, as the three
+ * Espressif cores do (their RING field has no bits), so every instruction is allowed in
+ * every mode and PS.UM only selects the user or the kernel exception vector.
+ *
  * External registers (RER/WER) reach the board's ERI bus through uam_xtensa_set_eri();
  * without it RER reads 0 and WER does nothing.
  */

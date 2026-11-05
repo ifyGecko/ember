@@ -2,7 +2,8 @@
  * test_xtensa.c - The Xtensa module's parts the self-test firmware cannot reach on
  * xtensa-ref: model selection and its validation, the reset state of each model, which
  * special registers each model has (RSR/WSR/XSR of a missing one is IllegalInstruction),
- * an option the model lacks, the interrupt lines through the board's API (level lines
+ * an option the model lacks, one privilege ring (privileged instructions in user mode,
+ * PS.RING without bits), the interrupt lines through the board's API (level lines
  * read as they are, edge and NMI lines latch, INTSET/INTCLEAR, INTENABLE's width, the
  * level chosen, EPCn/EPSn, EXCMLEVEL, the user vector, RFI, the lines reported), WAITI,
  * CCOUNT and CCOMPARE in virtual time, the window exceptions' vector choice and the
@@ -87,6 +88,7 @@ static uint32_t ROTW(int n) { return 0x408000u | ((unsigned)n & 15) << 4; }
 static uint32_t BREAK(unsigned s, unsigned t) { return 0x004000u | s << 8 | t << 4; }
 static uint32_t BREAK_N(unsigned s) { return 0xF02Du | s << 8; }
 static uint32_t WAITI(unsigned lv) { return 0x007000u | lv << 8; }
+static uint32_t RSIL(unsigned t, unsigned lv) { return 0x006000u | lv << 8 | t << 4; }
 static uint32_t JX(unsigned s) { return 0x0000A0u | s << 8; }
 #define RET  0x000080u
 #define RETW 0x000090u
@@ -373,6 +375,40 @@ static void test_special_registers(bool jit)
                 expect_exc(&m, XT_EXC_ILLEGAL, at, what);
             }
         }
+        uam_machine_fini(&m);
+    }
+}
+
+/* One ring (the cores' RING field has no bits): privileged instructions run with PS.UM set,
+ * and PS.RING reads 0. */
+static void test_one_ring(bool jit)
+{
+    for (size_t k = 0; k < UAM_ARRAY_LEN(models); k++) {
+        const uam_xtensa_config *cfg = models[k];
+        uam_machine m;
+        machine(&m, &uam_isa_xtensa, cfg, jit);
+        uint32_t a = put(&m, CODE, WSR(2, SR_INTENABLE));
+        a = put(&m, a, RSR(3, SR_EPC1));
+        a = put(&m, a, RSIL(4, 0));
+        a = put(&m, a, WSR(6, SR_PS));
+        a = put(&m, a, RSR(7, SR_PS));
+        spin(&m, a);
+        const uint32_t um = ps0(&m) | PS_UM;
+        sysw(&m, SR_PS, um);
+        sysw(&m, SR_EPC1, 0x1234);
+        sysw(&m, SR_EXCCAUSE, 63);
+        seta(&m, 2, 3);
+        seta(&m, 6, um | PS_RING);
+        run(&m, CODE, 12);
+        CHECK(m.cpu.pc == a, "%s: privileged instructions run in user mode (pc 0x%llx)", cfg->name,
+              (unsigned long long)m.cpu.pc);
+        CHECK(sysr(&m, SR_EXCCAUSE) == 63, "%s: no PrivilegedCause", cfg->name);
+        CHECK(sysr(&m, SR_INTENABLE) == 3, "%s: WSR INTENABLE in user mode", cfg->name);
+        CHECK(a_(&m, 3) == 0x1234, "%s: RSR EPC1 in user mode", cfg->name);
+        CHECK(a_(&m, 4) == um, "%s: RSIL in user mode", cfg->name);
+        CHECK(a_(&m, 7) == um, "%s: PS.RING has no bits (PS 0x%x)", cfg->name, (unsigned)a_(&m, 7));
+        sysw(&m, SR_EPS(2), um | PS_RING);
+        CHECK(sysr(&m, SR_EPS(2)) == um, "%s: nor has EPS2.RING", cfg->name);
         uam_machine_fini(&m);
     }
 }
@@ -1090,6 +1126,7 @@ int main(void)
     for (int jit = 0; jit < 2; jit++) {
         test_special_registers(jit);
         test_missing_option(jit);
+        test_one_ring(jit);
         test_waiti(jit);
         test_window_call(jit);
         test_window_exceptions(jit);

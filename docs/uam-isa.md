@@ -746,7 +746,9 @@ Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
   own that `take_exception` turns into the vector and the state the ISA defines. Bus faults are
   LoadStoreError and InstructionFetchError, Region Protection's refusals (`isa->translate`)
   Load/StoreProhibited and InstFetchProhibited, misaligned accesses LoadStoreAlignment on a core
-  with the Unaligned Exception option.
+  with the Unaligned Exception option. There is no PrivilegedCause: the cores have one ring
+  (their configuration's RING field has no bits, so PS.RING reads 0), and PS.UM only chooses
+  the user or kernel vector.
 - **Interrupt levels between blocks.** INTERRUPT is the level lines as they are plus the
   latched edge, software and timer bits; `irq_take` takes the highest level above PS.INTLEVEL
   (and above EXCMLEVEL while PS.EXCM is set; the NMI regardless): level 1 through the user or

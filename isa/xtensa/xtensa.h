@@ -61,7 +61,10 @@
 #define PS_CALLINC_SH 16
 #define PS_CALLINC  0x00030000u
 #define PS_WOE      0x00040000u
-#define PS_MASK     0x00070FFFu
+/* The bits PS holds. Not RING: the modelled cores have one ring (XCHAL_MMU_RINGS 1,
+ * XCHAL_MMU_RING_BITS 0 in their core-isa.h), so the field has no bits, CRING is always 0
+ * and no instruction raises PrivilegedCause; PS.UM only picks the user or kernel vector. */
+#define PS_MASK     (0x00070FFFu & ~PS_RING)
 
 /* EXCCAUSE values. */
 enum {
