@@ -211,6 +211,11 @@ TEST_M6502 := $(BUILD)/test_m6502
 TEST_Z80   := $(BUILD)/test_z80
 TEST_XTENSA := $(BUILD)/test_xtensa
 TEST_XTENSA_FPU := $(BUILD)/test_xtensa_fpu
+TEST_AVR32 := $(BUILD)/test_avr32
+TEST_MIPS := $(BUILD)/test_mips
+TEST_X86 := $(BUILD)/test_x86
+TEST_RISCV := $(BUILD)/test_riscv
+TEST_ARM := $(BUILD)/test_arm
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -392,6 +397,21 @@ $(TEST_Z80): $(BUILD)/obj/tests/unit/test_z80.o $(LIB)
 $(TEST_XTENSA): $(BUILD)/obj/tests/unit/test_xtensa.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_ARM): $(BUILD)/obj/tests/unit/test_arm.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_RISCV): $(BUILD)/obj/tests/unit/test_riscv.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_X86): $(BUILD)/obj/tests/unit/test_x86.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_MIPS): $(BUILD)/obj/tests/unit/test_mips.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_AVR32): $(BUILD)/obj/tests/unit/test_avr32.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # Its vectors are computed with exact arithmetic when it is built.
 $(BUILD)/gen/xtensa_fpu_vectors.h: tests/isa-xtensa/gen-fpu-vectors.py tests/isa-xtensa/opcodes.py
 	@mkdir -p $(dir $@)
@@ -507,7 +527,7 @@ endif
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA) $(TEST_XTENSA_FPU) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA) $(TEST_XTENSA_FPU) $(TEST_ARM) $(TEST_RISCV) $(TEST_X86) $(TEST_MIPS) $(TEST_AVR32) \
            $(TEST_JITDIFF) $(TEST_F80) $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -528,6 +548,11 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_Z80)
 	$(TEST_XTENSA)
 	$(TEST_XTENSA_FPU)
+	$(TEST_ARM)
+	$(TEST_RISCV)
+	$(TEST_X86)
+	$(TEST_MIPS)
+	$(TEST_AVR32)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
@@ -1004,6 +1029,6 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
-         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \
+         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/unit/test_avr32.d $(BUILD)/obj/tests/unit/test_mips.d $(BUILD)/obj/tests/unit/test_x86.d $(BUILD)/obj/tests/unit/test_riscv.d $(BUILD)/obj/tests/unit/test_arm.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \
          $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d
