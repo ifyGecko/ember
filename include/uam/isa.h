@@ -64,7 +64,9 @@ typedef enum uam_exc_kind {
 enum uam_exc_flag {
     /* The faulting instruction is a continuation (UAM_IMARK_CONT) of the
      * instruction at parent_pc - e.g. it sits in a branch delay slot. ISAs with
-     * delay slots restart at parent_pc (MIPS: EPC = branch, Cause.BD = 1). */
+     * delay slots restart at parent_pc (MIPS: EPC = branch, Cause.BD = 1); where the
+     * parent has completed (x86: the instruction after STI or MOV SS) the fault is the
+     * continuation's own. */
     UAM_EXC_F_CONT = 1u << 0,
 };
 

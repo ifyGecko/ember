@@ -16,7 +16,11 @@ uint64_t x86_h_sse(void *env, uint64_t a, uint64_t b, uint64_t c, uam_status *st
 static uint64_t h_load_seg(void *env, uint64_t seg, uint64_t sel, uint64_t c, uam_status *st)
 {
     CPU; (void)c;
-    CHECK(x86_load_seg(cpu, (unsigned)seg, (uint16_t)sel));
+    CHECK(x86_load_seg(cpu, (unsigned)seg & 0xFF, (uint16_t)sel));
+    if (seg & X86_LOAD_SEG_SHADOW) {   /* MOV SS / POP SS: over the next block's first insn */
+        x86_st(cpu)->int_shadow = true;
+        x86_update_priv(cpu);
+    }
     return 0;
 }
 

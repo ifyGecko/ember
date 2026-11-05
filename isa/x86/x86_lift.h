@@ -88,7 +88,7 @@ uint64_t x_io_rip(const xl *x);                                         /* this 
 uint64_t x_sx(uint64_t v, unsigned from_bits);              /* sign-extend to 64 */
 lr      x_jcc(xl *x, unsigned cc, int64_t rel);
 void    x_imul2(xl *x, unsigned w, uam_ref a, uam_ref b);   /* Gv = a * b, IMUL flags */
-void    x_load_seg(xl *x, unsigned seg, uam_ref sel16);
+void    x_load_seg(xl *x, unsigned seg, uam_ref sel16, bool shadow);
 uam_ref x_seg_sel(xl *x, unsigned seg);
 lr      x_push_seg(xl *x, unsigned seg);
 lr      x_pop_seg(xl *x, unsigned seg);

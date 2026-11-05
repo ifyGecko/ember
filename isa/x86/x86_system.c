@@ -112,6 +112,8 @@ void x86_update_priv(uam_cpu *cpu)
         p |= X86_PRIV_PG;
     if ((s->irq_lines & (1u << UAM_X86_IRQ_A20M)) && !s->in_smm)
         p |= X86_PRIV_A20M;
+    if (s->int_shadow)
+        p |= X86_PRIV_SHADOW;
     if (p != cpu->priv) {
         cpu->priv = p;
         uam_cpu_request_exit(cpu);
@@ -468,6 +470,10 @@ void x86_deliver(uam_cpu *cpu, unsigned vec, bool has_err, uint32_t err,
     x86_state *s = x86_st(cpu);
     uint64_t fault_pc = cpu->pc;
     (void)soft;
+    if (s->int_shadow) {         /* the shadowed instruction faulted: the shadow is over */
+        s->int_shadow = false;
+        x86_update_priv(cpu);
+    }
     for (;;) {
         if (deliver_once(cpu, vec, has_err, err, intn, return_pc) == UAM_OK)
             return;
@@ -501,8 +507,9 @@ static void x86_take_exception(uam_cpu *cpu, const uam_exception *exc)
     unsigned vec = X86_EXC_GP;
     bool has_err = true, intn = false;
     uint32_t err = 0;
-    /* the faulting instruction; an interrupt-shadowed one restarts with its parent */
-    cpu->pc = (exc->flags & UAM_EXC_F_CONT) ? exc->parent_pc : exc->pc;
+    /* the faulting instruction, also when it is the one in an STI or MOV SS shadow: the
+     * instruction before it has completed (SDM vol. 3, 6.5) */
+    cpu->pc = exc->pc;
     uint64_t ret = cpu->pc;
 
     switch (exc->kind) {
@@ -600,6 +607,8 @@ static bool x86_irq_wakeup(uam_cpu *cpu)
 static bool x86_irq_take(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
+    if (s->int_shadow)           /* MOV SS / POP SS: nothing before the next instruction */
+        return false;
     if (s->wait_sipi) {          /* INIT, SIPI and SMI are recognised */
         if (s->smi_pending && !s->in_smm && !s->shutdown) {
             /* SMI reaches an AP even in wait-for-SIPI (SMBASE relocation runs
@@ -812,6 +821,10 @@ uam_status x86_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t val)
         x86_set_rflags(cpu, (uint32_t)val);
         uam_cpu_request_exit(cpu);
         return UAM_OK;
+    case X86_SR_SHADOW:
+        s->int_shadow = val != 0;
+        x86_update_priv(cpu);
+        return UAM_OK;
     case X86_SR_STI: case X86_SR_CLI:
         if (!iopl_ok(cpu))
             return x86_raise(cpu, X86_EXC_GP, true, 0);
@@ -912,6 +925,7 @@ static uint64_t *saved_u64(x86_state *s, size_t i)
         &s->io_smi.rsi, &s->io_smi.rdi, &s->io_smm.misc, &s->io_smm.rip, &s->io_smm.mem,
         &s->io_smm.rcx, &s->io_smm.rsi, &s->io_smm.rdi,
         &s->mm[0], &s->mm[1], &s->mm[2], &s->mm[3], &s->mm[4], &s->mm[5], &s->mm[6], &s->mm[7],
+        &s->fpu_ip, &s->fpu_dp,
     };
     return i < UAM_ARRAY_LEN(f) ? f[i] : NULL;
 }
@@ -927,10 +941,11 @@ static void x86_save(uam_cpu *cpu, uam_state_writer *w)
     uam_state_put_u16(w, s->ldtr.sel); uam_state_put_u16(w, s->ldtr.attr);
     uam_state_put_u16(w, s->tr.sel); uam_state_put_u16(w, s->tr.attr);
     uam_state_put_u32(w, s->irq_lines);
+    uam_state_put_u16(w, s->fpu_op);
     uam_state_put_u8(w, s->sipi_vector);
     const bool b[] = { s->nmi_pending, s->smi_pending, s->init_pending, s->nmi_blocked,
                        s->in_smm, s->halted_in_smm, s->shutdown, s->wait_sipi, s->sipi_pending,
-                       s->smi_io, s->smm_io, s->mmx, s->wait_sipi_in_smm };
+                       s->smi_io, s->smm_io, s->mmx, s->wait_sipi_in_smm, s->int_shadow };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         uam_state_put_bool(w, b[i]);
     for (unsigned i = 0; i < 8; i++) {
@@ -956,11 +971,12 @@ static void x86_restore(uam_cpu *cpu, uam_state_reader *r)
     s->ldtr.sel = uam_state_get_u16(r); s->ldtr.attr = uam_state_get_u16(r);
     s->tr.sel = uam_state_get_u16(r); s->tr.attr = uam_state_get_u16(r);
     s->irq_lines = uam_state_get_u32(r);
+    s->fpu_op = uam_state_get_u16(r) & 0x7FF;
     s->sipi_vector = uam_state_get_u8(r);
     bool *const b[] = { &s->nmi_pending, &s->smi_pending, &s->init_pending, &s->nmi_blocked,
                         &s->in_smm, &s->halted_in_smm, &s->shutdown, &s->wait_sipi,
                         &s->sipi_pending, &s->smi_io, &s->smm_io, &s->mmx,
-                        &s->wait_sipi_in_smm };
+                        &s->wait_sipi_in_smm, &s->int_shadow };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         *b[i] = uam_state_get_bool(r);
     for (unsigned i = 0; i < 8; i++) {

@@ -373,19 +373,25 @@ static void far_ptr(xl *x, xop *o, uam_ref *sel, uam_ref *off)
 /* ---- segment registers --------------------------------------------------- */
 
 /* Load a data/stack segment register. Real and virtual-8086 mode are inline
- * (base = sel << 4); protected and long mode check the descriptor in a helper. */
-void x_load_seg(xl *x, unsigned seg, uam_ref sel16)
+ * (base = sel << 4); protected and long mode check the descriptor in a helper.
+ * `shadow`: MOV SS and POP SS hold off interrupts until after the next instruction
+ * (LSS does not). Inline, the next instruction joins this block; after the helper the
+ * block ends (SS.B may change the stack width), so the helper opens X86_PRIV_SHADOW. */
+void x_load_seg(xl *x, unsigned seg, uam_ref sel16, bool shadow)
 {
+    shadow = shadow && seg == X86_SEG_SS;
     if (x86_priv_realseg(x->priv)) {
         uam_ref base = x_bin(x, UAM_OP_SHL, 64, x_zext(x, 64, 16, sel16), x_imm(x, 4));
         uam_put(x->b, 16, X86_OFF_SEG_SEL(seg), sel16, NONE);
         uam_put(x->b, 64, X86_OFF_SEG_BASE(seg), base, NONE);
     } else {
-        x_helper(x, X86_H_LOAD_SEG, x_imm(x, seg), x_zext(x, 64, 16, sel16), NONE);
+        x_helper(x, X86_H_LOAD_SEG, x_imm(x, seg | (shadow ? X86_LOAD_SEG_SHADOW : 0)),
+                 x_zext(x, 64, 16, sel16), NONE);
         if (seg == X86_SEG_SS)   /* SS.B selects the stack width: re-key the next block */
             x->end = true;
+        return;
     }
-    if (seg == X86_SEG_SS)       /* MOV/POP SS hold off interrupts for one instruction */
+    if (shadow)                  /* the next instruction retires with this one */
         x->sti_shadow = true;
 }
 
@@ -404,7 +410,7 @@ lr x_pop_seg(xl *x, unsigned seg)
 {
     unsigned w = x->in.osz;
     uam_ref v = x_trunc(x, 16, w, x_pop(x, w));
-    x_load_seg(x, seg, v);
+    x_load_seg(x, seg, v, true);
     x_commit_sp(x);
     return LR_CONT;
 }
@@ -417,7 +423,7 @@ lr x_load_far(xl *x, unsigned seg)
     xop o = x_rm(x);
     uam_ref sel, off;
     far_ptr(x, &o, &sel, &off);
-    x_load_seg(x, seg, sel);
+    x_load_seg(x, seg, sel, false);
     x_setreg(x, x->in.reg, x->in.osz, off);
     return LR_CONT;
 }
@@ -768,7 +774,7 @@ static lr lift_80(xl *x)
         if (sr >= X86_NSEG || sr == X86_SEG_CS)
             return x_ud(x);
         xop s = x_rm(x);
-        x_load_seg(x, sr, x_rd(x, &s, 16));
+        x_load_seg(x, sr, x_rd(x, &s, 16), true);
         return LR_CONT;
     }
     case 0x8F: {   /* POP Ev: rSP is incremented before the address is formed */
@@ -995,6 +1001,9 @@ uam_status x86_lift(uam_lift_ctx *lc)
     bool wrap32 = x.code != X86_CODE64;
     uint64_t pc = lc->pc;
     bool shadow = false;   /* the previous instruction holds off interrupts */
+    /* A block that must end while the next instruction is still in a shadow carries it
+     * to the next block (X86_PRIV_SHADOW), whose first instruction ends it. */
+    const bool in_shadow = (cpu->priv & X86_PRIV_SHADOW) != 0;
 
     for (uint32_t n = 0;; n++) {
         /* one slot stays free: an instruction that opens an interrupt shadow
@@ -1015,6 +1024,8 @@ uam_status x86_lift(uam_lift_ctx *lc)
             uam_imark_cont(lc->b, pc, x.in.len);
         else
             uam_imark(lc->b, pc, x.in.len);
+        if (n == 0 && in_shadow)   /* nothing came between: the shadow ends here */
+            uam_syswr(lc->b, 64, X86_SR_SHADOW, uam_imm(lc->b, 0), NONE);
         x.pc = pc;
         x.next = pc + x.in.len;
         if (wrap32)
@@ -1032,5 +1043,9 @@ uam_status x86_lift(uam_lift_ctx *lc)
         }
         shadow = x.sti_shadow;
         pc = x.next;
+        if (n == 0 && in_shadow && !shadow) {   /* a held interrupt is taken right here */
+            uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
+            return UAM_OK;
+        }
     }
 }

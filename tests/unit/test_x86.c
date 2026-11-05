@@ -420,6 +420,68 @@ static void test_shadow(bool jit)
     uam_machine_fini(&m);
 }
 
+/* The shadow when MOV SS / POP SS end a block (protected mode re-keys the stack width),
+ * and a fault in the shadowed instruction: reported at that instruction. */
+static void test_shadow_cross(bool jit)
+{
+    uam_machine m;
+    plat p;
+    /* protected mode: INTR and NMI wait for the instruction after MOV SS / POP SS */
+    for (int k = 0; k < 3; k++) {
+        machine(&m, &p, jit);
+        prot32(&m);
+        x86_set_rflags(&m.cpu, RFLAGS_IF | 2);
+        if (k < 2)
+            PUT(&m, CODE, 0x8E, 0xD0, 0x40, 0x43, SPIN);         /* mov ss, ax; inc eax; inc ebx */
+        else
+            PUT(&m, CODE, 0x17, 0x90, 0x40, 0x43, SPIN);         /* pop ss; nop; inc eax; inc ebx */
+        wr(&m, STACK, 4, DS32);
+        setgpr(&m, X86_RAX, DS32);
+        setgpr(&m, X86_RBX, 0);
+        const char *what = k == 0 ? "INTR after MOV SS" : k == 1 ? "NMI after MOV SS" : "INTR after POP SS";
+        run(&m, CODE, 1);
+        CHECK(m.cpu.pc == CODE + (k < 2 ? 2 : 1), "%s: the SS load ran (pc 0x%llx)", what,
+              (unsigned long long)m.cpu.pc);
+        CHECK(m.cpu.priv & X86_PRIV_SHADOW, "%s: the shadow carried to the next block", what);
+        p.vector = 0x20;
+        line(&m, k == 1 ? UAM_X86_IRQ_NMI : UAM_X86_IRQ_INTR, 1);
+        CHECK(!take(&m), "%s: not taken before the next instruction", what);
+        run(&m, m.cpu.pc, 10);
+        const unsigned vec = k == 1 ? 2 : 0x20;
+        CHECK(m.cpu.pc == handler(vec), "%s: then taken (pc 0x%llx)", what, (unsigned long long)m.cpu.pc);
+        const uint32_t after = k < 2 ? CODE + 3 : CODE + 2;
+        CHECK(rd(&m, sp(&m), 4) == after, "%s: EIP 0x%x, after the shadowed instruction", what,
+              (unsigned)rd(&m, sp(&m), 4));
+        EQ64(gpr(&m, X86_RBX), 0, "no further");
+        CHECK(!(m.cpu.priv & X86_PRIV_SHADOW), "%s: the shadow is over", what);
+        uam_machine_fini(&m);
+    }
+    /* a fault in the shadowed instruction: its own address, the one before it done */
+    static const struct { bool prot; uint8_t b[3]; unsigned len; uint32_t ip; int32_t dsp; const char *what; } f[] = {
+        { false, { 0xFB, 0x0F, 0x0B }, 3, CODE + 1, -6, "real mode, sti; ud2" },
+        { false, { 0x17, 0x0F, 0x0B }, 3, CODE + 1, 2 - 6, "real mode, pop ss; ud2 (popped once)" },
+        { true,  { 0xFB, 0x0F, 0x0B }, 3, CODE + 1, -12, "protected mode, sti; ud2" },
+        { true,  { 0x8E, 0xD0, 0x0F }, 3, CODE + 2, -12, "protected mode, mov ss, ax; ud2" },
+    };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(f); i++) {
+        machine(&m, NULL, jit);
+        if (f[i].prot)
+            prot32(&m);
+        put_bytes(&m, CODE, f[i].b, f[i].len);
+        if (f[i].len == 3 && f[i].b[0] == 0x8E)
+            PUT(&m, CODE + 3, 0x0B);
+        wr(&m, STACK, 4, f[i].prot ? DS32 : 0);
+        setgpr(&m, X86_RAX, DS32);
+        run(&m, CODE, 10);
+        CHECK(m.cpu.pc == handler(6), "%s: #UD (pc 0x%llx)", f[i].what, (unsigned long long)m.cpu.pc);
+        EQ64(sp(&m), (uint64_t)(STACK + f[i].dsp), f[i].what);
+        CHECK(rd(&m, sp(&m), f[i].prot ? 4 : 2) == f[i].ip, "%s: return IP 0x%x want 0x%x", f[i].what,
+              (unsigned)rd(&m, sp(&m), f[i].prot ? 4 : 2), (unsigned)f[i].ip);
+        CHECK(!(m.cpu.priv & X86_PRIV_SHADOW), "%s: no shadow left", f[i].what);
+        uam_machine_fini(&m);
+    }
+}
+
 static void test_hlt(bool jit)
 {
     uam_machine m;
@@ -1062,6 +1124,9 @@ static void test_snapshot(void)
     CHECK(x86_ltr(c, TSSSEL) == UAM_OK, "ltr");
     st(&m)->smbase = 0x70000;
     st(&m)->fpr[5] = (x86_f80){ 0xC000000000000000ull, 0x4000 };
+    st(&m)->fpu_ip = 0x1234;                                     /* FNSTENV's FIP, FDP, FOP */
+    st(&m)->fpu_dp = 0x5678;
+    st(&m)->fpu_op = 0x5D9;
     line(&m, UAM_X86_IRQ_A20M, 1);
     line(&m, UAM_X86_IRQ_NMI, 1);
     const unsigned priv = m.cpu.priv;
@@ -1096,6 +1161,9 @@ static void test_snapshot(void)
     EQ64(msr(&m, 0x4322), 0, "the one stored after is gone");
     EQ64(st(&m)->smbase, 0x70000, "SMBASE");
     CHECK(st(&m)->fpr[5].m == 0xC000000000000000ull && st(&m)->fpr[5].se == 0x4000, "x87 register 5");
+    EQ64(st(&m)->fpu_ip, 0x1234, "the x87 last instruction pointer");
+    EQ64(st(&m)->fpu_dp, 0x5678, "the x87 last operand pointer");
+    EQ64(st(&m)->fpu_op, 0x5D9, "the x87 last opcode");
     EQ64(m.cpu.isa->irq_lines(c), 1u << UAM_X86_IRQ_A20M | 1u << UAM_X86_IRQ_NMI, "the line levels");
     CHECK(take(&m) && m.cpu.pc == handler(2), "the pending NMI, through the restored IDT");
     uam_snapshot_free(s);
@@ -1114,6 +1182,7 @@ int main(void)
         test_reset(jit);
         test_nmi(jit);
         test_shadow(jit);
+        test_shadow_cross(jit);
         test_hlt(jit);
         test_real_exceptions(jit);
         test_prot_exceptions(jit);

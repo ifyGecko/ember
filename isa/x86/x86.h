@@ -102,6 +102,8 @@ enum {
  *   bit  7    32-bit stack (SS.B), outside 64-bit code
  *   bit  8    paging enabled (CR0.PG)
  *   bit  9    A20M# in effect (physical address bit 20 forced to 0)
+ *   bit 10    the block's first instruction is in an interrupt shadow (a MOV SS or
+ *             POP SS that had to end the block before it): no interrupt before it
  */
 enum x86_mode {
     X86_MODE_REAL = 0,   /* real mode (reset state) */
@@ -117,6 +119,9 @@ enum { X86_CODE16 = 0, X86_CODE32 = 1, X86_CODE64 = 2 };
 #define X86_PRIV_STACK32    (1u << 7)
 #define X86_PRIV_PG         (1u << 8)
 #define X86_PRIV_A20M       (1u << 9)
+#define X86_PRIV_SHADOW     (1u << 10)
+/* X86_H_LOAD_SEG's segment argument: also open an interrupt shadow (MOV SS, POP SS). */
+#define X86_LOAD_SEG_SHADOW 0x100u
 
 static inline enum x86_mode x86_priv_mode(unsigned priv)
 {
@@ -244,6 +249,8 @@ enum {
     X86_SR_XCR0,         /* XGETBV / XSETBV with ECX = 0 */
     X86_SR_RDRAND,       /* RDRAND / RDSEED */
     X86_SR_CPL0_CHECK,   /* read: faults #GP unless CPL 0 (HLT, INVD, ...) */
+    X86_SR_SHADOW,       /* write: 1 = an interrupt shadow over the next block's first
+                          * instruction (X86_PRIV_SHADOW), 0 = that instruction retired */
     X86_SR__COUNT
 };
 
@@ -355,6 +362,7 @@ typedef struct x86_state {
     bool     shutdown;            /* triple fault: the hart stops */
     bool     wait_sipi;           /* an application processor waiting for a startup IPI */
     bool     wait_sipi_in_smm;    /* took an SMI while in wait-for-SIPI: return there on RSM */
+    bool     int_shadow;          /* X86_PRIV_SHADOW: no event before the next instruction */
     /* SMM I/O state (I/O instruction restart): the I/O instruction executing
      * (recorded by X86_H_IO, valid while icount == io_icount), what an SMI
      * it raised latched, and what the SMM handler may restart */
