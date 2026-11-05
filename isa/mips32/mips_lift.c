@@ -320,16 +320,24 @@ static bool is_control(const mips_state *s, uint32_t i)
 
 static lift_result lift_insn(ml *L, uint32_t i);
 
-/* True if `i` is a legal, non-control instruction usable in a delay slot. */
+/* True if `i` may be in a delay slot: anything but a control transfer. SYSCALL, BREAK
+ * and every other exception in the slot are reported with EPC = the branch and BD;
+ * the COP0 instructions whose effect needs a new block leave that to the branch's
+ * exits (ml.in_slot), and ERET, DERET, IRET and WAIT, UNPREDICTABLE there, are RI. */
 static bool is_simple_delay(const mips_state *s, uint32_t i)
 {
-    if (is_control(s, i))
-        return false;
-    if (OP(i) == 0 && (FUNCT(i) == 0x0C || FUNCT(i) == 0x0D))
-        return false; /* SYSCALL, BREAK terminate the block */
-    if (OP(i) == 0x10)
-        return false; /* COP0 (ERET/WAIT/MTC0) - keep delay slots simple */
-    return true;
+    return !is_control(s, i);
+}
+
+/* After an instruction that changes what later code may see (interrupt state, a
+ * mapping): end the block at the next instruction, or in a delay slot let the branch's
+ * exits do it. */
+static lift_result end_after(ml *L)
+{
+    if (L->in_slot)
+        return LIFT_SEQ;
+    uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP);
+    return LIFT_DONE;
 }
 
 /*
@@ -358,6 +366,7 @@ static lift_result finish_branch(ml *L, uam_ref cond, uam_ref target, bool likel
         slot.pc = dpc;
         slot.npc = dpc + 4;
         slot.raw = (uint32_t)raw;
+        slot.in_slot = true;
         if (lift_insn(&slot, (uint32_t)raw) == LIFT_DONE)
             return LIFT_DONE;                                     /* the slot always traps */
         if (likely && !uam_ref_is_none(cond))
@@ -455,8 +464,7 @@ static lift_result lift_cop0(ml *L, uint32_t i)
     }
     if (rs == 4) { /* MTC0 rt, rd, sel */
         uam_syswr(L->b, 32, CP0(RD(i), i & 7), rt_r(L, i), NONE);
-        uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP); /* may change interrupt state */
-        return LIFT_DONE;
+        return end_after(L); /* may change interrupt state */
     }
     if (rs == 0x0A) { /* RDPGPR rd, rt: rd = rt of the previous shadow set */
         reg_w(L, RD(i), mips_helper(L, MIPS_HELPER_RDPGPR, imm(L, RT(i)), NONE, NONE));
@@ -473,10 +481,15 @@ static lift_result lift_cop0(ml *L, uint32_t i)
                         : bin(L, UAM_OP_AND, old, imm(L, ~ST_IE));
         uam_syswr(L->b, 32, CP0_STATUS, nv, NONE);
         reg_w(L, RT(i), old);
-        uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP);
-        return LIFT_DONE;
+        return end_after(L);
     }
     if (i & (1u << 25)) { /* CO=1: ERET/WAIT/TLB */
+        bool unpredictable_in_slot = FUNCT(i) == 0x18 || FUNCT(i) == 0x1F || FUNCT(i) == 0x38
+                                     || FUNCT(i) == 0x20;
+        if (L->in_slot && unpredictable_in_slot) {
+            trap(L, NONE, EXC_RI, imm(L, L->raw));
+            return LIFT_DONE;
+        }
         switch (FUNCT(i)) {
         case 0x18: /* ERET */
         case 0x1F: /* DERET (treat like ERET) */
@@ -509,8 +522,7 @@ static lift_result lift_cop0(ml *L, uint32_t i)
             uam_helper(L->b, &L->lc->cpu->isa->helpers,
                        FUNCT(i) == 0x02 ? MIPS_HELPER_TLBWI : MIPS_HELPER_TLBWR,
                        NONE, NONE, NONE, NONE);
-            uam_exit(L->b, NONE, imm(L, L->npc), UAM_EXIT_JUMP);
-            return LIFT_DONE;
+            return end_after(L);
         default:
             break;
         }

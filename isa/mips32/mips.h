@@ -250,6 +250,7 @@ typedef struct ml {
     unsigned      endian; /* UAM_ACC_LE / UAM_ACC_BE for data accesses */
     unsigned      priv;   /* cpu->priv the block is translated at */
     uint32_t      raw;    /* the instruction as fetched (Reserved Instruction reports it) */
+    bool          in_slot; /* a branch's delay slot: the branch's exits end the block */
 } ml;
 
 #define NONE UAM_REF_NONE

@@ -354,6 +354,7 @@ static lift_result jump_with_slot(ml *L, uint32_t spc, uam_ref target)
     slot.pc = spc | 1u;
     slot.npc = (spc + 2) | 1u;
     slot.raw = si;
+    slot.in_slot = true;
     if (lift_simple(&slot, &s, jpc & ~1u) == LIFT_DONE)
         return LIFT_DONE;
     uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);

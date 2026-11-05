@@ -204,9 +204,12 @@ static void timer_update(uam_cpu *cpu)
 {
     mips_state *s = mips_st(cpu);
     uint32_t count = mips_count_now(cpu);
-    /* Ticks until Count reaches Compare, accounting for the /2 ratio and wrap. */
-    uint32_t delta_count = s->c.compare - count; /* unsigned wrap gives time to next match */
-    uint64_t when = uam_sched_now(cpu->sched) + (uint64_t)delta_count * 2 + 1;
+    /* The tick at which Count becomes Compare: Count steps on even ticks, so the match is
+     * delta counts after the even tick that began the current count (unsigned wrap gives the
+     * time to the next match). Compare == Count matches on the next tick. */
+    uint32_t delta_count = s->c.compare - count;
+    uint64_t now = uam_sched_now(cpu->sched);
+    uint64_t when = delta_count ? (now & ~UINT64_C(1)) + (uint64_t)delta_count * 2 : now + 1;
     uam_timer_arm(cpu->sched, &s->timer, when);
 }
 
@@ -231,7 +234,9 @@ static uint32_t cause_read(const mips_state *s)
         c |= (s->c.cause & (0x3u << CAUSE_IP_SHIFT)) | ((s->eic.ripl & 0x3F) << CAUSE_RIPL_SHIFT);
         return c | (s->c.timer_ip ? CAUSE_TI : 0);
     }
-    return (s->c.cause & ~CAUSE_IP_MASK) | (cause_ip(s) << CAUSE_IP_SHIFT);
+    /* Release 2: TI shows a pending timer interrupt in every interrupt mode. */
+    return (s->c.cause & ~(CAUSE_IP_MASK | CAUSE_TI)) | (cause_ip(s) << CAUSE_IP_SHIFT)
+         | (s->c.timer_ip ? CAUSE_TI : 0);
 }
 
 /* Vectored interrupts are in effect: VInt, IntCtl.VS != 0, Cause.IV, BEV clear. */
@@ -816,7 +821,8 @@ static uam_status mips_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t v64)
         uam_signal_set(&s->timer_line, 0);
         timer_update(cpu);
         break;
-    case CP0_EBASE:    s->c.ebase = (s->c.ebase & 0xC00FF000u) | (v & 0x3FFFF000u); break;
+    /* Exception Base bits 29:12 are written; 31:30 stay 1 and 0, CPUNum is read-only. */
+    case CP0_EBASE:    s->c.ebase = (s->c.ebase & 0xC0000000u) | (v & 0x3FFFF000u); break;
     case CP0_INTCTL:   s->c.intctl = v & 0x000003E0u; break;
     case CP0_SRSCTL:
         if (s->cfg.shadow_sets) {

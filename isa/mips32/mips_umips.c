@@ -738,6 +738,7 @@ static lift_result lift_control(ml *L, const um_insn *d)
     slot.pc = after | 1u;
     slot.npc = link;
     slot.raw = slen == 4 ? ((uint32_t)s0 << 16) | (uint16_t)s1 : (uint16_t)s0;
+    slot.in_slot = true;
     if (lift_simple(&slot, &sd, pcb) == LIFT_DONE)
         return LIFT_DONE;
     if (uam_ref_is_none(c)) {

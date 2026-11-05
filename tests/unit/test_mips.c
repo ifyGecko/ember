@@ -79,6 +79,8 @@ enum { V0 = 2, T0 = 8, T1 = 9, T2 = 10, T3 = 11, RA = 31 };
 #define JAL(t)             (0x0C000000u | (((uint32_t)(t) >> 2) & 0x03FFFFFFu))
 #define JALX(t)            (0x74000000u | (((uint32_t)(t) >> 2) & 0x03FFFFFFu))
 #define MFC0(rt, rd, sel)  (0x40000000u | (uint32_t)(rt) << 16 | (uint32_t)(rd) << 11 | (sel))
+#define MTC0(rt, rd, sel)  (0x40800000u | (uint32_t)(rt) << 16 | (uint32_t)(rd) << 11 | (sel))
+#define DI(rt)             (0x41606000u | (uint32_t)(rt) << 16)
 #define NOP     0x00000000u
 #define SPIN    0x1000FFFFu   /* b . */
 #define SYSCALL 0x0000000Cu
@@ -367,6 +369,11 @@ static void test_cp0_masks(void)
     EQ64(sysr(&m, CP0_CAUSE), 0, "and cleared");
     sysw(&m, CP0_EBASE, 0xFFFFFFFFu);
     EQ64(sysr(&m, CP0_EBASE), 0xBFFFF000u, "EBase: bits 29:12; 31 reads 1, 30 and CPUNum 0");
+    sysw(&m, CP0_EBASE, 0x80000000u);
+    EQ64(sysr(&m, CP0_EBASE), 0x80000000u, "EBase rewritten: every base bit cleared again");
+    sysw(&m, CP0_EBASE, 0x80010000u);
+    sysw(&m, CP0_EBASE, 0x80020000u);
+    EQ64(sysr(&m, CP0_EBASE), 0x80020000u, "EBase moved twice: the second base alone");
     sysw(&m, CP0_PRID, 0);
     EQ64(sysr(&m, CP0_PRID), uam_mips_ref.prid, "PRId is read-only");
     sysw(&m, CP0_INDEX, 0xFFFFFFFFu);
@@ -465,6 +472,10 @@ static void test_delay_slots(bool jit)
         { JR(T2),       SW(T1, 0, T0),  EXC_DBE, "JR, a store to nothing in its slot" },
         { BEQ(0, 0, 3), ADD(T1, T3, T3), EXC_OV, "an overflow in a delay slot" },
         { BEQ(0, 0, 3), LW(T1, 2, T2),  EXC_ADEL, "a misaligned load in a delay slot" },
+        { BEQ(0, 0, 3), SYSCALL,        EXC_SYS,  "SYSCALL in a delay slot" },
+        { BNE(0, 0, 3), BREAK,          EXC_BP,   "BREAK in the slot of a branch not taken" },
+        { BEQ(0, 0, 3), ERET,           EXC_RI,   "ERET in a delay slot (UNPREDICTABLE): RI" },
+        { JR(T2),       WAIT,           EXC_RI,   "WAIT in a delay slot (UNPREDICTABLE): RI" },
     };
     for (size_t i = 0; i < UAM_ARRAY_LEN(cases); i++) {
         uam_machine m;
@@ -477,6 +488,39 @@ static void test_delay_slots(bool jit)
         expect_exc(&m, GENERAL, cases[i].code, CODE, true, cases[i].what);
         uam_machine_fini(&m);
     }
+}
+
+/* COP0 instructions in a delay slot run, and the branch still goes where it goes. */
+static void test_cop0_in_slot(bool jit)
+{
+    uam_machine m;
+    machine(&m, &uam_isa_mips32be, NULL, jit);
+    /* MFC0 Status in the slot of a taken BEQ, MTC0 EPC in the slot of JR, DI in the slot
+     * of a BNE not taken */
+    PROG(&m, CODE, BEQ(0, 0, 3), MFC0(T1, 12, 0), SPIN, NOP, SPIN, NOP);
+    sysw(&m, CP0_STATUS, 0x0000FF00u);
+    run(&m, CODE, 8);
+    EQ64(m.cpu.pc, CODE + 16, "MFC0 in a delay slot: the branch taken");
+    EQ64(gpr(&m, T1), 0x0000FF00u, "and the slot read Status");
+    PROG(&m, CODE + 0x40, JR(T2), MTC0(T3, 14, 0), SPIN, NOP);
+    setr(&m, T2, CODE + 16);
+    setr(&m, T3, 0x80002468u);
+    run(&m, CODE + 0x40, 8);
+    EQ64(m.cpu.pc, CODE + 16, "MTC0 in a delay slot: JR still jumps");
+    EQ64(sysr(&m, CP0_EPC), 0x80002468u, "and the slot wrote EPC");
+    PROG(&m, CODE + 0x80, BNE(0, 0, 3), DI(T1), SPIN, NOP);
+    sysw(&m, CP0_STATUS, ST_IE);
+    run(&m, CODE + 0x80, 8);
+    EQ64(m.cpu.pc, CODE + 0x88, "DI in a delay slot: the branch not taken falls through");
+    CHECK(!(sysr(&m, CP0_STATUS) & ST_IE) && (gpr(&m, T1) & ST_IE), "DI cleared IE, returned the old Status");
+    /* MTC0 enabling a pending interrupt in the slot: taken after the branch, at its target */
+    PROG(&m, CODE + 0xC0, BEQ(0, 0, 3), MTC0(T3, 12, 0), SPIN, NOP, SPIN, NOP);
+    sysw(&m, CP0_STATUS, 0);
+    sysw(&m, CP0_CAUSE, 1u << 8);                                /* software interrupt 0 */
+    setr(&m, T3, 1u << 8 | ST_IE);
+    run(&m, CODE + 0xC0, 8);
+    expect_exc(&m, GENERAL, EXC_INT, CODE + 0xD0, false, "an interrupt the slot's MTC0 enabled");
+    uam_machine_fini(&m);
 }
 
 /* kuseg is unmapped while ERL is set; CP0 needs kernel mode or Status.CU0. */
@@ -677,7 +721,7 @@ static void test_timer(void)
     CHECK(!(sysr(&m, CP0_CAUSE) & 1u << 15), "no match before Compare");
     tick(&m, 2);
     EQ64(sysr(&m, CP0_COUNT), 1020, "Count reached Compare");
-    EQ64(sysr(&m, CP0_CAUSE) & 1u << 15, 1u << 15, "the match: Cause.IP7");
+    EQ64(sysr(&m, CP0_CAUSE) & (CAUSE_TI | 1u << 15), CAUSE_TI | 1u << 15, "the match: Cause.IP7 and TI");
     CHECK(uam_mips_timer_line(&m.cpu)->level == 1, "the timer line");
     sysw(&m, CP0_STATUS, 1u << 15 | ST_IE);
     EQ64(lines_taken(&m), 1u << 7, "line 7 reported");
@@ -685,7 +729,7 @@ static void test_timer(void)
     tick(&m, 100);
     CHECK(sysr(&m, CP0_CAUSE) & 1u << 15, "it stays until Compare is written");
     sysw(&m, CP0_COMPARE, sysr(&m, CP0_COMPARE));
-    CHECK(!(sysr(&m, CP0_CAUSE) & 1u << 15), "writing Compare clears it");
+    CHECK(!(sysr(&m, CP0_CAUSE) & (CAUSE_TI | 1u << 15)), "writing Compare clears it, and TI");
     CHECK(uam_mips_timer_line(&m.cpu)->level == 0, "and the line");
     /* across the wrap of Count */
     sysw(&m, CP0_COUNT, 0xFFFFFFF0u);
@@ -694,6 +738,23 @@ static void test_timer(void)
     CHECK(!(sysr(&m, CP0_CAUSE) & 1u << 15), "Count wrapping: not before 0x10");
     tick(&m, 4);
     CHECK(sysr(&m, CP0_CAUSE) & 1u << 15, "Count wrapped to Compare 0x10");
+    /* the match is when Count becomes Compare, whichever half of a count Compare is written in */
+    for (unsigned odd = 0; odd < 2; odd++) {
+        if ((uam_sched_now(&m.sched) & 1) != odd)
+            tick(&m, 1);
+        const uint32_t cmp = sysr(&m, CP0_COUNT) + 5;
+        sysw(&m, CP0_COMPARE, cmp);
+        while (sysr(&m, CP0_COUNT) != cmp - 1)
+            tick(&m, 1);
+        CHECK(!(sysr(&m, CP0_CAUSE) & 1u << 15), "written on an %s tick: no match at Compare - 1",
+              odd ? "odd" : "even");
+        tick(&m, 1);
+        while (sysr(&m, CP0_COUNT) == cmp - 1)
+            tick(&m, 1);
+        EQ64(sysr(&m, CP0_COUNT), cmp, "Count reached Compare");
+        CHECK(sysr(&m, CP0_CAUSE) & 1u << 15, "written on an %s tick: the match as Count reaches Compare",
+              odd ? "odd" : "even");
+    }
     uam_machine_fini(&m);
 }
 
@@ -1020,6 +1081,7 @@ int main(void)
     for (int jit = 0; jit < 2; jit++) {
         test_vectors(jit);
         test_delay_slots(jit);
+        test_cop0_in_slot(jit);
         test_modes(jit);
         test_irq_vectored(jit);
         test_wait(jit);
