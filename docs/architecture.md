@@ -767,8 +767,9 @@ Implemented (`make test`):
   32- and 64-bit delivery with error codes and double faults, #PF and CR2, ring 3, SMM on the
   Intel and AMD save maps, AMD's TSeg/TClose and SMMLOCK, the SMM code-fetch check and
   confinement (machine check, MCIP), RSM's saved-state checks, the SMI held in wait-for-SIPI
-  and MSR_SMM_BLOCKED, SMI and NMI ending shutdown, CR4 bits from CPUID and CR4.DE, MSRs,
-  CPUID, A20M#), `test_avr32` (the models, interrupt levels,
+  and MSR_SMM_BLOCKED, SMI and NMI ending shutdown, CR4 bits from CPUID and CR4.DE, the SMM
+  view - SMRAM windows, D_CLS/AClose, the AMD ASeg, two processors decoding differently at
+  once -, MSRs, CPUID, A20M#), `test_avr32` (the models, interrupt levels,
   NMI and their masks, what A stacks and B saves in RSR/RAR, the INT3 shadow bank, rete, SLEEP,
   COUNT/COMPARE, the MPU and the MMU, the interrupt controller on `avr32-ref`), `test_pic`,
   `test_mcs51`, `test_m6502`, `test_z80` and `test_xtensa` (special registers per model, one

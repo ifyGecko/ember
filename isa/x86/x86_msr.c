@@ -354,6 +354,7 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
             return UAM_OK;
         if (msr == MSR_AMD_SMM_ADDR) s->smm_addr = val & SMM_TSEG_FIELD;
         else                         s->smm_mask = val & SMMMASK_DEFINED;
+        x86_tlb_flush(cpu);            /* page walks may now read elsewhere */
         uam_cpu_xlate_changed(cpu);
         return UAM_OK;
     case MSR_SMM_MCA_CAP:

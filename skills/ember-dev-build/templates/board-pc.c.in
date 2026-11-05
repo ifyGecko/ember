@@ -169,13 +169,15 @@ static bool board_rdmsr(void *ctx, uint32_t msr, uint64_t *val)
     return uam_lapic_rdmsr(c->b->lapic[c->i], msr, val);
 }
 
-/* SMIACT#: the processor entered (true) or left SMM. The chipset's SMRAM decode follows it
- * (a host-bridge device: TSEG/A-segment regions enabled only in SMM). */
+/* SMIACT#: the processor entered (true) or left SMM. SMRAM decode does NOT belong here: the
+ * host bridge maps SMRAM in the SMM view (UAM_X86_SMM_VIEW) and sets every processor's SMRAM
+ * windows (uam_x86_set_smram_window) from its SMRAM registers, so each access is decoded by
+ * its own processor's state (examples/pc/q35_mch.c). Only chipset registers that track
+ * SMIACT# themselves (an SMI status bit, say) need this hook. */
 static void board_smm_changed(void *ctx, bool in_smm)
 {
     (void)ctx;
     (void)in_smm;
-    /* e.g. host_bridge_smm(c->b->mch, in_smm); */
 }
 
 static int pic_inta(void *ctx) { return uam_i8259_inta(ctx); }
@@ -512,7 +514,7 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
     /* The chipset: one device per function, added iteration by iteration (examples/pc/ of
      * the build skill; references/pc-platform.md):
      *   host bridge 00:00.0   PCIEXBAR -> uam_pci_ecam window (uam_bus_region_move/enable),
-     *                         PAM shadowing, SMRAM/TSEG (board_smm_changed), TOLUD
+     *                         PAM shadowing, SMRAM/TSEG (the SMM view + SMRAM windows), TOLUD
      *   LPC/eSPI   00:1f.0    ACPI PM block at PMBASE (uam_acpi_pm with hooks), SMI_EN/
      *                         SMI_STS + APM port 0xB2 (its SMI line to smi_all), PIRQ
      *                         routing (uam_pci_set_intx_router), reset control at 0xCF9

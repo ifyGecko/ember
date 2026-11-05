@@ -90,15 +90,19 @@ enum {
 enum { AS_IO_IN = 1u << 0, AS_IO_VALID = 1u << 1, AS_IO_STR = 1u << 2, AS_IO_REP = 1u << 3,
        AS_IO_SZ8 = 1u << 4, AS_IO_SZ16 = 1u << 5, AS_IO_SZ32 = 1u << 6 };
 
+/* The save state is written and read in SMM: SMM data accesses (the SMM view
+ * where SMBASE lies in an SMRAM window). */
 static void put_at(uam_cpu *cpu, unsigned off, unsigned size, uint64_t v)
 {
-    (void)uam_bus_write(cpu->bus, x86_st(cpu)->smbase + off, size, UAM_ACC_LE | UAM_ACC_PHYS, v);
+    uint64_t pa = x86_smram_filter(cpu, x86_st(cpu)->smbase + off, false);
+    (void)uam_bus_write(cpu->bus, pa, size, UAM_ACC_LE | UAM_ACC_PHYS, v);
 }
 
 static uint64_t get_at(uam_cpu *cpu, unsigned off, unsigned size)
 {
     uint64_t v = 0;
-    (void)uam_bus_read(cpu->bus, x86_st(cpu)->smbase + off, size, UAM_ACC_LE | UAM_ACC_PHYS, &v);
+    uint64_t pa = x86_smram_filter(cpu, x86_st(cpu)->smbase + off, false);
+    (void)uam_bus_read(cpu->bus, pa, size, UAM_ACC_LE | UAM_ACC_PHYS, &v);
     return v;
 }
 

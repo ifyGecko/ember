@@ -167,6 +167,7 @@ static void power_on_state(uam_cpu *cpu, uint64_t entry)
     s->plat = keep.plat; s->cpuid = keep.cpuid; s->smm_map = keep.smm_map;
     s->smm_confine = keep.smm_confine;
     s->pkg = keep.pkg; s->n_pkg = keep.n_pkg;
+    memcpy(s->smram_win, keep.smram_win, sizeof(s->smram_win));
     s->preset_smm_addr = keep.preset_smm_addr; s->preset_smm_mask = keep.preset_smm_mask;
     s->preset_hwcr = keep.preset_hwcr;
     s->smm_addr = s->preset_smm_addr; s->smm_mask = s->preset_smm_mask; s->hwcr = s->preset_hwcr;
@@ -962,6 +963,19 @@ uint64_t x86_smm_blocked(uam_cpu *cpu)
     return v;
 }
 
+void uam_x86_set_smram_window(uam_cpu *cpu, unsigned slot, uint64_t base, uint64_t size,
+                              unsigned flags)
+{
+    x86_state *s = x86_st(cpu);
+    if (slot >= UAM_X86_SMRAM_WINDOWS)
+        return;
+    s->smram_win[slot].base = base;
+    s->smram_win[slot].size = size;
+    s->smram_win[slot].flags = flags;
+    x86_tlb_flush(cpu);            /* page walks may now read elsewhere */
+    uam_cpu_xlate_changed(cpu);
+}
+
 void uam_x86_set_smm_confine(uam_cpu *cpu, bool on)
 {
     x86_st(cpu)->smm_confine = on;
@@ -1017,7 +1031,16 @@ static uint64_t *saved_u64(x86_state *s, size_t i)
         &s->mm[0], &s->mm[1], &s->mm[2], &s->mm[3], &s->mm[4], &s->mm[5], &s->mm[6], &s->mm[7],
         &s->fpu_ip, &s->fpu_dp, &s->smm_addr, &s->smm_mask, &s->hwcr, &s->smm_fc,
         &s->mcg_status,
+        &s->smram_win[0].base, &s->smram_win[0].size, &s->smram_win[0].flags,
+        &s->smram_win[1].base, &s->smram_win[1].size, &s->smram_win[1].flags,
+        &s->smram_win[2].base, &s->smram_win[2].size, &s->smram_win[2].flags,
+        &s->smram_win[3].base, &s->smram_win[3].size, &s->smram_win[3].flags,
+        &s->smram_win[4].base, &s->smram_win[4].size, &s->smram_win[4].flags,
+        &s->smram_win[5].base, &s->smram_win[5].size, &s->smram_win[5].flags,
+        &s->smram_win[6].base, &s->smram_win[6].size, &s->smram_win[6].flags,
+        &s->smram_win[7].base, &s->smram_win[7].size, &s->smram_win[7].flags,
     };
+    _Static_assert(UAM_X86_SMRAM_WINDOWS == 8, "the list above saves 8 SMRAM windows");
     return i < UAM_ARRAY_LEN(f) ? f[i] : NULL;
 }
 

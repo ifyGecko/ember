@@ -252,8 +252,11 @@ every class above exists; what the policy leaves out goes to the firmware's hand
   An SMM instruction fetch outside SMRAM (SMRR, and on AMD the TSeg/ASeg) is then a
   `fetch`-class crash at the first instruction outside - a call-out through a corrupted
   or NULL function pointer, a jump into memory the OS controls - instead of whatever that
-  memory happens to hold. It needs SMRAM defined (SMRR programmed, or SMM_ADDR/SMM_MASK
-  with TValid; `uam_x86_preset_amd_smm` where the security processor sets them).
+  memory happens to hold. It needs SMRAM defined (SMRR programmed, SMM_ADDR/SMM_MASK
+  with TValid - `uam_x86_preset_amd_smm` where the security processor sets them - or the
+  board's SMRAM windows). Where the board decodes SMRAM through the SMM view, a buffer or
+  guard inside SMRAM is addressed as SMM sees it: `p:0x400000000000+ADDR`
+  (`UAM_X86_SMM_VIEW` + ADDR), for `--dump-mem`, `--guard` and `mem:` alike.
 
 **Cores without exceptions** (8-bit AVR, 8-bit PIC, 8051, 6502, Z80): there is no handler
 and no class but the bus faults.

@@ -27,9 +27,11 @@ void x86_tlb_flush(uam_cpu *cpu)
         s->tlb[i].vpage = UINT64_MAX;
 }
 
+/* A page-table read: a data access as the processor emits it (SMRAM decode included). */
 static bool rd_phys(uam_cpu *cpu, uint64_t pa, unsigned size, uint64_t *v)
 {
-    return uam_bus_read(cpu->bus, pa, size, UAM_ACC_LE | UAM_ACC_PHYS | UAM_ACC_DEBUG, v) == UAM_OK;
+    return uam_bus_read(cpu->bus, x86_smram_filter(cpu, pa, false), size,
+                        UAM_ACC_LE | UAM_ACC_PHYS | UAM_ACC_DEBUG, v) == UAM_OK;
 }
 
 /*
@@ -222,13 +224,33 @@ static bool aseg_hit(const x86_state *s, uint64_t pa)
            pa - SMM_ASEG_BASE < SMM_ASEG_SIZE;
 }
 
+/* An SMRAM window of the SMM view containing pa: the board's, or the AMD ASeg.
+ * *closed: the window is closed for data accesses. */
+static bool window_hit(const x86_state *s, uint64_t pa, bool *closed)
+{
+    for (unsigned i = 0; i < UAM_X86_SMRAM_WINDOWS; i++)
+        if (s->smram_win[i].size && pa - s->smram_win[i].base < s->smram_win[i].size) {
+            *closed = (s->smram_win[i].flags & UAM_X86_SMRAM_DATA_CLOSED) != 0;
+            return true;
+        }
+    if (aseg_hit(s, pa)) {
+        *closed = (s->smm_mask & SMMMASK_ACLOSE) != 0;
+        return true;
+    }
+    return false;
+}
+
 uint64_t x86_smram_filter(uam_cpu *cpu, uint64_t pa, bool fetch)
 {
     x86_state *s = x86_st(cpu);
     uint64_t base;
+    bool closed;
     if (cpu->priv & X86_PRIV_A20M)
         pa &= ~(1ull << 20);
     if (s->in_smm) {
+        /* SMIACT#: SMRAM windows are the SMM view's (data: unless closed for data) */
+        if (window_hit(s, pa, &closed) && (fetch || !closed))
+            return UAM_X86_SMM_VIEW + pa;
         /* TClose: SMM's data accesses to the TSeg go where non-SMM ones do */
         if (!fetch && (s->smm_mask & SMMMASK_TCLOSE) && tseg_hit(s, pa, &base))
             return UAM_X86_SMRR_SINK + (pa - base);
@@ -259,11 +281,14 @@ bool x86_smm_fetch_blocked(const x86_state *s, uint64_t pa)
         return true;
     if (!s->smm_confine)
         return false;
-    /* the board's confinement: SMRAM is whatever SMRR, TSeg and ASeg define;
-     * with none of them defined yet there is nothing to check against */
+    /* the board's confinement: SMRAM is whatever SMRR, TSeg, ASeg and the SMRAM
+     * windows define; with none of them defined yet there is nothing to check against */
     bool any = (s->smm_map != UAM_X86_SMM_MAP_AMD64 && (s->smrr_mask & (1u << 11))) ||
                (s->smm_map == UAM_X86_SMM_MAP_AMD64 && (s->smm_mask & (SMMMASK_TVALID | SMMMASK_AVALID)));
-    return any && !in_smrr && !tseg_hit(s, pa, &base) && !aseg_hit(s, pa);
+    for (unsigned i = 0; i < UAM_X86_SMRAM_WINDOWS; i++)
+        any |= s->smram_win[i].size != 0;
+    bool closed;
+    return any && !in_smrr && !tseg_hit(s, pa, &base) && !window_hit(s, pa, &closed);
 }
 
 /* Code at pa is tracked as mapped (re-validated on every uam_cpu_xlate_changed)
@@ -272,7 +297,9 @@ bool x86_smm_fetch_blocked(const x86_state *s, uint64_t pa)
 static bool smram_sensitive(const x86_state *s, uint64_t pa)
 {
     uint64_t base;
-    return x86_smm_fetch_checked(s) || smrr_hit(s, pa, &base) || tseg_hit(s, pa, &base);
+    bool closed;
+    return x86_smm_fetch_checked(s) || smrr_hit(s, pa, &base) || tseg_hit(s, pa, &base) ||
+           window_hit(s, pa, &closed);
 }
 
 uam_status x86_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_xlate *out)

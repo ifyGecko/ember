@@ -183,13 +183,13 @@ static bool board_rdmsr(void *ctx, uint32_t msr, uint64_t *val)
     return uam_lapic_rdmsr(c->b->lapic[c->i], msr, val);
 }
 
-/* SMIACT#: the processor entered (true) or left SMM. The chipset's SMRAM decode follows it
- * (a host-bridge device: TSEG/A-segment regions enabled only in SMM). */
-static void board_smm_changed(void *ctx, bool in_smm)
+/* The host bridge's SMRAM windows, for every processor (the SMM view: uam/isa/x86.h). */
+static void board_smram_window(void *ctx, unsigned slot, uint64_t base, uint64_t size,
+                               bool data_closed)
 {
-    board_cpu *c = ctx;
-    if (c->b->mch)
-        q35_mch_smm(c->b->mch, in_smm);
+    uam_cpu *c;
+    for (unsigned i = 0; (c = uam_machine_cpu(ctx, i)) != NULL; i++)
+        uam_x86_set_smram_window(c, slot, base, size, data_closed ? UAM_X86_SMRAM_DATA_CLOSED : 0);
 }
 
 static int pic_inta(void *ctx) { return uam_i8259_inta(ctx); }
@@ -558,7 +558,11 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
     uam_pci_set_msi_sink(pci, uam_apic_bus_msi, abus);
 
     /* the chipset: Q35 MCH 00:00.0 and ICH9 LPC 00:1f.0 */
-    q35_mch_config mc = { .sys = &m->bus, .pci = pci, .low_ram_top = low, .boot_flash = boot };
+    /* SMRAM is decoded per access through the SMM view: no smm_changed hook needed */
+    q35_mch_config mc = { .sys = &m->bus, .pci = pci,
+                          .low_ram = uam_bus_region(&m->bus, "ram"), .low_ram_top = low,
+                          .boot_flash = boot, .smm_view = UAM_X86_SMM_VIEW,
+                          .smram_window = board_smram_window, .smram_ctx = m };
     uam_device *mch = q35_mch_create("mch", &mc);
     uam_device *lpc = ich9_lpc_create("lpc", pci, &m->bus, &m->sched, BOARD_TICK_HZ, UAM_X86_PIO_BASE);
     if ((st = add(m, mch)) != UAM_OK || (st = add(m, lpc)) != UAM_OK ||
@@ -610,7 +614,7 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
     for (unsigned i = 0; i < b->ncpu; i++) {
         uam_cpu *cpu = uam_machine_cpu(m, i);
         uam_x86_platform plat = { .ctx = &b->pcpu[i], .inta = board_inta, .rdmsr = board_rdmsr,
-                                  .wrmsr = board_wrmsr, .smm_changed = board_smm_changed };
+                                  .wrmsr = board_wrmsr };
         uam_x86_set_platform(cpu, &plat);
         uam_x86_set_msr_policy(cpu, mp && strcmp(mp, "gp") == 0 ? UAM_X86_MSR_GP : UAM_X86_MSR_STORE,
                                mt && strcmp(mt, "0") != 0);

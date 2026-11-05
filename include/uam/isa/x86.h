@@ -45,6 +45,40 @@ static inline uint64_t uam_x86_pio(uint16_t port) { return UAM_X86_PIO_BASE + po
 #define UAM_X86_SMRR_SINK  0x0000800000000000ull  /* 2^47 */
 
 /*
+ * The SMM view. A chipset decodes SMRAM by SMIACT#: the same address is SMRAM
+ * to a processor in SMM and something else (VGA, a closed hole, plain DRAM) to
+ * everyone else. Here a processor in SMM presents its accesses to an SMRAM
+ * window on a separate aperture, UAM_X86_SMM_VIEW + address, where the board
+ * maps SMRAM (RAM, or an alias of the DRAM behind it); the address itself
+ * keeps the normal decode, which other processors, DMA and the debugger see.
+ * Every processor decides by its own state, so nothing is switched on SMM
+ * entry and exit.
+ *
+ * The windows: the board's (uam_x86_set_smram_window: Intel's compatible
+ * SMRAM at A0000 and TSEG, as the chipset's SMRAM registers open them) and,
+ * with the AMD64 map, the ASeg (A0000-BFFFF) while SMM_MASK.AValid is set.
+ * Instruction fetches always use the view; data accesses use the normal
+ * decode where the window is closed for data (UAM_X86_SMRAM_DATA_CLOSED,
+ * Intel's D_CLS; AMD's AClose). Page walks and the save state are data.
+ * To read SMRAM as SMM sees it from outside (gdb, --dump-mem p:), add
+ * UAM_X86_SMM_VIEW to its address.
+ */
+#define UAM_X86_SMM_VIEW   0x0000400000000000ull  /* 2^46 */
+#define UAM_X86_SMRAM_WINDOWS 8u
+
+enum {
+    /* SMM data accesses to the window use the normal decode; fetches stay SMRAM */
+    UAM_X86_SMRAM_DATA_CLOSED = 1u << 0,
+};
+
+/* Set window `slot` (< UAM_X86_SMRAM_WINDOWS) to [base, base + size); size 0
+ * removes it. A chipset model calls it for every processor whenever its SMRAM
+ * registers change (and at its reset). Kept across processor RESET and saved
+ * in snapshots. */
+void uam_x86_set_smram_window(uam_cpu *cpu, unsigned slot, uint64_t base, uint64_t size,
+                              unsigned flags);
+
+/*
  * Interrupt input lines, as numbered for isa->irq_input. A PC has one wire
  * into the core (INTR, from the local APIC or the legacy 8259), plus the
  * non-maskable and system-management pins, and INIT (a soft reset that keeps
@@ -78,8 +112,10 @@ typedef struct uam_x86_platform {
      * module's MSR policy (uam_x86_set_msr_policy). */
     bool (*rdmsr)(void *ctx, uint32_t msr, uint64_t *val);
     bool (*wrmsr)(void *ctx, uint32_t msr, uint64_t val);
-    /* The hart entered (true) or left (false) SMM - SMIACT#. The chipset uses
-     * it to open and close SMRAM to the processor. */
+    /* The hart entered (true) or left (false) SMM - SMIACT#; also called when
+     * a processor is switched in (several processors). SMRAM decode no longer
+     * needs it - map SMRAM in the SMM view (UAM_X86_SMM_VIEW) - but a chipset
+     * may still track SMIACT# for its own registers. */
     void (*smm_changed)(void *ctx, bool in_smm);
     /* CPUID: called after the module has computed its answer r[0..3] (EAX,
      * EBX, ECX, EDX) for (leaf, subleaf); the board may change any of it. For
@@ -160,7 +196,10 @@ void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info);
  *            accesses outside SMM, and the AValid/TValid/AClose/TClose bits -
  *            and HWCR (C001_0015h), whose SMMLOCK makes SMM_BASE, SMM_ADDR and
  *            SMM_MASK read-only (writes ignored) until RESET. The ASeg
- *            (A0000-BFFFF) stays the chipset's to route, through smm_changed.
+ *            (A0000-BFFFF) is an SMM-view window while AValid is set (closed
+ *            for data by AClose): the board maps the DRAM behind it at
+ *            UAM_X86_SMM_VIEW + 0xA0000. The TSeg needs no view mapping: SMM
+ *            reaches its DRAM at its own address, everyone else the sink.
  */
 typedef enum uam_x86_smm_map {
     UAM_X86_SMM_MAP_INTEL64 = 0,

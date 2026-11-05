@@ -35,14 +35,19 @@ typedef struct mch {
     uam_pci_func   fn;
     uam_bus       *sys;
     uam_pci_bus   *pci;
+    void         (*smram_window)(void *ctx, unsigned slot, uint64_t base, uint64_t size,
+                                 bool data_closed);
+    void          *smram_ctx;
     uam_region    *flash;
     uint64_t       low_ram_top;
     uam_region    *ecam;
     uam_region    *pam[N_PAM];
     uam_region    *aseg;
     uam_region    *tseg[3];    /* 1, 2, 8 MiB */
-    bool           in_smm;
 } mch;
+
+/* SMRAM windows of the SMM view, the same for every processor */
+enum { WIN_ASEG = 0, WIN_TSEG = 1 };
 
 static mch *from_dev(uam_device *d) { return UAM_CONTAINER_OF(d, mch, dev); }
 static mch *from_fn(uam_pci_func *f) { return f->ctx; }
@@ -101,16 +106,27 @@ static uint64_t tolud(const mch *m)
     return (uint64_t)(uam_pci_get(m->fn.cfg, MCH_TOLUD, 2) >> 4) << 20;
 }
 
+static void set_window(mch *m, unsigned slot, uint64_t base, uint64_t size, bool data_closed)
+{
+    if (m->smram_window)
+        m->smram_window(m->smram_ctx, slot, base, size, data_closed);
+}
+
+/*
+ * SMRAM is decoded by SMIACT#, which every access carries: a processor in SMM reaches the
+ * A-segment and TSEG through the SMM view (where this device mirrors low RAM), while
+ * everyone else - another processor, DMA, this one outside SMM - sees the normal decode
+ * below. Nothing changes on SMM entry or exit.
+ */
 static void update_smram(mch *m)
 {
     uint8_t smram = m->fn.cfg[MCH_SMRAM], esm = m->fn.cfg[MCH_ESMRAMC];
     bool g = smram & SMRAM_G_SMRAME;
-    /* A-segment: RAM in SMM or while open; otherwise legacy video space */
-    bool aseg_ram = g && (m->in_smm || (smram & SMRAM_D_OPEN));
-    uam_bus_region_enable(m->sys, m->aseg, !aseg_ram);
-    /* TSEG: hidden outside SMM */
+    /* the normal decode: the A-segment is legacy video space unless D_OPEN shows the RAM;
+     * an enabled TSEG reads as all ones */
+    uam_bus_region_enable(m->sys, m->aseg, !(g && (smram & SMRAM_D_OPEN)));
     unsigned szsel = (esm >> 1) & 3;
-    bool tseg_on = g && (esm & ESMRAMC_T_EN) && !m->in_smm && szsel < 3;
+    bool tseg_on = g && (esm & ESMRAMC_T_EN) && szsel < 3;
     static const uint64_t tsz[3] = { 1u << 20, 2u << 20, 8u << 20 };
     for (unsigned i = 0; i < 3; i++) {
         bool on = tseg_on && i == szsel;
@@ -118,15 +134,10 @@ static void update_smram(mch *m)
             uam_bus_region_move(m->sys, m->tseg[i], tolud(m) - tsz[i]);
         uam_bus_region_enable(m->sys, m->tseg[i], on);
     }
-}
-
-void q35_mch_smm(uam_device *d, bool in_smm)
-{
-    mch *m = from_dev(d);
-    if (m->in_smm == in_smm)
-        return;
-    m->in_smm = in_smm;
-    update_smram(m);
+    /* the SMM view: both are RAM; D_CLS sends SMM's data accesses to the A-segment to
+     * video space (code still runs from SMRAM) */
+    set_window(m, WIN_ASEG, g ? 0xA0000 : 0, g ? 0x20000 : 0, (smram & SMRAM_D_CLS) != 0);
+    set_window(m, WIN_TSEG, tseg_on ? tolud(m) - tsz[szsel] : 0, tseg_on ? tsz[szsel] : 0, false);
 }
 
 /* ---- configuration space ------------------------------------------------- */
@@ -172,13 +183,13 @@ static void mch_destroy(uam_device *d) { free(from_dev(d)); }
 
 static void mch_save(uam_device *d, uam_state_writer *w)
 {
-    uam_state_put_bool(w, from_dev(d)->in_smm);
+    (void)d; (void)w;   /* everything is in the configuration space, which the PCI bus saves */
 }
 
 static void mch_restore(uam_device *d, uam_state_reader *r)
 {
     mch *m = from_dev(d);
-    m->in_smm = uam_state_get_bool(r);
+    (void)r;
     /* the PCI bus restored the configuration space; rebuild the decode */
     update_ecam(m);
     update_pam(m);
@@ -198,6 +209,8 @@ uam_device *q35_mch_create(const char *name, const q35_mch_config *cfg)
     uam_device_init(&m->dev, &mch_ops, name);
     m->sys = cfg->sys;
     m->pci = cfg->pci;
+    m->smram_window = cfg->smram_window;
+    m->smram_ctx = cfg->smram_ctx;
     m->flash = cfg->boot_flash;
     m->low_ram_top = cfg->low_ram_top;
 
@@ -247,6 +260,12 @@ uam_device *q35_mch_create(const char *name, const q35_mch_config *cfg)
     m->aseg = uam_bus_region(m->sys, "mch.aseg");
     for (unsigned i = 0; i < 3; i++)
         m->tseg[i] = uam_bus_region(m->sys, tname[i]);
+    /* the SMM view: low RAM as a processor in SMM reaches it (the windows pick where) */
+    if (uam_bus_map_alias(m->sys, "mch.smm-view", cfg->smm_view, cfg->low_ram_top, cfg->low_ram,
+                          0, NULL) != UAM_OK) {
+        free(m);
+        return NULL;
+    }
     if (m->flash && m->flash->size >= 0x20000) {
         static const char *const pname[N_PAM] = { "pam.e0000", "pam.e4000", "pam.e8000",
                                                   "pam.ec000", "pam.f0000" };

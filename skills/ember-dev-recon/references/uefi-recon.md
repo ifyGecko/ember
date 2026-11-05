@@ -19,7 +19,7 @@ firmware*). Fact sheet shape: `recon-report-schema.md`, *PC firmware*.
 | I/O ports | template devices, a chipset device, or a probe `--mmio-rule 0x10000000000+port=...` (`UAM_X86_PIO_BASE` + port); the "io" catch-all logs the rest and reads 0 |
 | MSRs | `board_rdmsr` / `board_wrmsr` (platform MSRs only; see 7.4) |
 | memory size, TOLUD, SPD, CMOS | `BOARD_LOW_RAM_MAX`, SPD contents of the SMBus model, `--image cmos=` |
-| SMRAM, SMI sources | host bridge (`board_smm_changed`), LPC/PM device; `-o apm-smi=1` meanwhile |
+| SMRAM, SMI sources | host bridge (SMRAM windows + the SMM view), LPC/PM device; `-o apm-smi=1` meanwhile |
 | console, POST codes | COM1 0x3F8, `-o debugcon=0x402`, port 0x80: the first milestones |
 | processors | `-o cpus=N`; how APs are started (INIT/SIPI vector, AP stack) |
 

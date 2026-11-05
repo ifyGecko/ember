@@ -440,6 +440,9 @@ typedef struct x86_state {
      * (uam_x86_preset_amd_smm) and the SMM code-fetch confinement */
     uint64_t           preset_smm_addr, preset_smm_mask, preset_hwcr;
     bool               smm_confine;
+    /* the board's SMRAM windows (uam_x86_set_smram_window); size 0 = unused.
+     * Kept across RESET, saved in snapshots */
+    struct { uint64_t base, size, flags; } smram_win[UAM_X86_SMRAM_WINDOWS];
     /* the logical processors of this one's package (uam_x86_set_package), in
      * MSR_SMM_BLOCKED/DELAYED bit order; owned copy */
     uam_cpu          **pkg;
@@ -496,8 +499,10 @@ uam_status x86_lin_read(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t *val
 uam_status x86_lin_write(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t val, bool sup);
 void       x86_tlb_flush(uam_cpu *cpu);
 /* A physical address as the processor emits it: bit 20 cleared under A20M#;
- * outside SMM the SMRR range and the AMD TSeg go to UAM_X86_SMRR_SINK, and so
- * does, in SMM, a data access (`fetch` false) to a TSeg closed by TClose. */
+ * outside SMM the SMRR range and the AMD TSeg go to UAM_X86_SMRR_SINK; in SMM
+ * an access to an SMRAM window goes to UAM_X86_SMM_VIEW + address (a fetch
+ * always, data unless the window is closed for data), and a data access to a
+ * TSeg closed by TClose to the sink. */
 uint64_t   x86_smram_filter(uam_cpu *cpu, uint64_t pa, bool fetch);
 /* In SMM, instruction fetches are checked against SMRAM: Intel's SMM_Code_Chk_En
  * (fetches must stay in the SMRR range), or the board's confinement

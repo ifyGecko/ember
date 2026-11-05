@@ -466,6 +466,8 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
         uam_master_abort_name_window(um, UAM_X86_PIO_BASE, UAM_X86_PIO_SIZE, "I/O port", true);
         uam_master_abort_name_window(um, UAM_X86_SMRR_SINK, UINT64_C(1) << 32,
                                      "SMRAM (SMRR/TSeg) outside SMM", false);
+        uam_master_abort_name_window(um, UAM_X86_SMM_VIEW, UINT64_C(1) << 32,
+                                     "SMM view (no SMRAM mapped)", false);
     }
     uam_bus_set_unmapped(&m->bus, um);
 

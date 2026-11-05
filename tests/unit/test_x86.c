@@ -1119,6 +1119,112 @@ static void test_amd_smram(void)
     uam_machine_fini(&m);
 }
 
+/* ---- the SMM view: SMRAM decode by the accessing processor's SMM state ------------ */
+
+#define VIEW UAM_X86_SMM_VIEW
+
+static void test_smm_view(bool jit)
+{
+    uam_machine m;
+    plat p;
+    machine(&m, &p, jit);
+    /* SMRAM over the default SMBASE, in the SMM view only: the normal decode at the same
+     * addresses is ordinary RAM with other contents */
+    CHECK(uam_bus_map_ram(&m.bus, "smram", VIEW + SMBASE, 0x10000) == UAM_OK, "SMRAM in the SMM view");
+    uam_x86_set_smram_window(&m.cpu, 0, SMBASE, 0x10000, 0);
+    /* the handler, only in SMRAM: guest loads and stores to SMRAM, then RSM */
+    PUT(&m, VIEW + SMBASE + 0x8000,
+        0x66, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE,                   /* mov eax, 0xDEADBEEF */
+        0x67, 0x66, 0xA3, 0x20, 0x00, 0x03, 0x00,             /* mov [0x30020], eax */
+        0x67, 0x66, 0x8B, 0x1D, 0x10, 0x00, 0x03, 0x00,       /* mov ebx, [0x30010] */
+        0x67, 0x66, 0x89, 0x1D, 0x24, 0x00, 0x03, 0x00,       /* mov [0x30024], ebx */
+        0x0F, 0xAA);                                          /* rsm */
+    wr(&m, VIEW + SMBASE + 0x10, 4, 0xCAFEF00D);
+    wr(&m, SMBASE + 0x10, 4, 0x11111111);
+    PUT(&m, SMBASE + 0x8000, SPIN);                /* the normal decode */
+    wr(&m, SMBASE + 0xFFD8, 8, 0x1234);
+    PUT(&m, CODE, SPIN);
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_LOAD), SMBASE + 0x10, "outside SMM: the normal decode");
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_FETCH), SMBASE + 0x10, "outside SMM: fetch, the normal decode");
+    m.cpu.pc = CODE;
+    line(&m, UAM_X86_IRQ_SMI, 1);
+    CHECK(take(&m), "SMI");
+    line(&m, UAM_X86_IRQ_SMI, 0);
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_LOAD), VIEW + SMBASE + 0x10, "in SMM: the SMM view");
+    EQ64(xl(&m, SMBASE + 0xFFFF, UAM_XLATE_STORE), VIEW + SMBASE + 0xFFFF, "in SMM: a store, the SMM view");
+    EQ64(xl(&m, SMBASE - 1, UAM_XLATE_LOAD), SMBASE - 1, "below the window: the normal decode");
+    EQ64(xl(&m, SMBASE + 0x10000, UAM_XLATE_LOAD), SMBASE + 0x10000, "above it: the normal decode");
+    EQ64(rd(&m, VIEW + SMBASE + 0xFFD8, 8), CODE, "the save state is written to SMRAM");
+    EQ64(rd(&m, SMBASE + 0xFFD8, 8), 0x1234, "not to the normal decode");
+    /* closed for data (Intel D_CLS): data uses the normal decode, fetches stay SMRAM */
+    uam_x86_set_smram_window(&m.cpu, 0, SMBASE, 0x10000, UAM_X86_SMRAM_DATA_CLOSED);
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_LOAD), SMBASE + 0x10, "closed for data: a load, the normal decode");
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_FETCH), VIEW + SMBASE + 0x10, "closed for data: a fetch, SMRAM");
+    uam_x86_set_smram_window(&m.cpu, 0, SMBASE, 0x10000, 0);
+    /* the handler (fetched from SMRAM) loads and stores SMRAM; RSM reads its save state */
+    wr(&m, VIEW + SMBASE + 0xFF5C, 8, 0xABC);        /* the saved RAX */
+    uam_exec_run(&m.exec, 5);
+    CHECK(!st(&m)->in_smm && m.cpu.pc == CODE, "RSM from SMRAM: back at CODE");
+    EQ64(gpr(&m, X86_RAX), 0xABC, "RAX from SMRAM's save state");
+    EQ64(rd(&m, VIEW + SMBASE + 0x20, 4), 0xDEADBEEF, "the handler's store went to SMRAM");
+    EQ64(rd(&m, VIEW + SMBASE + 0x24, 4), 0xCAFEF00D, "its load came from SMRAM");
+    CHECK(rd(&m, SMBASE + 0x20, 4) == 0 && rd(&m, SMBASE + 0x24, 4) == 0, "the normal decode untouched");
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_LOAD), SMBASE + 0x10, "after RSM: the normal decode");
+    /* removed: no view in SMM either */
+    uam_x86_set_smram_window(&m.cpu, 0, 0, 0, 0);
+    st(&m)->in_smm = true;
+    EQ64(xl(&m, SMBASE + 0x10, UAM_XLATE_LOAD), SMBASE + 0x10, "no window: the normal decode in SMM");
+    st(&m)->in_smm = false;
+    uam_machine_fini(&m);
+}
+
+/* Two processors on one bus: the one in SMM sees SMRAM, the other the normal decode. */
+static void test_smm_view_smp(void)
+{
+    uam_machine m;
+    CHECK(uam_machine_init(&m, &uam_isa_x86_64) == UAM_OK, "machine init");
+    CHECK(uam_bus_map_ram(&m.bus, "ram", 0, RAM_SIZE) == UAM_OK, "RAM");
+    CHECK(uam_bus_map_ram(&m.bus, "smram", VIEW + 0x200000, 0x100000) == UAM_OK, "SMRAM in the view");
+    CHECK(uam_machine_add_cpus(&m, 1) == UAM_OK, "a second processor");
+    uam_machine_reset(&m, CODE);
+    uam_cpu *c0 = uam_machine_cpu(&m, 0), *c1 = uam_machine_cpu(&m, 1);
+    CHECK(c0 && c1, "two processors");
+    uam_x86_set_smram_window(c0, 1, 0x200000, 0x100000, 0);
+    uam_x86_set_smram_window(c1, 1, 0x200000, 0x100000, 0);
+    x86_st(c0)->in_smm = true;
+    uam_xlate x0 = { 0 }, x1 = { 0 };
+    CHECK(x86_translate(c0, 0x200040, UAM_XLATE_LOAD, &x0) == UAM_OK &&
+          x86_translate(c1, 0x200040, UAM_XLATE_LOAD, &x1) == UAM_OK, "translate on both");
+    EQ64(x0.paddr, VIEW + 0x200040, "processor 0, in SMM: SMRAM");
+    EQ64(x1.paddr, 0x200040, "processor 1, not in SMM: the normal decode, at the same time");
+    x86_st(c0)->in_smm = false;
+    uam_machine_fini(&m);
+}
+
+/* AMD's ASeg: an SMM-view window while AValid; AClose closes it for data. */
+static void test_amd_aseg(void)
+{
+    uam_machine m;
+    machine(&m, NULL, false);
+    uam_x86_set_smm_map(&m.cpu, UAM_X86_SMM_MAP_AMD64);
+    st(&m)->in_smm = true;
+    EQ64(xl(&m, 0xA0010, UAM_XLATE_LOAD), 0xA0010, "AValid clear: in SMM the ASeg is MMIO (VGA)");
+    CHECK(x86_wrmsr(&m.cpu, MSR_AMD_SMM_MASK, SMMMASK_AVALID) == UAM_OK, "AValid");
+    EQ64(xl(&m, 0xA0010, UAM_XLATE_LOAD), VIEW + 0xA0010, "AValid: an SMM load, SMRAM");
+    EQ64(xl(&m, 0xBFFFF, UAM_XLATE_FETCH), VIEW + 0xBFFFF, "AValid: an SMM fetch, SMRAM");
+    EQ64(xl(&m, 0xC0000, UAM_XLATE_LOAD), 0xC0000, "past the ASeg: the normal decode");
+    CHECK(x86_wrmsr(&m.cpu, MSR_AMD_SMM_MASK, SMMMASK_AVALID | SMMMASK_ACLOSE) == UAM_OK, "AClose");
+    EQ64(xl(&m, 0xA0010, UAM_XLATE_LOAD), 0xA0010, "AClose: an SMM load goes to MMIO");
+    EQ64(xl(&m, 0xA0010, UAM_XLATE_FETCH), VIEW + 0xA0010, "AClose: an SMM fetch stays SMRAM");
+    st(&m)->in_smm = false;
+    EQ64(xl(&m, 0xA0010, UAM_XLATE_FETCH), 0xA0010, "outside SMM: MMIO");
+    uam_x86_set_smm_map(&m.cpu, UAM_X86_SMM_MAP_INTEL64);
+    st(&m)->in_smm = true;
+    EQ64(xl(&m, 0xA0010, UAM_XLATE_LOAD), 0xA0010, "the Intel map has no ASeg of its own");
+    st(&m)->in_smm = false;
+    uam_machine_fini(&m);
+}
+
 /* The exception the code-fetch check raises, as an exception hook sees it. */
 typedef struct seen_exc { unsigned n; uam_exception e; } seen_exc;
 static uam_hook_action on_exc(void *ctx, uam_cpu *cpu, const uam_exception *e)
@@ -1522,6 +1628,7 @@ static void test_snapshot(void)
     st(&m)->hwcr = HWCR_SMMLOCK;
     st(&m)->smm_fc = SMM_FC_LOCK;
     st(&m)->mcg_status = MCG_MCIP;
+    uam_x86_set_smram_window(c, 3, 0x200000, 0x100000, UAM_X86_SMRAM_DATA_CLOSED);
     st(&m)->fpr[5] = (x86_f80){ 0xC000000000000000ull, 0x4000 };
     st(&m)->fpu_ip = 0x1234;                                     /* FNSTENV's FIP, FDP, FOP */
     st(&m)->fpu_dp = 0x5678;
@@ -1540,6 +1647,7 @@ static void test_snapshot(void)
     line(&m, UAM_X86_IRQ_A20M, 0);
     line(&m, UAM_X86_IRQ_NMI, 0);
     st(&m)->nmi_pending = false;
+    uam_x86_set_smram_window(c, 3, 0, 0, 0);
     m.sched.idle += 1000;
 
     CHECK(uam_snapshot_restore(&m, s) == UAM_OK, "restore");
@@ -1562,6 +1670,8 @@ static void test_snapshot(void)
     CHECK(st(&m)->smm_addr == 0x200000 && st(&m)->smm_mask == (TSEG_MASK | SMMMASK_TVALID) &&
           st(&m)->hwcr == HWCR_SMMLOCK && st(&m)->smm_fc == SMM_FC_LOCK && st(&m)->mcg_status == MCG_MCIP,
           "SMM_ADDR, SMM_MASK, HWCR, SMM feature control, MCG_STATUS");
+    CHECK(st(&m)->smram_win[3].base == 0x200000 && st(&m)->smram_win[3].size == 0x100000 &&
+          st(&m)->smram_win[3].flags == UAM_X86_SMRAM_DATA_CLOSED, "an SMRAM window");
     CHECK(st(&m)->fpr[5].m == 0xC000000000000000ull && st(&m)->fpr[5].se == 0x4000, "x87 register 5");
     EQ64(st(&m)->fpu_ip, 0x1234, "the x87 last instruction pointer");
     EQ64(st(&m)->fpu_dp, 0x5678, "the x87 last operand pointer");
@@ -1580,6 +1690,8 @@ int main(void)
     test_amd_smram();
     test_smm_blocked();
     test_cr4_valid();
+    test_smm_view_smp();
+    test_amd_aseg();
     test_cpuid();
     test_gdb();
     test_snapshot();
@@ -1595,6 +1707,7 @@ int main(void)
         test_smm_intel(jit);
         test_smm_amd(jit);
         test_smm_code_chk(jit);
+        test_smm_view(jit);
         test_rsm_checks(jit);
         test_ports_a20(jit);
     }
