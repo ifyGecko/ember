@@ -198,7 +198,7 @@ static uam_status xlate(uam_cpu *cpu, uint64_t va, uam_xlate_kind kind, bool use
 /* The SMRR range (IA32_SMRR_PHYSMASK.V): *base is its base when pa is in it. */
 static bool smrr_hit(const x86_state *s, uint64_t pa, uint64_t *base)
 {
-    if (!(s->smrr_mask & (1u << 11)))
+    if (s->smm_map == UAM_X86_SMM_MAP_AMD64 || !(s->smrr_mask & (1u << 11)))   /* SMRR is Intel's */
         return false;
     uint64_t mask = s->smrr_mask & 0x000FFFFFFFFFF000ull;
     *base = s->smrr_base & mask;
@@ -261,7 +261,7 @@ bool x86_smm_fetch_blocked(const x86_state *s, uint64_t pa)
         return false;
     /* the board's confinement: SMRAM is whatever SMRR, TSeg and ASeg define;
      * with none of them defined yet there is nothing to check against */
-    bool any = (s->smrr_mask & (1u << 11)) ||
+    bool any = (s->smm_map != UAM_X86_SMM_MAP_AMD64 && (s->smrr_mask & (1u << 11))) ||
                (s->smm_map == UAM_X86_SMM_MAP_AMD64 && (s->smm_mask & (SMMMASK_TVALID | SMMMASK_AVALID)));
     return any && !in_smrr && !tseg_hit(s, pa, &base) && !aseg_hit(s, pa);
 }

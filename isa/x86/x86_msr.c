@@ -56,7 +56,8 @@ static void cpuid_module(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4
         r[2] = (1u << 13) | (1u << 23) | (1u << 30) |         /* CX16 POPCNT RDRAND */
                ((c->features & UAM_X86_FEAT_X2APIC) ? (1u << 21) : 0) |
                ((c->features & UAM_X86_FEAT_TSC_DEADLINE) ? (1u << 24) : 0);
-        r[3] = (1u << 0) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 8) |
+        /* FPU DE PSE TSC MSR PAE MCE CX8 APIC MTRR PGE CMOV PAT PSE-36 CLFSH MMX FXSR SSE SSE2 [HTT] */
+        r[3] = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) |
                (1u << 9) | (1u << 12) | (1u << 13) | (1u << 15) | (1u << 16) | (1u << 17) |
                (1u << 19) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26) |
                (n > 1 ? (1u << 28) : 0);
@@ -95,6 +96,56 @@ void x86_cpuid(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4])
     cpuid_module(cpu, leaf, sub, r);
     if (s->plat.cpuid)
         s->plat.cpuid(s->plat.ctx, leaf, sub, r);
+}
+
+/* The CR4 bits this processor has: those of the features CPUID reports (the
+ * board's hook included), as hardware reserves the bits of features it lacks.
+ * MOV to CR4 raises #GP(0) on any other bit; RSM shuts down on one. */
+uint64_t x86_cr4_valid(uam_cpu *cpu)
+{
+    uint32_t r0[4], r1[4], r7[4] = { 0 }, r71[4] = { 0 };
+    x86_cpuid(cpu, 0, 0, r0);
+    x86_cpuid(cpu, 1, 0, r1);
+    if (r0[0] >= 7) {
+        x86_cpuid(cpu, 7, 0, r7);
+        if (r7[0] >= 1)
+            x86_cpuid(cpu, 7, 1, r71);
+    }
+    const uint32_t ecx1 = r1[2], edx1 = r1[3], ebx7 = r7[1], ecx7 = r7[2], edx7 = r7[3], eax71 = r71[0];
+    static const struct { uint8_t cr4, reg, bit; } map[] = {
+        /* reg: 0 leaf 1 EDX, 1 leaf 1 ECX, 2 leaf 7 EBX, 3 leaf 7 ECX, 4 leaf 7 EDX, 5 leaf 7.1 EAX */
+        { 0, 0, 1 }, { 1, 0, 1 },   /* VME, PVI: VME */
+        { 2, 0, 4 },                /* TSD: TSC */
+        { 3, 0, 2 },                /* DE */
+        { 4, 0, 3 },                /* PSE */
+        { 5, 0, 6 },                /* PAE */
+        { 6, 0, 7 },                /* MCE */
+        { 7, 0, 13 },               /* PGE */
+        { 9, 0, 24 },               /* OSFXSR: FXSR */
+        { 10, 0, 25 },              /* OSXMMEXCPT: SSE */
+        { 11, 3, 2 },               /* UMIP */
+        { 12, 3, 16 },              /* LA57 */
+        { 13, 1, 5 },               /* VMXE: VMX */
+        { 14, 1, 6 },               /* SMXE: SMX */
+        { 16, 2, 0 },               /* FSGSBASE */
+        { 17, 1, 17 },              /* PCIDE: PCID */
+        { 18, 1, 26 },              /* OSXSAVE: XSAVE */
+        { 19, 3, 23 },              /* KL */
+        { 20, 2, 7 },               /* SMEP */
+        { 21, 2, 20 },              /* SMAP */
+        { 22, 3, 3 },               /* PKE: PKU */
+        { 23, 3, 7 }, { 23, 4, 20 },/* CET: CET_SS or CET_IBT */
+        { 24, 3, 31 },              /* PKS */
+        { 25, 4, 5 },               /* UINTR */
+        { 28, 5, 26 },              /* LAM_SUP: LAM */
+        { 32, 5, 17 },              /* FRED */
+    };
+    const uint32_t regs[] = { edx1, ecx1, ebx7, ecx7, edx7, eax71 };
+    uint64_t v = CR4_PCE;           /* RDPMC at CPL > 0: every processor has it */
+    for (size_t i = 0; i < UAM_ARRAY_LEN(map); i++)
+        if (regs[map[i].reg] & (1u << map[i].bit))
+            v |= 1ull << map[i].cr4;
+    return v;
 }
 
 /* ---- the MSR store ------------------------------------------------------- */
@@ -162,23 +213,44 @@ uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val)
     case MSR_FEATURE_CONTROL: *val = s->feature_control; return UAM_OK;
     case MSR_TSC_ADJUST:      *val = s->tsc_offset; return UAM_OK;
     case MSR_BIOS_SIGN_ID:    *val = 0; return UAM_OK;
-    case MSR_SMBASE:
-        if (!s->in_smm) break;
+    case MSR_SMBASE:          /* Intel: read-only, only in SMM */
+        if (s->smm_map == UAM_X86_SMM_MAP_AMD64) break;
+        if (!s->in_smm)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
         *val = s->smbase; return UAM_OK;
     case MSR_AMD_SMM_BASE:
         if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
         *val = s->smbase; return UAM_OK;
-    case MSR_MTRRCAP:         *val = 0xD08; return UAM_OK;   /* 8 variable, fixed, WC, SMRR */
-    case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
+    case MSR_MTRRCAP:         /* the board may describe its own; else 8 variable, fixed, WC (+ SMRR on Intel) */
+        if (s->plat.rdmsr && s->plat.rdmsr(s->plat.ctx, msr, val))
+            return UAM_OK;
+        *val = s->smm_map == UAM_X86_SMM_MAP_AMD64 ? 0x508 : 0xD08;
+        return UAM_OK;
+    case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* Intel; accessible only in SMM */
+        if (s->smm_map == UAM_X86_SMM_MAP_AMD64) break;
         if (!s->in_smm)
             return x86_raise(cpu, X86_EXC_GP, true, 0);
         *val = msr == MSR_SMRR_PHYSBASE ? s->smrr_base : s->smrr_mask;
         return UAM_OK;
-    case MSR_SMM_MCA_CAP: case MSR_SMM_FEATURE_CONTROL:   /* with the code check; SMM only */
+    case MSR_SMM_MCA_CAP:   /* the enhanced-SMM MSRs: each with its feature, SMM only */
+        if (!(s->cpuid.features & (UAM_X86_FEAT_SMM_CODE_CHK | UAM_X86_FEAT_SMM_BLOCKED))) break;
+        if (!s->in_smm)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        *val = ((s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK) ? SMM_MCA_CODE_CHK : 0) |
+               ((s->cpuid.features & UAM_X86_FEAT_SMM_BLOCKED) ? SMM_MCA_LONG_FLOW : 0);
+        return UAM_OK;
+    case MSR_SMM_FEATURE_CONTROL:
         if (!(s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK)) break;
         if (!s->in_smm)
             return x86_raise(cpu, X86_EXC_GP, true, 0);
-        *val = msr == MSR_SMM_MCA_CAP ? SMM_MCA_CODE_CHK : s->smm_fc;
+        *val = s->smm_fc;
+        return UAM_OK;
+    case MSR_SMM_DELAYED: case MSR_SMM_BLOCKED:
+        if (!(s->cpuid.features & UAM_X86_FEAT_SMM_BLOCKED)) break;
+        if (!s->in_smm)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        /* no processor here is ever in a long flow that delays an SMI */
+        *val = msr == MSR_SMM_BLOCKED ? x86_smm_blocked(cpu) : 0;
         return UAM_OK;
     case MSR_AMD_HWCR:
         if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
@@ -264,9 +336,9 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
         s->feature_control = val; return UAM_OK;
     case MSR_TSC_ADJUST:      s->tsc_offset = val; return UAM_OK;
     case MSR_BIOS_SIGN_ID: case MSR_PLATFORM_ID: return UAM_OK;
-    case MSR_SMBASE:
-        if (!s->in_smm) break;
-        s->smbase = val & 0xFFFFFFFFu; return UAM_OK;
+    case MSR_SMBASE:          /* Intel: read-only (RSM takes SMBASE from the save state) */
+        if (s->smm_map == UAM_X86_SMM_MAP_AMD64) break;
+        return x86_raise(cpu, X86_EXC_GP, true, 0);
     case MSR_AMD_SMM_BASE:
         if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
         if (!(s->hwcr & HWCR_SMMLOCK))   /* HWCR.SMMLOCK: read-only, writes ignored */
@@ -285,7 +357,10 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
         uam_cpu_xlate_changed(cpu);
         return UAM_OK;
     case MSR_SMM_MCA_CAP:
-        if (!(s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK)) break;
+        if (!(s->cpuid.features & (UAM_X86_FEAT_SMM_CODE_CHK | UAM_X86_FEAT_SMM_BLOCKED))) break;
+        return x86_raise(cpu, X86_EXC_GP, true, 0);   /* read-only */
+    case MSR_SMM_DELAYED: case MSR_SMM_BLOCKED:
+        if (!(s->cpuid.features & UAM_X86_FEAT_SMM_BLOCKED)) break;
         return x86_raise(cpu, X86_EXC_GP, true, 0);   /* read-only */
     case MSR_SMM_FEATURE_CONTROL:
         if (!(s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK)) break;
@@ -296,7 +371,8 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
         uam_cpu_xlate_changed(cpu);
         return UAM_OK;
     case MSR_MTRRCAP:         return x86_raise(cpu, X86_EXC_GP, true, 0);
-    case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
+    case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* Intel; accessible only in SMM */
+        if (s->smm_map == UAM_X86_SMM_MAP_AMD64) break;
         if (!s->in_smm)
             return x86_raise(cpu, X86_EXC_GP, true, 0);
         if (msr == MSR_SMRR_PHYSBASE) s->smrr_base = val & 0x000FFFFFFFFFF0FFull;

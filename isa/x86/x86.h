@@ -161,8 +161,6 @@ enum {
 };
 enum { EFER_SCE = 1u << 0, EFER_LME = 1u << 8, EFER_LMA = 1u << 10, EFER_NXE = 1u << 11 };
 #define EFER_DEFINED (EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE)
-/* CR4 bits this processor reserves: 15 and 26-63 (LAM, FRED and later are not modelled) */
-#define CR4_RESERVED 0xFFFFFFFFFC008000ull
 
 /* SMRAM protection. AMD (with the AMD64 map): SMM_MASK's valid and close bits, the
  * TSeg base/mask field of SMM_ADDR and SMM_MASK (bits 51:17), the ASeg, and
@@ -176,6 +174,7 @@ enum { SMMMASK_AVALID = 1u << 0, SMMMASK_TVALID = 1u << 1,
 #define SMM_ASEG_SIZE      0x20000ull
 #define HWCR_SMMLOCK       1ull
 #define SMM_MCA_CODE_CHK   (1ull << 58)
+#define SMM_MCA_LONG_FLOW  (1ull << 59)   /* MSR_SMM_DELAYED is there */
 enum { SMM_FC_LOCK = 1u << 0, SMM_FC_CODE_CHK_EN = 1u << 2 };
 /* IA32_MCG_STATUS */
 enum { MCG_RIPV = 1u << 0, MCG_EIPV = 1u << 1, MCG_MCIP = 1u << 2 };
@@ -203,6 +202,8 @@ enum {
     MSR_MCG_STATUS       = 0x0000017A,
     MSR_SMM_MCA_CAP      = 0x0000017D,   /* with UAM_X86_FEAT_SMM_CODE_CHK; SMM only */
     MSR_SMM_FEATURE_CONTROL = 0x000004E0,/* with UAM_X86_FEAT_SMM_CODE_CHK; SMM only */
+    MSR_SMM_DELAYED      = 0x000004E2,   /* with UAM_X86_FEAT_SMM_BLOCKED; SMM only */
+    MSR_SMM_BLOCKED      = 0x000004E3,   /* with UAM_X86_FEAT_SMM_BLOCKED; SMM only */
     MSR_MISC_ENABLE      = 0x000001A0,
     MSR_MTRR_PHYSBASE0   = 0x00000200,
     MSR_MTRR_DEF_TYPE    = 0x000002FF,
@@ -395,7 +396,6 @@ typedef struct x86_state {
     bool     halted_in_smm;       /* auto-HALT restart in the save state */
     bool     shutdown;            /* triple fault: the hart stops */
     bool     wait_sipi;           /* an application processor waiting for a startup IPI */
-    bool     wait_sipi_in_smm;    /* took an SMI while in wait-for-SIPI: return there on RSM */
     bool     int_shadow;          /* X86_PRIV_SHADOW: no event before the next instruction */
     /* SMM I/O state (I/O instruction restart): the I/O instruction executing
      * (recorded by X86_H_IO, valid while icount == io_icount), what an SMI
@@ -440,6 +440,10 @@ typedef struct x86_state {
      * (uam_x86_preset_amd_smm) and the SMM code-fetch confinement */
     uint64_t           preset_smm_addr, preset_smm_mask, preset_hwcr;
     bool               smm_confine;
+    /* the logical processors of this one's package (uam_x86_set_package), in
+     * MSR_SMM_BLOCKED/DELAYED bit order; owned copy */
+    uam_cpu          **pkg;
+    unsigned           n_pkg;
 
     x86_tlb_ent tlb[X86_TLB_SIZE];
 } x86_state;
@@ -548,6 +552,8 @@ void       x86_cpuid(uam_cpu *cpu, uint32_t leaf, uint32_t sub, uint32_t r[4]);
 uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val);
 uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val);
 void       x86_cpuid_defaults(uam_x86_cpuid_info *info);
+/* CR4's bits for the features CPUID reports (with the board's hook); the rest are reserved. */
+uint64_t   x86_cr4_valid(uam_cpu *cpu);
 
 /* The x87 80-bit format in software (x86_f80.c): rounding to nearest, x87 NaN rules,
  * the indefinite for an invalid operation. */
@@ -589,6 +595,8 @@ uint64_t    x86_h_x87(void *env, uint64_t desc, uint64_t lin, uint64_t c, uam_st
 
 /* SMM (x86_smm.c) */
 void       x86_smm_enter(uam_cpu *cpu);
+/* MSR_SMM_BLOCKED's value: the package's processors in wait-for-SIPI (x86_system.c). */
+uint64_t   x86_smm_blocked(uam_cpu *cpu);
 /* RSM at RIP rsm_rip; a saved state no processor could be in shuts the hart down. */
 uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t rsm_rip, uint64_t *new_pc);
 

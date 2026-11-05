@@ -121,10 +121,23 @@ typedef struct plat {
     int      vector;          /* what INTA answers */
     unsigned inta, smm_on, smm_off;
     uint64_t wr_val;
+    uint64_t mtrrcap;         /* nonzero: the board answers MTRRCAP */
+    uint32_t leaf7_ebx;       /* CPUID.7.0:EBX the board adds */
 } plat;
 static int p_inta(void *c) { ((plat *)c)->inta++; return ((plat *)c)->vector; }
 static void p_smm(void *c, bool on) { if (on) ((plat *)c)->smm_on++; else ((plat *)c)->smm_off++; }
-static bool p_rdmsr(void *c, uint32_t n, uint64_t *v) { (void)c; if (n != 0xC0DE) return false; *v = 0xFEED; return true; }
+static bool p_rdmsr(void *c, uint32_t n, uint64_t *v)
+{
+    if (n == MSR_MTRRCAP && ((plat *)c)->mtrrcap) { *v = ((plat *)c)->mtrrcap; return true; }
+    if (n != 0xC0DE) return false;
+    *v = 0xFEED;
+    return true;
+}
+static void p_cpuid(void *c, uint32_t leaf, uint32_t sub, uint32_t r[4])
+{
+    if (leaf == 7 && sub == 0)
+        r[1] |= ((plat *)c)->leaf7_ebx;
+}
 static bool p_wrmsr(void *c, uint32_t n, uint64_t v)
 {
     if (n != 0xC0DE && n != MSR_APIC_BASE) return false;
@@ -146,7 +159,8 @@ static void machine(uam_machine *m, plat *p, bool jit)
         memset(p, 0, sizeof(*p));
         p->vector = -1;
         uam_x86_set_platform(&m->cpu, &(uam_x86_platform){ .ctx = p, .inta = p_inta, .rdmsr = p_rdmsr,
-                                                            .wrmsr = p_wrmsr, .smm_changed = p_smm });
+                                                            .wrmsr = p_wrmsr, .smm_changed = p_smm,
+                                                            .cpuid = p_cpuid });
     }
     uam_machine_reset(m, CODE);
     for (unsigned v = 0; v < 256; v++) {
@@ -315,6 +329,18 @@ static void test_init_sipi(void)
     CHECK(!st(&m)->sipi_pending, "a running processor ignores a SIPI");
     line(&m, UAM_X86_IRQ_NMI, 0);
     line(&m, UAM_X86_IRQ_INTR, 0);
+
+    /* an SMI is held while the AP waits for its startup IPI, then taken before its first
+     * instruction */
+    uam_machine_reset(&m, 0xFFFFFFF0u);
+    line(&m, UAM_X86_IRQ_SMI, 1);
+    CHECK(!wake(&m) && !take(&m), "AP: the SMI does not wake it");
+    CHECK(st(&m)->wait_sipi && st(&m)->smi_pending && !st(&m)->in_smm, "AP: still waiting, the SMI held");
+    uam_x86_sipi(&m.cpu, 0x12);
+    CHECK(take(&m) && st(&m)->in_smm && m.cpu.pc == SMBASE + 0x8000, "AP: the SIPI, then the SMI at once");
+    EQ64(rd(&m, SMBASE + 0xFFD8, 8), 0, "save: RIP 0, the SIPI's start");
+    EQ64(rd(&m, SMBASE + 0xFFAC, 4), 0x1200, "save: CS 1200");
+    line(&m, UAM_X86_IRQ_SMI, 0);
 
     /* INIT on the BSP in protected mode: back to the reset state, waiting for a SIPI;
      * SMBASE, the APIC base and the BSP flag stay */
@@ -552,8 +578,26 @@ static void test_real_exceptions(bool jit)
     PUT(&m, CODE, 0x0F, 0x0B);   /* ud2 */
     run(&m, CODE, 10);
     CHECK(st(&m)->shutdown && m.cpu.waiting, "triple fault: shut down");
+    EQ64(m.cpu.pc, CODE, "shut down at the faulting instruction");
+    /* NMI, SMI, INIT and RESET end the shutdown state (SDM vol. 3, interrupt 8); INTR does not */
+    st(&m)->irq_lines |= 1u << UAM_X86_IRQ_INTR;
+    x86_set_rflags(&m.cpu, RFLAGS_IF | 2);
+    CHECK(!wake(&m), "INTR does not wake a shut-down hart");
+    st(&m)->irq_lines &= ~(1u << UAM_X86_IRQ_INTR);
     line(&m, UAM_X86_IRQ_NMI, 1);
-    CHECK(!wake(&m), "an NMI does not wake a shut-down hart");
+    CHECK(wake(&m) && take(&m), "an NMI does");
+    CHECK(st(&m)->shutdown && st(&m)->nmi_blocked, "its delivery (no IVT) shuts the hart down again");
+    line(&m, UAM_X86_IRQ_NMI, 0);
+    line(&m, UAM_X86_IRQ_NMI, 1);
+    CHECK(!wake(&m), "a second NMI: blocked by the first");
+    PUT(&m, SMBASE + 0x8000, 0x0F, 0xAA);   /* rsm */
+    line(&m, UAM_X86_IRQ_SMI, 1);
+    CHECK(wake(&m) && take(&m), "an SMI does");
+    CHECK(!st(&m)->shutdown && st(&m)->in_smm && m.cpu.pc == SMBASE + 0x8000, "in SMM, out of shutdown");
+    EQ64(rd(&m, SMBASE + 0xFFD8, 8), CODE, "save: RIP at the instruction that shut the hart down");
+    EQ64(rd(&m, SMBASE + 0xFF02, 2), 0, "save: no auto-HALT");
+    uam_exec_run(&m.exec, 2);
+    CHECK(st(&m)->shutdown && !st(&m)->in_smm && m.cpu.pc == CODE, "RSM resumes there: the UD2 shuts it down again");
     line(&m, UAM_X86_IRQ_INIT, 1);
     CHECK(wake(&m), "INIT does");
     uam_machine_fini(&m);
@@ -759,8 +803,11 @@ static void test_smm_intel(bool jit)
     const uint16_t cs_attr = x86_seg_attr(&m.cpu, X86_SEG_CS);
     const uint64_t cr0 = sysr(&m, X86_SR_CR0);
     m.cpu.pc = CODE;
+    wr(&m, SMBASE + 0xFED8, 8, ~0ull);   /* stale contents */
+    wr(&m, SMBASE + 0xFEE0, 4, ~0u);
     line(&m, UAM_X86_IRQ_SMI, 1);
     CHECK(wake(&m) && take(&m), "SMI taken");
+    CHECK(rd(&m, SMBASE + 0xFED8, 8) == 0 && rd(&m, SMBASE + 0xFEE0, 4) == 0, "save: EPT/VMX control 0 (no VMX)");
     EQ64(p.smm_on, 1, "SMIACT# on");
     EQ64(m.cpu.pc, SMBASE + 0x8000, "at SMBASE + 8000");
     CHECK(x86_priv_smm(m.cpu.priv) && x86_priv_mode(m.cpu.priv) == X86_MODE_REAL, "SMM, real-address mode");
@@ -865,9 +912,11 @@ static void test_smm_amd(bool jit)
     const uint64_t cr0 = sysr(&m, X86_SR_CR0);
     const uint16_t cs_attr = x86_seg_attr(&m.cpu, X86_SEG_CS);
     m.cpu.pc = CODE;
+    wr(&m, SMBASE + 0xFEC4, 4, 0xFFFFFFFF);   /* stale contents */
     line(&m, UAM_X86_IRQ_SMI, 1);
     CHECK(take(&m) && m.cpu.pc == SMBASE + 0x8000, "AMD64: SMI");
     const uint64_t b = SMBASE;
+    EQ64(rd(&m, b + 0xFEC4, 4), 0, "AMD save: Local SMI Status written");
     EQ64(rd(&m, b + 0xFF00, 4), SMBASE, "AMD save: SMBASE");
     EQ64(rd(&m, b + 0xFEFC, 4), 0x30064, "AMD save: revision");
     EQ64(rd(&m, b + 0xFF78, 8), CODE, "AMD save: RIP");
@@ -972,6 +1021,21 @@ static void test_msr(void)
           "#GP policy: MTRRs are storage");
     CHECK(gp(&m, x86_rdmsr(c, MSR_AMD_SMM_BASE, &v)), "the AMD SMM_BASE MSR is missing with the Intel map");
     CHECK(gp(&m, x86_rdmsr(c, MSR_SMBASE, &v)), "IA32_SMBASE is missing outside SMM");
+    /* IA32_SMBASE: read-only, also in SMM; RSM takes SMBASE from the save state */
+    st(&m)->in_smm = true;
+    CHECK(gp(&m, x86_wrmsr(c, MSR_SMBASE, 0x50000)), "IA32_SMBASE write: #GP");
+    EQ64(msr(&m, MSR_SMBASE), SMBASE, "IA32_SMBASE unchanged");
+    st(&m)->in_smm = false;
+    /* MTRRCAP: the board may answer; with the AMD64 map no SMRR, and the SMRR MSRs are not the core's */
+    p.mtrrcap = 0x50A;
+    EQ64(msr(&m, MSR_MTRRCAP), 0x50A, "MTRRCAP: the board's");
+    p.mtrrcap = 0;
+    uam_x86_set_smm_map(c, UAM_X86_SMM_MAP_AMD64);
+    EQ64(msr(&m, MSR_MTRRCAP), 0x508, "AMD64 map: MTRRCAP without SMRR");
+    st(&m)->in_smm = true;
+    CHECK(gp(&m, x86_rdmsr(c, MSR_SMRR_PHYSBASE, &v)), "AMD64 map: no SMRR MSRs (the #GP policy)");
+    CHECK(gp(&m, x86_rdmsr(c, MSR_SMBASE, &v)), "AMD64 map: no IA32_SMBASE (the #GP policy)");
+    st(&m)->in_smm = false;
     uam_machine_fini(&m);
 }
 
@@ -1210,6 +1274,8 @@ static void test_rsm_checks(bool jit)
     rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | 1ull << 32 }), "Intel: CR0 upper bits");
     rsm_bad(jit, I, FIELDS({ 0xFE40, 4, 1u << 15 }), "Intel: reserved CR4 bit 15");
     rsm_bad(jit, I, FIELDS({ 0xFE40, 4, 1u << 26 }), "Intel: reserved CR4 bit 26");
+    rsm_bad(jit, I, FIELDS({ 0xFE40, 4, CR4_VME }), "Intel: CR4.VME, which CPUID does not report");
+    rsm_bad(jit, A, FIELDS({ 0xFF48, 8, CR4_OSXSAVE }), "AMD: CR4.OSXSAVE without XSAVE");
     rsm_bad(jit, I, FIELDS({ 0xFFE0, 8, EFER_LMA }), "Intel: EFER.LMA without LME and PG");
     rsm_bad(jit, I, FIELDS({ 0xFFE0, 8, 1u << 2 }), "Intel: a reserved EFER bit");
     rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | CR0_PG }, { 0xFFE0, 8, lm }, { 0xFE40, 4, 0 }),
@@ -1228,6 +1294,79 @@ static void test_rsm_checks(bool jit)
     rsm_bad(jit, A, FIELDS({ 0xFF58, 8, pe | CR0_PG }, { 0xFED0, 8, lm }, { 0xFF48, 8, CR4_PAE },
                            { 0xFE12, 2, 0x9B | 0x600 }),
             "AMD: CS.L and CS.D in long mode");
+}
+
+/* MSR_SMM_BLOCKED / MSR_SMM_DELAYED: the package's processors that hold an SMI. */
+static void test_smm_blocked(void)
+{
+    uam_machine m0, m1;
+    uint64_t v = 0;
+    machine(&m0, NULL, false);
+    machine(&m1, NULL, false);
+    uam_cpu *const pkg[] = { &m0.cpu, &m1.cpu };
+    CHECK(uam_x86_set_package(pkg, 2) == UAM_OK, "a package of two");
+    m1.cpu.hartid = 1;
+    uam_machine_reset(&m1, 0xFFFFFFF0u);        /* processor 1 waits for a startup IPI */
+    st(&m0)->in_smm = true;
+    CHECK(x86_rdmsr(&m0.cpu, MSR_SMM_BLOCKED, &v) == UAM_OK && v == 0, "no feature: 4E3h is storage");
+    uam_x86_cpuid_info id;
+    uam_x86_get_cpuid(&m0.cpu, &id);
+    id.features |= UAM_X86_FEAT_SMM_BLOCKED;
+    uam_x86_set_cpuid(&m0.cpu, &id);
+    EQ64(msr(&m0, MSR_SMM_BLOCKED), 2, "processor 1 blocks SMIs");
+    EQ64(msr(&m0, MSR_SMM_DELAYED), 0, "none delayed");
+    EQ64(msr(&m0, MSR_SMM_MCA_CAP), 1ull << 59, "LONG_FLOW_INDICATION, no code check");
+    CHECK(gp(&m0, x86_wrmsr(&m0.cpu, MSR_SMM_BLOCKED, 0)), "read-only");
+    uam_x86_sipi(&m1.cpu, 0x10);
+    CHECK(take(&m1), "processor 1 started");
+    EQ64(msr(&m0, MSR_SMM_BLOCKED), 0, "then none blocks");
+    st(&m0)->in_smm = false;
+    CHECK(gp(&m0, x86_rdmsr(&m0.cpu, MSR_SMM_BLOCKED, &v)), "outside SMM: #GP");
+    uam_machine_reset(&m0, CODE);
+    st(&m0)->in_smm = true;
+    EQ64(msr(&m0, MSR_SMM_BLOCKED), 0, "the package survives RESET");
+    st(&m0)->in_smm = false;
+    uam_machine_fini(&m1);
+    uam_machine_fini(&m0);
+}
+
+/* CR4's bits follow CPUID: a feature's bit is reserved when CPUID does not report it.
+ * CR4.DE: DR4/DR5 are #UD instead of aliases of DR6/DR7. */
+static void test_cr4_valid(void)
+{
+    uam_machine m;
+    plat p;
+    machine(&m, &p, false);
+    uam_cpu *c = &m.cpu;
+    uint32_t r[4];
+    uint64_t v = 0;
+    x86_cpuid(c, 1, 0, r);
+    CHECK((r[3] & (1u << 2 | 1u << 7)) == (1u << 2 | 1u << 7) && !(r[3] & 1u << 1), "CPUID: DE and MCE, no VME");
+    EQ64(x86_cr4_valid(c), CR4_TSD | CR4_DE | CR4_PSE | CR4_PAE | CR4_MCE | CR4_PGE | CR4_PCE |
+                           CR4_OSFXSR | CR4_OSXMMEXCPT, "the reference processor's CR4 bits");
+    CHECK(m.cpu.isa->sysreg_write(c, X86_SR_CR4, CR4_DE | CR4_PAE | CR4_MCE | CR4_OSFXSR | CR4_OSXMMEXCPT) == UAM_OK,
+          "CR4 = 0x668, as AMD firmware sets it");
+    CHECK(gp(&m, m.cpu.isa->sysreg_write(c, X86_SR_CR4, CR4_VME)), "CR4.VME without VME: #GP");
+    CHECK(gp(&m, m.cpu.isa->sysreg_write(c, X86_SR_CR4, CR4_OSXSAVE)), "CR4.OSXSAVE without XSAVE: #GP");
+    CHECK(gp(&m, m.cpu.isa->sysreg_write(c, X86_SR_CR4, 1u << 15)), "CR4 bit 15: #GP");
+    CHECK(gp(&m, m.cpu.isa->sysreg_write(c, X86_SR_CR4, CR4_SMEP)), "CR4.SMEP without SMEP: #GP");
+    EQ64(sysr(&m, X86_SR_CR4), CR4_DE | CR4_PAE | CR4_MCE | CR4_OSFXSR | CR4_OSXMMEXCPT, "CR4 unchanged by them");
+    p.leaf7_ebx = 1u << 7;   /* the board reports SMEP */
+    CHECK(m.cpu.isa->sysreg_write(c, X86_SR_CR4, CR4_SMEP) == UAM_OK, "the board's CPUID adds SMEP: allowed");
+    /* CR4.DE */
+    sysw(&m, X86_SR_CR4, 0);
+    sysw(&m, X86_SR_DR5, 0x455);
+    EQ64(sysr(&m, X86_SR_DR7), 0x455, "DE clear: DR5 is DR7");
+    sysw(&m, X86_SR_DR6, 0xFFFF0FF1);
+    EQ64(sysr(&m, X86_SR_DR4), 0xFFFF0FF1, "DE clear: DR4 is DR6");
+    sysw(&m, X86_SR_CR4, CR4_DE);
+    CHECK(m.cpu.isa->sysreg_read(c, X86_SR_DR4, &v) == UAM_ERR_FAULT && st(&m)->pend_vec == X86_EXC_UD,
+          "DE set: DR4 is #UD");
+    st(&m)->pend_valid = false;
+    CHECK(m.cpu.isa->sysreg_write(c, X86_SR_DR5, 1) == UAM_ERR_FAULT && st(&m)->pend_vec == X86_EXC_UD,
+          "DE set: DR5 is #UD");
+    st(&m)->pend_valid = false;
+    uam_machine_fini(&m);
 }
 
 static void test_cpuid(void)
@@ -1439,6 +1578,8 @@ int main(void)
     test_intr();
     test_msr();
     test_amd_smram();
+    test_smm_blocked();
+    test_cr4_valid();
     test_cpuid();
     test_gdb();
     test_snapshot();

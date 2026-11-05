@@ -46,6 +46,8 @@
  *                      amd64 also brings AMD's SMM_ADDR/SMM_MASK/HWCR.SMMLOCK
  *   -o smm-code-chk=1  offer Intel's SMM code-access check
  *                      (UAM_X86_FEAT_SMM_CODE_CHK; the firmware enables it)
+ *   -o smm-blocked=1   offer Intel's MSR_SMM_BLOCKED/MSR_SMM_DELAYED
+ *                      (UAM_X86_FEAT_SMM_BLOCKED; all processors are one package)
  *   -o smm-confine=1   SMM code-fetch confinement (uam_x86_set_smm_confine):
  *                      an SMM fetch outside SMRAM is a machine check
  *   -o persist=1       write flash programs/erases back to the image file
@@ -428,21 +430,28 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
     const char *confine = uam_board_config_option(cfg, "smm-confine");
     bool smm_code_chk = chk && strcmp(chk, "0") != 0;
     bool smm_confine = confine && strcmp(confine, "0") != 0;
+    const char *blocked = uam_board_config_option(cfg, "smm-blocked");
+    bool smm_blocked = blocked && strcmp(blocked, "0") != 0;
+    uam_cpu *pkg[MAX_CPUS];   /* every processor in one package */
     for (unsigned i = 0; i < b->ncpu; i++) {
         uam_cpu *cpu = uam_machine_cpu(m, i);
+        pkg[i] = cpu;
         uam_x86_platform plat = { .ctx = &b->pcpu[i], .inta = ref_inta, .rdmsr = ref_rdmsr,
                                   .wrmsr = ref_wrmsr };
         uam_x86_set_platform(cpu, &plat);
         uam_x86_cpuid_info id;
         uam_x86_get_cpuid(cpu, &id);
         id.features |= UAM_X86_FEAT_X2APIC | UAM_X86_FEAT_TSC_DEADLINE |
-                       (smm_code_chk ? UAM_X86_FEAT_SMM_CODE_CHK : 0);
+                       (smm_code_chk ? UAM_X86_FEAT_SMM_CODE_CHK : 0) |
+                       (smm_blocked ? UAM_X86_FEAT_SMM_BLOCKED : 0);
         id.logical_cpus = b->ncpu;
         id.initial_apic_id = i;
         uam_x86_set_cpuid(cpu, &id);
         uam_x86_set_smm_map(cpu, smm_map);
         uam_x86_set_smm_confine(cpu, smm_confine);
     }
+    if ((st = uam_x86_set_package(pkg, b->ncpu)) != UAM_OK)
+        return st;
 
     /* Unclaimed accesses master-abort (all ones), as on a PC, unless the user
      * asked for the zero/echo policies. */

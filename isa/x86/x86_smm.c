@@ -24,9 +24,18 @@
  * and close SMRAM for the processor.
  *
  * RSM first checks the saved CR0, CR4, EFER and CS for a state no processor
- * could be in (PG without PE, NW without CD, reserved bits, long mode without
- * PAE, an EFER.LMA that does not follow, CS.L with CS.D); it then restores
- * nothing and shuts the hart down, as hardware does.
+ * could be in (PG without PE, NW without CD, reserved bits - for CR4 those of
+ * features CPUID does not report -, long mode without PAE, an EFER.LMA that
+ * does not follow, CS.L with CS.D); it then restores nothing and shuts the
+ * hart down, as hardware does.
+ *
+ * Fields that describe what this processor does not have are written as 0:
+ * Intel's EPT/VMX control (no VMX), AMD's Local SMI Status (no core-local SMI
+ * source), the AMD SVM and shadow-stack fields.
+ *
+ * When SMIs are taken (x86_system.c): not in wait-for-SIPI (held until the
+ * startup IPI; MSR_SMM_BLOCKED reports it), and in the shutdown state, which
+ * the SMI ends (RSM resumes at the instruction that shut the hart down).
  *
  * The SMRAM protection the processor itself enforces is in x86_mmu.c (the SMRR
  * range; with the AMD64 map the TSeg and ASeg of SMM_ADDR/SMM_MASK, locked by
@@ -49,6 +58,7 @@ enum {
     SS_GDT_HI = 0x7DD0, SS_LDT_HI = 0x7DD4, SS_IDT_HI = 0x7DD8, SS_IO_RIP = 0x7DE8,
     SS_CR4 = 0x7E40,
     SS_GDT_LO = 0x7E8C, SS_IDT_LO = 0x7E94, SS_LDT_LO = 0x7E9C,
+    SS_EPT_VMX_CTL = 0x7ED8, SS_EN_EPT_VMX_CTL = 0x7EE0,   /* no VMX: 0 */
     SS_SMBASE = 0x7EF8, SS_REVID = 0x7EFC, SS_IORESTART = 0x7F00, SS_AUTOHALT = 0x7F02,
     SS_R15 = 0x7F1C,             /* R15..R8, then RAX RCX RDX RBX RSP RBP RSI RDI */
     SS_IO_MEM = 0x7F9C, SS_IO_MISC = 0x7FA4,
@@ -66,7 +76,8 @@ enum {
     AS_IDTR_LIMIT = 0xFE84, AS_IDTR_BASE = 0xFE88,
     AS_TR = 0xFE90,
     AS_IO_RIP = 0xFEA0, AS_IO_RCX = 0xFEA8, AS_IO_RSI = 0xFEB0, AS_IO_RDI = 0xFEB8,
-    AS_IO_TRAP = 0xFEC0, AS_IORESTART = 0xFEC8, AS_AUTOHALT = 0xFEC9, AS_NMI_MASK = 0xFECA,
+    AS_IO_TRAP = 0xFEC0, AS_LOCAL_SMI = 0xFEC4,
+    AS_IORESTART = 0xFEC8, AS_AUTOHALT = 0xFEC9, AS_NMI_MASK = 0xFECA,
     AS_EFER = 0xFED0, AS_SVM_GUEST = 0xFED8,   /* SVM guest, VMCB, virtual interrupt: 0 */
     AS_REVID = 0xFEFC, AS_SMBASE = 0xFF00,
     AS_SSP = 0xFF18,             /* SSP, then SVM guest PAT, host EFER/CR4/CR3/CR0: 0 */
@@ -137,6 +148,8 @@ static void intel_save(uam_cpu *cpu, bool halted)
     put(cpu, SS_CR4, 4, s->cr4);
     put(cpu, SS_SMBASE, 4, s->smbase);
     put(cpu, SS_REVID, 4, SMM_REVID);
+    put(cpu, SS_EPT_VMX_CTL, 8, 0);
+    put(cpu, SS_EN_EPT_VMX_CTL, 4, 0);
     put(cpu, SS_IORESTART, 2, 0);
     put(cpu, SS_IO_MISC, 4, s->smm_io ? s->io_smm.misc : 0);
     put(cpu, SS_IO_MEM, 8, s->smm_io ? s->io_smm.mem : 0);
@@ -248,6 +261,7 @@ static void amd_save(uam_cpu *cpu, bool halted)
     put_at(cpu, AS_IO_RSI, 8, s->smm_io ? s->io_smm.rsi : 0);
     put_at(cpu, AS_IO_RDI, 8, s->smm_io ? s->io_smm.rdi : 0);
     put_at(cpu, AS_IO_TRAP, 4, s->smm_io ? amd_io_trap(s->io_smm.misc) : 0);
+    put_at(cpu, AS_LOCAL_SMI, 4, 0);   /* Local SMI Status: no core-local SMI source here */
     put_at(cpu, AS_IORESTART, 1, 0);
     put_at(cpu, AS_AUTOHALT, 1, halted ? 1 : 0);
     put_at(cpu, AS_NMI_MASK, 1, s->nmi_blocked);
@@ -312,7 +326,8 @@ static rsm_info amd_load(uam_cpu *cpu)
 /* A saved state no processor could be in: RSM enters shutdown instead of
  * restoring it (Intel SDM vol. 2, RSM; AMD APM vol. 2, the SMM chapter). The
  * checks are the architectural ones both list. NULL if valid. */
-static const char *rsm_invalid(uint64_t cr0, uint64_t cr4, uint64_t efer, uint16_t cs_attr)
+static const char *rsm_invalid(uint64_t cr0, uint64_t cr4, uint64_t efer, uint16_t cs_attr,
+                               uint64_t cr4_valid)
 {
     if (cr0 >> 32)
         return "CR0 bits 63:32 set";
@@ -320,7 +335,7 @@ static const char *rsm_invalid(uint64_t cr0, uint64_t cr4, uint64_t efer, uint16
         return "CR0.PG without CR0.PE";
     if ((cr0 & CR0_NW) && !(cr0 & CR0_CD))
         return "CR0.NW without CR0.CD";
-    if (cr4 & CR4_RESERVED)
+    if (cr4 & ~cr4_valid)
         return "a reserved CR4 bit set";
     if (efer & ~(uint64_t)EFER_DEFINED)
         return "a reserved EFER bit set";
@@ -336,11 +351,12 @@ static const char *rsm_invalid(uint64_t cr0, uint64_t cr4, uint64_t efer, uint16
 
 static const char *rsm_check(uam_cpu *cpu)
 {
+    const uint64_t valid = x86_cr4_valid(cpu);
     if (x86_st(cpu)->smm_map == UAM_X86_SMM_MAP_AMD64)
         return rsm_invalid(get_at(cpu, AS_CR0, 8), get_at(cpu, AS_CR4, 8), get_at(cpu, AS_EFER, 8),
-                           core_attr((uint16_t)get_at(cpu, AS_SEG + X86_SEG_CS * 16 + 2, 2)));
+                           core_attr((uint16_t)get_at(cpu, AS_SEG + X86_SEG_CS * 16 + 2, 2)), valid);
     return rsm_invalid(get(cpu, SS_CR0, 8), get(cpu, SS_CR4, 4), get(cpu, SS_EFER, 8),
-                       (uint16_t)get(cpu, SS_HIDDEN + X86_SEG_CS * 16 + 12, 2));
+                       (uint16_t)get(cpu, SS_HIDDEN + X86_SEG_CS * 16 + 12, 2), valid);
 }
 
 /* ---- entry and RSM -------------------------------------------------------- */
@@ -413,13 +429,6 @@ uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t rsm_rip, uint64_t *new_pc)
     if (s->plat.smm_changed)
         s->plat.smm_changed(s->plat.ctx, false);
     s->smbase = ri.smbase;   /* the handler may relocate SMBASE */
-    if (s->wait_sipi_in_smm) {
-        /* The SMI had woken a wait-for-SIPI AP: return it to that state (the
-         * relocated SMBASE is kept) rather than executing the restored context. */
-        s->wait_sipi_in_smm = false;
-        s->wait_sipi = true;
-        cpu->waiting = true;
-    }
     x86_tlb_flush(cpu);
     x86_update_priv(cpu);
     uam_cpu_xlate_changed(cpu);

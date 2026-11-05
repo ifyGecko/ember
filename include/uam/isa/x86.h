@@ -135,6 +135,12 @@ enum {
      * only in SMM. Enabled, an SMM instruction fetch outside the SMRR range is
      * an unrecoverable machine check: #MC with CR4.MCE set, else shutdown. */
     UAM_X86_FEAT_SMM_CODE_CHK = 1u << 2,
+    /* Intel's MSR_SMM_BLOCKED (4E3h: the package's processors that hold an SMI,
+     * i.e. wait for a startup IPI) and MSR_SMM_DELAYED (4E2h: always 0 here),
+     * with MSR_SMM_MCA_CAP.LONG_FLOW_INDICATION; SMM only. SMM rendezvous code
+     * uses them not to wait for processors that cannot arrive. The bits follow
+     * uam_x86_set_package. */
+    UAM_X86_FEAT_SMM_BLOCKED  = 1u << 3,
 };
 
 void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info);
@@ -183,9 +189,18 @@ void uam_x86_preset_amd_smm(uam_cpu *cpu, uint64_t smm_addr, uint64_t smm_mask, 
 void uam_x86_set_smm_confine(uam_cpu *cpu, bool on);
 
 /*
+ * The logical processors of one physical package, in the bit order of the
+ * package-scope MSR_SMM_BLOCKED/MSR_SMM_DELAYED (UAM_X86_FEAT_SMM_BLOCKED).
+ * Call once per package after creating its processors; kept across RESET.
+ */
+uam_status uam_x86_set_package(uam_cpu *const *cpus, unsigned n);
+
+/*
  * Multiprocessor start-up. Processor 0 (hartid 0) is the bootstrap processor
  * (IA32_APIC_BASE.BSP); every other processor leaves reset, and INIT, in the
- * wait-for-SIPI state, where only INIT and a startup IPI are recognised. A
+ * wait-for-SIPI state, where only INIT and a startup IPI are recognised; an
+ * SMI stays pending until the startup IPI, as on hardware (MSR_SMM_BLOCKED
+ * reports such processors), and is taken before the first instruction. A
  * startup IPI with `vector` starts it in real mode at vector << 12 (CS =
  * vector << 8). The local APIC model delivers it through this call.
  */

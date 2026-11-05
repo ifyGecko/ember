@@ -147,8 +147,10 @@ static uam_status x86_init(uam_cpu *cpu)
 static void x86_fini(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
-    if (s)
+    if (s) {
         free(s->msrs);
+        free(s->pkg);
+    }
     free(s);
     cpu->isa_state = NULL;
 }
@@ -164,6 +166,7 @@ static void power_on_state(uam_cpu *cpu, uint64_t entry)
     s->msr_policy = keep.msr_policy; s->msr_trace = keep.msr_trace;
     s->plat = keep.plat; s->cpuid = keep.cpuid; s->smm_map = keep.smm_map;
     s->smm_confine = keep.smm_confine;
+    s->pkg = keep.pkg; s->n_pkg = keep.n_pkg;
     s->preset_smm_addr = keep.preset_smm_addr; s->preset_smm_mask = keep.preset_smm_mask;
     s->preset_hwcr = keep.preset_hwcr;
     s->smm_addr = s->preset_smm_addr; s->smm_mask = s->preset_smm_mask; s->hwcr = s->preset_hwcr;
@@ -625,12 +628,11 @@ static bool intr_ready(uam_cpu *cpu)
 static bool x86_irq_wakeup(uam_cpu *cpu)
 {
     x86_state *s = x86_st(cpu);
-    if (s->wait_sipi)
-        /* A wait-for-SIPI AP still takes an SMI: SMM (e.g. PiSmmCpu SMBASE
-         * relocation) is broadcast to every core before the APs are started. */
-        return s->sipi_pending || s->init_pending || (s->smi_pending && !s->in_smm);
-    if (s->shutdown)
-        return s->init_pending;
+    if (s->wait_sipi)   /* an SMI is held until the startup IPI (MSR_SMM_BLOCKED) */
+        return s->sipi_pending || s->init_pending;
+    if (s->shutdown)    /* left on NMI, SMI, INIT or RESET (SDM vol. 3, interrupt 8) */
+        return s->init_pending || (s->smi_pending && !s->in_smm) ||
+               (s->nmi_pending && !s->nmi_blocked);
     return (s->smi_pending && !s->in_smm) || (s->init_pending && !s->in_smm) ||
            (s->nmi_pending && !s->nmi_blocked) || intr_ready(cpu);
 }
@@ -640,18 +642,7 @@ static bool x86_irq_take(uam_cpu *cpu)
     x86_state *s = x86_st(cpu);
     if (s->int_shadow)           /* MOV SS / POP SS: nothing before the next instruction */
         return false;
-    if (s->wait_sipi) {          /* INIT, SIPI and SMI are recognised */
-        if (s->smi_pending && !s->in_smm && !s->shutdown) {
-            /* SMI reaches an AP even in wait-for-SIPI (SMBASE relocation runs
-             * before APs are started). Enter SMM now and, on RSM, go back to
-             * waiting for the startup IPI rather than resuming execution. */
-            s->smi_pending = false;
-            s->wait_sipi = false;
-            s->wait_sipi_in_smm = true;
-            cpu->waiting = false;
-            x86_smm_enter(cpu);
-            return true;
-        }
+    if (s->wait_sipi) {          /* only INIT and the startup IPI: an SMI stays pending */
         if (s->init_pending) {
             s->init_pending = false;
             enter_wait_sipi(cpu);
@@ -666,10 +657,17 @@ static bool x86_irq_take(uam_cpu *cpu)
                     SEGA_P | SEGA_S | 0xB);
         cpu->pc = base;
         uam_cpu_xlate_changed(cpu);
-        return true;
+        if (!s->smi_pending)
+            return true;
+        /* an SMI held in wait-for-SIPI: taken at the first instruction boundary */
     }
-    if (s->smi_pending && !s->in_smm && !s->shutdown) {
+    if (s->smi_pending && !s->in_smm) {
         s->smi_pending = false;
+        if (s->shutdown) {       /* the SMI ends the shutdown state; RSM resumes at pc */
+            s->shutdown = false;
+            cpu->waiting = false;
+            fprintf(stderr, "x86: SMI ends the shutdown state at pc=%#llx\n", (unsigned long long)cpu->pc);
+        }
         s->halted_in_smm = cpu->waiting;
         cpu->waiting = false;
         x86_smm_enter(cpu);
@@ -709,15 +707,19 @@ static bool x86_irq_take(uam_cpu *cpu)
         enter_wait_sipi(cpu);
         return false;
     }
-    if (s->shutdown)
-        return false;
     if (s->nmi_pending && !s->nmi_blocked) {
         s->nmi_pending = false;
         s->nmi_blocked = true;
+        if (s->shutdown) {       /* the NMI ends the shutdown state; its IRET returns to pc */
+            s->shutdown = false;
+            fprintf(stderr, "x86: NMI ends the shutdown state at pc=%#llx\n", (unsigned long long)cpu->pc);
+        }
         cpu->waiting = false;
         x86_deliver(cpu, X86_EXC_NMI, false, 0, false, cpu->pc, false);
         return true;
     }
+    if (s->shutdown)             /* INTR does not end it */
+        return false;
     if (intr_ready(cpu) && s->plat.inta) {
         int vec = s->plat.inta(s->plat.ctx);
         if (vec < 0)
@@ -798,8 +800,12 @@ uam_status x86_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val)
     case X86_SR_CR3: *val = s->cr3; return UAM_OK;
     case X86_SR_CR4: *val = s->cr4; return UAM_OK;
     case X86_SR_CR8: *val = s->cr8; return UAM_OK;
+    case X86_SR_DR4: case X86_SR_DR5:   /* CR4.DE: #UD; otherwise DR6 and DR7 */
+        if (s->cr4 & CR4_DE)
+            return x86_raise(cpu, X86_EXC_UD, false, 0);
+        *val = s->dr[id - X86_SR_DR4 + 6]; return UAM_OK;
     case X86_SR_DR0: case X86_SR_DR1: case X86_SR_DR2: case X86_SR_DR3:
-    case X86_SR_DR4: case X86_SR_DR5: case X86_SR_DR6: case X86_SR_DR7:
+    case X86_SR_DR6: case X86_SR_DR7:
         *val = s->dr[id - X86_SR_DR0]; return UAM_OK;
     case X86_SR_RFLAGS:
         if (x86_priv_mode(cpu->priv) == X86_MODE_V86 && iopl(cpu) < 3)
@@ -840,8 +846,8 @@ uam_status x86_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t val)
         uam_cpu_xlate_changed(cpu);
         return UAM_OK;
     case X86_SR_CR4:
-        if ((s->efer & EFER_LMA) && !(val & CR4_PAE))
-            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        if ((val & ~x86_cr4_valid(cpu)) || ((s->efer & EFER_LMA) && !(val & CR4_PAE)))
+            return x86_raise(cpu, X86_EXC_GP, true, 0);   /* a bit of a feature CPUID lacks */
         if ((val ^ s->cr4) & (CR4_PAE | CR4_PSE | CR4_PGE | CR4_SMEP | CR4_SMAP | CR4_LA57)) {
             x86_tlb_flush(cpu);
             uam_cpu_xlate_changed(cpu);
@@ -849,8 +855,12 @@ uam_status x86_sysreg_write(uam_cpu *cpu, uint32_t id, uint64_t val)
         s->cr4 = val;
         return UAM_OK;
     case X86_SR_CR8: s->cr8 = val & 0xF; return UAM_OK;
+    case X86_SR_DR4: case X86_SR_DR5:   /* CR4.DE: #UD; otherwise DR6 and DR7 */
+        if (s->cr4 & CR4_DE)
+            return x86_raise(cpu, X86_EXC_UD, false, 0);
+        s->dr[id - X86_SR_DR4 + 6] = val; return UAM_OK;
     case X86_SR_DR0: case X86_SR_DR1: case X86_SR_DR2: case X86_SR_DR3:
-    case X86_SR_DR4: case X86_SR_DR5: case X86_SR_DR6: case X86_SR_DR7:
+    case X86_SR_DR6: case X86_SR_DR7:
         s->dr[id - X86_SR_DR0] = val; return UAM_OK;
     case X86_SR_RFLAGS: return write_rflags_popf(cpu, val);
     case X86_SR_RFLAGS_INT:
@@ -924,6 +934,32 @@ void uam_x86_preset_amd_smm(uam_cpu *cpu, uint64_t smm_addr, uint64_t smm_mask, 
     s->preset_hwcr = lock ? HWCR_SMMLOCK : 0;
     s->hwcr = (s->hwcr & ~HWCR_SMMLOCK) | s->preset_hwcr;
     uam_cpu_xlate_changed(cpu);
+}
+
+uam_status uam_x86_set_package(uam_cpu *const *cpus, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        x86_state *s = x86_st(cpus[i]);
+        uam_cpu **copy = malloc(n * sizeof(*copy));
+        if (!copy)
+            return UAM_ERR_NOMEM;
+        memcpy(copy, cpus, n * sizeof(*copy));
+        free(s->pkg);
+        s->pkg = copy;
+        s->n_pkg = n;
+    }
+    return UAM_OK;
+}
+
+/* MSR_SMM_BLOCKED: bit i set while package processor i blocks SMIs (wait-for-SIPI). */
+uint64_t x86_smm_blocked(uam_cpu *cpu)
+{
+    x86_state *s = x86_st(cpu);
+    uint64_t v = 0;
+    for (unsigned i = 0; i < s->n_pkg && i < 64; i++)
+        if (x86_st(s->pkg[i])->wait_sipi)
+            v |= 1ull << i;
+    return v;
 }
 
 void uam_x86_set_smm_confine(uam_cpu *cpu, bool on)
@@ -1000,7 +1036,7 @@ static void x86_save(uam_cpu *cpu, uam_state_writer *w)
     uam_state_put_u8(w, s->sipi_vector);
     const bool b[] = { s->nmi_pending, s->smi_pending, s->init_pending, s->nmi_blocked,
                        s->in_smm, s->halted_in_smm, s->shutdown, s->wait_sipi, s->sipi_pending,
-                       s->smi_io, s->smm_io, s->mmx, s->wait_sipi_in_smm, s->int_shadow };
+                       s->smi_io, s->smm_io, s->mmx, s->int_shadow };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         uam_state_put_bool(w, b[i]);
     for (unsigned i = 0; i < 8; i++) {
@@ -1031,7 +1067,7 @@ static void x86_restore(uam_cpu *cpu, uam_state_reader *r)
     bool *const b[] = { &s->nmi_pending, &s->smi_pending, &s->init_pending, &s->nmi_blocked,
                         &s->in_smm, &s->halted_in_smm, &s->shutdown, &s->wait_sipi,
                         &s->sipi_pending, &s->smi_io, &s->smm_io, &s->mmx,
-                        &s->wait_sipi_in_smm, &s->int_shadow };
+                        &s->int_shadow };
     for (size_t i = 0; i < UAM_ARRAY_LEN(b); i++)
         *b[i] = uam_state_get_bool(r);
     for (unsigned i = 0; i < 8; i++) {

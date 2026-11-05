@@ -228,7 +228,9 @@ reset vector.
 (the local APIC timer clock, default 1 GHz), `-o smm-map=intel64|amd64` (the SMRAM
 save-state layout the firmware's SMM handler expects; `amd64` also brings AMD's SMM_ADDR,
 SMM_MASK and HWCR.SMMLOCK: the TSeg closed outside SMM, locked until RESET),
-`-o smm-code-chk=1` (offer Intel's SMM code-access check, which the firmware enables) and
+`-o smm-code-chk=1` (offer Intel's SMM code-access check, which the firmware enables),
+`-o smm-blocked=1` (offer Intel's MSR_SMM_BLOCKED/MSR_SMM_DELAYED: the processors that hold
+an SMI while they wait for a startup IPI) and
 `-o smm-confine=1` (an SMM instruction fetch outside SMRAM is a machine check, on any
 vendor: a crash oracle for SMM call-outs).
 
