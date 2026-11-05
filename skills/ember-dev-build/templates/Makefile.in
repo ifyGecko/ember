@@ -1,0 +1,33 @@
+# Makefile - builds build/@BOARD@-run from emulation/*.c against ember's libraries.
+# scripts/build-ember.sh builds ember into .ember-build/ and writes .ember-build/paths.mk;
+# after that `make` (or scripts/rebuild.sh) is all an edit needs. Every emulation/*.c is
+# compiled: a new device file needs no Makefile change. -lm: ember's floating-point models
+# (x86 x87 and SSE, the MIPS and PowerPC FPUs) use libm.
+
+BOARD := @BOARD@
+-include .ember-build/paths.mk
+ifeq ($(EMBER_SRC),)
+$(error ember is not built yet: run scripts/build-ember.sh)
+endif
+
+CC     ?= cc
+CFLAGS ?= -O2 -g
+WARN   := -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes
+EMU_CFLAGS := -std=c11 -D_DEFAULT_SOURCE $(WARN) -I$(EMBER_SRC)/include -Iemulation $(CFLAGS)
+
+SRC := $(wildcard emulation/*.c)
+OBJ := $(SRC:emulation/%.c=build/obj/%.o)
+BIN := build/$(BOARD)-run
+
+$(BIN): $(OBJ) $(EMBER_BUILD)/libuam.a
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(EMBER_BUILD)/libuam.a -lm
+
+build/obj/%.o: emulation/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(EMU_CFLAGS) -MMD -MP -c $< -o $@
+
+.PHONY: clean
+clean:
+	rm -rf build/obj $(BIN)
+
+-include $(OBJ:.o=.d)

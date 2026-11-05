@@ -1,0 +1,664 @@
+/*
+ * pcbrd_board.c - the "pcbrd" board: an x86-64 PC. It creates the processors, maps RAM
+ * and the boot flash, instantiates ember's generic PC devices and the platform's own
+ * chipset devices (one file each in emulation/), and wires their lines. It implements no
+ * device. Bring-up guide: ember-dev-build references/pc-platform.md.
+ *
+ * Regression fixture for tests/run-tests.sh: the board new-emulation.sh --isa x86_64
+ * generates, with the PC example devices of ember-dev-build (references/examples/pc) wired
+ * in as a Q35-class chipset - enough for OVMF to boot to the UEFI shell, and for
+ * fixture/pc/fw to check every example:
+ *   00:00.0 Q35 MCH (q35_mch.c)  00:1f.0 ICH9 LPC (ich9_lpc.c), APM 0xB2, reset 0xCF9
+ *   00:1f.3 SMBus with an SPD EEPROM at 0x50 (i801_smbus.c): --image spd=FILE
+ *   00:1f.5 SPI controller (pch_spi.c): -o flash=spi, the whole SPI image as --image flash=
+ *   Super I/O at 0x2E deciding COM1's decode (superio.c): -o superio=1
+ *   test finisher at port 0x700
+ *
+ * Memory map (physical):
+ *   0x00000000 - low_top        RAM below the PCI/MMIO hole (BOARD_LOW_RAM_MAX: the TOLUD the
+ *                               firmware programs, RECON)
+ *   0x100000000 -               the rest of RAM (--ram SIZE beyond the hole)
+ *   board_windows[]             catch-alls over the chipset's fixed MMIO (RECON)
+ *   0xFEC00000                  I/O APIC
+ *   0xFED00000                  HPET
+ *   0xFEE00000                  local APIC (moves with IA32_APIC_BASE)
+ *   4 GiB - flash size          boot flash (CFI command set): --image flash=FILE (the BIOS
+ *                               region, ending at 4 GiB), or --image code=FILE + --image
+ *                               vars=FILE (an OVMF-style split: vars below code)
+ * I/O ports (the aperture at UAM_X86_PIO_BASE + port; IN/OUT are bus accesses there):
+ *   0x20/0xA0/0x4D0 8259 + ELCR, 0x40-0x43/0x61 8254, 0x60/0x64 8042, 0x70-0x73 RTC/CMOS,
+ *   0x80 POST codes, 0x92 system control A, 0x3F8 COM1 (the console), 0xCF8-0xCFF PCI
+ *   configuration; every other port goes to the "io" catch-all, which logs it and reads 0.
+ * Interrupts: ISA IRQs go to the 8259 and to the I/O APIC (IRQ 0 on pin 2); the 8259 feeds
+ * the bootstrap processor's LINT0; each local APIC drives its processor. PCI INTx: the
+ * standard swizzle onto I/O APIC pins 16-19 until the chipset's PIRQ router replaces it;
+ * MSI writes are interrupt messages on the APIC bus.
+ * Virtual time: one tick (instruction) is one nanosecond (BOARD_TICK_HZ).
+ *
+ * Options:
+ *   -o cpus=N          processors (1..BOARD_MAX_CPUS); the others wait for INIT/SIPI
+ *   -o apic-hz=HZ      local APIC timer input clock (default 1 GHz)
+ *   -o persist=1       write flash programs/erases back to the image files
+ *   -o debugcon=PORT   a debug console port writing to the console (edk2: 0x402)
+ *   -o msr-trace=1     log every MSR access no device answers ("x86: rdmsr/wrmsr" lines)
+ *   -o msr=gp          unknown MSRs raise #GP (default: remember writes, read them back)
+ *   -o apm-smi=1       any write to port 0xB2 raises SMI# on every processor (a stand-in
+ *                      until the chipset's SMI logic, which gates it, is modelled);
+ *                      without it or a chipset SMI device, software SMIs go nowhere
+ *   -o abort-log=0     unclaimed addresses master-abort silently (default: each first
+ *                      access is logged, master_abort_log.c)
+ *   --image cmos=FILE  initial CMOS/NVRAM contents (up to 256 bytes)
+ *   --image os=FILE    a raw stage placed in RAM at BOARD_IMAGE_BASE and entered at
+ *                      BOARD_ENTRY in real mode (test images, an extracted stage);
+ *                      without it the processors start at the reset vector 0xFFFFFFF0
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "uam/boards.h"
+#include "uam/dev/apic.h"
+#include "uam/dev/cfi_flash.h"
+#include "uam/dev/hpet.h"
+#include "uam/dev/i8042.h"
+#include "uam/dev/i8254.h"
+#include "uam/dev/i8259.h"
+#include "uam/dev/mc146818.h"
+#include "uam/dev/pc_misc.h"
+#include "uam/dev/pci.h"
+#include "uam/dev/test_finisher.h"
+#include "uam/dev/uart16550.h"
+#include "uam/dev/unimp.h"
+#include "uam/dev/unknown_mmio.h"
+#include "uam/isa/x86.h"
+#include "uam/loader.h"
+#include "uam/machine.h"
+
+#include "i801_smbus.h"
+#include "ich9_lpc.h"
+#include "master_abort_log.h"
+#include "pch_spi.h"
+#include "pcbrd_board.h"
+#include "q35_mch.h"
+#include "superio.h"
+
+#define BOARD_TICK_HZ       UINT64_C(1000000000)     /* virtual ticks per emulated second */
+#define BOARD_RAM_SIZE      UINT64_C(0x20000000)     /* default; --ram overrides */
+#define BOARD_LOW_RAM_MAX   UINT64_C(0x80000000)     /* RAM below 4 GiB ends here at most */
+#define BOARD_HIGH_RAM_BASE UINT64_C(0x100000000)
+#define BOARD_LAPIC_BASE    UINT64_C(0xFEE00000)
+#define BOARD_IOAPIC_BASE   UINT64_C(0xFEC00000)
+#define BOARD_HPET_BASE     UINT64_C(0xFED00000)
+#define BOARD_FLASH_BLOCK   UINT64_C(0x1000)         /* erase block of the boot flash */
+#define BOARD_FLASH_MAX     (UINT64_C(16) << 20)
+#define BOARD_RTC_EPOCH     UINT64_C(1767225600)     /* 2026-01-01 00:00:00 UTC: deterministic */
+#define BOARD_MAX_CPUS      64u
+/* --image os=: a raw stage in RAM, entered in real mode (CS base 0, IP = the entry). */
+#define BOARD_IMAGE_BASE    UINT64_C(0x0)
+#define BOARD_ENTRY         UINT64_C(0x0)
+#define BOARD_RESET_VEC     UINT64_C(0xfffffff0)    /* the architectural reset vector */
+
+/* The processor identity CPUID reports (RECON: the family/model/stepping the firmware
+ * compares, the vendor string it checks). Zero/empty keeps ember's generic identity. */
+#define BOARD_CPU_VENDOR    "GenuineIntel"           /* Core 2-class: the Q35 generation */
+#define BOARD_CPU_SIGNATURE 0x00010676u
+#define BOARD_CPU_BRAND     "ember-dev pcbrd x86-64 processor"
+#define BOARD_CPU_PHYS_BITS 39u
+
+/* Catch-alls over the chipset's fixed MMIO windows (physical: MCHBAR, DMIBAR, RCBA, SPIBAR,
+ * the PMC, the sideband port window, TPM, ...), mapped under the real devices at
+ * UAM_PRIO_BACKGROUND. Each reads as zero, logs the first access to each offset and prints
+ * its hottest offsets at exit: the bring-up to-do list. Windows a chipset device moves
+ * (BARs the firmware programs) belong to that device, not here. */
+static const struct board_window {
+    const char *name;
+    uint64_t    base, size;
+} board_windows[] = {
+    /* { "mchbar", UINT64_C(0xFED10000), 0x8000 },      RECON MMIO row: ... */
+    { NULL, 0, 0 },
+};
+
+/* Registers the --image os= entry point expects (RECON "entry state"); processor 0 only.
+ * x86 names: rax rcx rdx rbx rsp rbp rsi rdi r8-r15, cs ds es fs gs ss and their .base. */
+static const struct board_reg {
+    const char *name;
+    uint64_t    value;
+} board_entry_regs[] = {
+    /* { "rsp", 0x7000 }, */
+    { NULL, 0 },
+};
+
+/* ISA interrupt: to the 8259 and to the I/O APIC. */
+typedef struct isa_irq { uam_device *pic, *ioapic; } isa_irq;
+
+typedef struct board board;
+typedef struct board_cpu { board *b; unsigned i; } board_cpu;   /* platform hook context */
+
+/* Configuration and wiring. Anything here the guest can observe or that changes while it
+ * runs must also be registered with uam_machine_add_state, or snapshots will not restore it. */
+struct board {
+    uam_machine *m;
+    unsigned     ncpu;
+    uam_device  *lapic[BOARD_MAX_CPUS];
+    board_cpu    pcpu[BOARD_MAX_CPUS];
+    char         lapic_name[BOARD_MAX_CPUS][12];
+    uam_region  *lapic_region;
+    isa_irq      isa;
+    char        *os_path;
+    uam_device  *mch;
+};
+
+static uint64_t pio(uint64_t port) { return UAM_X86_PIO_BASE + port; }
+
+/* ---- platform hooks for the processors ---------------------------------------- */
+
+static int board_inta(void *ctx)
+{
+    board_cpu *c = ctx;
+    return uam_lapic_inta(c->b->lapic[c->i]);
+}
+
+static bool board_wrmsr(void *ctx, uint32_t msr, uint64_t val)
+{
+    board_cpu *c = ctx;
+    board *b = c->b;
+    uam_device *lapic = b->lapic[c->i];
+    if (msr == 0x1B) {   /* IA32_APIC_BASE: move the register page, enable this APIC */
+        bool en = (val >> 11) & 1, x2 = (val >> 10) & 1;
+        uam_bus_region_move(&b->m->bus, b->lapic_region, val & 0xFFFFFFFFFF000ull);
+        if (b->ncpu == 1)
+            uam_bus_region_enable(&b->m->bus, b->lapic_region, en && !x2);
+        uam_lapic_set_enabled(lapic, en);
+        uam_lapic_set_x2apic(lapic, x2);
+        return false;    /* the processor keeps IA32_APIC_BASE itself */
+    }
+    /* Platform MSRs the firmware needs answered (RECON MSR table) go to a chipset or
+     * "uncore" device's function from here; everything else falls to the MSR policy. */
+    return uam_lapic_wrmsr(lapic, msr, val);   /* x2APIC registers, IA32_TSC_DEADLINE */
+}
+
+static bool board_rdmsr(void *ctx, uint32_t msr, uint64_t *val)
+{
+    board_cpu *c = ctx;
+    return uam_lapic_rdmsr(c->b->lapic[c->i], msr, val);
+}
+
+/* SMIACT#: the processor entered (true) or left SMM. The chipset's SMRAM decode follows it
+ * (a host-bridge device: TSEG/A-segment regions enabled only in SMM). */
+static void board_smm_changed(void *ctx, bool in_smm)
+{
+    board_cpu *c = ctx;
+    if (c->b->mch)
+        q35_mch_smm(c->b->mch, in_smm);
+}
+
+static int pic_inta(void *ctx) { return uam_i8259_inta(ctx); }
+
+/* ACPI S5: the chipset powers the machine off. */
+static void power_off(void *ctx) { uam_machine_stop_cb(ctx, 0); }
+
+static void isa_sink(void *ctx, unsigned irq, int level)
+{
+    isa_irq *w = ctx;
+    uam_i8259_input(w->pic, irq, level);
+    uam_ioapic_input(w->ioapic, irq == 0 ? 2 : irq, level);
+}
+
+/* PCI INTx of bus-0 slot S, pin P: the standard swizzle onto I/O APIC pins 16-19. A chipset
+ * with PIRQ routing registers replaces this with its own router (uam_pci_set_intx_router). */
+static void pci_intx(void *ctx, unsigned slot, unsigned pin, int level)
+{
+    uam_ioapic_input(ctx, 16 + ((slot + pin) & 3), level);
+}
+
+/* A20M# and the chipset's SMI# reach every processor. */
+static void a20m_all(void *ctx, unsigned input, int level)
+{
+    (void)input;
+    board *b = ctx;
+    for (unsigned i = 0; i < b->ncpu; i++)
+        uam_cpu_irq_sink(uam_machine_cpu(b->m, i), UAM_X86_IRQ_A20M, level);
+}
+
+static void smi_all(void *ctx, unsigned input, int level)
+{
+    (void)input;
+    board *b = ctx;
+    for (unsigned i = 0; i < b->ncpu; i++)
+        uam_cpu_irq_sink(uam_machine_cpu(b->m, i), UAM_X86_IRQ_SMI, level);
+}
+
+/* ---- construction helpers ----------------------------------------------------- */
+
+static uam_status add(uam_machine *m, uam_device *d)
+{
+    if (!d)
+        return UAM_ERR_NOMEM;
+    uam_machine_add_device(m, d);
+    return UAM_OK;
+}
+
+static uam_status map_io(uam_machine *m, const char *name, uint64_t port, uint64_t size,
+                         uam_device *d)
+{
+    return uam_bus_map_mmio(&m->bus, name, pio(port), size, d);
+}
+
+static uam_status map_windows(uam_machine *m)
+{
+    for (const struct board_window *w = board_windows; w->name; w++) {
+        uam_device *u = uam_unimp_create(w->name, w->base);
+        uam_status st = add(m, u);
+        if (st != UAM_OK ||
+            (st = uam_bus_map_mmio_ex(&m->bus, w->name, w->base, w->size, u,
+                                      &(uam_map_attrs){ .prio = UAM_PRIO_BACKGROUND })) != UAM_OK)
+            return st;
+    }
+    return UAM_OK;
+}
+
+/* Boot flash ending at 4 GiB: "flash" alone, or "vars" below "code". */
+static uam_status map_flash(uam_machine *m, const uam_board_config *cfg, uam_region **boot)
+{
+    const char *names[2] = { uam_board_config_image(cfg, "code"), uam_board_config_image(cfg, "vars") };
+    const char *whole = uam_board_config_image(cfg, "flash");
+    uint64_t top = UINT64_C(0x100000000);
+    if (whole) {
+        names[0] = whole;
+        names[1] = NULL;
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        if (!names[i])
+            continue;
+        uint8_t *data;
+        size_t len;
+        uam_status st = uam_load_file(names[i], &data, &len);
+        if (st != UAM_OK)
+            return st;
+        uint64_t size = (len + BOARD_FLASH_BLOCK - 1) & ~(BOARD_FLASH_BLOCK - 1);
+        if (!size || size > BOARD_FLASH_MAX) {
+            free(data);
+            uam_log(UAM_LOG_ERROR, "pcbrd", "%s: flash image size %zu not supported", names[i], len);
+            return UAM_ERR_INVALID;
+        }
+        top -= size;
+        uam_device *f = uam_cfi_flash_map(&m->bus, i == 0 ? "flash-code" : "flash-vars", top, size,
+                                          BOARD_FLASH_BLOCK, data, len);
+        free(data);
+        if ((st = add(m, f)) != UAM_OK)
+            return st;
+        uam_cfi_flash_set_ids(f, 0x89, 0x18);      /* an Intel command-set firmware hub part */
+        if (i == 0)
+            *boot = uam_cfi_flash_region(f);
+        const char *persist = uam_board_config_option(cfg, "persist");
+        if (persist && strcmp(persist, "0") != 0 &&
+            (st = uam_cfi_flash_set_backing_file(f, names[i])) != UAM_OK)
+            return st;
+    }
+    return UAM_OK;
+}
+
+/* CMOS: an image of the battery-backed RAM, or the PC/AT memory-size bytes. */
+static uam_status cmos_init(uam_device *rtc, const uam_board_config *cfg, uint64_t low)
+{
+    const char *img = uam_board_config_image(cfg, "cmos");
+    if (img) {
+        uint8_t *data;
+        size_t len;
+        uam_status st = uam_load_file(img, &data, &len);
+        if (st != UAM_OK)
+            return st;
+        for (size_t i = 0; i < len && i < 256; i++)
+            if (i >= 0x0E)   /* 0x00-0x0D are the clock and its status registers */
+                uam_mc146818_nvram_set(rtc, (unsigned)i, data[i]);
+        free(data);
+        return UAM_OK;
+    }
+    /* The extended CMOS memory bytes OVMF reads when it has no other source: 64 KiB units above
+     * 16 MiB (0x34-0x35); this board puts no RAM above 4 GiB (0x5B-0x5D stay 0). */
+    uint64_t above16 = low > (16u << 20) ? (low - (16u << 20)) >> 16 : 0;
+    uam_mc146818_nvram_set(rtc, 0x34, (uint8_t)above16);
+    uam_mc146818_nvram_set(rtc, 0x35, (uint8_t)(above16 >> 8));
+    uint64_t ext_kb = low > (1u << 20) ? (low - (1u << 20)) >> 10 : 0;
+    if (ext_kb > 0xFFFF)
+        ext_kb = 0xFFFF;
+    uam_mc146818_nvram_set(rtc, 0x15, 0x80);   /* 640 KiB base memory */
+    uam_mc146818_nvram_set(rtc, 0x16, 0x02);
+    uam_mc146818_nvram_set(rtc, 0x17, (uint8_t)ext_kb);
+    uam_mc146818_nvram_set(rtc, 0x18, (uint8_t)(ext_kb >> 8));
+    uam_mc146818_nvram_set(rtc, 0x30, (uint8_t)ext_kb);
+    uam_mc146818_nvram_set(rtc, 0x31, (uint8_t)(ext_kb >> 8));
+    return UAM_OK;
+}
+
+static bool set_reg(uam_cpu *cpu, const char *name, uint64_t value)
+{
+    for (size_t i = 0; i < cpu->isa->n_regs; i++) {
+        const uam_regdesc *r = &cpu->isa->regs[i];
+        if (strcmp(r->name, name) == 0) {
+            uam_cpu_reg_write(cpu, r->offset, r->width, value);
+            return true;
+        }
+    }
+    uam_log(UAM_LOG_ERROR, "pcbrd", "entry register '%s' unknown to %s", name, cpu->isa->name);
+    return false;
+}
+
+static uam_hook_action entry_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx;
+    (void)pc;
+    for (const struct board_reg *r = board_entry_regs; r->name; r++)
+        set_reg(cpu, r->name, r->value);
+    return UAM_HOOK_CONTINUE;
+}
+
+/* Place the stage (raw at BOARD_IMAGE_BASE, or ELF by its own headers; physical addresses)
+ * and return where the bootstrap processor starts. */
+static uam_status place_os(uam_machine *m, const board *b, uint64_t *entry)
+{
+    uam_image_info info;
+    uam_status st = uam_load_image(&m->bus, NULL, b->os_path, BOARD_IMAGE_BASE, &info);
+    if (st != UAM_OK) {
+        uam_log(UAM_LOG_ERROR, "pcbrd", "cannot load %s: %s", b->os_path, uam_status_str(st));
+        return st;
+    }
+    *entry = info.elf_class ? info.entry : BOARD_ENTRY;
+    return UAM_OK;
+}
+
+/* A system reset (port 92h, the 8042, the chipset's 0xCF9) restarts every processor at
+ * m->reset_pc with RAM preserved. A raw stage is placed again, as its loader would. */
+static void board_reset(uam_machine *m, uam_reset_kind kind, void *ctx)
+{
+    board *b = ctx;
+    uint64_t entry;
+    if (kind == UAM_RESET_SYSTEM && b->os_path && place_os(m, b, &entry) == UAM_OK)
+        m->reset_pc = entry;
+}
+
+static void board_fini(uam_machine *m)
+{
+    board *b = m->board_data;
+    if (b)
+        free(b->os_path);
+    free(b);
+    m->board_data = NULL;
+}
+
+/* ---- the board ---------------------------------------------------------------- */
+
+static uam_status build(uam_machine *m, const uam_board_config *cfg)
+{
+    uam_status st = uam_machine_init(m, &uam_isa_x86_64);
+    if (st != UAM_OK)
+        return st;
+    m->board_name = "pcbrd";
+    m->reset_pc = BOARD_RESET_VEC;
+
+    board *b = calloc(1, sizeof(*b));
+    if (!b)
+        return UAM_ERR_NOMEM;
+    b->m = m;
+    m->board_data = b;
+    m->board_fini = board_fini;
+    m->on_reset = board_reset;
+    m->on_reset_ctx = b;
+    const char *ncpu = uam_board_config_option(cfg, "cpus");
+    b->ncpu = ncpu ? (unsigned)strtoul(ncpu, NULL, 0) : 1;
+    if (b->ncpu < 1 || b->ncpu > BOARD_MAX_CPUS) {
+        uam_log(UAM_LOG_ERROR, "pcbrd", "cpus=%s: 1..%u", ncpu, BOARD_MAX_CPUS);
+        return UAM_ERR_INVALID;
+    }
+    if ((st = uam_machine_add_cpus(m, b->ncpu - 1)) != UAM_OK)
+        return st;
+    isa_irq *isa = &b->isa;
+
+    /* RAM: below the MMIO hole, the rest above 4 GiB */
+    uint64_t ram = cfg->ram_size ? cfg->ram_size : BOARD_RAM_SIZE;
+    uint64_t low = ram < BOARD_LOW_RAM_MAX ? ram : BOARD_LOW_RAM_MAX, high = ram - low;
+    if ((st = uam_bus_map_ram(&m->bus, "ram", 0, low)) != UAM_OK)
+        return st;
+    if (high && (st = uam_bus_map_ram(&m->bus, "ram-high", BOARD_HIGH_RAM_BASE, high)) != UAM_OK)
+        return st;
+
+    /* the port space: catch-all first, real devices on top; then the MMIO catch-alls */
+    uam_device *iowin = uam_unimp_create("io", UAM_X86_PIO_BASE);
+    if ((st = add(m, iowin)) != UAM_OK ||
+        (st = uam_bus_map_mmio_ex(&m->bus, "io", UAM_X86_PIO_BASE, UAM_X86_PIO_SIZE, iowin,
+                                  &(uam_map_attrs){ .prio = UAM_PRIO_BACKGROUND })) != UAM_OK ||
+        (st = map_windows(m)) != UAM_OK)
+        return st;
+    /* boot flash: CFI (OVMF), or the SPI controller's BIOS window (-o flash=spi) */
+    uam_region *boot = NULL;
+    uam_device *spi = NULL;
+    const char *fl = uam_board_config_option(cfg, "flash");
+    if (fl && strcmp(fl, "spi") == 0) {
+        const char *img = uam_board_config_image(cfg, "flash");
+        uint8_t *data;
+        size_t len;
+        static const uint8_t jedec[3] = { 0xEF, 0x40, 0x14 };   /* a 1 MiB SPI NOR part */
+        if (!img || (st = uam_load_file(img, &data, &len)) != UAM_OK)
+            return img ? st : UAM_ERR_INVALID;
+        spi = pch_spi_create("spi", &m->bus, data, len, UINT64_C(0x100000000), 0x8086, 0xA324,
+                             jedec);
+        free(data);
+        if ((st = add(m, spi)) != UAM_OK)
+            return st;
+        boot = pch_spi_window(spi);
+    } else if ((st = map_flash(m, cfg, &boot)) != UAM_OK) {
+        return st;
+    }
+
+    /* interrupt controllers: 8259 pair, I/O APIC, one local APIC per processor on a bus */
+    uam_device *pic = uam_i8259_create("pic");
+    const char *ahz = uam_board_config_option(cfg, "apic-hz");
+    uint64_t apic_hz = ahz ? strtoull(ahz, NULL, 0) : 1000000000u;
+    uam_device *ioapic = uam_ioapic_create("ioapic", (uint8_t)b->ncpu);
+    uam_apic_bus *abus = uam_apic_bus_create("apic-bus");
+    if ((st = add(m, pic)) != UAM_OK || (st = add(m, ioapic)) != UAM_OK ||
+        (st = add(m, abus ? uam_apic_bus_device(abus) : NULL)) != UAM_OK)
+        return st;
+    isa->pic = pic;
+    isa->ioapic = ioapic;
+    for (unsigned i = 0; i < b->ncpu; i++) {
+        uam_cpu *cpu = uam_machine_cpu(m, i);
+        snprintf(b->lapic_name[i], sizeof(b->lapic_name[i]), i ? "lapic%u" : "lapic", i);
+        uam_device *l = uam_lapic_create(b->lapic_name[i], &m->sched, BOARD_TICK_HZ, apic_hz,
+                                         (uint8_t)i);
+        if ((st = add(m, l)) != UAM_OK || (st = uam_apic_bus_add(abus, l)) != UAM_OK)
+            return st;
+        b->lapic[i] = l;
+        b->pcpu[i] = (board_cpu){ b, i };
+        uam_lapic_set_eoi_hook(l, uam_ioapic_eoi, ioapic);
+        uam_lapic_set_startup(l, uam_x86_sipi, cpu);
+        uam_lapic_set_tsc(l, uam_x86_read_tsc, cpu);
+        uam_signal_connect(uam_lapic_intr_line(l), uam_cpu_irq_sink, cpu, UAM_X86_IRQ_INTR);
+        uam_signal_connect(uam_lapic_nmi_line(l), uam_cpu_irq_sink, cpu, UAM_X86_IRQ_NMI);
+        uam_signal_connect(uam_lapic_smi_line(l), uam_cpu_irq_sink, cpu, UAM_X86_IRQ_SMI);
+        uam_signal_connect(uam_lapic_init_line(l), uam_cpu_irq_sink, cpu, UAM_X86_IRQ_INIT);
+    }
+    /* every processor sees its own APIC at the register page */
+    uam_device *lwin = b->ncpu == 1 ? b->lapic[0]
+                     : uam_lapic_window_create("lapic-window", b->lapic, b->ncpu,
+                                               uam_machine_current_cpu, m);
+    if (b->ncpu > 1 && (st = add(m, lwin)) != UAM_OK)
+        return st;
+    if ((st = map_io(m, "pic-master", 0x20, 2, uam_i8259_master(pic))) != UAM_OK ||
+        (st = map_io(m, "pic-slave", 0xA0, 2, uam_i8259_slave(pic))) != UAM_OK ||
+        (st = map_io(m, "elcr", 0x4D0, 2, uam_i8259_elcr(pic))) != UAM_OK ||
+        (st = uam_bus_map_mmio(&m->bus, "lapic", BOARD_LAPIC_BASE, UAM_LAPIC_SIZE, lwin)) != UAM_OK ||
+        (st = uam_bus_map_mmio(&m->bus, "ioapic", BOARD_IOAPIC_BASE, UAM_IOAPIC_SIZE, ioapic)) != UAM_OK)
+        return st;
+    b->lapic_region = uam_bus_region(&m->bus, "lapic");
+    uam_signal_connect(uam_i8259_intr_line(pic), uam_lapic_lint, b->lapic[0], 0);
+    uam_lapic_set_extint(b->lapic[0], pic_inta, pic);
+    uam_ioapic_set_target(ioapic, uam_apic_bus_deliver, abus);
+
+    /* timers and the RTC/CMOS */
+    uam_device *pit = uam_i8254_create("pit", &m->sched, BOARD_TICK_HZ);
+    uam_device *rtc = uam_mc146818_create("rtc", &m->sched, BOARD_TICK_HZ, BOARD_RTC_EPOCH);
+    uam_device *hpet = uam_hpet_create("hpet", &m->sched, BOARD_TICK_HZ);
+    if ((st = add(m, pit)) != UAM_OK || (st = add(m, rtc)) != UAM_OK || (st = add(m, hpet)) != UAM_OK)
+        return st;
+    if ((st = map_io(m, "pit", 0x40, 4, uam_i8254_ports(pit))) != UAM_OK ||
+        (st = map_io(m, "port61", 0x61, 1, uam_i8254_port61(pit))) != UAM_OK ||
+        (st = map_io(m, "rtc", 0x70, 2, uam_mc146818_bank0(rtc))) != UAM_OK ||
+        (st = map_io(m, "rtc-bank1", 0x72, 2, uam_mc146818_bank1(rtc))) != UAM_OK ||
+        (st = uam_bus_map_mmio(&m->bus, "hpet", BOARD_HPET_BASE, UAM_HPET_SIZE, hpet)) != UAM_OK ||
+        (st = cmos_init(rtc, cfg, low)) != UAM_OK)
+        return st;
+    uam_signal_connect(uam_i8254_irq_line(pit), isa_sink, isa, 0);
+    uam_signal_connect(uam_mc146818_irq_line(rtc), isa_sink, isa, 8);
+    uam_hpet_set_sinks(hpet, uam_ioapic_input, ioapic, isa_sink, isa, (1u << UAM_IOAPIC_PINS) - 1);
+
+    /* keyboard controller, COM1 (the console), POST codes, port 92h and the A20 gate */
+    const char *sio_opt = uam_board_config_option(cfg, "superio");
+    bool sio_on = sio_opt && strcmp(sio_opt, "0") != 0;
+    uam_device *kbc = uam_i8042_create("i8042");
+    uam_device *uart = uam_uart16550_create("com1", cfg->console);
+    uam_device *post = uam_postcode_create("post");
+    uam_device *sysctl = uam_pc_sysctl_create("sysctl");
+    uam_device *a20 = uam_a20_gate_create("a20");
+    if ((st = add(m, kbc)) != UAM_OK || (st = add(m, uart)) != UAM_OK || (st = add(m, post)) != UAM_OK ||
+        (st = add(m, sysctl)) != UAM_OK || (st = add(m, a20)) != UAM_OK)
+        return st;
+    if ((st = map_io(m, "kbc-data", 0x60, 1, uam_i8042_data(kbc))) != UAM_OK ||
+        (st = map_io(m, "kbc-cmd", 0x64, 1, uam_i8042_cmd(kbc))) != UAM_OK ||
+        (st = uam_bus_map_mmio_ex(&m->bus, "com1", pio(0x3F8), 8, uart,
+                                  &(uam_map_attrs){ .disabled = sio_on })) != UAM_OK ||
+        (st = map_io(m, "post", 0x80, 1, post)) != UAM_OK ||
+        (st = map_io(m, "sysctl", 0x92, 1, sysctl)) != UAM_OK ||
+        (st = uam_board_add_uart_input(m, "com1", uart)) != UAM_OK)
+        return st;
+    uam_signal_connect(uam_i8042_kbd_irq(kbc), isa_sink, isa, 1);
+    uam_signal_connect(uam_i8042_aux_irq(kbc), isa_sink, isa, 12);
+    uam_signal_connect(uam_uart16550_irq_line(uart), isa_sink, isa, 4);
+    uam_signal_connect(uam_i8042_reset_line(kbc), uam_machine_reset_sink, m, UAM_RESET_SYSTEM);
+    uam_signal_connect(uam_pc_sysctl_reset_line(sysctl), uam_machine_reset_sink, m, UAM_RESET_SYSTEM);
+    uam_signal_connect(uam_i8042_a20_line(kbc), uam_a20_gate_input, a20, 0);
+    uam_signal_connect(uam_pc_sysctl_a20_line(sysctl), uam_a20_gate_input, a20, 1);
+    uam_signal_connect(uam_a20_gate_a20m_line(a20), a20m_all, b, 0);
+    const char *dc = uam_board_config_option(cfg, "debugcon");
+    if (dc) {
+        uam_device *con = uam_debugcon_create("debugcon", cfg->console, 0xFF);
+        if ((st = add(m, con)) != UAM_OK ||
+            (st = map_io(m, "debugcon", strtoull(dc, NULL, 0) & 0xFFFF, 1, con)) != UAM_OK)
+            return st;
+    }
+
+    /* PCI configuration space: bus 0 behind 0xCF8/0xCFC; MSI to the APIC bus */
+    uam_pci_bus *pci = uam_pci_bus_create("pci", &m->bus, UAM_X86_PIO_BASE);
+    if (!pci)
+        return UAM_ERR_NOMEM;
+    uam_machine_add_device(m, uam_pci_bus_device(pci));
+    if ((st = map_io(m, "pci-cfg", 0xCF8, 8, uam_pci_cam(pci))) != UAM_OK)
+        return st;
+    uam_pci_set_intx_router(pci, pci_intx, ioapic);
+    uam_pci_set_msi_sink(pci, uam_apic_bus_msi, abus);
+
+    /* the chipset: Q35 MCH 00:00.0 and ICH9 LPC 00:1f.0 */
+    q35_mch_config mc = { .sys = &m->bus, .pci = pci, .low_ram_top = low, .boot_flash = boot };
+    uam_device *mch = q35_mch_create("mch", &mc);
+    uam_device *lpc = ich9_lpc_create("lpc", pci, &m->bus, &m->sched, BOARD_TICK_HZ, UAM_X86_PIO_BASE);
+    if ((st = add(m, mch)) != UAM_OK || (st = add(m, lpc)) != UAM_OK ||
+        (st = map_io(m, "apm", 0xB2, 2, ich9_apm(lpc))) != UAM_OK)
+        return st;
+    b->mch = mch;
+    uam_pci_cam_passthrough(pci, ich9_reset_control(lpc));      /* RST_CNT at 0xCF9 */
+    uam_pci_set_intx_router(pci, ich9_pci_intx, lpc);           /* replaces the swizzle */
+    ich9_set_irq_targets(lpc, uam_i8259_input, pic, uam_ioapic_input, ioapic);
+    ich9_set_poweroff(lpc, power_off, m);
+    uam_signal_connect(ich9_smi_line(lpc), smi_all, b, 0);
+    uam_signal_connect(ich9_sci_line(lpc), isa_sink, isa, 9);
+    uam_signal_connect(ich9_reset_line(lpc), uam_machine_reset_sink, m, UAM_RESET_SYSTEM);
+    if (spi && (st = uam_pci_register(pci, pch_spi_func(spi), 31, 5)) != UAM_OK)
+        return st;
+
+    /* SMBus 00:1f.3 with an SPD EEPROM at 0x50 (--image spd=FILE) */
+    const char *spd = uam_board_config_image(cfg, "spd");
+    if (spd) {
+        uint8_t *data;
+        size_t len;
+        uam_device *smb = i801_smbus_create("smbus", 0x8086, 0x2930);
+        if ((st = add(m, smb)) != UAM_OK || (st = uam_load_file(spd, &data, &len)) != UAM_OK)
+            return st;
+        st = i801_smbus_add_spd(smb, 0x50, data, len);
+        free(data);
+        if (st != UAM_OK || (st = uam_pci_register(pci, i801_smbus_func(smb), 31, 3)) != UAM_OK)
+            return st;
+    }
+
+    /* Super I/O at 0x2E: logical device 2 (UART A) decides where COM1 decodes */
+    if (sio_on) {
+        superio_config sc = { .enter_key = { 0x87, 0x87 }, .enter_len = 2, .exit_key = 0xAA,
+                              .chip_id = 0x0C11 };
+        uam_device *sio = superio_create("superio", &sc, &m->bus, UAM_X86_PIO_BASE);
+        if ((st = add(m, sio)) != UAM_OK || (st = map_io(m, "superio", 0x2E, SUPERIO_SIZE, sio)) != UAM_OK ||
+            (st = superio_add_ldn(sio, 2, uam_bus_region(&m->bus, "com1"), 0x3F8, 4, false)) != UAM_OK)
+            return st;
+    }
+
+    /* the test finisher (fixture firmware) */
+    uam_device *test = uam_test_finisher_create("test", uam_machine_stop_cb, m);
+    if ((st = add(m, test)) != UAM_OK || (st = map_io(m, "test", 0x700, 0x10, test)) != UAM_OK)
+        return st;
+
+    /* each processor's view of the platform */
+    const char *mt = uam_board_config_option(cfg, "msr-trace");
+    const char *mp = uam_board_config_option(cfg, "msr");
+    for (unsigned i = 0; i < b->ncpu; i++) {
+        uam_cpu *cpu = uam_machine_cpu(m, i);
+        uam_x86_platform plat = { .ctx = &b->pcpu[i], .inta = board_inta, .rdmsr = board_rdmsr,
+                                  .wrmsr = board_wrmsr, .smm_changed = board_smm_changed };
+        uam_x86_set_platform(cpu, &plat);
+        uam_x86_set_msr_policy(cpu, mp && strcmp(mp, "gp") == 0 ? UAM_X86_MSR_GP : UAM_X86_MSR_STORE,
+                               mt && strcmp(mt, "0") != 0);
+        uam_x86_cpuid_info id;
+        uam_x86_get_cpuid(cpu, &id);
+        if (BOARD_CPU_VENDOR[0])
+            snprintf(id.vendor, sizeof(id.vendor), "%s", BOARD_CPU_VENDOR);
+        if (BOARD_CPU_SIGNATURE)
+            id.signature = BOARD_CPU_SIGNATURE;
+        if (BOARD_CPU_BRAND[0])
+            snprintf(id.brand, sizeof(id.brand), "%s", BOARD_CPU_BRAND);
+        id.phys_addr_bits = BOARD_CPU_PHYS_BITS;
+        id.features |= UAM_X86_FEAT_X2APIC | UAM_X86_FEAT_TSC_DEADLINE;
+        id.logical_cpus = b->ncpu;
+        id.initial_apic_id = i;
+        uam_x86_set_cpuid(cpu, &id);
+    }
+
+    /* Addresses no region claims: master abort as on a PC (reads all ones, writes dropped),
+     * each first access logged unless -o abort-log=0; --unknown-mmio zero|echo instead reads
+     * them as zero (or the last write), for a run that hunts a missing window. */
+    const char *al = uam_board_config_option(cfg, "abort-log");
+    uam_device *um = cfg->unknown_mmio == UAM_UNKNOWN_FAULT
+        ? master_abort_log_create("master-abort", !al || strcmp(al, "0") != 0)
+        : uam_unknown_mmio_create("unknown-mmio", cfg->unknown_mmio == UAM_UNKNOWN_ECHO
+                                                      ? UAM_UNKNOWN_POLICY_ECHO
+                                                      : UAM_UNKNOWN_POLICY_ZERO);
+    if ((st = add(m, um)) != UAM_OK)
+        return st;
+    uam_bus_set_unmapped(&m->bus, um);
+
+    uint64_t entry = BOARD_RESET_VEC;
+    const char *os = uam_board_config_image(cfg, "os");
+    if (os) {
+        if (!(b->os_path = strdup(os)))
+            return UAM_ERR_NOMEM;
+        if ((st = place_os(m, b, &entry)) != UAM_OK)
+            return st;
+    }
+    if (board_entry_regs[0].name && (st = uam_exec_add_pc_hook(&m->exec, entry, entry_hook, b)) != UAM_OK)
+        return st;
+
+    uam_machine_reset(m, entry);
+    return UAM_OK;
+}
+
+const uam_board pcbrd_board = {
+    .name = "pcbrd",
+    .description = "pcbrd firmware emulation (x86_64)",
+    .build = build,
+};

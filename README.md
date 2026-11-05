@@ -450,6 +450,16 @@ of corrupting memory. Rebuild the library and the board together after updating 
 Only the modules you reference are linked: a MIPS-only board pulls in neither
 the RISC-V lifter nor the stock boards.
 
+## Agent skills
+
+`skills/` holds agent skills that take a firmware image from an unknown blob to a running
+ember board and then fuzz it: `ember-dev-recon` (triage: architecture, load address, memory
+map, MMIO, whether ember can run it), `ember-dev-build` (an out-of-tree board brought up one
+device at a time, against ember built from a pinned commit) and `ember-fuzz` (the snapshot
+fuzz harness and suzzer). They are plain `SKILL.md` folders; `skills/install.sh` links them
+into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agents/skills`).
+`skills/tests/run-tests.sh ~/ember` checks their tooling end to end. See `skills/README.md`.
+
 ## Layout
 
 ```
@@ -539,6 +549,7 @@ tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 tools/             also fetch-suzzer.sh (make suzzer), xbench.sh / jitbench.sh (timing),
                    jitprof.py (native-code profiles; docs/jit-perf.md)
 examples/          external-board: an out-of-tree board using the library
+skills/            agent skills (recon, board bring-up, fuzzing), their installer and tests
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
                    loops, stores next to code, MMIO rules, coverage, the fuzz harness,

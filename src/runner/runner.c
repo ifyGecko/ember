@@ -6,11 +6,11 @@
  *   124 instruction or virtual-time limit, 125 deadlock, 126 internal error or
  *   fault loop, 127 debug trap or breakpoint, 128 livelock (waiting while timers
  *   keep firing, and no console or network input that could wake the hart),
- *   130 interrupted (SIGINT/SIGTERM),
+ *   129 a --guard stopped the run, 130 interrupted (SIGINT/SIGTERM),
  *   2 usage or setup error.
  * With --fuzz-replay, the most severe verdict of any input instead (uam/fuzz.h):
  *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout, 24 rejected (the
- *   input route refused it); of several crashes, the first one's.
+ *   input route refused it), 25 crash (guard); of several crashes, the first one's.
  * A fuzz run that stops on an error (an internal error of the executor, a lost
  * frontend) exits 2.
  */

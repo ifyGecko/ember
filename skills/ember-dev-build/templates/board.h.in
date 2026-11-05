@@ -1,0 +1,11 @@
+/*
+ * @CNAME@_board.h - the "@BOARD@" board descriptor, registered by main.c.
+ */
+#ifndef @GUARD@_BOARD_H
+#define @GUARD@_BOARD_H
+
+#include "uam/machine.h"
+
+extern const uam_board @CNAME@_board;
+
+#endif

@@ -180,6 +180,9 @@ tools/            uam-run.c fetch-suzzer.sh (`make suzzer`: clone suzzer into ./
                   by git) xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
                   docs/jit-perf.md)
 examples/         external-board/ (an out-of-tree board built against `make lib`)
+skills/           ember-dev-recon/ ember-dev-build/ ember-fuzz/ (agent skills: SKILL.md, scripts,
+                  references, templates) install.sh tests/ (run-tests.sh: the skills' tooling
+                  against an ember checkout; never part of the library)
 tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: reference boards plus
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c

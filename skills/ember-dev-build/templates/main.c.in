@@ -1,0 +1,14 @@
+/*
+ * main.c - the @BOARD@ runner: register the board, then run ember's stock command line
+ * (uam/runner.h): consoles, network ports, tracing, PC breakpoints, gdb, statistics.
+ * The stock boards are not linked in.
+ */
+#include "uam/runner.h"
+
+#include "@CNAME@_board.h"
+
+int main(int argc, char **argv)
+{
+    uam_board_register(&@CNAME@_board);
+    return uam_run_main(argc, argv);
+}

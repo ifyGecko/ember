@@ -1,0 +1,219 @@
+/*
+ * @CNAME@_board.c - the "@BOARD@" board: creates the hart, maps memory, places the
+ * firmware, instantiates the devices and wires their lines. It implements no device:
+ * each hardware component is its own file in emulation/.
+ *
+ * Addresses and evidence: RECON.md. Cite the iter-XX.md that introduced each change.
+ * Local emulation for analysis; not part of ember.
+ */
+#include <stdlib.h>
+#include <string.h>
+@INCLUDES@
+#include "@ISA_HEADER@"
+#include "uam/dev/unimp.h"
+#include "uam/dev/unknown_mmio.h"
+#include "uam/loader.h"
+#include "uam/machine.h"
+
+#include "@CNAME@_board.h"
+
+/* Memory map: PHYSICAL addresses (ember's bus is physical).@MEM_NOTE@ */
+#define BOARD_RAM_BASE   UINT64_C(@RAM_BASE@)
+#define BOARD_RAM_SIZE   UINT64_C(@RAM_SIZE@)
+@MEM_DEFINES@/* Firmware placement, in the guest's own (virtual) addresses: the loader translates them
+ * (MIPS kseg0/kseg1 -> physical) before writing to the bus. */
+#define BOARD_IMAGE_BASE UINT64_C(@IMAGE_BASE@)  /* RECON: confirmed base */
+#define BOARD_ENTRY      UINT64_C(@ENTRY@)  /* RECON: entry point */
+#define BOARD_RESET_VEC  UINT64_C(@RESET_VEC@)  /* where the hart starts with no --image os= */
+/* Processors (-o cpus=N): every processor starts at the reset address and the firmware
+ * tells them apart by its architectural number (MIPS EBase.CPUNum, RISC-V mhartid, ARM
+ * MPIDR.Aff0, PowerPC PIR, Xtensa PRID) and parks the ones it does not use. Per-processor
+ * interrupts (an IPI block, per-hart timer lines) are board wiring: one connection per
+ * uam_machine_cpu(m, i). 1: an architecture with one processor per board. */
+#define BOARD_MAX_CPUS   @MAX_CPUS@u
+
+/* Catch-alls over EVERY RECON MMIO window (physical), mapped under the real devices at
+ * UAM_PRIO_BACKGROUND. Each reads as zero, logs the first access to each offset and prints
+ * its hottest offsets at exit: the bring-up to-do list. Keep a window when a real device is
+ * mapped over part of it, so stray offsets still log. */
+static const struct board_window {
+    const char *name;
+    uint64_t    base, size;
+} board_windows[] = {
+    /* { "sysctl", UINT64_C(0x18000000), 0x10000 },     RECON MMIO row: ... */
+@DEFAULT_WINDOWS@    { NULL, 0, 0 },
+};
+
+/* Registers the entry point expects from the loader that normally jumps there (RECON
+ * "entry state"). Applied by a PC hook each time the hart arrives at BOARD_ENTRY, so they
+ * also hold after a guest-requested reset. Leave empty if the entry sets them itself. */
+static const struct board_reg {
+    const char *name;   /* ISA register name: "sp", "a0", "gp", ... */
+    uint64_t    value;
+} board_entry_regs[] = {
+    /* { "sp", 0x80400000 },  { "a0", 0 },  */
+    { NULL, 0 },
+};
+
+/* Configuration only. Anything here the guest can observe or that changes while it runs
+ * must also be registered with uam_machine_add_state, or snapshots will not restore it. */
+typedef struct board {
+    char *os_path;   /* --image os=PATH; re-placed on every system reset */
+} board;
+
+@HELPERS@static uam_status attach(uam_machine *m, uam_device *dev, uint64_t base, uint64_t size)
+{
+    if (!dev)
+        return UAM_ERR_NOMEM;
+    uam_machine_add_device(m, dev);
+    return uam_bus_map_mmio(&m->bus, dev->name, base, size, dev);
+}
+
+static uam_status map_windows(uam_machine *m)
+{
+    for (const struct board_window *w = board_windows; w->name; w++) {
+        uam_device *u = uam_unimp_create(w->name, w->base);
+        if (!u)
+            return UAM_ERR_NOMEM;
+        uam_machine_add_device(m, u);
+        uam_status st = uam_bus_map_mmio_ex(&m->bus, w->name, w->base, w->size, u,
+                                            &(uam_map_attrs){ .prio = UAM_PRIO_BACKGROUND });
+        if (st != UAM_OK)
+            return st;
+    }
+    return UAM_OK;
+}
+
+static bool set_reg(uam_cpu *cpu, const char *name, uint64_t value)
+{
+    for (size_t i = 0; i < cpu->isa->n_regs; i++) {
+        const uam_regdesc *r = &cpu->isa->regs[i];
+        if (strcmp(r->name, name) == 0) {
+            uam_cpu_reg_write(cpu, r->offset, r->width, value);
+            return true;
+        }
+    }
+    uam_log(UAM_LOG_ERROR, "@BOARD@", "entry register '%s' unknown to %s", name, cpu->isa->name);
+    return false;
+}
+
+static uam_hook_action entry_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx;
+    (void)pc;
+    for (const struct board_reg *r = board_entry_regs; r->name; r++)
+        set_reg(cpu, r->name, r->value);
+    return UAM_HOOK_CONTINUE;
+}
+
+/* Place the OS image (raw at BOARD_IMAGE_BASE, or ELF by its own headers) and return where
+ * the hart should start. */
+static uam_status place_os(uam_machine *m, const board *b, uint64_t *entry)
+{
+    uam_image_info info;
+    uam_status st = uam_load_image(&m->bus, &m->cpu, b->os_path, BOARD_IMAGE_BASE, &info);
+    if (st != UAM_OK) {
+        uam_log(UAM_LOG_ERROR, "@BOARD@", "cannot load %s: %s", b->os_path, uam_status_str(st));
+        return st;
+    }
+    *entry = info.elf_class ? info.entry : BOARD_ENTRY;
+    return UAM_OK;
+}
+
+/* A device asked for a system reset (RAM is preserved, devices are reset afterwards). We
+ * skip the real boot loader, so do its job: put a fresh copy of the OS in place. */
+static void board_reset(uam_machine *m, uam_reset_kind kind, void *ctx)
+{
+    board *b = ctx;
+    uint64_t entry;
+    if (kind == UAM_RESET_SYSTEM && b->os_path && place_os(m, b, &entry) == UAM_OK)
+        m->reset_pc = entry;
+}
+
+static void board_fini(uam_machine *m)
+{
+    board *b = m->board_data;
+    if (b)
+        free(b->os_path);
+    free(b);
+    m->board_data = NULL;
+}
+
+static uam_status build(uam_machine *m, const uam_board_config *cfg)
+{
+    uam_status st = uam_machine_init(m, &@ISA_DESC@);
+    if (st != UAM_OK)
+        return st;
+    m->board_name = "@BOARD@";
+    m->reset_pc = BOARD_RESET_VEC;
+    /* More processors are added before the first reset; each gets the CPU model below. */
+    const char *ncpu_opt = uam_board_config_option(cfg, "cpus");
+    unsigned ncpu = ncpu_opt ? (unsigned)strtoul(ncpu_opt, NULL, 0) : 1;
+    if (ncpu < 1 || ncpu > BOARD_MAX_CPUS) {
+        uam_log(UAM_LOG_ERROR, "@BOARD@", "cpus=%s: 1..%u", ncpu_opt, BOARD_MAX_CPUS);
+        return UAM_ERR_INVALID;
+    }
+    if ((st = uam_machine_add_cpus(m, ncpu - 1)) != UAM_OK)
+        return st;
+@CPU_MODEL@
+    board *b = calloc(1, sizeof(*b));
+    if (!b)
+        return UAM_ERR_NOMEM;
+    m->board_data = b;
+    m->board_fini = board_fini;
+    m->on_reset = board_reset;
+    m->on_reset_ctx = b;
+
+@RAM_MAP@
+    if (st != UAM_OK)
+        return st;
+@MEMORY@    if ((st = map_windows(m)) != UAM_OK)
+        return st;
+
+@PLATFORM@
+    /* Devices, one file each, added iteration by iteration. The console UART comes first:
+     *   uam_device *uart = soc_uart_create("uart0", cfg->console);       (emulation/soc_uart.c)
+     *   if ((st = attach(m, uart, UART_BASE, 0x100)) != UAM_OK)          (UART_BASE: RECON)
+     *       return st;
+     *   @IRQ_CONNECT@
+     * Every device implements save/restore (or is UAM_DEVICE_STATELESS), or snapshots fail.
+     * A register the guest needs before its device exists: --mmio-rule in run.sh (the
+     * runner maps rules over the catch-all windows, under every real device).@DEVICE_NOTE@ */
+    (void)attach;
+
+    /* Addresses no window covers: fault (default, like a bus error) or log (--unknown-mmio). */
+    if (cfg->unknown_mmio != UAM_UNKNOWN_FAULT) {
+        uam_device *um = uam_unknown_mmio_create(
+            "unknown-mmio", cfg->unknown_mmio == UAM_UNKNOWN_ECHO ? UAM_UNKNOWN_POLICY_ECHO
+                                                                  : UAM_UNKNOWN_POLICY_ZERO);
+        if (!um)
+            return UAM_ERR_NOMEM;
+        uam_machine_add_device(m, um);
+        uam_bus_set_unmapped(&m->bus, um);
+    }
+
+    /* The reset state first: the loader translates image addresses as the processor does
+     * after a reset (configured CPU model, AVR32B segments, the Book E boot page). */
+    uam_machine_reset(m, BOARD_RESET_VEC);
+    uint64_t entry = BOARD_RESET_VEC;
+    const char *os = uam_board_config_image(cfg, "os");
+    if (os) {
+        if (!(b->os_path = strdup(os)))
+            return UAM_ERR_NOMEM;
+        if ((st = place_os(m, b, &entry)) != UAM_OK)
+            return st;
+    }
+    /* Entry registers are processor 0's (m->exec); hooks every processor must see (HLE,
+     * probes) go in with uam_machine_add_pc_hook instead. */
+    if (board_entry_regs[0].name && (st = uam_exec_add_pc_hook(&m->exec, entry, entry_hook, b)) != UAM_OK)
+        return st;
+
+    uam_machine_reset(m, entry);
+    return UAM_OK;
+}
+
+const uam_board @CNAME@_board = {
+    .name = "@BOARD@",
+    .description = "@DESC@",
+    .build = build,
+};
