@@ -100,11 +100,11 @@ static uint64_t h_ltr(void *env, uint64_t sel, uint64_t b, uint64_t c, uam_statu
     return 0;
 }
 
-static uint64_t h_rsm(void *env, uint64_t a, uint64_t b, uint64_t c, uam_status *st)
+static uint64_t h_rsm(void *env, uint64_t rip, uint64_t b, uint64_t c, uam_status *st)
 {
-    CPU; (void)a; (void)b; (void)c;
+    CPU; (void)b; (void)c;
     uint64_t pc = 0;
-    CHECK(x86_smm_rsm(cpu, &pc));
+    CHECK(x86_smm_rsm(cpu, rip, &pc));
     return pc;
 }
 
@@ -328,7 +328,7 @@ const uam_helper_desc x86_helpers[X86_H__COUNT] = {
     H(X86_H_WRMSR,    "x86_wrmsr",    0, 0,  RWF, h_wrmsr),
     H(X86_H_LLDT,     "x86_lldt",     1, 0,  RWF, h_lldt),
     H(X86_H_LTR,      "x86_ltr",      1, 0,  RWF, h_ltr),
-    H(X86_H_RSM,      "x86_rsm",      0, 64, RWF, h_rsm),
+    H(X86_H_RSM,      "x86_rsm",      1, 64, RWF, h_rsm),
     H(X86_H_DIVQ,     "x86_divq",     1, 0,  RWF, h_divq),
     H(X86_H_IDIVQ,    "x86_idivq",    1, 0,  RWF, h_idivq),
     H(X86_H_FXSAVE,   "x86_fxsave",   1, 0,  RWF, h_fxsave),

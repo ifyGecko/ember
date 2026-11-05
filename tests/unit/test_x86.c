@@ -975,6 +975,261 @@ static void test_msr(void)
     uam_machine_fini(&m);
 }
 
+/* ---- SMRAM protection: AMD's TSeg and SMMLOCK, the SMM code-fetch check, RSM's checks -- */
+
+static uint64_t xl(uam_machine *m, uint64_t va, uam_xlate_kind k)
+{
+    uam_xlate x = { 0 };
+    CHECK(x86_translate(&m->cpu, va, k, &x) == UAM_OK, "translate 0x%llx", (unsigned long long)va);
+    return x.paddr;
+}
+
+#define TSEG      0x200000u
+#define TSEG_MASK 0x000FFFFFFFF00000ull   /* 1 MiB */
+
+static void test_amd_smram(void)
+{
+    uam_machine m;
+    machine(&m, NULL, false);
+    uam_cpu *c = &m.cpu;
+    uint64_t v = 0;
+    /* with the Intel map these are not the core's: the store policy keeps them */
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, SMMMASK_TVALID) == UAM_OK, "Intel map: SMM_MASK is storage");
+    EQ64(xl(&m, TSEG + 0x10, UAM_XLATE_LOAD), TSEG + 0x10, "Intel map: no TSeg");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, 0) == UAM_OK, "SMM_MASK back to 0");
+
+    uam_x86_set_smm_map(c, UAM_X86_SMM_MAP_AMD64);
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_ADDR, TSEG | 0x1FFFF) == UAM_OK, "SMM_ADDR");
+    EQ64(msr(&m, MSR_AMD_SMM_ADDR), TSEG, "SMM_ADDR: bits 51:17");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, TSEG_MASK | SMMMASK_TVALID | 0x6000) == UAM_OK, "SMM_MASK");
+    EQ64(msr(&m, MSR_AMD_SMM_MASK), TSEG_MASK | SMMMASK_TVALID | 0x6000, "SMM_MASK reads back");
+    /* outside SMM the TSeg goes to the sink, for data and code; the ASeg is the chipset's */
+    EQ64(xl(&m, TSEG + 0x10, UAM_XLATE_LOAD), UAM_X86_SMRR_SINK + 0x10, "TSeg load outside SMM: the sink");
+    EQ64(xl(&m, TSEG + 0xFFFFF, UAM_XLATE_STORE), UAM_X86_SMRR_SINK + 0xFFFFF, "TSeg store: the sink");
+    EQ64(xl(&m, TSEG + 0x20, UAM_XLATE_FETCH), UAM_X86_SMRR_SINK + 0x20, "TSeg fetch: the sink");
+    EQ64(xl(&m, TSEG + 0x100000, UAM_XLATE_LOAD), TSEG + 0x100000, "past the TSeg: memory");
+    EQ64(xl(&m, TSEG - 1, UAM_XLATE_LOAD), TSEG - 1, "before the TSeg: memory");
+    st(&m)->in_smm = true;
+    EQ64(xl(&m, TSEG + 0x10, UAM_XLATE_LOAD), TSEG + 0x10, "TSeg in SMM: memory");
+    /* TClose: SMM data accesses go where non-SMM ones do, fetches stay in SMRAM */
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, TSEG_MASK | SMMMASK_TVALID | SMMMASK_TCLOSE) == UAM_OK, "TClose");
+    EQ64(xl(&m, TSEG + 0x10, UAM_XLATE_LOAD), UAM_X86_SMRR_SINK + 0x10, "TClose: an SMM load, the sink");
+    EQ64(xl(&m, TSEG + 0x10, UAM_XLATE_FETCH), TSEG + 0x10, "TClose: an SMM fetch, SMRAM");
+    CHECK(x86_lin_read(c, TSEG + 0x10, 4, &v, true) == UAM_ERR_FAULT && st(&m)->pend_vec == X86_EXC_GP,
+          "TClose: a C-side read goes to the (unmapped) sink too");
+    st(&m)->pend_valid = false;
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, TSEG_MASK | SMMMASK_TVALID) == UAM_OK, "TClose off");
+    st(&m)->in_smm = false;
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, TSEG_MASK) == UAM_OK, "TValid clear");
+    EQ64(xl(&m, TSEG + 0x10, UAM_XLATE_LOAD), TSEG + 0x10, "TValid clear: no TSeg");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, TSEG_MASK | SMMMASK_TVALID) == UAM_OK, "TValid again");
+
+    /* HWCR.SMMLOCK: write-once; SMM_BASE, SMM_ADDR and SMM_MASK become read-only */
+    CHECK(x86_wrmsr(c, MSR_AMD_HWCR, 0x40000) == UAM_OK && msr(&m, MSR_AMD_HWCR) == 0x40000, "HWCR is storage");
+    CHECK(x86_wrmsr(c, MSR_AMD_HWCR, HWCR_SMMLOCK) == UAM_OK, "SMMLOCK");
+    CHECK(x86_wrmsr(c, MSR_AMD_HWCR, 0x2) == UAM_OK && msr(&m, MSR_AMD_HWCR) == (0x2 | HWCR_SMMLOCK),
+          "SMMLOCK stays set; the other bits are written");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_MASK, 0) == UAM_OK && msr(&m, MSR_AMD_SMM_MASK) == (TSEG_MASK | SMMMASK_TVALID),
+          "locked: an SMM_MASK write is ignored");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_ADDR, 0x400000) == UAM_OK && msr(&m, MSR_AMD_SMM_ADDR) == TSEG,
+          "locked: an SMM_ADDR write is ignored");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_BASE, 0x50000) == UAM_OK && msr(&m, MSR_AMD_SMM_BASE) == SMBASE,
+          "locked: an SMM_BASE write is ignored");
+    /* INIT keeps all of it; RESET clears it */
+    line(&m, UAM_X86_IRQ_INIT, 1);
+    take(&m);
+    line(&m, UAM_X86_IRQ_INIT, 0);
+    CHECK(msr(&m, MSR_AMD_HWCR) & HWCR_SMMLOCK, "INIT keeps SMMLOCK");
+    EQ64(msr(&m, MSR_AMD_SMM_MASK), TSEG_MASK | SMMMASK_TVALID, "INIT keeps SMM_MASK");
+    uam_machine_reset(&m, CODE);
+    EQ64(msr(&m, MSR_AMD_HWCR), 0, "RESET clears HWCR");
+    EQ64(msr(&m, MSR_AMD_SMM_MASK), 0, "RESET clears SMM_MASK");
+    /* a preset (the security processor's configuration) is what RESET loads */
+    uam_x86_preset_amd_smm(c, 0x300000, TSEG_MASK | SMMMASK_TVALID, true);
+    EQ64(xl(&m, 0x300040, UAM_XLATE_LOAD), UAM_X86_SMRR_SINK + 0x40, "the preset applies at once");
+    CHECK(x86_wrmsr(c, MSR_AMD_SMM_ADDR, 0) == UAM_OK && msr(&m, MSR_AMD_SMM_ADDR) == 0x300000,
+          "the preset is locked");
+    uam_machine_reset(&m, CODE);
+    CHECK(msr(&m, MSR_AMD_SMM_ADDR) == 0x300000 && (msr(&m, MSR_AMD_HWCR) & HWCR_SMMLOCK),
+          "RESET loads the preset");
+    uam_machine_fini(&m);
+}
+
+/* The exception the code-fetch check raises, as an exception hook sees it. */
+typedef struct seen_exc { unsigned n; uam_exception e; } seen_exc;
+static uam_hook_action on_exc(void *ctx, uam_cpu *cpu, const uam_exception *e)
+{
+    (void)cpu;
+    seen_exc *s = ctx;
+    s->n++;
+    s->e = *e;
+    return UAM_HOOK_CONTINUE;
+}
+
+/* An SMI whose handler at SMBASE + 8000 far-jumps to CODE, outside SMRAM. */
+static void smi_to_code(uam_machine *m)
+{
+    PUT(m, SMBASE + 0x8000, 0xEA, CODE & 0xFF, CODE >> 8, 0x00, 0x00);   /* jmp 0000:CODE */
+    PUT(m, CODE, SPIN);
+    m->cpu.pc = CODE;
+    line(m, UAM_X86_IRQ_SMI, 1);
+    CHECK(take(m) && m->cpu.pc == SMBASE + 0x8000, "SMI");
+    line(m, UAM_X86_IRQ_SMI, 0);
+}
+
+static void smrr_over_smbase(uam_machine *m)
+{
+    CHECK(x86_wrmsr(&m->cpu, MSR_SMRR_PHYSBASE, SMBASE | 6) == UAM_OK, "SMRR base");
+    CHECK(x86_wrmsr(&m->cpu, MSR_SMRR_PHYSMASK, 0x000FFFFFFFFF0000ull | 0x800) == UAM_OK, "SMRR mask, valid");
+}
+
+static void test_smm_code_chk(bool jit)
+{
+    uam_machine m;
+    seen_exc seen = { 0 };
+    uint64_t v = 0;
+    /* without the feature the MSRs are not the core's */
+    machine(&m, NULL, jit);
+    CHECK(x86_rdmsr(&m.cpu, MSR_SMM_MCA_CAP, &v) == UAM_OK && v == 0, "no feature: 17Dh is storage");
+    uam_machine_fini(&m);
+
+    /* Intel's check: a fetch outside SMRR in SMM, CR4.MCE clear: shutdown */
+    machine(&m, NULL, jit);
+    uam_exec_set_exc_hook(&m.exec, on_exc, &seen);
+    uam_x86_cpuid_info id;
+    uam_x86_get_cpuid(&m.cpu, &id);
+    id.features |= UAM_X86_FEAT_SMM_CODE_CHK;
+    uam_x86_set_cpuid(&m.cpu, &id);
+    CHECK(gp(&m, x86_rdmsr(&m.cpu, MSR_SMM_MCA_CAP, &v)), "MSR_SMM_MCA_CAP outside SMM: #GP");
+    CHECK(gp(&m, x86_wrmsr(&m.cpu, MSR_SMM_FEATURE_CONTROL, 4)), "MSR_SMM_FEATURE_CONTROL outside SMM: #GP");
+    smi_to_code(&m);
+    EQ64(msr(&m, MSR_SMM_MCA_CAP), 1ull << 58, "SMM_Code_Access_Chk reported");
+    CHECK(gp(&m, x86_wrmsr(&m.cpu, MSR_SMM_MCA_CAP, 0)), "MSR_SMM_MCA_CAP is read-only");
+    smrr_over_smbase(&m);
+    CHECK(gp(&m, x86_wrmsr(&m.cpu, MSR_SMM_FEATURE_CONTROL, 2)), "a reserved bit: #GP");
+    CHECK(x86_wrmsr(&m.cpu, MSR_SMM_FEATURE_CONTROL, SMM_FC_CODE_CHK_EN | SMM_FC_LOCK) == UAM_OK,
+          "SMM_Code_Chk_En, locked");
+    CHECK(gp(&m, x86_wrmsr(&m.cpu, MSR_SMM_FEATURE_CONTROL, 0)), "locked: #GP");
+    CHECK(m.cpu.priv & X86_PRIV_SMMCHK, "the check re-keys SMM code");
+    uam_exec_run(&m.exec, 10);
+    CHECK(st(&m)->shutdown && m.cpu.waiting, "the fetch at CODE: a machine check, CR4.MCE clear: shutdown");
+    EQ64(m.cpu.pc, CODE, "at the fetch outside SMRAM");
+    CHECK(seen.n == 1 && seen.e.kind == UAM_EXC_FETCH_FAULT && seen.e.cause == X86_XF_SMM_CODE &&
+          seen.e.pc == CODE, "the hook sees a FETCH_FAULT with the SMM-code cause (n=%u kind=%d)",
+          seen.n, (int)seen.e.kind);
+    uam_machine_fini(&m);
+
+    /* ... CR4.MCE set: #MC, through a vector inside SMRAM; a second one shuts down */
+    machine(&m, NULL, jit);
+    uam_x86_get_cpuid(&m.cpu, &id);
+    id.features |= UAM_X86_FEAT_SMM_CODE_CHK;
+    uam_x86_set_cpuid(&m.cpu, &id);
+    smi_to_code(&m);
+    smrr_over_smbase(&m);
+    CHECK(x86_wrmsr(&m.cpu, MSR_SMM_FEATURE_CONTROL, SMM_FC_CODE_CHK_EN) == UAM_OK, "SMM_Code_Chk_En");
+    sysw(&m, X86_SR_CR4, CR4_MCE);
+    wr(&m, 4 * X86_EXC_MC, 4, (SMBASE >> 4) << 16 | 0x9000);   /* IVT: SMBASE>>4 : 9000 */
+    PUT(&m, SMBASE + 0x9000, SPIN);
+    setgpr(&m, X86_RSP, 0x8000);
+    uam_exec_run(&m.exec, 10);
+    CHECK(!st(&m)->shutdown, "CR4.MCE: no shutdown");
+    EQ64(m.cpu.pc, SMBASE + 0x9000, "#MC delivered (to the handler in SMRAM)");
+    EQ64(msr(&m, MSR_MCG_STATUS), MCG_MCIP | MCG_EIPV, "MCG_STATUS: MCIP, EIPV, not restartable");
+    wr(&m, 4 * X86_EXC_MC, 4, handler(X86_EXC_MC));      /* the next #MC's handler is outside */
+    PUT(&m, SMBASE + 0x9000, 0xEA, CODE & 0xFF, CODE >> 8, 0x00, 0x00);
+    uam_cpu_xlate_changed(&m.cpu);
+    m.cpu.pc = SMBASE + 0x9000;
+    uam_exec_run(&m.exec, 10);
+    CHECK(st(&m)->shutdown, "a machine check during MCIP: shutdown");
+    uam_machine_fini(&m);
+
+    /* the board's confinement (AMD map, no hardware check): SMRAM = TSeg */
+    machine(&m, NULL, jit);
+    seen = (seen_exc){ 0 };
+    uam_exec_set_exc_hook(&m.exec, on_exc, &seen);
+    uam_x86_set_smm_map(&m.cpu, UAM_X86_SMM_MAP_AMD64);
+    uam_x86_set_smm_confine(&m.cpu, true);
+    smi_to_code(&m);
+    uam_exec_run(&m.exec, 10);
+    CHECK(!st(&m)->shutdown && m.cpu.pc == CODE && seen.n == 0,
+          "confinement without a TSeg/SMRR: nothing to check against");
+    uam_machine_fini(&m);
+
+    machine(&m, NULL, jit);
+    seen = (seen_exc){ 0 };
+    uam_exec_set_exc_hook(&m.exec, on_exc, &seen);
+    uam_x86_set_smm_map(&m.cpu, UAM_X86_SMM_MAP_AMD64);
+    uam_x86_set_smm_confine(&m.cpu, true);
+    CHECK(x86_wrmsr(&m.cpu, MSR_AMD_SMM_ADDR, SMBASE & ~0x1FFFFull) == UAM_OK, "TSeg base");
+    CHECK(x86_wrmsr(&m.cpu, MSR_AMD_SMM_MASK, 0x000FFFFFFFFE0000ull | SMMMASK_TVALID) == UAM_OK, "TSeg 128 KiB");
+    smi_to_code(&m);
+    CHECK(m.cpu.priv & X86_PRIV_SMMCHK, "confinement: SMM code re-keyed");
+    uam_exec_run(&m.exec, 10);
+    CHECK(st(&m)->shutdown && m.cpu.pc == CODE, "confinement: the fetch at CODE shuts the hart down");
+    CHECK(seen.n == 1 && seen.e.kind == UAM_EXC_FETCH_FAULT && seen.e.cause == X86_XF_SMM_CODE,
+          "confinement: the hook sees it");
+    uam_machine_fini(&m);
+}
+
+/* RSM with a saved state no processor could be in: shutdown, nothing restored.
+ * Each field is { offset from SMBASE, size, value }. */
+typedef struct ss_field { unsigned off, size; uint64_t val; } ss_field;
+#define FIELDS(...) (const ss_field[]){ __VA_ARGS__ }, sizeof((const ss_field[]){ __VA_ARGS__ }) / sizeof(ss_field)
+
+static void rsm_bad(bool jit, uam_x86_smm_map map, const ss_field *f, size_t n, const char *what)
+{
+    uam_machine m;
+    plat p;
+    machine(&m, &p, jit);
+    uam_x86_set_smm_map(&m.cpu, map);
+    prot32(&m);
+    PUT(&m, CODE, SPIN);
+    PUT(&m, SMBASE + 0x8000, 0x0F, 0xAA);   /* rsm */
+    setgpr(&m, X86_RAX, 0x1234);
+    m.cpu.pc = CODE;
+    line(&m, UAM_X86_IRQ_SMI, 1);
+    CHECK(take(&m), "%s: SMI", what);
+    for (size_t i = 0; i < n; i++)
+        wr(&m, SMBASE + f[i].off, f[i].size, f[i].val);
+    wr(&m, SMBASE + (map == UAM_X86_SMM_MAP_AMD64 ? 0xFFF8 : 0xFF5C), 8, 0x5678);   /* saved RAX */
+    uam_exec_run(&m.exec, 1);
+    CHECK(st(&m)->shutdown && m.cpu.waiting, "%s: RSM shuts down", what);
+    CHECK(st(&m)->in_smm && p.smm_off == 0, "%s: still in SMM, SMIACT# on", what);
+    EQ64(m.cpu.pc, SMBASE + 0x8000, "the hart stays at the RSM");
+    EQ64(gpr(&m, X86_RAX), 0x1234, "nothing restored");
+    uam_machine_fini(&m);
+}
+
+static void test_rsm_checks(bool jit)
+{
+    const uam_x86_smm_map I = UAM_X86_SMM_MAP_INTEL64, A = UAM_X86_SMM_MAP_AMD64;
+    const uint64_t pe = CR0_ET | CR0_PE, lm = EFER_LME | EFER_LMA;
+    /* Intel offsets: CR0 FFF8, CR4 FE40, EFER FFE0, CS's hidden attributes FC1C (core layout) */
+    rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, CR0_ET | CR0_PG }), "Intel: CR0.PG without PE");
+    rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | CR0_NW }), "Intel: CR0.NW without CD");
+    rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | 1ull << 32 }), "Intel: CR0 upper bits");
+    rsm_bad(jit, I, FIELDS({ 0xFE40, 4, 1u << 15 }), "Intel: reserved CR4 bit 15");
+    rsm_bad(jit, I, FIELDS({ 0xFE40, 4, 1u << 26 }), "Intel: reserved CR4 bit 26");
+    rsm_bad(jit, I, FIELDS({ 0xFFE0, 8, EFER_LMA }), "Intel: EFER.LMA without LME and PG");
+    rsm_bad(jit, I, FIELDS({ 0xFFE0, 8, 1u << 2 }), "Intel: a reserved EFER bit");
+    rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | CR0_PG }, { 0xFFE0, 8, lm }, { 0xFE40, 4, 0 }),
+            "Intel: long mode without CR4.PAE");
+    rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | CR0_PG }, { 0xFFE0, 8, EFER_LME }, { 0xFE40, 4, CR4_PAE }),
+            "Intel: LME and PG without LMA");
+    rsm_bad(jit, I, FIELDS({ 0xFFF8, 8, pe | CR0_PG }, { 0xFFE0, 8, lm }, { 0xFE40, 4, CR4_PAE },
+                           { 0xFC1C, 2, SEGA_P | SEGA_S | 0xB | SEGA_L | SEGA_DB }),
+            "Intel: CS.L and CS.D in long mode");
+    /* AMD offsets: CR0 FF58, CR4 FF48, EFER FED0, CS attributes FE12 (AMD's packing: L 9, D 10) */
+    rsm_bad(jit, A, FIELDS({ 0xFF58, 8, CR0_ET | CR0_PG }), "AMD: CR0.PG without PE");
+    rsm_bad(jit, A, FIELDS({ 0xFF48, 8, 1ull << 40 }), "AMD: reserved CR4 bit 40");
+    rsm_bad(jit, A, FIELDS({ 0xFED0, 8, lm }), "AMD: EFER.LMA with CR0.PG clear");
+    rsm_bad(jit, A, FIELDS({ 0xFF58, 8, pe | CR0_PG }, { 0xFED0, 8, lm }, { 0xFF48, 8, CR4_PSE }),
+            "AMD: long mode without CR4.PAE");
+    rsm_bad(jit, A, FIELDS({ 0xFF58, 8, pe | CR0_PG }, { 0xFED0, 8, lm }, { 0xFF48, 8, CR4_PAE },
+                           { 0xFE12, 2, 0x9B | 0x600 }),
+            "AMD: CS.L and CS.D in long mode");
+}
+
 static void test_cpuid(void)
 {
     uam_machine m;
@@ -1123,6 +1378,11 @@ static void test_snapshot(void)
     CHECK(x86_wrmsr(c, 0x4321, 0x99) == UAM_OK, "a stored MSR");
     CHECK(x86_ltr(c, TSSSEL) == UAM_OK, "ltr");
     st(&m)->smbase = 0x70000;
+    st(&m)->smm_addr = 0x200000;                                 /* SMRAM protection */
+    st(&m)->smm_mask = TSEG_MASK | SMMMASK_TVALID;
+    st(&m)->hwcr = HWCR_SMMLOCK;
+    st(&m)->smm_fc = SMM_FC_LOCK;
+    st(&m)->mcg_status = MCG_MCIP;
     st(&m)->fpr[5] = (x86_f80){ 0xC000000000000000ull, 0x4000 };
     st(&m)->fpu_ip = 0x1234;                                     /* FNSTENV's FIP, FDP, FOP */
     st(&m)->fpu_dp = 0x5678;
@@ -1160,6 +1420,9 @@ static void test_snapshot(void)
     EQ64(msr(&m, 0x4321), 0x99, "the stored MSR");
     EQ64(msr(&m, 0x4322), 0, "the one stored after is gone");
     EQ64(st(&m)->smbase, 0x70000, "SMBASE");
+    CHECK(st(&m)->smm_addr == 0x200000 && st(&m)->smm_mask == (TSEG_MASK | SMMMASK_TVALID) &&
+          st(&m)->hwcr == HWCR_SMMLOCK && st(&m)->smm_fc == SMM_FC_LOCK && st(&m)->mcg_status == MCG_MCIP,
+          "SMM_ADDR, SMM_MASK, HWCR, SMM feature control, MCG_STATUS");
     CHECK(st(&m)->fpr[5].m == 0xC000000000000000ull && st(&m)->fpr[5].se == 0x4000, "x87 register 5");
     EQ64(st(&m)->fpu_ip, 0x1234, "the x87 last instruction pointer");
     EQ64(st(&m)->fpu_dp, 0x5678, "the x87 last operand pointer");
@@ -1175,6 +1438,7 @@ int main(void)
     test_init_sipi();
     test_intr();
     test_msr();
+    test_amd_smram();
     test_cpuid();
     test_gdb();
     test_snapshot();
@@ -1189,6 +1453,8 @@ int main(void)
         test_long_exceptions(jit);
         test_smm_intel(jit);
         test_smm_amd(jit);
+        test_smm_code_chk(jit);
+        test_rsm_checks(jit);
         test_ports_a20(jit);
     }
     printf("test_x86: %d/%d checks passed\n", n_checks - n_failed, n_checks);

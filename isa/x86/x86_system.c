@@ -106,6 +106,8 @@ void x86_update_priv(uam_cpu *cpu)
     unsigned p = cpl | mode << X86_PRIV_MODE_SHIFT | code << X86_PRIV_CODE_SHIFT;
     if (s->in_smm)
         p |= X86_PRIV_SMM;
+    if (x86_smm_fetch_checked(s))
+        p |= X86_PRIV_SMMCHK;
     if ((x86_seg_attr(cpu, X86_SEG_SS) & SEGA_DB) && mode != X86_MODE_V86)
         p |= X86_PRIV_STACK32;
     if (s->cr0 & CR0_PG)
@@ -161,6 +163,10 @@ static void power_on_state(uam_cpu *cpu, uint64_t entry)
     s->msrs = keep.msrs; s->n_msrs = keep.n_msrs; s->cap_msrs = keep.cap_msrs;
     s->msr_policy = keep.msr_policy; s->msr_trace = keep.msr_trace;
     s->plat = keep.plat; s->cpuid = keep.cpuid; s->smm_map = keep.smm_map;
+    s->smm_confine = keep.smm_confine;
+    s->preset_smm_addr = keep.preset_smm_addr; s->preset_smm_mask = keep.preset_smm_mask;
+    s->preset_hwcr = keep.preset_hwcr;
+    s->smm_addr = s->preset_smm_addr; s->smm_mask = s->preset_smm_mask; s->hwcr = s->preset_hwcr;
     s->mtrr_def_type = keep.mtrr_def_type; s->pat = 0x0007040600070406ull;
     s->rng = 0x853c49e6748fea9bull;
     memset(cpu->regfile, 0, cpu->regfile_size);
@@ -449,13 +455,31 @@ static uam_status deliver_once(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
     return deliver_prot(cpu, vec, has_err, err, intn, ret);
 }
 
-static void shutdown(uam_cpu *cpu)
+void x86_shutdown(uam_cpu *cpu, const char *why)
 {
     x86_state *s = x86_st(cpu);
     s->shutdown = true;
     cpu->waiting = true;
     uam_cpu_request_exit(cpu);
-    fprintf(stderr, "x86: triple fault at pc=%#llx: hart shut down\n", (unsigned long long)cpu->pc);
+    fprintf(stderr, "x86: %s at pc=%#llx: hart shut down\n", why, (unsigned long long)cpu->pc);
+}
+
+/* A machine check the processor raises itself (the SMM code-fetch check): #MC with
+ * CR4.MCE set, unless one is already in progress (MCG_STATUS.MCIP), otherwise
+ * shutdown. It is not restartable (RIPV clear); the error IP is the fetching
+ * instruction (EIPV). There are no machine-check banks to log it in. */
+static void machine_check(uam_cpu *cpu, const char *why)
+{
+    x86_state *s = x86_st(cpu);
+    fprintf(stderr, "x86: machine check at pc=%#llx: %s\n", (unsigned long long)cpu->pc, why);
+    if (!(s->cr4 & CR4_MCE)) {
+        x86_shutdown(cpu, "machine check with CR4.MCE clear");
+    } else if (s->mcg_status & MCG_MCIP) {
+        x86_shutdown(cpu, "machine check while one is in progress (MCIP)");
+    } else {
+        s->mcg_status = MCG_MCIP | MCG_EIPV;
+        x86_deliver(cpu, X86_EXC_MC, false, 0, false, cpu->pc, false);
+    }
 }
 
 /*
@@ -486,7 +510,7 @@ void x86_deliver(uam_cpu *cpu, unsigned vec, bool has_err, uint32_t err,
             fault_pc = s->pend_pc;
         }
         if (vec == X86_EXC_DF) {
-            shutdown(cpu);
+            x86_shutdown(cpu, "triple fault");
             return;
         }
         bool df = (contributory(vec) && contributory(v2)) ||
@@ -543,6 +567,13 @@ static void x86_take_exception(uam_cpu *cpu, const uam_exception *exc)
         break;
     case UAM_EXC_LOAD_MISALIGNED: case UAM_EXC_STORE_MISALIGNED:
         vec = X86_EXC_AC;
+        break;
+    case UAM_EXC_FETCH_FAULT:
+        if (exc->cause == X86_XF_SMM_CODE) {
+            machine_check(cpu, "SMM code fetch outside SMRAM");
+            return;
+        }
+        vec = X86_EXC_GP;
         break;
     default:   /* bus faults: nothing decodes the address */
         vec = X86_EXC_GP;
@@ -651,13 +682,18 @@ static bool x86_irq_take(uam_cpu *cpu)
         bool sipi = s->sipi_pending;            /* a SIPI that came after this INIT */
         uint8_t vec = s->sipi_vector;
         /* INIT keeps what only RESET clears: SMBASE (SMM relocation survives
-         * an INIT-SIPI restart), the SMM range and PAT, the APIC base */
+         * an INIT-SIPI restart), the SMM ranges and their locks, PAT, the APIC base */
         uint64_t smbase = s->smbase, smrr_base = s->smrr_base, smrr_mask = s->smrr_mask;
+        uint64_t smm_addr = s->smm_addr, smm_mask = s->smm_mask, hwcr = s->hwcr, smm_fc = s->smm_fc;
         uint64_t pat = s->pat, apic_base = s->apic_base;
         power_on_state(cpu, 0xFFFFFFF0ull);
         s->smbase = smbase;
         s->smrr_base = smrr_base;
         s->smrr_mask = smrr_mask;
+        s->smm_addr = smm_addr;
+        s->smm_mask = smm_mask;
+        s->hwcr = hwcr;
+        s->smm_fc = smm_fc;
         s->pat = pat;
         s->apic_base = apic_base;
         /* A received INIT IPI puts ANY processor - the BSP included - into
@@ -877,6 +913,24 @@ void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info)
 void uam_x86_set_smm_map(uam_cpu *cpu, uam_x86_smm_map map)
 {
     x86_st(cpu)->smm_map = map;
+    uam_cpu_xlate_changed(cpu);   /* the TSeg and ASeg apply with the AMD64 map only */
+}
+
+void uam_x86_preset_amd_smm(uam_cpu *cpu, uint64_t smm_addr, uint64_t smm_mask, bool lock)
+{
+    x86_state *s = x86_st(cpu);
+    s->preset_smm_addr = s->smm_addr = smm_addr & SMM_TSEG_FIELD;
+    s->preset_smm_mask = s->smm_mask = smm_mask & SMMMASK_DEFINED;
+    s->preset_hwcr = lock ? HWCR_SMMLOCK : 0;
+    s->hwcr = (s->hwcr & ~HWCR_SMMLOCK) | s->preset_hwcr;
+    uam_cpu_xlate_changed(cpu);
+}
+
+void uam_x86_set_smm_confine(uam_cpu *cpu, bool on)
+{
+    x86_st(cpu)->smm_confine = on;
+    x86_update_priv(cpu);
+    uam_cpu_xlate_changed(cpu);
 }
 
 void uam_x86_get_cpuid(uam_cpu *cpu, uam_x86_cpuid_info *info)
@@ -925,7 +979,8 @@ static uint64_t *saved_u64(x86_state *s, size_t i)
         &s->io_smi.rsi, &s->io_smi.rdi, &s->io_smm.misc, &s->io_smm.rip, &s->io_smm.mem,
         &s->io_smm.rcx, &s->io_smm.rsi, &s->io_smm.rdi,
         &s->mm[0], &s->mm[1], &s->mm[2], &s->mm[3], &s->mm[4], &s->mm[5], &s->mm[6], &s->mm[7],
-        &s->fpu_ip, &s->fpu_dp,
+        &s->fpu_ip, &s->fpu_dp, &s->smm_addr, &s->smm_mask, &s->hwcr, &s->smm_fc,
+        &s->mcg_status,
     };
     return i < UAM_ARRAY_LEN(f) ? f[i] : NULL;
 }

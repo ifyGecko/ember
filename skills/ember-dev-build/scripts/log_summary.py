@@ -97,6 +97,7 @@ RE_STUB_FIRST = re.compile(r"\] mmio-stub: (\S+) \(([^)]*)\): first (read|write)
 RE_STUB_SUM = re.compile(r"\] mmio-stub: (\S+): (\d+) reads, (\d+) writes, (\d+) registers")
 RE_LOGPC = re.compile(r"^\S+: pc 0x([0-9a-f]+) reached \(hit (\d+), icount (\d+)(?:, cpu (\d+))?\)")
 RE_TRIPLE = re.compile(r"^x86: triple fault at pc=(0x[0-9a-f]+)")
+RE_SHUTDOWN = re.compile(r"^x86: (.+) at pc=(0x[0-9a-f]+): hart shut down")
 RE_MSR = re.compile(r"^x86: (rdmsr|wrmsr) (0x[0-9a-f]+) (?:->|<-) (0x[0-9a-f]+)")
 RE_POST = re.compile(r"\] post: code (0x[0-9a-f]+)")
 RE_GUARD = re.compile(r"^(?:\S+: )?guard (\S+) \((stop|fault|log)\): cpu (\d+) pc (0x[0-9a-f]+) (read|write) (\d+) at (0x[0-9a-f]+)")
@@ -257,6 +258,12 @@ def main(argv=None):
         if m:
             triple = m.group(1)
             note(i, "x86 TRIPLE FAULT at pc %s: the processor shut down" % triple)
+            continue
+        m = RE_SHUTDOWN.match(ln)
+        if m:
+            # also a machine check (SMM code fetch outside SMRAM) or an RSM with an
+            # invalid saved state: the processor stopped the same way
+            note(i, "x86 SHUTDOWN at pc %s: %s" % (m.group(2), m.group(1)))
             continue
         m = RE_MSR.match(ln)
         if m:

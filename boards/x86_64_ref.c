@@ -42,7 +42,12 @@
  *                      (APIC ID = index), the others wait for a startup IPI
  *   -o apic-hz=HZ      local APIC timer input clock
  *   -o smm-map=MAP     SMRAM save-state map: intel64 (default) or amd64
- *                      (uam_x86_set_smm_map), for the SMM handler's vendor
+ *                      (uam_x86_set_smm_map), for the SMM handler's vendor;
+ *                      amd64 also brings AMD's SMM_ADDR/SMM_MASK/HWCR.SMMLOCK
+ *   -o smm-code-chk=1  offer Intel's SMM code-access check
+ *                      (UAM_X86_FEAT_SMM_CODE_CHK; the firmware enables it)
+ *   -o smm-confine=1   SMM code-fetch confinement (uam_x86_set_smm_confine):
+ *                      an SMM fetch outside SMRAM is a machine check
  *   -o persist=1       write flash programs/erases back to the image file
  *
  * --image bios=PATH is a legacy BIOS ROM (up to 1 MiB): it ends at 4 GiB, and
@@ -419,6 +424,10 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
         uam_log(UAM_LOG_ERROR, "x86_64-ref", "smm-map must be intel64 or amd64, not '%s'", smap);
         return UAM_ERR_INVALID;
     }
+    const char *chk = uam_board_config_option(cfg, "smm-code-chk");
+    const char *confine = uam_board_config_option(cfg, "smm-confine");
+    bool smm_code_chk = chk && strcmp(chk, "0") != 0;
+    bool smm_confine = confine && strcmp(confine, "0") != 0;
     for (unsigned i = 0; i < b->ncpu; i++) {
         uam_cpu *cpu = uam_machine_cpu(m, i);
         uam_x86_platform plat = { .ctx = &b->pcpu[i], .inta = ref_inta, .rdmsr = ref_rdmsr,
@@ -426,11 +435,13 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
         uam_x86_set_platform(cpu, &plat);
         uam_x86_cpuid_info id;
         uam_x86_get_cpuid(cpu, &id);
-        id.features |= UAM_X86_FEAT_X2APIC | UAM_X86_FEAT_TSC_DEADLINE;
+        id.features |= UAM_X86_FEAT_X2APIC | UAM_X86_FEAT_TSC_DEADLINE |
+                       (smm_code_chk ? UAM_X86_FEAT_SMM_CODE_CHK : 0);
         id.logical_cpus = b->ncpu;
         id.initial_apic_id = i;
         uam_x86_set_cpuid(cpu, &id);
         uam_x86_set_smm_map(cpu, smm_map);
+        uam_x86_set_smm_confine(cpu, smm_confine);
     }
 
     /* Unclaimed accesses master-abort (all ones), as on a PC, unless the user
@@ -445,7 +456,7 @@ static uam_status x86_ref_build(uam_machine *m, const uam_board_config *cfg)
     if (cfg->unknown_mmio == UAM_UNKNOWN_FAULT) {
         uam_master_abort_name_window(um, UAM_X86_PIO_BASE, UAM_X86_PIO_SIZE, "I/O port", true);
         uam_master_abort_name_window(um, UAM_X86_SMRR_SINK, UINT64_C(1) << 32,
-                                     "SMRR range outside SMM", false);
+                                     "SMRAM (SMRR/TSeg) outside SMM", false);
     }
     uam_bus_set_unmapped(&m->bus, um);
 

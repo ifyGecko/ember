@@ -614,6 +614,8 @@ x86-test: $(RUN) $(TRUN) firmware-x86
 	$(RUN) -b x86_64-ref --raw-base 0 --entry 0 --jit $(dir $(FW_X86))legacy.bin < /dev/null
 	$(TRUN) -b x86_64-test -o smm-map=amd64 --raw-base 0 --entry 0 $(dir $(FW_X86))smm-amd.bin < /dev/null
 	$(TRUN) -b x86_64-test -o smm-map=amd64 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smm-amd.bin < /dev/null
+	$(TRUN) -b x86_64-test -o smm-confine=1 -o smm-code-chk=1 --raw-base 0 --entry 0 --jit $(FW_X86) < /dev/null
+	$(TRUN) -b x86_64-test -o smm-map=amd64 -o smm-confine=1 --raw-base 0 --entry 0 $(dir $(FW_X86))smm-amd.bin < /dev/null
 	python3 tests/firmware-x86/bios-check.py $(TRUN) $(dir $(FW_X86))biosrom.bin
 	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 $(dir $(FW_X86))smp.bin < /dev/null
 	$(RUN) -b x86_64-ref -o cpus=4 --raw-base 0 --entry 0 --jit $(dir $(FW_X86))smp.bin < /dev/null

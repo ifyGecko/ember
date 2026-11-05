@@ -34,11 +34,13 @@ extern const uam_isa uam_isa_x86_64;
 static inline uint64_t uam_x86_pio(uint16_t port) { return UAM_X86_PIO_BASE + port; }
 
 /*
- * Outside SMM, accesses to the range the SMM range registers (IA32_SMRR_*)
- * protect are redirected to UAM_X86_SMRR_SINK + (address - range base). Boards
- * leave the sink unmapped, so the access gets the board's unclaimed-access
- * behaviour (a PC master-aborts: reads all ones, writes dropped), or map a
- * device there to observe it.
+ * Outside SMM, accesses to the SMRAM the processor itself protects - the SMM
+ * range registers' range (IA32_SMRR_*) and, with the AMD64 map, the TSeg
+ * (SMM_ADDR/SMM_MASK) - are redirected to UAM_X86_SMRR_SINK + (address -
+ * range base); so are SMM's data accesses to a TSeg closed by SMM_MASK.TClose.
+ * Boards leave the sink unmapped, so the access gets the board's
+ * unclaimed-access behaviour (a PC master-aborts: reads all ones, writes
+ * dropped), or map a device there to observe it.
  */
 #define UAM_X86_SMRR_SINK  0x0000800000000000ull  /* 2^47 */
 
@@ -128,6 +130,11 @@ typedef struct uam_x86_cpuid_info {
 enum {
     UAM_X86_FEAT_X2APIC       = 1u << 0,
     UAM_X86_FEAT_TSC_DEADLINE = 1u << 1,
+    /* Intel's SMM code-access check: MSR_SMM_MCA_CAP (17Dh) reports it and
+     * MSR_SMM_FEATURE_CONTROL (4E0h: lock, SMM_Code_Chk_En) enables it; both
+     * only in SMM. Enabled, an SMM instruction fetch outside the SMRR range is
+     * an unrecoverable machine check: #MC with CR4.MCE set, else shutdown. */
+    UAM_X86_FEAT_SMM_CODE_CHK = 1u << 2,
 };
 
 void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info);
@@ -141,7 +148,13 @@ void uam_x86_set_cpuid(uam_cpu *cpu, const uam_x86_cpuid_info *info);
  *            RIP at +0xFFD8, I/O restart at +0xFF00, IOMisc at +0xFFA4.
  *   AMD64    AMD64: SMBASE + 0xFE00..0xFFFF; SMBASE at +0xFF00, RIP at
  *            +0xFF78, I/O restart at +0xFEC8, SMM I/O trap at +0xFEC0; also
- *            the SMM_BASE MSR (C001_0111h), which reads and sets SMBASE.
+ *            the SMM_BASE MSR (C001_0111h), which reads and sets SMBASE, and
+ *            AMD's SMRAM protection, which the core then keeps: SMM_ADDR
+ *            (C001_0112h) and SMM_MASK (C001_0113h) - the TSeg, closed to
+ *            accesses outside SMM, and the AValid/TValid/AClose/TClose bits -
+ *            and HWCR (C001_0015h), whose SMMLOCK makes SMM_BASE, SMM_ADDR and
+ *            SMM_MASK read-only (writes ignored) until RESET. The ASeg
+ *            (A0000-BFFFF) stays the chipset's to route, through smm_changed.
  */
 typedef enum uam_x86_smm_map {
     UAM_X86_SMM_MAP_INTEL64 = 0,
@@ -149,6 +162,25 @@ typedef enum uam_x86_smm_map {
 } uam_x86_smm_map;
 
 void uam_x86_set_smm_map(uam_cpu *cpu, uam_x86_smm_map map);
+
+/*
+ * AMD64 map: the SMM configuration that is in place before the x86 cores run
+ * (on AMD platforms the security processor programs it): SMM_ADDR, SMM_MASK
+ * and HWCR.SMMLOCK as they read at every RESET from now on. Applied at once.
+ */
+void uam_x86_preset_amd_smm(uam_cpu *cpu, uint64_t smm_addr, uint64_t smm_mask, bool lock);
+
+/*
+ * SMM code-fetch confinement, a check hardware does not make on every
+ * processor: while in SMM, an instruction fetch from outside SMRAM (the SMRR
+ * range, and with the AMD64 map the valid TSeg and ASeg) is handled like a
+ * failed Intel SMM code-access check - a machine check - and reported as
+ * UAM_EXC_FETCH_FAULT at the fetching pc (an exception hook, e.g. the fuzz
+ * harness, sees it first). Inactive until one of those ranges is defined.
+ * Kept across RESET. For finding SMM call-outs (a handler calling or jumping
+ * into memory the OS controls).
+ */
+void uam_x86_set_smm_confine(uam_cpu *cpu, bool on);
 
 /*
  * Multiprocessor start-up. Processor 0 (hartid 0) is the bootstrap processor

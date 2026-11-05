@@ -225,8 +225,12 @@ its size), an I/O page at 0x7F00 with a 16550 (the console, IRQ line 0), the tes
 reset vector.
 `x86_64-ref` takes the images `flash` (a CFI boot flash of up to 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
 (a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
-(the local APIC timer clock, default 1 GHz) and `-o smm-map=intel64|amd64` (the SMRAM
-save-state layout the firmware's SMM handler expects).
+(the local APIC timer clock, default 1 GHz), `-o smm-map=intel64|amd64` (the SMRAM
+save-state layout the firmware's SMM handler expects; `amd64` also brings AMD's SMM_ADDR,
+SMM_MASK and HWCR.SMMLOCK: the TSeg closed outside SMM, locked until RESET),
+`-o smm-code-chk=1` (offer Intel's SMM code-access check, which the firmware enables) and
+`-o smm-confine=1` (an SMM instruction fetch outside SMRAM is a machine check, on any
+vendor: a crash oracle for SMM call-outs).
 
 With `--jit`, compiled blocks jump straight into each other (block chaining) instead of
 returning to the run loop after every block, which pays off most on firmware with short

@@ -22,7 +22,18 @@
  * it). The platform's smm_changed hook is called before the save state is
  * written on entry and after it is read on RSM, so a chipset model can open
  * and close SMRAM for the processor.
+ *
+ * RSM first checks the saved CR0, CR4, EFER and CS for a state no processor
+ * could be in (PG without PE, NW without CD, reserved bits, long mode without
+ * PAE, an EFER.LMA that does not follow, CS.L with CS.D); it then restores
+ * nothing and shuts the hart down, as hardware does.
+ *
+ * The SMRAM protection the processor itself enforces is in x86_mmu.c (the SMRR
+ * range; with the AMD64 map the TSeg and ASeg of SMM_ADDR/SMM_MASK, locked by
+ * HWCR.SMMLOCK) and the SMM code-fetch check there too.
  */
+#include <stdio.h>
+
 #include "uam/bus.h"
 #include "x86.h"
 
@@ -296,6 +307,42 @@ static rsm_info amd_load(uam_cpu *cpu)
     };
 }
 
+/* ---- RSM's checks --------------------------------------------------------- */
+
+/* A saved state no processor could be in: RSM enters shutdown instead of
+ * restoring it (Intel SDM vol. 2, RSM; AMD APM vol. 2, the SMM chapter). The
+ * checks are the architectural ones both list. NULL if valid. */
+static const char *rsm_invalid(uint64_t cr0, uint64_t cr4, uint64_t efer, uint16_t cs_attr)
+{
+    if (cr0 >> 32)
+        return "CR0 bits 63:32 set";
+    if ((cr0 & CR0_PG) && !(cr0 & CR0_PE))
+        return "CR0.PG without CR0.PE";
+    if ((cr0 & CR0_NW) && !(cr0 & CR0_CD))
+        return "CR0.NW without CR0.CD";
+    if (cr4 & CR4_RESERVED)
+        return "a reserved CR4 bit set";
+    if (efer & ~(uint64_t)EFER_DEFINED)
+        return "a reserved EFER bit set";
+    bool lm = (efer & EFER_LME) && (cr0 & CR0_PG);
+    if (lm && !(cr4 & CR4_PAE))
+        return "long mode without CR4.PAE";
+    if (((efer & EFER_LMA) != 0) != lm)
+        return "EFER.LMA does not match EFER.LME and CR0.PG";
+    if (lm && (cs_attr & SEGA_L) && (cs_attr & SEGA_DB))
+        return "CS.L and CS.D both set in long mode";
+    return NULL;
+}
+
+static const char *rsm_check(uam_cpu *cpu)
+{
+    if (x86_st(cpu)->smm_map == UAM_X86_SMM_MAP_AMD64)
+        return rsm_invalid(get_at(cpu, AS_CR0, 8), get_at(cpu, AS_CR4, 8), get_at(cpu, AS_EFER, 8),
+                           core_attr((uint16_t)get_at(cpu, AS_SEG + X86_SEG_CS * 16 + 2, 2)));
+    return rsm_invalid(get(cpu, SS_CR0, 8), get(cpu, SS_CR4, 4), get(cpu, SS_EFER, 8),
+                       (uint16_t)get(cpu, SS_HIDDEN + X86_SEG_CS * 16 + 12, 2));
+}
+
 /* ---- entry and RSM -------------------------------------------------------- */
 
 void x86_smm_enter(uam_cpu *cpu)
@@ -332,9 +379,18 @@ void x86_smm_enter(uam_cpu *cpu)
     cpu->pc = s->smbase + 0x8000u;
 }
 
-uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t *new_pc)
+uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t rsm_rip, uint64_t *new_pc)
 {
     x86_state *s = x86_st(cpu);
+    const char *bad = rsm_check(cpu);
+    if (bad) {
+        /* nothing is restored; the hart stays at the RSM, in SMM, shut down */
+        char why[96];
+        snprintf(why, sizeof(why), "RSM with an invalid saved state (%s)", bad);
+        cpu->pc = *new_pc = x86_seg_base(cpu, X86_SEG_CS) + rsm_rip;
+        x86_shutdown(cpu, why);
+        return UAM_OK;
+    }
     rsm_info ri = s->smm_map == UAM_X86_SMM_MAP_AMD64 ? amd_load(cpu) : intel_load(cpu);
     uint64_t rip = ri.rip;
     /* I/O instruction restart: back to the trapped I/O instruction (the

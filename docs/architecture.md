@@ -765,7 +765,8 @@ Implemented (`make test`):
   IRQ and FIQ, WFI, the generic timer, translation-table formats the self-test does not build,
   BE8, the GIC on `arm-ref`), `test_x86` (reset and INIT/SIPI, the interrupt shadow, HLT, real,
   32- and 64-bit delivery with error codes and double faults, #PF and CR2, ring 3, SMM on the
-  Intel and AMD save maps, MSRs, CPUID, A20M#), `test_avr32` (the models, interrupt levels,
+  Intel and AMD save maps, AMD's TSeg/TClose and SMMLOCK, the SMM code-fetch check and
+  confinement (machine check, MCIP), RSM's saved-state checks, MSRs, CPUID, A20M#), `test_avr32` (the models, interrupt levels,
   NMI and their masks, what A stacks and B saves in RSR/RAR, the INT3 shadow bank, rete, SLEEP,
   COUNT/COMPARE, the MPU and the MMU, the interrupt controller on `avr32-ref`), `test_pic`,
   `test_mcs51`, `test_m6502`, `test_z80` and `test_xtensa` (special registers per model, one

@@ -104,6 +104,7 @@ enum {
  *   bit  9    A20M# in effect (physical address bit 20 forced to 0)
  *   bit 10    the block's first instruction is in an interrupt shadow (a MOV SS or
  *             POP SS that had to end the block before it): no interrupt before it
+ *   bit 11    in SMM with the SMM code-fetch check in force (x86_smm_fetch_checked)
  */
 enum x86_mode {
     X86_MODE_REAL = 0,   /* real mode (reset state) */
@@ -120,6 +121,7 @@ enum { X86_CODE16 = 0, X86_CODE32 = 1, X86_CODE64 = 2 };
 #define X86_PRIV_PG         (1u << 8)
 #define X86_PRIV_A20M       (1u << 9)
 #define X86_PRIV_SHADOW     (1u << 10)
+#define X86_PRIV_SMMCHK     (1u << 11)
 /* X86_H_LOAD_SEG's segment argument: also open an interrupt shadow (MOV SS, POP SS). */
 #define X86_LOAD_SEG_SHADOW 0x100u
 
@@ -158,6 +160,29 @@ enum {
     CR4_OSXSAVE = 1u << 18, CR4_SMEP = 1u << 20, CR4_SMAP = 1u << 21,
 };
 enum { EFER_SCE = 1u << 0, EFER_LME = 1u << 8, EFER_LMA = 1u << 10, EFER_NXE = 1u << 11 };
+#define EFER_DEFINED (EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE)
+/* CR4 bits this processor reserves: 15 and 26-63 (LAM, FRED and later are not modelled) */
+#define CR4_RESERVED 0xFFFFFFFFFC008000ull
+
+/* SMRAM protection. AMD (with the AMD64 map): SMM_MASK's valid and close bits, the
+ * TSeg base/mask field of SMM_ADDR and SMM_MASK (bits 51:17), the ASeg, and
+ * HWCR.SMMLOCK. Intel: MSR_SMM_MCA_CAP's SMM_Code_Access_Chk and
+ * MSR_SMM_FEATURE_CONTROL's lock and SMM_Code_Chk_En. */
+enum { SMMMASK_AVALID = 1u << 0, SMMMASK_TVALID = 1u << 1,
+       SMMMASK_ACLOSE = 1u << 2, SMMMASK_TCLOSE = 1u << 3 };
+#define SMM_TSEG_FIELD     0x000FFFFFFFFE0000ull
+#define SMMMASK_DEFINED    (SMM_TSEG_FIELD | 0x770Full)   /* + AMemType 10:8, TMemType 14:12 */
+#define SMM_ASEG_BASE      0xA0000ull
+#define SMM_ASEG_SIZE      0x20000ull
+#define HWCR_SMMLOCK       1ull
+#define SMM_MCA_CODE_CHK   (1ull << 58)
+enum { SMM_FC_LOCK = 1u << 0, SMM_FC_CODE_CHK_EN = 1u << 2 };
+/* IA32_MCG_STATUS */
+enum { MCG_RIPV = 1u << 0, MCG_EIPV = 1u << 1, MCG_MCIP = 1u << 2 };
+
+/* uam_xlate.fault of a fetch refused by the SMM code-fetch check: x86_translate
+ * returns UAM_ERR_FAULT with it, and take_exception turns it into a machine check */
+#define X86_XF_SMM_CODE    0x80000000u
 
 /* MSR numbers the core implements itself. */
 enum {
@@ -176,6 +201,8 @@ enum {
     MSR_SYSENTER_EIP     = 0x00000176,
     MSR_MCG_CAP          = 0x00000179,
     MSR_MCG_STATUS       = 0x0000017A,
+    MSR_SMM_MCA_CAP      = 0x0000017D,   /* with UAM_X86_FEAT_SMM_CODE_CHK; SMM only */
+    MSR_SMM_FEATURE_CONTROL = 0x000004E0,/* with UAM_X86_FEAT_SMM_CODE_CHK; SMM only */
     MSR_MISC_ENABLE      = 0x000001A0,
     MSR_MTRR_PHYSBASE0   = 0x00000200,
     MSR_MTRR_DEF_TYPE    = 0x000002FF,
@@ -189,7 +216,10 @@ enum {
     MSR_GS_BASE          = 0xC0000101,
     MSR_KERNEL_GS_BASE   = 0xC0000102,
     MSR_TSC_AUX          = 0xC0000103,
+    MSR_AMD_HWCR         = 0xC0010015,   /* the AMD64 map: the core keeps it (SMMLOCK) */
     MSR_AMD_SMM_BASE     = 0xC0010111,   /* with the AMD64 save-state map */
+    MSR_AMD_SMM_ADDR     = 0xC0010112,   /* the AMD64 map: TSeg base */
+    MSR_AMD_SMM_MASK     = 0xC0010113,   /* the AMD64 map: TSeg mask, ASeg/TSeg valid/close */
 };
 
 /* ---- exception vectors --------------------------------------------------- */
@@ -345,6 +375,10 @@ typedef struct x86_state {
     x86_sysseg ldtr, tr;
     uint64_t smbase;              /* SMRAM base; reset value 0x30000 */
     uint64_t smrr_base, smrr_mask;/* IA32_SMRR_PHYSBASE / PHYSMASK (bit 11: valid) */
+    uint64_t smm_addr, smm_mask;  /* AMD SMM_ADDR / SMM_MASK (the AMD64 map) */
+    uint64_t hwcr;                /* AMD HWCR (the AMD64 map); bit 0 SMMLOCK */
+    uint64_t smm_fc;              /* Intel MSR_SMM_FEATURE_CONTROL */
+    uint64_t mcg_status;          /* IA32_MCG_STATUS: a machine check the core raised */
     uint64_t apic_base;           /* IA32_APIC_BASE */
     uint64_t kernel_gs_base, star, lstar, cstar, fmask, tsc_aux, pat;
     uint64_t sysenter_cs, sysenter_esp, sysenter_eip;
@@ -402,6 +436,10 @@ typedef struct x86_state {
     uam_x86_platform   plat;
     uam_x86_cpuid_info cpuid;
     uam_x86_smm_map    smm_map;   /* the SMRAM save-state map (board-selected) */
+    /* board-selected, kept across RESET: the AMD SMM configuration RESET loads
+     * (uam_x86_preset_amd_smm) and the SMM code-fetch confinement */
+    uint64_t           preset_smm_addr, preset_smm_mask, preset_hwcr;
+    bool               smm_confine;
 
     x86_tlb_ent tlb[X86_TLB_SIZE];
 } x86_state;
@@ -441,6 +479,8 @@ uam_status x86_raise(uam_cpu *cpu, unsigned vec, bool has_err, uint32_t err);
 /* exceptions and interrupts (x86_system.c) */
 void x86_deliver(uam_cpu *cpu, unsigned vec, bool has_err, uint32_t err,
                  bool soft, uint64_t return_pc, bool intn);
+/* The hart enters the shutdown state (until INIT or RESET); logs "x86: <why> at pc=...". */
+void x86_shutdown(uam_cpu *cpu, const char *why);
 
 /* paging and linear-address memory access from C (x86_mmu.c) */
 uam_status x86_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_xlate *out);
@@ -451,9 +491,16 @@ uam_status x86_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_
 uam_status x86_lin_read(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t *val, bool sup);
 uam_status x86_lin_write(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t val, bool sup);
 void       x86_tlb_flush(uam_cpu *cpu);
-/* A physical address as the processor emits it: bit 20 cleared under A20M#,
- * and the SMRR range outside SMM goes to UAM_X86_SMRR_SINK. */
-uint64_t   x86_smrr_filter(uam_cpu *cpu, uint64_t pa);
+/* A physical address as the processor emits it: bit 20 cleared under A20M#;
+ * outside SMM the SMRR range and the AMD TSeg go to UAM_X86_SMRR_SINK, and so
+ * does, in SMM, a data access (`fetch` false) to a TSeg closed by TClose. */
+uint64_t   x86_smram_filter(uam_cpu *cpu, uint64_t pa, bool fetch);
+/* In SMM, instruction fetches are checked against SMRAM: Intel's SMM_Code_Chk_En
+ * (fetches must stay in the SMRR range), or the board's confinement
+ * (uam_x86_set_smm_confine: SMRR, TSeg and ASeg). */
+bool       x86_smm_fetch_checked(const x86_state *s);
+/* ... and this fetch, at physical address pa, is outside the range allowed. */
+bool       x86_smm_fetch_blocked(const x86_state *s, uint64_t pa);
 
 /* descriptors and far transfers (x86_seg.c) */
 uam_status x86_load_seg(uam_cpu *cpu, unsigned seg, uint16_t sel);   /* MOV/POP Sreg rules */
@@ -542,7 +589,8 @@ uint64_t    x86_h_x87(void *env, uint64_t desc, uint64_t lin, uint64_t c, uam_st
 
 /* SMM (x86_smm.c) */
 void       x86_smm_enter(uam_cpu *cpu);
-uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t *new_pc);
+/* RSM at RIP rsm_rip; a saved state no processor could be in shuts the hart down. */
+uam_status x86_smm_rsm(uam_cpu *cpu, uint64_t rsm_rip, uint64_t *new_pc);
 
 /* the system-register handlers (x86_system.c), shared with helpers */
 uam_status x86_sysreg_read(uam_cpu *cpu, uint32_t id, uint64_t *val);

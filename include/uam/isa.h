@@ -75,7 +75,9 @@ typedef struct uam_exception {
     unsigned     flags;     /* enum uam_exc_flag */
     uint64_t     pc;        /* pc of the faulting/trapping instruction */
     uint64_t     parent_pc; /* pc of the instruction `pc` continues; == pc if not CONT */
-    uint64_t     cause;     /* UAM_EXC_TRAP: ISA cause. *_XLATE: uam_xlate.fault. */
+    uint64_t     cause;     /* UAM_EXC_TRAP: ISA cause. *_XLATE: uam_xlate.fault.
+                             * FETCH_FAULT: uam_xlate.fault if translate refused
+                             * the fetch, 0 for a bus fault. */
     uint64_t     tval;      /* faulting (virtual) address or ISA value */
 } uam_exception;
 
@@ -160,6 +162,9 @@ typedef struct uam_isa {
      * calls it for every fetch, load and store (except UAM_ACC_PHYS accesses).
      * On failure it returns UAM_ERR_XLATE with out->fault set, and the access
      * raises UAM_EXC_{FETCH,LOAD,STORE}_XLATE with the virtual address as tval.
+     * A fetch the processor refuses for its physical address (x86's SMM
+     * code-fetch check) may instead return UAM_ERR_FAULT with out->fault set:
+     * it raises UAM_EXC_FETCH_FAULT with that fault as the cause.
      * It must not change ISA state; exception side effects (BadVAddr, ...)
      * belong in take_exception. Whenever a mapping may change, the ISA calls
      * uam_cpu_xlate_changed(cpu); cpu->priv must reflect the privilege the

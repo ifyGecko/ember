@@ -3,7 +3,9 @@
  *
  * CPUID describes exactly what this module implements: x86-64 with SSE2,
  * CMPXCHG16B, POPCNT, RDRAND, NX, 1 GiB pages, RDTSCP, PAT and MTRRs (with
- * the SMM range registers).
+ * the SMM range registers). SMRAM protection MSRs: AMD's HWCR, SMM_ADDR and
+ * SMM_MASK with the AMD64 map; Intel's MSR_SMM_MCA_CAP and
+ * MSR_SMM_FEATURE_CONTROL with UAM_X86_FEAT_SMM_CODE_CHK.
  * Vendor, signature, brand, topology and physical-address width come from
  * the board (uam_x86_set_cpuid). MSRs the core does not implement go first
  * to the platform hook, then to the configured policy.
@@ -172,10 +174,26 @@ uam_status x86_rdmsr(uam_cpu *cpu, uint32_t msr, uint64_t *val)
             return x86_raise(cpu, X86_EXC_GP, true, 0);
         *val = msr == MSR_SMRR_PHYSBASE ? s->smrr_base : s->smrr_mask;
         return UAM_OK;
+    case MSR_SMM_MCA_CAP: case MSR_SMM_FEATURE_CONTROL:   /* with the code check; SMM only */
+        if (!(s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK)) break;
+        if (!s->in_smm)
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        *val = msr == MSR_SMM_MCA_CAP ? SMM_MCA_CODE_CHK : s->smm_fc;
+        return UAM_OK;
+    case MSR_AMD_HWCR:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
+        *val = s->hwcr; return UAM_OK;
+    case MSR_AMD_SMM_ADDR:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
+        *val = s->smm_addr; return UAM_OK;
+    case MSR_AMD_SMM_MASK:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
+        *val = s->smm_mask; return UAM_OK;
     case MSR_SYSENTER_CS:     *val = s->sysenter_cs; return UAM_OK;
     case MSR_SYSENTER_ESP:    *val = s->sysenter_esp; return UAM_OK;
     case MSR_SYSENTER_EIP:    *val = s->sysenter_eip; return UAM_OK;
-    case MSR_MCG_CAP: case MSR_MCG_STATUS: *val = 0; return UAM_OK;
+    case MSR_MCG_CAP:         *val = 0; return UAM_OK;   /* no banks */
+    case MSR_MCG_STATUS:      *val = s->mcg_status; return UAM_OK;
     case MSR_MISC_ENABLE:     *val = s->misc_enable; return UAM_OK;
     case MSR_PAT:             *val = s->pat; return UAM_OK;
     case MSR_MTRR_DEF_TYPE:   *val = s->mtrr_def_type; return UAM_OK;
@@ -251,7 +269,32 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
         s->smbase = val & 0xFFFFFFFFu; return UAM_OK;
     case MSR_AMD_SMM_BASE:
         if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
-        s->smbase = val & 0xFFFFFFFFu; return UAM_OK;
+        if (!(s->hwcr & HWCR_SMMLOCK))   /* HWCR.SMMLOCK: read-only, writes ignored */
+            s->smbase = val & 0xFFFFFFFFu;
+        return UAM_OK;
+    case MSR_AMD_HWCR:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
+        s->hwcr = val | (s->hwcr & HWCR_SMMLOCK);   /* SMMLOCK: set once, until RESET */
+        return UAM_OK;
+    case MSR_AMD_SMM_ADDR: case MSR_AMD_SMM_MASK:
+        if (s->smm_map != UAM_X86_SMM_MAP_AMD64) break;
+        if (s->hwcr & HWCR_SMMLOCK)
+            return UAM_OK;
+        if (msr == MSR_AMD_SMM_ADDR) s->smm_addr = val & SMM_TSEG_FIELD;
+        else                         s->smm_mask = val & SMMMASK_DEFINED;
+        uam_cpu_xlate_changed(cpu);
+        return UAM_OK;
+    case MSR_SMM_MCA_CAP:
+        if (!(s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK)) break;
+        return x86_raise(cpu, X86_EXC_GP, true, 0);   /* read-only */
+    case MSR_SMM_FEATURE_CONTROL:
+        if (!(s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK)) break;
+        if (!s->in_smm || (s->smm_fc & SMM_FC_LOCK) || (val & ~(uint64_t)(SMM_FC_LOCK | SMM_FC_CODE_CHK_EN)))
+            return x86_raise(cpu, X86_EXC_GP, true, 0);
+        s->smm_fc = val;
+        x86_update_priv(cpu);
+        uam_cpu_xlate_changed(cpu);
+        return UAM_OK;
     case MSR_MTRRCAP:         return x86_raise(cpu, X86_EXC_GP, true, 0);
     case MSR_SMRR_PHYSBASE: case MSR_SMRR_PHYSMASK:   /* accessible only in SMM */
         if (!s->in_smm)
@@ -263,7 +306,9 @@ uam_status x86_wrmsr(uam_cpu *cpu, uint32_t msr, uint64_t val)
     case MSR_SYSENTER_CS:     s->sysenter_cs = val; return UAM_OK;
     case MSR_SYSENTER_ESP:    s->sysenter_esp = val; return UAM_OK;
     case MSR_SYSENTER_EIP:    s->sysenter_eip = val; return UAM_OK;
-    case MSR_MCG_STATUS:      return UAM_OK;
+    case MSR_MCG_STATUS:      /* the handler clears MCIP */
+        s->mcg_status = val & (MCG_RIPV | MCG_EIPV | MCG_MCIP);
+        return UAM_OK;
     case MSR_MISC_ENABLE:     s->misc_enable = val; return UAM_OK;
     case MSR_PAT:             s->pat = val; return UAM_OK;
     case MSR_MTRR_DEF_TYPE:   s->mtrr_def_type = val; return UAM_OK;

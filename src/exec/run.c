@@ -450,7 +450,7 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
             bool xl = core.fault_st == UAM_ERR_XLATE;
             *exc = (uam_exception){ .kind = xl ? UAM_EXC_FETCH_XLATE : UAM_EXC_FETCH_FAULT,
                                     .pc = pc, .parent_pc = pc,
-                                    .cause = xl ? core.fault_xf : 0,
+                                    .cause = core.fault_xf,   /* 0 for a bus fault */
                                     .tval = core.fault_st != UAM_OK ? core.fault_addr : pc };
         }
         return NULL;

@@ -193,37 +193,115 @@ static uam_status xlate(uam_cpu *cpu, uint64_t va, uam_xlate_kind kind, bool use
     return UAM_OK;
 }
 
-uint64_t x86_smrr_filter(uam_cpu *cpu, uint64_t pa)
+/* ---- SMRAM protection ----------------------------------------------------- */
+
+/* The SMRR range (IA32_SMRR_PHYSMASK.V): *base is its base when pa is in it. */
+static bool smrr_hit(const x86_state *s, uint64_t pa, uint64_t *base)
+{
+    if (!(s->smrr_mask & (1u << 11)))
+        return false;
+    uint64_t mask = s->smrr_mask & 0x000FFFFFFFFFF000ull;
+    *base = s->smrr_base & mask;
+    return (pa & mask) == *base;
+}
+
+/* The AMD TSeg (SMM_MASK.TValid, with the AMD64 map): matched like an MTRR. */
+static bool tseg_hit(const x86_state *s, uint64_t pa, uint64_t *base)
+{
+    if (s->smm_map != UAM_X86_SMM_MAP_AMD64 || !(s->smm_mask & SMMMASK_TVALID))
+        return false;
+    uint64_t mask = s->smm_mask & SMM_TSEG_FIELD;
+    *base = s->smm_addr & mask;
+    return (pa & mask) == *base;
+}
+
+/* The AMD ASeg (SMM_MASK.AValid): A0000-BFFFF. */
+static bool aseg_hit(const x86_state *s, uint64_t pa)
+{
+    return s->smm_map == UAM_X86_SMM_MAP_AMD64 && (s->smm_mask & SMMMASK_AVALID) &&
+           pa - SMM_ASEG_BASE < SMM_ASEG_SIZE;
+}
+
+uint64_t x86_smram_filter(uam_cpu *cpu, uint64_t pa, bool fetch)
 {
     x86_state *s = x86_st(cpu);
+    uint64_t base;
     if (cpu->priv & X86_PRIV_A20M)
         pa &= ~(1ull << 20);
-    if (s->in_smm || !(s->smrr_mask & (1u << 11)))
+    if (s->in_smm) {
+        /* TClose: SMM's data accesses to the TSeg go where non-SMM ones do */
+        if (!fetch && (s->smm_mask & SMMMASK_TCLOSE) && tseg_hit(s, pa, &base))
+            return UAM_X86_SMRR_SINK + (pa - base);
         return pa;
-    uint64_t mask = s->smrr_mask & 0x000FFFFFFFFFF000ull;
-    uint64_t base = s->smrr_base & mask;
-    return (pa & mask) == base ? UAM_X86_SMRR_SINK + (pa - base) : pa;
+    }
+    if (smrr_hit(s, pa, &base) || tseg_hit(s, pa, &base))
+        return UAM_X86_SMRR_SINK + (pa - base);
+    return pa;
+}
+
+bool x86_smm_fetch_checked(const x86_state *s)
+{
+    if (!s->in_smm)
+        return false;
+    if ((s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK) && (s->smm_fc & SMM_FC_CODE_CHK_EN))
+        return true;
+    return s->smm_confine;
+}
+
+bool x86_smm_fetch_blocked(const x86_state *s, uint64_t pa)
+{
+    uint64_t base;
+    if (!x86_smm_fetch_checked(s))
+        return false;
+    bool in_smrr = smrr_hit(s, pa, &base);
+    /* Intel's check: an unrecoverable machine check outside the SMRR range */
+    if ((s->cpuid.features & UAM_X86_FEAT_SMM_CODE_CHK) && (s->smm_fc & SMM_FC_CODE_CHK_EN) && !in_smrr)
+        return true;
+    if (!s->smm_confine)
+        return false;
+    /* the board's confinement: SMRAM is whatever SMRR, TSeg and ASeg define;
+     * with none of them defined yet there is nothing to check against */
+    bool any = (s->smrr_mask & (1u << 11)) ||
+               (s->smm_map == UAM_X86_SMM_MAP_AMD64 && (s->smm_mask & (SMMMASK_TVALID | SMMMASK_AVALID)));
+    return any && !in_smrr && !tseg_hit(s, pa, &base) && !aseg_hit(s, pa);
+}
+
+/* Code at pa is tracked as mapped (re-validated on every uam_cpu_xlate_changed)
+ * when an SMRAM range covers it or SMM fetches are checked: a change of those
+ * ranges then reaches code translated before it. */
+static bool smram_sensitive(const x86_state *s, uint64_t pa)
+{
+    uint64_t base;
+    return x86_smm_fetch_checked(s) || smrr_hit(s, pa, &base) || tseg_hit(s, pa, &base);
 }
 
 uam_status x86_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kind, uam_xlate *out)
 {
     x86_state *s = x86_st(cpu);
+    uam_status st = UAM_OK;
     out->fault = 0;
     if (!(s->cr0 & CR0_PG)) {
         out->paddr = (s->efer & EFER_LMA) ? vaddr : (vaddr & 0xFFFFFFFFull);
-        if (kind != UAM_XLATE_DEBUG)
-            out->paddr = x86_smrr_filter(cpu, out->paddr);
         /* paging and SMM changes re-key code through cpu->priv; SMRR and SMM
          * changes also bump xlate_gen, which drops cached data translations */
         out->fixed = true;
-        return UAM_OK;
+    } else {
+        out->fixed = false;
+        bool user = kind != UAM_XLATE_DEBUG && x86_priv_cpl(cpu->priv) == 3;
+        st = xlate(cpu, vaddr, kind, user, &out->paddr, &out->fault);
     }
-    out->fixed = false;
-    bool user = kind != UAM_XLATE_DEBUG && x86_priv_cpl(cpu->priv) == 3;
-    uam_status st = xlate(cpu, vaddr, kind, user, &out->paddr, &out->fault);
-    if (st == UAM_OK && kind != UAM_XLATE_DEBUG)
-        out->paddr = x86_smrr_filter(cpu, out->paddr);
-    return st;
+    if (st != UAM_OK || kind == UAM_XLATE_DEBUG)
+        return st;
+    if (kind == UAM_XLATE_FETCH) {
+        if (out->fixed && smram_sensitive(s, out->paddr))
+            out->fixed = false;
+        if (x86_smm_fetch_blocked(s, out->paddr)) {
+            out->fault = X86_XF_SMM_CODE;   /* a machine check (take_exception) */
+            return UAM_ERR_FAULT;
+        }
+    }
+    out->paddr = x86_smram_filter(cpu, out->paddr, kind == UAM_XLATE_FETCH);
+    return UAM_OK;
 }
 
 /* ---- linear-address access from C ---------------------------------------- */
@@ -251,7 +329,7 @@ static uam_status lin_access(uam_cpu *cpu, uint64_t lin, unsigned size, uint64_t
         } else if (!(s->efer & EFER_LMA)) {
             pa &= 0xFFFFFFFFull;
         }
-        pa = x86_smrr_filter(cpu, pa);
+        pa = x86_smram_filter(cpu, pa, false);
         /* bytes [done, done + n) in one physical piece; n is a power of two or split bytewise */
         for (unsigned i = 0; i < n;) {
             unsigned chunk = (n - i >= 8 && !((pa + i) & 7)) ? 8 : (n - i >= 4 && !((pa + i) & 3)) ? 4

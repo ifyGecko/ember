@@ -452,7 +452,7 @@ static lr system_0f(xl *x)
     case 0xAA: {   /* RSM: only in SMM */
         if (!x86_priv_smm(x->priv))
             return x_ud(x);
-        x_jump(x, x_helper(x, X86_H_RSM, NONE, NONE, NONE), UAM_EXIT_EXC_RETURN);
+        x_jump(x, x_helper(x, X86_H_RSM, x_imm(x, x_io_rip(x)), NONE, NONE), UAM_EXIT_EXC_RETURN);
         return LR_END;
     }
     }
