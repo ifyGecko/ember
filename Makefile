@@ -36,6 +36,7 @@
 #   libuam-pic.a      8-bit PIC ISA module
 #   libuam-mcs51.a    8051 (MCS-51) ISA module   libuam-m6502.a  6502 (NMOS, 2A03, 65C02) ISA module
 #   libuam-z80.a      Z80 ISA module
+#   libuam-xtensa.a   Xtensa (LX106, LX6, LX7; little- and big-endian) ISA module
 #   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref, ...)
 #   libuam-fuzz.a     the fuzz harness and its frontends (fuzz/)
 #   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main; uses libuam-fuzz)
@@ -83,6 +84,21 @@ M6502_SDCC_SKIP = @echo "$@: 6502 fuzz target skipped (no $(SDCC); set SDCC=path
 SDASZ80     ?= sdasz80
 HAVE_SDASZ80 := $(if $(shell command -v $(SDASZ80) 2>/dev/null),1)
 Z80_SKIP     = @echo "$@: Z80 firmware skipped (no $(SDASZ80): install SDCC, or set SDASZ80=path)"
+
+# The Xtensa firmware is built with each core's GNU toolchain: the LX106's (Debian's
+# gcc-xtensa-lx106), the LX6's and LX7's from Espressif's xtensa-esp-elf release (the ESP32
+# and ESP32-S3 compilers). A model whose compiler is missing is skipped.
+XTENSA_LX106_CROSS ?= xtensa-lx106-elf-
+XTENSA_LX6_CROSS   ?= xtensa-esp32-elf-
+XTENSA_LX7_CROSS   ?= xtensa-esp32s3-elf-
+XTENSA_MODELS := $(if $(shell command -v $(XTENSA_LX106_CROSS)gcc 2>/dev/null),lx106) \
+                 $(if $(shell command -v $(XTENSA_LX6_CROSS)gcc 2>/dev/null),lx6) \
+                 $(if $(shell command -v $(XTENSA_LX7_CROSS)gcc 2>/dev/null),lx7)
+XTENSA_MODELS := $(strip $(XTENSA_MODELS))
+XTENSA_MISSING := $(filter-out $(XTENSA_MODELS),lx106 lx6 lx7)
+XTENSA_SKIP    = @echo "$@: Xtensa models without a toolchain skipped: $(XTENSA_MISSING) (set XTENSA_LX106_CROSS, XTENSA_LX6_CROSS, XTENSA_LX7_CROSS)"
+xt_cross = $(if $(filter lx106,$(1)),$(XTENSA_LX106_CROSS),$(if $(filter lx6,$(1)),$(XTENSA_LX6_CROSS),$(XTENSA_LX7_CROSS)))
+xt_reset = $(if $(filter lx106,$(1)),0x40000080,0x40000400)
 
 # ---- suzzer ------------------------------------------------------------------------------
 # SUZZER_DIR: an existing suzzer checkout to use in place; empty turns the integration off.
@@ -135,6 +151,8 @@ PIC_SRC     := isa/pic8/pic_lift.c isa/pic8/pic_system.c
 MCS51_SRC   := isa/mcs51/mcs51_lift.c isa/mcs51/mcs51_system.c
 M6502_SRC   := isa/m6502/m6502_lift.c isa/m6502/m6502_system.c
 Z80_SRC     := isa/z80/z80_lift.c isa/z80/z80_system.c
+XTENSA_SRC  := isa/xtensa/xtensa_decode.c isa/xtensa/xtensa_lift.c isa/xtensa/xtensa_system.c \
+               isa/xtensa/xtensa_fpu.c
 X86_SRC     := isa/x86/x86_decode.c isa/x86/x86_f80.c isa/x86/x86_lift.c isa/x86/x86_lift_ops.c isa/x86/x86_lift0f.c \
                isa/x86/x86_string.c isa/x86/x86_sse.c isa/x86/x86_sse_ops.c isa/x86/x86_sse_fp.c isa/x86/x86_x87.c isa/x86/x86_helpers.c \
                isa/x86/x86_mmu.c isa/x86/x86_seg.c isa/x86/x86_msr.c isa/x86/x86_smm.c \
@@ -148,7 +166,7 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_f
                devices/mcs51_timer.c devices/mcs51_serial.c devices/mcs51_port.c devices/pic32_intc.c \
                devices/z80_ctc.c
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c \
-               boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c boards/m6502_ref.c boards/z80_ref.c \
+               boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c boards/m6502_ref.c boards/z80_ref.c boards/xtensa_ref.c \
                boards/stock.c boards/mmio_rules.c
 SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
                fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
@@ -159,14 +177,14 @@ HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/b
                src/debug/gdbstub.c src/runner/runner.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
-LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(PIC_SRC) $(MCS51_SRC) $(M6502_SRC) $(Z80_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
+LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(PIC_SRC) $(MCS51_SRC) $(M6502_SRC) $(Z80_SRC) $(XTENSA_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
 obj = $(1:%.c=$(BUILD)/obj/%.o)
 LIB_OBJ  := $(call obj,$(LIB_SRC))
 
 LIB        := $(BUILD)/libuam.a
 MODULE_LIBS := $(BUILD)/libuam-core.a $(BUILD)/libuam-riscv.a $(BUILD)/libuam-mips.a \
                $(BUILD)/libuam-arm.a $(BUILD)/libuam-x86.a $(BUILD)/libuam-ppc.a $(BUILD)/libuam-avr.a \
-               $(BUILD)/libuam-avr32.a $(BUILD)/libuam-pic.a $(BUILD)/libuam-mcs51.a $(BUILD)/libuam-m6502.a $(BUILD)/libuam-z80.a \
+               $(BUILD)/libuam-avr32.a $(BUILD)/libuam-pic.a $(BUILD)/libuam-mcs51.a $(BUILD)/libuam-m6502.a $(BUILD)/libuam-z80.a $(BUILD)/libuam-xtensa.a \
                $(BUILD)/libuam-devices.a $(BUILD)/libuam-boards.a $(BUILD)/libuam-fuzz.a \
                $(BUILD)/libuam-host.a
 RUN       := $(BUILD)/uam-run
@@ -191,6 +209,7 @@ TEST_PIC  := $(BUILD)/test_pic
 TEST_MCS51 := $(BUILD)/test_mcs51
 TEST_M6502 := $(BUILD)/test_m6502
 TEST_Z80   := $(BUILD)/test_z80
+TEST_XTENSA_FPU := $(BUILD)/test_xtensa_fpu
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -211,6 +230,7 @@ FW_PIC32_UM := $(BUILD)/firmware-pic32/selftest-mz-um.elf
 MIPS16_DEC := $(BUILD)/mips16-dec
 UMIPS_DEC  := $(BUILD)/umips-dec
 DSP_DEC    := $(BUILD)/dsp-dec
+XT_DEC     := $(BUILD)/xt-dec
 FW_AVR    := $(BUILD)/firmware-avr
 AVR_MODELS := e eplus xm xt rc
 FW_AVR32_A := $(BUILD)/firmware-avr32/selftest-a.elf
@@ -222,13 +242,14 @@ MCS51_MODELS := 8051 8052 cip51
 FW_6502   := $(BUILD)/firmware-6502
 M6502_MODELS := nmos 2a03 65c02
 FW_Z80    := $(BUILD)/firmware-z80
+FW_XTENSA := $(BUILD)/firmware-xtensa
 Z80_MODELS := nmos cmos
 EXAMPLE   := $(BUILD)/examples/external-board/ext-run
 
 .PHONY: all lib test runner-test unit-test firmware-test firmware firmware-mips firmware-arm mips-test arm-test \
         firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test firmware-pic pic-test \
         firmware-mcs51 mcs51-test firmware-pic32 pic32-test firmware-6502 6502-test firmware-z80 z80-test \
-        example-test \
+        firmware-xtensa xtensa-test example-test \
         snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
         bench-test xbench install \
         clean FORCE
@@ -274,6 +295,7 @@ $(BUILD)/libuam-pic.a:     $(call obj,$(PIC_SRC))
 $(BUILD)/libuam-mcs51.a:   $(call obj,$(MCS51_SRC))
 $(BUILD)/libuam-m6502.a:   $(call obj,$(M6502_SRC))
 $(BUILD)/libuam-z80.a:     $(call obj,$(Z80_SRC))
+$(BUILD)/libuam-xtensa.a:  $(call obj,$(XTENSA_SRC))
 $(BUILD)/libuam-devices.a: $(call obj,$(DEV_SRC))
 $(BUILD)/libuam-boards.a:  $(call obj,$(BOARD_SRC))
 $(BUILD)/libuam-fuzz.a:    $(call obj,$(FUZZ_SRC))
@@ -304,6 +326,9 @@ $(MIPS16_DEC): $(BUILD)/obj/tests/isa-mips/mips16-dec.o $(LIB)
 $(UMIPS_DEC): $(BUILD)/obj/tests/isa-mips/umips-dec.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 $(DSP_DEC): $(BUILD)/obj/tests/isa-mips/dsp-dec.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+$(BUILD)/obj/tests/isa-xtensa/%-dec.o: UAM_COMPILE += -Iisa/xtensa
+$(XT_DEC): $(BUILD)/obj/tests/isa-xtensa/xt-dec.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_IR): $(BUILD)/obj/tests/unit/test_ir.o $(LIB)
@@ -362,6 +387,15 @@ $(TEST_M6502): $(BUILD)/obj/tests/unit/test_m6502.o $(LIB)
 
 $(TEST_Z80): $(BUILD)/obj/tests/unit/test_z80.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+# Its vectors are computed with exact arithmetic when it is built.
+$(BUILD)/gen/xtensa_fpu_vectors.h: tests/isa-xtensa/gen-fpu-vectors.py tests/isa-xtensa/opcodes.py
+	@mkdir -p $(dir $@)
+	python3 -I -B tests/isa-xtensa/gen-fpu-vectors.py > $@
+$(BUILD)/obj/tests/unit/test_xtensa_fpu.o: UAM_COMPILE += -Iisa/xtensa -I$(BUILD)/gen
+$(BUILD)/obj/tests/unit/test_xtensa_fpu.o: $(BUILD)/gen/xtensa_fpu_vectors.h
+$(TEST_XTENSA_FPU): $(BUILD)/obj/tests/unit/test_xtensa_fpu.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) -lm
 
 # test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
 $(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
@@ -443,6 +477,15 @@ else
 	$(Z80_SKIP)
 endif
 
+firmware-xtensa:
+ifneq ($(XTENSA_MODELS),)
+	$(MAKE) -C tests/firmware-xtensa MODELS="$(XTENSA_MODELS)" OUT=$(abspath $(FW_XTENSA)) \
+	    LX106_CROSS=$(XTENSA_LX106_CROSS) LX6_CROSS=$(XTENSA_LX6_CROSS) LX7_CROSS=$(XTENSA_LX7_CROSS) all c
+endif
+ifneq ($(XTENSA_MISSING),)
+	$(XTENSA_SKIP)
+endif
+
 firmware-avr32:
 ifeq ($(HAVE_AVR32),1)
 	$(MAKE) -C tests/firmware-avr32 CROSS=$(AVR32_CROSS) OUT=$(abspath $(BUILD))/firmware-avr32
@@ -460,8 +503,8 @@ endif
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_JITDIFF) \
-           $(TEST_F80) $(SUZZER_UNIT)
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA_FPU) \
+           $(TEST_JITDIFF) $(TEST_F80) $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
 	$(TEST_HOST)
@@ -479,6 +522,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_MCS51)
 	$(TEST_M6502)
 	$(TEST_Z80)
+	$(TEST_XTENSA_FPU)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
@@ -578,6 +622,36 @@ avr-test: $(RUN) firmware-avr
 	    $(RUN) -b avr-ref -o model=$$m --jit --stats $(FW_AVR)/selftest-$$m.elf < /dev/null; \
 	done
 
+# The Xtensa self-test on each model with a toolchain: little-endian (xtensa-ref) and,
+# laid out the big-endian way, on xtensaeb-ref; the decoder against each toolchain's
+# disassembler.
+xtensa-test: $(RUN) firmware-xtensa $(XT_DEC)
+ifneq ($(filter lx106,$(XTENSA_MODELS)),)
+	$(RUN) -b xtensa-ref -o model=lx106 --stats $(FW_XTENSA)/selftest-lx106.elf < /dev/null
+	$(RUN) -b xtensa-ref -o model=lx106 --jit --stats $(FW_XTENSA)/selftest-lx106.elf < /dev/null
+	$(RUN) -b xtensaeb-ref -o model=lx106 --raw-base 0x40000000 --entry 0x40000080 $(FW_XTENSA)/selftest-lx106-be.bin < /dev/null
+	$(RUN) -b xtensaeb-ref -o model=lx106 --jit --raw-base 0x40000000 --entry 0x40000080 $(FW_XTENSA)/selftest-lx106-be.bin < /dev/null
+endif
+ifneq ($(filter lx6,$(XTENSA_MODELS)),)
+	$(RUN) -b xtensa-ref -o model=lx6 --stats $(FW_XTENSA)/selftest-lx6.elf < /dev/null
+	$(RUN) -b xtensa-ref -o model=lx6 --jit --stats $(FW_XTENSA)/selftest-lx6.elf < /dev/null
+	$(RUN) -b xtensaeb-ref -o model=lx6 --raw-base 0x40000000 --entry 0x40000400 $(FW_XTENSA)/selftest-lx6-be.bin < /dev/null
+	$(RUN) -b xtensaeb-ref -o model=lx6 --jit --raw-base 0x40000000 --entry 0x40000400 $(FW_XTENSA)/selftest-lx6-be.bin < /dev/null
+endif
+ifneq ($(filter lx7,$(XTENSA_MODELS)),)
+	$(RUN) -b xtensa-ref -o model=lx7 --stats $(FW_XTENSA)/selftest-lx7.elf < /dev/null
+	$(RUN) -b xtensa-ref -o model=lx7 --jit --stats $(FW_XTENSA)/selftest-lx7.elf < /dev/null
+	$(RUN) -b xtensaeb-ref -o model=lx7 --raw-base 0x40000000 --entry 0x40000400 $(FW_XTENSA)/selftest-lx7-be.bin < /dev/null
+	$(RUN) -b xtensaeb-ref -o model=lx7 --jit --raw-base 0x40000000 --entry 0x40000400 $(FW_XTENSA)/selftest-lx7-be.bin < /dev/null
+endif
+ifneq ($(XTENSA_MODELS),)
+	python3 -I -B tests/isa-xtensa/xt-check.py $(XT_DEC) $(BUILD) \
+	    $(foreach m,$(XTENSA_MODELS),$(m)=$(call xt_cross,$(m))objdump)
+endif
+ifneq ($(XTENSA_MISSING),)
+	$(XTENSA_SKIP)
+endif
+
 # The Z80 self-test on both cores the board models.
 z80-test: $(RUN) firmware-z80
 ifeq ($(HAVE_SDASZ80),1)
@@ -652,7 +726,7 @@ example-test: lib firmware-mips
 # A run split by --save-snapshot / --load-snapshot must equal the uninterrupted run,
 # on the stock boards and on the out-of-tree example board.
 snapshot-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-x86 firmware-ppc firmware-avr firmware-avr32 firmware-pic \
-               firmware-mcs51 firmware-pic32 firmware-6502 firmware-z80 \
+               firmware-mcs51 firmware-pic32 firmware-6502 firmware-z80 firmware-xtensa \
                example-test
 	sh tests/snapshot/snapshot-check.sh $(RUN) rv32-ref $(FIRMWARE) 1 3000 6900
 	sh tests/snapshot/snapshot-check.sh $(RUN) mips-ref $(FW_MIPS_BE) 777 6000 11800
@@ -714,6 +788,15 @@ ifeq ($(HAVE_SDASZ80),1)
 else
 	$(Z80_SKIP)
 endif
+ifneq ($(filter lx106,$(XTENSA_MODELS)),)
+	sh tests/snapshot/snapshot-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/selftest-lx106.elf 1 500 3000 9000 14000 -- -o model=lx106
+endif
+ifneq ($(filter lx6,$(XTENSA_MODELS)),)
+	sh tests/snapshot/snapshot-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/selftest-lx6.elf 1 500 3000 9000 14000 -- -o model=lx6
+endif
+ifneq ($(filter lx7,$(XTENSA_MODELS)),)
+	sh tests/snapshot/snapshot-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/selftest-lx7.elf 1 500 3000 9000 14000 -- -o model=lx7
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/snapshot/snapshot-check.sh $(RUN) avr32-ref $(FW_AVR32_A) 777 164500 165000 165300 165600 165900
@@ -732,7 +815,7 @@ endif
 # Block coverage: identical maps from the interpreter and the JIT (chained or not), and
 # runs that end exactly as without coverage, on every ISA.
 cov-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
-          firmware-pic32 firmware-6502 firmware-z80
+          firmware-pic32 firmware-6502 firmware-z80 firmware-xtensa
 	sh tests/cov/cov-check.sh $(RUN) rv32-ref $(FIRMWARE)
 	sh tests/cov/cov-check.sh $(RUN) mips-ref $(FW_MIPS_BE)
 	sh tests/cov/cov-check.sh $(RUN) mipsel-ref $(FW_MIPS_EL)
@@ -768,6 +851,15 @@ ifeq ($(HAVE_SDASZ80),1)
 else
 	$(Z80_SKIP)
 endif
+ifneq ($(filter lx106,$(XTENSA_MODELS)),)
+	sh tests/cov/cov-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/selftest-lx106.elf -- -o model=lx106
+endif
+ifneq ($(filter lx6,$(XTENSA_MODELS)),)
+	sh tests/cov/cov-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/selftest-lx6.elf -- -o model=lx6
+endif
+ifneq ($(filter lx7,$(XTENSA_MODELS)),)
+	sh tests/cov/cov-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/selftest-lx7.elf -- -o model=lx7
+endif
 
 ifeq ($(HAVE_AVR32),1)
 	sh tests/cov/cov-check.sh $(RUN) avr32-ref $(FW_AVR32_A)
@@ -784,7 +876,7 @@ endif
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
 fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
-           firmware-pic32 firmware-6502 firmware-z80
+           firmware-pic32 firmware-6502 firmware-z80 firmware-xtensa
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -812,6 +904,15 @@ ifeq ($(HAVE_SDASZ80)$(HAVE_SDCC),11)
 	    $(FW_Z80)/fuzztarget.bin
 else
 	$(Z80_SKIP)
+endif
+ifneq ($(filter lx106,$(XTENSA_MODELS)),)
+	FUZZ_CHECK_ARGS="-o model=lx106" sh tests/fuzz/fuzz-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/fuzztarget-lx106.elf
+endif
+ifneq ($(filter lx6,$(XTENSA_MODELS)),)
+	FUZZ_CHECK_ARGS="-o model=lx6" sh tests/fuzz/fuzz-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/fuzztarget-lx6.elf
+endif
+ifneq ($(filter lx7,$(XTENSA_MODELS)),)
+	FUZZ_CHECK_ARGS="-o model=lx7" sh tests/fuzz/fuzz-check.sh $(RUN) xtensa-ref $(FW_XTENSA)/fuzztarget-lx7.elf
 endif
 	sh tests/fuzz/fuzz-check.sh $(RUN) pic32-ref $(BUILD)/firmware-pic32/fuzztarget-mz.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) pic32-ref $(BUILD)/firmware-pic32/fuzztarget-mx.elf
@@ -855,7 +956,7 @@ suzzer-test:
 	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
 endif
 
-test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test z80-test \
+test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test z80-test xtensa-test \
       example-test snapshot-test cov-test fuzz-test \
       suzzer-test \
       gdb-test runner-test bench-test
@@ -898,6 +999,6 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
-         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d \
+         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \
          $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d

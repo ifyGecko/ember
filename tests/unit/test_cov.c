@@ -24,6 +24,7 @@
 #include "uam/isa/avr32.h"
 #include "uam/isa/mcs51.h"
 #include "uam/isa/m6502.h"
+#include "uam/isa/xtensa.h"
 #include "uam/isa/z80.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
@@ -552,6 +553,37 @@ static prog z80_prog(int n)
     return p;
 }
 
+/* Xtensa (the default model, LX6): 24-bit instructions packed little-endian into the words;
+ * x is a2. */
+static prog xtensa_prog(int n)
+{
+    prog p = { .name = "xtensa", .isa = &uam_isa_xtensa, .base = 0x1000, .phys = 0x1000, .be = false,
+               .xreg = 2 * 4, .illegal = 0x00000000u /* ill */ };
+    const uint32_t movi_a3 = ((uint32_t)n & 0xFF) << 16 | 0xA000u | (((uint32_t)n >> 8) & 0xF) << 8 | 0x32u;
+    const uint32_t insn[6] = {
+        0x00A022u,      /* movi a2, 0 */
+        movi_a3,        /* movi a3, n */
+        0x01C222u,      /* loop: addi a2, a2, 1 */
+        0xF99237u,      /* bne a2, a3, loop */
+        0x07A042u,      /* movi a4, 7 */
+        0xFFFF06u,      /* j . */
+    };
+    uint8_t b[24] = { 0 };
+    for (unsigned i = 0; i < 6; i++)
+        for (unsigned k = 0; k < 3; k++)
+            b[3 * i + k] = (uint8_t)(insn[i] >> (8 * k));
+    for (unsigned i = 0; i < 5; i++)
+        p.w[i] = (uint32_t)b[4 * i] | (uint32_t)b[4 * i + 1] << 8 | (uint32_t)b[4 * i + 2] << 16
+                 | (uint32_t)b[4 * i + 3] << 24;
+    p.n = 5;
+    p.site[0] = p.base;
+    p.site[1] = p.base + 6;
+    p.site[2] = p.base + 9;
+    p.site[3] = p.base + 12;
+    p.done = p.base + 15;
+    return p;
+}
+
 typedef enum { BK_INTERP, BK_JIT, BK_JIT_NOCHAIN } backend;
 static const char *const bk_name[] = { "interp", "jit", "jit-nochain" };
 
@@ -1005,12 +1037,12 @@ int main(void)
                             arm_prog(3, false, false), arm_prog(3, true, false),
                             arm_prog(3, true, true), ppc_prog(3), avr_prog(3), avr32_prog(3),
                             pic_prog(3), mcs51_prog(3), mips16_prog(3), umips_prog(3),
-                            m6502_prog(3), z80_prog(3) };
+                            m6502_prog(3), z80_prog(3), xtensa_prog(3) };
     const prog progs300[] = { rv_prog(300), mips_prog(300, true), mips_prog(300, false),
                               arm_prog(300, false, false), arm_prog(300, true, false),
                               arm_prog(300, true, true), ppc_prog(300), avr_prog(300), avr32_prog(300),
                               pic_prog(300), mcs51_prog(300), mips16_prog(300), umips_prog(300),
-                              m6502_prog(300), z80_prog(300) };
+                              m6502_prog(300), z80_prog(300), xtensa_prog(300) };
     for (size_t i = 0; i < UAM_ARRAY_LEN(progs3); i++) {
         test_coverage_on(&progs3[i], &progs300[i]);
         test_site_errors(&progs3[i]);

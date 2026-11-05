@@ -3,7 +3,7 @@
 Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A with an
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
 and AVR32B, 8-bit PIC in four core families, the 8051 in three core models, the 6502 in
-three core models, the Z80), the
+three core models, the Z80, Xtensa in three core models and both byte orders), the
 snapshot part of phase 3 and the JIT from
 phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
@@ -11,7 +11,7 @@ watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/littl
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), 8-bit AVR
 (`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), the 8051 (`mcs51-ref`), the 6502
-(`6502-ref`), the Z80 (`z80-ref`), host
+(`6502-ref`), the Z80 (`z80-ref`), Xtensa (`xtensa-ref` / `xtensaeb-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. See section 7 for what remains.
@@ -131,6 +131,7 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
                   i8237.h ide.h fdc.h vga.h lpt.h gptimer.h avr32_intc.h mcs51_timer.h
                   mcs51_serial.h mcs51_port.h z80_ctc.h
 include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h m6502.h z80.h
+                  xtensa.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
 src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
@@ -152,6 +153,8 @@ isa/pic8/         pic_lift.c pic_system.c pic.h (private)
 isa/mcs51/        mcs51_lift.c mcs51_system.c mcs51.h (private)
 isa/m6502/        m6502_lift.c m6502_system.c m6502.h (private)
 isa/z80/          z80_lift.c z80_system.c z80.h (private)
+isa/xtensa/       xtensa_decode.c xtensa_opc.h (generated) xtensa_lift.c xtensa_system.c
+                  xtensa_fpu.c xtensa.h (private)
 isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
@@ -161,7 +164,7 @@ devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.
                   ipi.c i8237.c fdc.c vga.c lpt.c gptimer.c avr32_intc.c mcs51_timer.c
                   mcs51_serial.c mcs51_port.c z80_ctc.c
 boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c avr_ref.c avr32_ref.c
-                  mcs51_ref.c m6502_ref.c z80_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+                  mcs51_ref.c m6502_ref.c z80_ref.c xtensa_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
@@ -177,7 +180,7 @@ tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: refe
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
                   test_smp.c test_ppc.c test_avr.c test_pic.c test_mcs51.c test_m6502.c
-                  test_z80.c test_f80.c
+                  test_z80.c test_xtensa_fpu.c test_f80.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -207,6 +210,12 @@ tests/firmware-6502/  selftest.s nmos.s model-*.s gen_vectors.py ihx2bin.py fuzz
                       (the 6502: sdas6500 self-tests per core model, an SDCC fuzz target)
 tests/firmware-z80/   selftest.s model-*.s gen_vectors.py crt0.s fuzztarget.c  (the Z80:
                       sdasz80 self-tests per core model, SDCC start code and fuzz target)
+tests/firmware-xtensa/ selftest.S model.h gen_vectors.py window.inc start.S link.ld selftest.ld
+                      fuzztarget.c lx106-libgcc.c  (Xtensa: the self-test per model, built
+                      with each core's GNU toolchain, and the C programs' start code)
+tests/isa-xtensa/     opcodes.py gen-opcodes.py xt-dec.c xt-check.py le2be.py gen-fpu-vectors.py
+                      (the opcode table, the decoder against the GNU disassemblers, the
+                      big-endian layout of a little-endian build)
                       start-booke.S link-booke.ld  (the self-test for the Book E model)
 tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bios-check.py
                       (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
@@ -273,7 +282,10 @@ devices.
   and a test finisher in external data), `6502-ref` (the 6502, `-o model=nmos|2a03|65c02`:
   RAM, ROM with the vectors, and in an I/O page a NS16550A UART, two general-purpose timers
   (one on IRQ, one on NMI) and a test finisher), and `z80-ref` (the Z80, `-o model=nmos|cmos`:
-  64 KiB of RAM, and on I/O ports a NS16550A UART, a Z80 CTC and a test finisher). Real devices are
+  64 KiB of RAM, and on I/O ports a NS16550A UART, a Z80 CTC and a test finisher), and
+  `xtensa-ref` / `xtensaeb-ref` (Xtensa, `-o model=lx106|lx6|lx7`, `-o cpus=N`: RAM where
+  VECBASE and the reset vectors point, a NS16550A UART, two general-purpose timers (one on an
+  edge-triggered interrupt, one on the NMI) and a test finisher). Real devices are
   built out of tree on the library (`examples/external-board/`). Ember's own tests also use
   generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
   virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
@@ -459,6 +471,23 @@ devices.
   interrupt at RETI. A Z80 has no exceptions: an access nothing answers halts the core. Not
   modelled: instruction timing (one tick per instruction), R while HALT waits, IM 0 with an
   instruction other than RST or CALL on the bus, and the NMOS LD A,I/R IFF2 race.
+- **Xtensa** (`isa/xtensa`, `uam/isa/xtensa.h`): a configurable core, two descriptors (little-
+  and big-endian; a big-endian core reverses the fields of each instruction format, which the
+  decoder puts back first). The CPU model (`uam_xtensa_config`) lists the options, the
+  interrupt table (type and level per interrupt), the levels, the vectors and the region
+  attributes' rights; the models are the cores of the ESP8266 (LX106: CALL0 only, Extended
+  L32R, alignment exceptions), the ESP32 (LX6) and the ESP32-S3 (LX7), from their published
+  configuration headers. The decoder is generated from an opcode table checked against the GNU
+  assemblers and disassemblers of those cores. Register windows keep the current window in
+  the register file (rotations swap it), with the overflow check before each instruction that
+  names a4-a15; zero-overhead loops are a lift-time loop end checked on block entry; the
+  XEA2 exceptions, the Interrupt and High-Priority Interrupt options (levels, PS.EXCM, NMI,
+  RFI), CCOUNT/CCOMPARE in virtual time, Region Protection as translation, MAC16, booleans,
+  S32C1I, and the single-precision FPU (in software, with its divide and square-root step
+  instructions) are modelled (uam-isa.md section 10j). Not modelled: designer-defined TIE
+  instructions (the ESP32-S3's AI extension, the ESP32's double-precision helpers), the cache
+  and OCD instructions, IBREAK/DBREAK/ICOUNT debug exceptions, and timing (one tick per
+  instruction).
 
 ## 6. Analysis and fuzzing
 
@@ -643,7 +672,12 @@ Implemented (`make test`):
   ALU, INC/DEC, DAA, rotate, CB and 16-bit arithmetic flag, bits 3 and 5 included, and the
   block instructions' flags against vectors from a model of the instruction set, the index
   registers and prefix chains, R, IFF2, Q, MEMPTR, I/O, interrupts in IM 1 and IM 2 from the
-  CTC, the instruction after EI, HALT); and a multiprocessor self-test on four processors of each
+  CTC, the instruction after EI, HALT); the Xtensa self-test on each model, little- and
+  big-endian (the computational instructions against vectors from a model of their
+  definitions, loads and stores, branches, register windows with overflow and underflow
+  through the manual's handlers, loops including a loop end in code translated before the
+  loop, booleans, MAC16, the FPU, S32C1I, every exception and interrupt level, the NMI,
+  Region Protection), and its decoder against the GNU disassemblers; and a multiprocessor self-test on four processors of each
   architecture (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
   `tests/firmware-x86/legacy.asm` (task switches, gates, the I/O bitmap, virtual-8086 mode,
   A20, MMX) and `biosrom.asm`, a BIOS-style ROM from the reset vector through VGA, floppy (DMA),

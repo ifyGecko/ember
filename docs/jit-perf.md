@@ -230,6 +230,14 @@ arithmetic helpers (`tools/xbench.sh --variants z80 --rounds 4` times it). It ru
 MIPS with the JIT and 20 MIPS interpreted: every instruction computes the whole flags byte,
 bits 3 and 5 included, and counts R.
 
+The Xtensa builds (`bench-lx106.elf` with the LX106's CALL0 code, `bench-lx6.elf` and
+`bench-lx7.elf` with the windowed ABI) are in the timed run. Measured with the JIT against RV32
+(0.279 s, 1860 MIPS): LX106 0.459 s at 1700 MIPS (780 million instructions: no MULUH and no
+divide, so libgcc's routines run instead), LX6 0.567 s at 840 MIPS and LX7 0.491 s at 980 MIPS
+(about 480 million). The windowed builds pay for every call and return: ENTRY and RETW are
+helpers that store the current window into the physical register file and load the next one
+(32 register moves), and each block's first instruction that names a4-a15 tests the window.
+
 Each kernel on its own (`--per-kernel --rounds 1600`, medians of 3): time over the
 fastest guest's on that kernel.
 

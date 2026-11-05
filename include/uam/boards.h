@@ -21,6 +21,8 @@ extern const uam_board uam_board_avr32_ref;   /* "avr32-ref": AVR32A (UC3 class)
 extern const uam_board uam_board_pic_ref;     /* "pic-ref": 8-bit PIC (-o model=) */
 extern const uam_board uam_board_mcs51_ref;   /* "mcs51-ref": 8051 (-o model=) */
 extern const uam_board uam_board_z80_ref;     /* "z80-ref": Z80 (-o model=nmos|cmos) */
+extern const uam_board uam_board_xtensa_ref;  /* "xtensa-ref": Xtensa LE (-o model=lx106|lx6|lx7) */
+extern const uam_board uam_board_xtensaeb_ref;/* "xtensaeb-ref": Xtensa BE */
 extern const uam_board uam_board_pic32_ref;   /* "pic32-ref": PIC32MX, PIC32MM or PIC32MZ class MIPS */
 extern const uam_board uam_board_m6502_ref;   /* "6502-ref": NMOS 6502, 2A03 or 65C02 (-o model=) */
 

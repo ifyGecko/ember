@@ -713,6 +713,51 @@ The Z80 needed no new IR; these are conventions of its lifter (`isa/z80`).
 - **Repeating block instructions** do one iteration and `EXIT` to themselves while they repeat,
   so each iteration is an instruction and an interrupt can come between them.
 
+## 10j. A configurable core, register windows and zero-overhead loops (Xtensa)
+
+Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
+
+- **The options are the model's.** One module for every configuration: the CPU model lists the
+  options, and an instruction or special register of an option the model lacks is an illegal
+  instruction, decided when the block is lifted. The decoder is a table of fixed bits over the
+  little-endian instruction word (generated from `tests/isa-xtensa/opcodes.py`, checked against
+  the GNU tools of each core); a big-endian core lays each format's fields out in the opposite
+  order, and the decoder rearranges them to the little-endian word first.
+- **The current window in the register file.** With the Windowed Register option the physical
+  file holds every frame, and the 16 registers WindowBase selects are copied to fixed offsets
+  while they are current; ENTRY, RETW, ROTW, a window exception and its return, and a write of
+  WINDOWBASE put them back and load the new ones (in a helper or a system register write), so
+  lifted code reads `a0`-`a15` at fixed offsets. The window-overflow check of an instruction
+  that names `a4`-`a15` is a guarded `TRAP` on a register-file word the system code keeps
+  (WindowStart rotated to WindowBase, zero while PS.WOE is clear or PS.EXCM set), tested once
+  per window group per block; the exception picks the frame to spill and its vector.
+- **Zero-overhead loops through a lift-time loop end.** The loop-back happens when an
+  instruction falls through to LEND with LCOUNT not zero and PS.EXCM clear. A block is lifted
+  with LEND's value at the time and ends there when LEND is one of its boundaries, followed by
+  the loop-back: `[LENDA == LEND] PUT LCOUNT - 1; [..] EXIT LBEG`. LENDA, a register-file word,
+  is LEND while a loop-back can happen and all ones otherwise. On entry every block checks that
+  LENDA is not at another of its boundaries; if it is (the loop end moved into code translated
+  before), the hart runs one instruction per block (a bit of `cpu->priv`) with the loop-back
+  tested after each, and the code's next translation sees the new LEND. LCOUNT therefore is not
+  translation state, and a loop's iteration count never causes a new translation.
+- **Exceptions as values, vectors at VECBASE.** EXCCAUSE values are `TRAP` causes; window
+  overflow and underflow, BREAK (a debug exception, or nothing at or above DEBUGLEVEL), and the
+  helpers' failures (ENTRY's overflow, RETW's underflow, MOVSP's Alloca) have causes of their
+  own that `take_exception` turns into the vector and the state the ISA defines. Bus faults are
+  LoadStoreError and InstructionFetchError, Region Protection's refusals (`isa->translate`)
+  Load/StoreProhibited and InstFetchProhibited, misaligned accesses LoadStoreAlignment on a core
+  with the Unaligned Exception option.
+- **Interrupt levels between blocks.** INTERRUPT is the level lines as they are plus the
+  latched edge, software and timer bits; `irq_take` takes the highest level above PS.INTLEVEL
+  (and above EXCMLEVEL while PS.EXCM is set; the NMI regardless): level 1 through the user or
+  kernel vector with EXCCAUSE 4, higher levels through their own with EPCn and EPSn. Writes of
+  PS, INTENABLE, INTSET, INTCLEAR and CCOMPARE, RSIL and the returns request an exit. CCOUNT
+  counts ticks of virtual time; each CCOMPARE match is a scheduler timer.
+- **Coprocessors by a dynamic check.** The FPU's instructions test CPENABLE once per block (a
+  register-file copy), so changing CPENABLE, as an RTOS's lazy context switch does, never
+  retranslates code. FP arithmetic, conversions and compares are one helper on the register
+  file; FP loads, stores and moves stay IR. MAC16's 40-bit accumulator is IR on 64-bit values.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |

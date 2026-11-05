@@ -17,6 +17,14 @@ AVR_CROSS    ?= avr-
 AVR32_CROSS  ?= avr32-
 HAVE_AVR32   := $(if $(shell command -v $(AVR32_CROSS)gcc 2>/dev/null),1)
 SDCC         ?= sdcc
+# Xtensa: the LX106's toolchain (Debian), the LX6's and LX7's (Espressif's ESP32 and ESP32-S3).
+XTENSA_LX106_CROSS ?= xtensa-lx106-elf-
+XTENSA_LX6_CROSS   ?= xtensa-esp32-elf-
+XTENSA_LX7_CROSS   ?= xtensa-esp32s3-elf-
+XTENSA_BENCH := $(if $(shell command -v $(XTENSA_LX106_CROSS)gcc 2>/dev/null),$(OUT)/bench-lx106.elf) \
+                $(if $(shell command -v $(XTENSA_LX6_CROSS)gcc 2>/dev/null),$(OUT)/bench-lx6.elf) \
+                $(if $(shell command -v $(XTENSA_LX7_CROSS)gcc 2>/dev/null),$(OUT)/bench-lx7.elf)
+$(foreach m,lx106 lx6 lx7,$(if $(filter $(OUT)/bench-$(m).elf,$(XTENSA_BENCH)),,$(shell rm -f $(OUT)/bench-$(m).elf)))
 HAVE_SDCC    := $(if $(shell command -v $(SDCC) 2>/dev/null),1)
 # Without the toolchain, images from an earlier build would be tested as current: drop them.
 ifneq ($(HAVE_AVR32),1)
@@ -43,7 +51,7 @@ ALL := $(OUT)/bench-rv32.elf $(OUT)/bench-mips.elf $(OUT)/bench-mipsel.elf \
        $(OUT)/bench-arm.elf $(OUT)/bench-thumb.elf $(OUT)/bench-thumb-be.elf \
        $(OUT)/bench-ppc.elf $(OUT)/bench-x86.bin $(OUT)/bench-avr.elf $(OUT)/bench-host \
        $(OUT)/bench-pic32mx.elf $(OUT)/bench-pic32mm.elf $(OUT)/bench-pic32mz.elf \
-       $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf) \
+       $(if $(HAVE_AVR32),$(OUT)/bench-avr32a.elf $(OUT)/bench-avr32b.elf) $(XTENSA_BENCH) \
        $(if $(HAVE_SDCC),$(OUT)/bench-mcs51.bin $(OUT)/bench-6502.bin $(OUT)/bench-65c02.bin \
                           $(OUT)/bench-z80.bin)
 
@@ -88,6 +96,18 @@ $(OUT)/bench-avr.elf: bench.c $(OUT)/.config
 	$(AVR_CROSS)gcc -mmcu=atmega2560 -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -fno-builtin \
 	    -fno-tree-loop-distribute-patterns $(DEFS) -Wl,--defsym=__DATA_REGION_LENGTH__=0xFE00 \
 	    -Wl,--defsym=__stack=0xFFFF bench.c -o $@
+
+# Xtensa (xtensa-ref, models lx106, lx6, lx7) with the start code and link script of the
+# C firmware; the LX106's libgcc lacks two routines the ESP8266's ROM provides.
+XT_FW = $(FW)-xtensa
+XT_FLAGS = $(COMMON) $(LDCOMMON) -T $(XT_FW)/link.ld
+$(OUT)/bench-lx106.elf: bench.c $(XT_FW)/start.S $(XT_FW)/link.ld $(XT_FW)/lx106-libgcc.c $(OUT)/.config
+	$(XTENSA_LX106_CROSS)gcc -mtext-section-literals $(XT_FLAGS) $(XT_FW)/start.S bench.c \
+	    $(XT_FW)/lx106-libgcc.c -lgcc -o $@
+$(OUT)/bench-lx6.elf: bench.c $(XT_FW)/start.S $(XT_FW)/link.ld $(OUT)/.config
+	$(XTENSA_LX6_CROSS)gcc $(XT_FLAGS) $(XT_FW)/start.S bench.c -lgcc -o $@
+$(OUT)/bench-lx7.elf: bench.c $(XT_FW)/start.S $(XT_FW)/link.ld $(OUT)/.config
+	$(XTENSA_LX7_CROSS)gcc $(XT_FLAGS) $(XT_FW)/start.S bench.c -lgcc -o $@
 
 # AVR32 (avr32-ref, models a and b), only when an AVR32 toolchain is found (AVR32_CROSS): its
 # gcc 4.4 lacks -fno-tree-loop-distribute-patterns, and wants the C locale.

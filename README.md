@@ -38,7 +38,11 @@ serial port and ports, the 6502 (the NMOS 6502 with its undefined opcodes, the 2
 decimal mode and the WDC 65C02 as CPU models of one module) on the `6502-ref` board, and the
 Z80 (documented and undocumented: the index registers' halves, the flags' bits 3 and 5,
 MEMPTR, R, interrupt modes 0-2 and NMI; NMOS and CMOS models) on the `z80-ref` board with a
-16550 and a Z80 CTC on its I/O ports - run by a
+16550 and a Z80 CTC on its I/O ports, and Xtensa (a configurable core: the options of the
+LX106, LX6 and LX7 cores as the ESP8266, ESP32 and ESP32-S3 have them, as CPU models of one
+module - register windows, zero-overhead loops, booleans, MAC16, the single-precision FPU,
+the XEA2 exceptions with seven interrupt levels and the NMI, CCOUNT/CCOMPARE, Region
+Protection - little- and big-endian) on the `xtensa-ref` and `xtensaeb-ref` boards - run by a
 reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
 with block chaining (a block optimizer feeds both). Every reference board but `avr-ref`,
 `pic-ref`, `mcs51-ref`, `6502-ref` and `z80-ref` (an AVR, a PIC, an 8051, a 6502 and a Z80 have
@@ -77,7 +81,7 @@ host-independent.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, 8051, 6502 and Z80 firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, 8051, 6502, Z80 and Xtensa firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
                      # (and suzzer interop, with a suzzer checkout)
@@ -127,6 +131,13 @@ its `sdld`; the 6502 fuzz target and benchmark build need `sdcc` (all in Debian'
 Without them those checks are skipped with a note (`SDAS6500=`, `SDLD=`, `SDCC=`).
 The Z80 self-tests (one per core model) are assembled with SDCC's `sdasz80`, and the Z80 fuzz
 target and benchmark build with SDCC; without them they are skipped (`SDASZ80=` names it).
+The Xtensa firmware (self-test, fuzz target, benchmark) is built with each core's GNU
+toolchain: the LX106's `xtensa-lx106-elf-` (Debian's `gcc-xtensa-lx106`), the LX6's and LX7's
+`xtensa-esp32-elf-` and `xtensa-esp32s3-elf-` (Espressif's `xtensa-esp-elf` release). A model
+whose toolchain is missing is skipped with a note (`XTENSA_LX106_CROSS=`, `XTENSA_LX6_CROSS=`,
+`XTENSA_LX7_CROSS=` give the prefixes). No big-endian Xtensa toolchain is needed: the
+big-endian self-test is the little-endian build laid out the big-endian way
+(tests/isa-xtensa/le2be.py).
 
 ## Run firmware
 
@@ -154,6 +165,8 @@ build/uam-run -b mcs51-ref -o model=cip51 build/firmware-mcs51/selftest-cip51.bi
 build/uam-run -b 6502-ref build/firmware-6502/selftest-nmos.bin  # NMOS 6502 (raw ROM image at 0x8000)
 build/uam-run -b 6502-ref -o model=65c02 build/firmware-6502/selftest-65c02.bin  # WDC 65C02
 build/uam-run -b z80-ref build/firmware-z80/selftest-nmos.bin  # a Z80 (raw image at 0)
+build/uam-run -b xtensa-ref -o model=lx106 build/firmware-xtensa/selftest-lx106.elf  # ESP8266's core
+build/uam-run -b xtensa-ref build/firmware-xtensa/selftest-lx6.elf  # the ESP32's core (lx6, the default)
 build/uam-run -b pic32-ref -o model=mz build/firmware-pic32/selftest-mz.elf  # PIC32 (MIPS32, TLB, EIC)
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
@@ -191,6 +204,13 @@ image built with SDCC runs as a raw binary (`makebin -p`).
 64 KiB of RAM (`--ram` sets less), and on I/O ports (the low byte decoded) a 16550 (the
 console, ports 0x00-0x07), a Z80 CTC (0x10-0x13), whose vectors serve interrupt mode 2, and
 the test finisher (0xF0); images are raw binaries loaded at 0.
+`xtensa-ref` (little-endian) and `xtensaeb-ref` (big-endian) take `-o model=lx106|lx6|lx7`
+(default `lx6`; the cores of the ESP8266, ESP32 and ESP32-S3, with their options, interrupt
+tables and vectors) and `-o cpus=N` (1-4; PRID 0xCDCD, 0xABAB, ...): RAM at 0x40000000, where
+VECBASE and the reset vectors are (`--ram`, default 4 MiB), a 16550 at 0x60000000 (interrupt
+5), timers at 0x60001000 (interrupt 10, edge) and 0x60002000 (interrupt 14, the NMI) and the
+test finisher at 0x60003000; designer-defined TIE (the ESP32-S3's AI instructions, the ESP32's
+double-precision helpers) is not modelled.
 `pic32-ref` is a MIPS32 microcontroller with the PIC32 memory map (boot flash at 0x1fc00000,
 program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored interrupt controller;
 `-o model=mx|mm|mz` picks the core (mx: MIPS16e-capable, fixed mapping; mm: microMIPS-only; mz:
@@ -438,7 +458,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
-                   pic.h mcs51.h m6502.h z80.h)
+                   pic.h mcs51.h m6502.h z80.h xtensa.h)
 src/ir/            IR builder, verifier, printer
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
@@ -489,6 +509,13 @@ isa/m6502/         6502 lifter (m6502_lift.c: the NMOS and 65C02 opcode maps, de
 isa/z80/           Z80 lifter (z80_lift.c: the documented and undocumented instruction set,
                    prefixes, flags with bits 3 and 5, MEMPTR, Q and R) and system side
                    (z80_system.c: the CPU models, IFF1/IFF2 and the interrupt modes, NMI)
+isa/xtensa/        Xtensa: the decoder (xtensa_decode.c over xtensa_opc.h, generated from
+                   tests/isa-xtensa/opcodes.py; the big-endian field order), the lifter
+                   (xtensa_lift.c: every option's instructions, the window-overflow check,
+                   zero-overhead loops), the system side (xtensa_system.c: the LX106, LX6
+                   and LX7 models, XEA2 exceptions and interrupts, register windows,
+                   CCOUNT/CCOMPARE, Region Protection) and the FPU (xtensa_fpu.c: single
+                   precision in software, the divide and square-root steps)
 devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, unimp, mmio_stub,
                    virtio_net; PC architecture: i8259, i8254, mc146818, lapic, ioapic, hpet,
                    i8042, acpi_pm, pc_misc (port 92, A20 gate, POST codes), i8237 DMA, fdc
@@ -502,7 +529,7 @@ devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, uni
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR),
                    avr32_ref.c (AVR32), pic_ref.c (8-bit PIC), mcs51_ref.c (8051),
-                   m6502_ref.c (6502), z80_ref.c (Z80):
+                   m6502_ref.c (6502), z80_ref.c (Z80), xtensa_ref.c (Xtensa):
                    reference boards of generic
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
@@ -519,7 +546,8 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    interrupt priorities, the 8051's interrupt system, SFR pages, code banks
                    and its timer and serial devices, the 6502's arithmetic over every input,
                    its interrupt poll and models, the Z80's interrupt modes, NMI, the
-                   repeating block instructions' flags, MEMPTR and the CTC
+                   repeating block instructions' flags, MEMPTR and the CTC, the Xtensa
+                   FPU against exact arithmetic (test_xtensa_fpu)
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images
@@ -541,6 +569,11 @@ tests/firmware-6502/ 6502 self-test (sdas6500), one build per core model (instru
 tests/firmware-z80/ Z80 self-test (sdasz80), one build per core model (vectors from the
                    instruction set's definitions: gen_vectors.py), fuzz target and start code
                    for SDCC (crt0.s)
+tests/firmware-xtensa/ Xtensa self-test, one build per model (computational vectors from
+                   gen_vectors.py; windows, loops, exceptions, interrupts, ...), and with
+                   start.S the C programs: fuzz target, benchmark
+tests/isa-xtensa/  the opcode table (opcodes.py) and its generator, the decoder check against
+                   the GNU disassemblers (xt-check.py), the big-endian layout (le2be.py)
 tests/firmware-pic32/ self-test for the pic32-ref board (MIPS32 and microMIPS on mz, MIPS16e
                    on mx, microMIPS on mm)
 tests/isa-mips/    the MIPS16e, microMIPS and DSP decoders checked against binutils

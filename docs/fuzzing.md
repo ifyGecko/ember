@@ -185,7 +185,9 @@ high-priority) peripheral line and 1 the low-priority one (on `pic-ref`: 0 the t
 UART); on the 8051 a line is an interrupt source (vector 0x03 + 8n; on `mcs51-ref`: 0 INT0,
 1 Timer 0, 2 INT1, 3 Timer 1, 4 the serial port); on the 6502 lines 0-29 are wired-OR into
 IRQ and 30 is the NMI (on `6502-ref`: 0 the UART, 1 timer 0, 30 timer 1); on the Z80 0 is
-/INT and 1 /NMI (on `z80-ref` /INT is the UART's and the CTC's line).
+/INT and 1 /NMI (on `z80-ref` /INT is the UART's and the CTC's line); on Xtensa a line is
+the interrupt of that number in the model's table (on `xtensa-ref`: 5 the UART, 10 timer 0,
+14 timer 1, the NMI).
 The interrupt is reported once the CPU has taken it
 (`uam_exec_set_irq_hook`, `uam_interrupt`: the interrupted pc, the handler pc, the lines); the
 detail is the crashing lines as a mask. Without the option no interrupt hook is installed.
@@ -372,7 +374,8 @@ suzzer versions that have it; older brains apply `--io-timeout`, 60 s by default
 that for a boot that takes longer). Any coverage source works: with
 `--cov-sites`, HELLO describes the scheme (site or hashed-PC, N, rotation) so the brain can
 tell maps apart; with `--cov-blocks` it describes none. HELLO's arch is `rv32`, `mips32be`,
-`mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64`, `avr`, `avr32`, `pic`, `mcs51`, `m6502` or `z80`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
+`mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64`, `avr`, `avr32`, `pic`, `mcs51`, `m6502`, `z80`,
+`xtensa` or `xtensaeb`, and the boot map goes out first as an unsolicited INIT snapshot (id 0).
 
 | Verdict | SZR1 reply | `status` |
 |---|---|---|

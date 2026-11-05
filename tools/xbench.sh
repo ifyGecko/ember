@@ -23,8 +23,9 @@
 #
 # Builds go to DIR (default build/firmware-bench), DIR-kN per kernel, DIR-check.
 # Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b
-#   pic32mx pic32mm pic32mz
-# (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS), and
+#   pic32mx pic32mm pic32mz lx106 lx6 lx7
+# (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS; the
+# Xtensa ones likewise: XTENSA_LX106_CROSS, XTENSA_LX6_CROSS, XTENSA_LX7_CROSS), and
 # with --check also mcs51, 6502, 65c02 and z80 (when SDCC built them): the 8051 needs some
 # 450 million instructions a round, the 6502 some 180 million and the Z80 some 137 million
 # (SDCC's 64-bit arithmetic), hundreds of times RV32's, so timing them takes --variants
@@ -53,7 +54,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$variants" ]; then
-    variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b pic32mx pic32mm pic32mz"
+    variants="rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b pic32mx pic32mm pic32mz lx106 lx6 lx7"
     [ $check = 0 ] || variants="$variants mcs51 6502 65c02 z80"
 fi
 
@@ -87,6 +88,9 @@ run_all() {
         pic32mx)  board=pic32-ref  img=bench-pic32mx.elf extra="-o model=mx --ram 0x20000";;
         pic32mm)  board=pic32-ref  img=bench-pic32mm.elf extra="-o model=mm --ram 0x20000";;
         pic32mz)  board=pic32-ref  img=bench-pic32mz.elf extra="-o model=mz --ram 0x20000";;
+        lx106)    board=xtensa-ref img=bench-lx106.elf extra="-o model=lx106";;
+        lx6)      board=xtensa-ref img=bench-lx6.elf extra="-o model=lx6";;
+        lx7)      board=xtensa-ref img=bench-lx7.elf extra="-o model=lx7";;
         *) echo "xbench.sh: unknown variant $v" >&2; exit 2;;
         esac
         if [ ! -f "$out/$img" ]; then

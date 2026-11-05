@@ -72,6 +72,8 @@ static void putc_(char c)
 #define UART0 0x7F00u      /* 6502-ref; the finisher is at 0x7F10 */
 #elif defined(__AVR32__)
 #define UART0 0xffff1400u  /* avr32-ref */
+#elif defined(__XTENSA__)
+#define UART0 0x60000000u  /* xtensa-ref */
 #else
 #error "no board for this ISA"
 #endif
