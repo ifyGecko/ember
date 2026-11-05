@@ -338,8 +338,8 @@ const uam_runner_ext uam_suzzer_runner_ext = {
     .help =
         "  suzzer formats:\n"
         "      --cov-sites LCV3    coverage sites from a suzzer patch list (site ids, orig bytes)\n"
-        "      --cov-module N=BASE load base of patch-list module N (repeatable; default: the\n"
-        "                          list's base table, then the image's link base for module 0)\n"
+        "      --cov-module NAME=BASE  load base of the patch-list module NAME (repeatable; default:\n"
+        "                          the list's base table, then the image's link base for module 0)\n"
         "      --cov-scheme M      site (default) or pc: libcov's coverage model\n"
         "      --cov-ngram N       N-gram length 1..8 (default 2, like libcov)\n"
         "      --cov-rotate        N-gram rotation, as libcov's LIBCOV_NGRAM_ROTATE=1\n"

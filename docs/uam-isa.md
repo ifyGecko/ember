@@ -12,7 +12,7 @@ IR fits into the rest of the emulator.
 
 ## 1. Design goals
 
-1. **Small but proficient.** 47 opcodes. (The native JIT was added without adding any: the
+1. **Small but proficient.** 47 opcodes, plus the instrumentation op `COV` (§7.5). (The native JIT was added without adding any: the
    optimizer and an inline memory fast path carried the speed, so the universal opcode set
    stayed exactly as below.)  Enough to express real ISAs (RISC-V, ARM, MIPS,
    PowerPC, x86) directly, without encoding tricks. Not so many that every backend and every
@@ -348,7 +348,7 @@ resumed.
 
 ## 8. Block well-formedness
 
-The verifier (run on every lifted block in debug builds) enforces these rules:
+The verifier (run on every lifted block unless disabled with `--no-verify`) enforces these rules:
 
 1. **Shape.** The block starts with `IMARK` and ends with exactly one terminator: an unguarded
    `EXIT`, `TRAP`, or `WAIT`. Nothing follows the terminator. Guarded `EXIT`s (side exits) may

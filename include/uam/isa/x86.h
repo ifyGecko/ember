@@ -5,7 +5,8 @@
  * 16-bit real mode at the architectural reset vector (physical 0xFFFFFFF0,
  * CS base 0xFFFF0000) and brings itself up through protected and long mode
  * as the firmware loads CR0/CR4/EFER and paging - the classic PC firmware
- * path. See docs/uam-isa.md for the IR and docs/x86.md for the module.
+ * path. See docs/uam-isa.md for the IR and docs/architecture.md (section 5,
+ * "Legacy PC") for the module.
  *
  * x86 I/O ports are not a separate address space in UAM: the lifter turns
  * IN/OUT into ordinary loads and stores at a reserved physical aperture

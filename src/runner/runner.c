@@ -283,7 +283,7 @@ static void usage(FILE *out)
         "      --map               print the bus map after building the board\n"
         "      --no-verify         skip IR verification of translated blocks\n"
         "      --no-opt            do not optimize translated blocks\n"
-        "      --jit               compile blocks to native code (x86-64 host)\n"
+        "      --jit               compile blocks to native code (x86-64 and AArch64 hosts)\n"
         "      --no-chain          with --jit, return to the run loop after every block\n"
         "      --perf-map          with --jit, write /tmp/perf-PID.map so perf names compiled\n"
         "                          blocks by guest pc (env UAM_PERF_MAP=1)\n"

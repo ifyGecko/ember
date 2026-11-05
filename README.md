@@ -1,14 +1,14 @@
 # UAM: a Universal Abstract Machine firmware emulator
 
 UAM runs raw firmware images by lifting the native instruction set into a small,
-ISA-neutral IR (47 opcodes) and executing that IR. The abstract machine only does
+ISA-neutral IR (47 opcodes, plus COV for instrumentation) and executing that IR. The abstract machine only does
 computation. Memory, time, interrupts and devices all sit behind explicit interfaces,
 with one module per concern.
 
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
 
-Status: eight guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
+Status: twelve guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, an R4K-style TLB or fixed mapping, GPR shadow register sets,
 vectored and external-controller interrupts, configurable CPU model) on the `mips-ref` /
 `mipsel-ref` boards and, as a MIPS32 microcontroller, the PIC32 memory map with a vectored
@@ -41,12 +41,12 @@ MEMPTR, R, interrupt modes 0-2 and NMI; NMOS and CMOS models) on the `z80-ref` b
 16550 and a Z80 CTC on its I/O ports, and Xtensa (a configurable core: the options of the
 LX106, LX6 and LX7 cores as the ESP8266, ESP32 and ESP32-S3 have them, as CPU models of one
 module - register windows, zero-overhead loops, booleans, MAC16, the single-precision FPU,
-the XEA2 exceptions with seven interrupt levels and the NMI, CCOUNT/CCOMPARE, Region
+the XEA2 exceptions with up to seven interrupt levels, the NMI the highest, CCOUNT/CCOMPARE, Region
 Protection - little- and big-endian) on the `xtensa-ref` and `xtensaeb-ref` boards - run by a
 reference interpreter or, with `--jit`, a native JIT for x86-64 and AArch64 hosts
 with block chaining (a block optimizer feeds both). Every reference board but `avr-ref`,
-`pic-ref`, `mcs51-ref`, `6502-ref` and `z80-ref` (an AVR, a PIC, an 8051, a 6502 and a Z80 have
-one processor) takes `-o cpus=N`:
+`avr32-ref`, `pic-ref`, `pic32-ref`, `mcs51-ref`, `6502-ref` and `z80-ref` (the microcontroller
+boards have one processor) takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
@@ -81,7 +81,7 @@ host-independent.
 
 ```bash
 make                 # build/uam-run and the libraries
-make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, 8051, 6502, Z80 and Xtensa firmware self-tests, external-board example,
+make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
                      # (and suzzer interop, with a suzzer checkout)
@@ -177,8 +177,8 @@ build/uam-run --help
 ```
 
 Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
-names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `mcs51-ref`,
-`6502-ref` and `z80-ref`,
+names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `avr32-ref`, `pic-ref`,
+`pic32-ref`, `mcs51-ref`, `6502-ref` and `z80-ref`,
 `-o cpus=N`
 (`--quantum N`: instructions each processor runs before the next, default 4096); `ppc-ref` takes
 `-o model=classic|booke`. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
@@ -522,13 +522,15 @@ devices/           clint, plic, gic, uart16550, test_finisher, unknown_mmio, uni
                    (82077), ide (PIO + bus master), lpt, vga; pci (bridges, MSI/MSI-X,
                    expansion ROMs), ahci, nvme, cfi_flash; ipi; gptimer (a general-purpose
                    timer for CPUs without one of their own); avr32_intc (AVR32-style interrupt
-                   controller: groups with a level and an autovector each); the 8051's own
+                   controller: groups with a level and an autovector each); pic32_intc
+                   (PIC32-style vectored interrupt controller on the MIPS EIC interface); the 8051's own
                    peripherals: mcs51_timer (Timer 0/1 and TCON), mcs51_serial (SCON/SBUF),
                    mcs51_port (ports and plain SFR registers); z80_ctc (the Z80 CTC: four
                    counter/timers with mode 2 vectors and daisy-chain priority)
 boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    x86_64_ref.c (x86-64), ppc_ref.c (PowerPC), avr_ref.c (8-bit AVR),
-                   avr32_ref.c (AVR32), pic_ref.c (8-bit PIC), mcs51_ref.c (8051),
+                   avr32_ref.c (AVR32), pic_ref.c (8-bit PIC), pic32_ref.c (PIC32),
+                   mcs51_ref.c (8051),
                    m6502_ref.c (6502), z80_ref.c (Z80), xtensa_ref.c (Xtensa):
                    reference boards of generic
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
@@ -540,20 +542,26 @@ examples/          external-board: an out-of-tree board using the library
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
                    loops, stores next to code, MMIO rules, coverage, the fuzz harness,
-                   multiprocessor observers, suzzer's formats, the PowerPC board interface,
-                   the x87's software 80-bit format (against the host's x87 on x86-64), the
-                   AVR interrupt controllers and the general-purpose timer, the PIC stacks and
-                   interrupt priorities, the 8051's interrupt system, SFR pages, code banks
-                   and its timer and serial devices, the 6502's arithmetic over every input,
-                   its interrupt poll and models, the Z80's interrupt modes, NMI, the
-                   repeating block instructions' flags, MEMPTR and the CTC, the Xtensa
-                   system code (models, special registers per model, interrupt lines and
-                   levels, CCOMPARE, window exceptions, faults, BREAK, the ERI hook, the
-                   gdb view, snapshots, big-endian layout) and its FPU against exact
-                   arithmetic (test_xtensa_fpu)
+                   multiprocessor observers, suzzer's formats, the x87's software 80-bit
+                   format (against the host's x87 on x86-64), the Xtensa FPU against exact
+                   arithmetic (test_xtensa_fpu); and one test_<arch>.c per ISA for what its
+                   self-test cannot reach (such as the CPU models and reset state, exception
+                   and interrupt entry through the board's API, timers, the debugger view): test_riscv (with
+                   the CLINT and PLIC), test_mips (CP0, TLB, vectored and EIC interrupts,
+                   MIPS16e/microMIPS modes), test_arm (banked modes, aborts, CP15, the MMU's
+                   formats, the generic timer, the GIC), test_x86 (reset and SIPI, IVT/IDT
+                   delivery and double faults, SMM on both save maps, MSRs, CPUID), test_ppc,
+                   test_avr (interrupt controllers, the general-purpose timer), test_avr32
+                   (the event model of A and B, MPU and MMU, the interrupt controller),
+                   test_pic (stacks, interrupt priorities), test_mcs51 (interrupts, SFR
+                   pages, code banks, its timers and serial port), test_m6502 (arithmetic
+                   over every input, the interrupt poll), test_z80 (interrupt modes, block
+                   instruction flags, MEMPTR, the CTC) and test_xtensa (special registers per
+                   model, interrupt levels, CCOMPARE, window exceptions, BREAK, the ERI)
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
-tests/firmware/    bare-metal RV32 self-test and network-test images
+tests/firmware/    bare-metal RV32 self-test, network-test, multiprocessor, fuzz-target and
+                   scripted-console images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
 tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
 tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E builds), multiprocessor
@@ -588,6 +596,7 @@ tests/cov/ tests/fuzz/  block-coverage maps across backends; the fuzz harness on
 tests/suzzer/ tests/szr/  suzzer's formats and the SZR1 executor (with a suzzer checkout)
 tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
 tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch
-tests/bench/       one C benchmark for every guest ISA (make bench-test, make xbench)
+tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC (make bench-test,
+                   make xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

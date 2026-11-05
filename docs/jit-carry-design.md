@@ -60,7 +60,7 @@ This attacks the same spread step 9 did, where flag-heavy ISAs are slower than f
 
 ## 3. Stage N: narrow reads of a known wider value
 
-**Where:** `src/ir/opt.c`, at its GET case (`lookup_known`, line 108).
+**Where:** `src/ir/opt.c`, at its GET case (`lookup_known`).
 
 **Rule:** a GET of bytes [off, off+w) whose bytes all lie inside a known value v at [koff, koff+kw) becomes:
 - `TRUNC.w v` when off == koff;

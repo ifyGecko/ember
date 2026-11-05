@@ -14,8 +14,8 @@
  *   - it is not machine state: passes are not saved in snapshots (like PC hooks).
  * Registering or removing a pass discards all translated code.
  *
- * Passes under analysis/ include only ir.h and this header (docs/architecture.md
- * section 3); the uam_exec they attach to stays opaque to them.
+ * Passes under analysis/ include only ir.h, this header and cov.h
+ * (docs/architecture.md section 3); the uam_exec they attach to stays opaque to them.
  *
  * Dependencies: ir.h.
  */

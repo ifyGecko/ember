@@ -176,7 +176,7 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
 
 You asked whether my changes, or anything else in ember, lean toward one architecture. Short answer:
 - **Steps 0–8:** no change is guest-specific. Each acts on IR shapes or runtime structures that every ISA produces.
-- **Elsewhere in ember:** an audit of the generic layers found four real leaks and two bugs on the generic/ISA boundary. All have small generic fixes; nothing has been changed yet.
+- **Elsewhere in ember:** an audit of the generic layers found four real leaks and one bug on the generic/ISA boundary, each with a small generic fix; all have since been fixed (see below).
 
 ### 8.1 Steps 0–8
 

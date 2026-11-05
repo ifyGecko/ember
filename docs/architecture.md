@@ -10,7 +10,8 @@ JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device by
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
 (`arm-ref` / `armeb-ref` boards), x86-64 (`x86_64-ref`), 32-bit PowerPC (`ppc-ref`), 8-bit AVR
-(`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), the 8051 (`mcs51-ref`), the 6502
+(`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), PIC32 (`pic32-ref`, on the MIPS32
+module), the 8051 (`mcs51-ref`), the 6502
 (`6502-ref`), the Z80 (`z80-ref`), Xtensa (`xtensa-ref` / `xtensaeb-ref`), host
 I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
@@ -50,7 +51,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | Interface | Responsibility | Implemented by |
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
-| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51`, `isa/m6502` |
+| `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: the platform view a processor sees, such as SMRAM, follows it). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51`, `isa/m6502`, `isa/z80`, `isa/xtensa` |
 | `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
@@ -82,7 +83,10 @@ ir            ← nothing (pure data + algorithms over it)
 isa/*         → ir, isa.h, state.h      (x86 and PowerPC page-table walks also bus.h:
                                          physical reads and accessed/referenced/changed bits;
                                          AVR interrupt entry: the return address it pushes;
-                                         PIC: a named INDF reached through a banked operand)
+                                         PIC: a named INDF reached through a banked operand;
+                                         AVR32, 6502 and Z80 interrupt entry: the stack
+                                         pushes; also sched.h for the clock: the timers of
+                                         ARM, AVR32, MIPS, PowerPC, x86 and Xtensa)
 exec/*        → ir, isa.h, bus.h, sched.h, pass.h, cov.h (it wires passes in)
 analysis/*    → ir, pass.h, cov.h        (never an ISA or a device)
 core (bus, sched, signal, chardev, netdev, state) → their own headers only
@@ -129,7 +133,7 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
                   mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
                   i8042.h acpi_pm.h pc_misc.h pci.h ahci.h nvme.h cfi_flash.h ipi.h
                   i8237.h ide.h fdc.h vga.h lpt.h gptimer.h avr32_intc.h mcs51_timer.h
-                  mcs51_serial.h mcs51_port.h z80_ctc.h
+                  mcs51_serial.h mcs51_port.h z80_ctc.h pic32_intc.h
 include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h m6502.h z80.h
                   xtensa.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
@@ -143,7 +147,8 @@ src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.
 src/debug/        gdbstub.c
 src/runner/       runner.c
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
-isa/mips32/       mips_lift.c mips_system.c mips.h (private)
+isa/mips32/       mips_lift.c mips_system.c mips16.c (MIPS16e) mips_umips.c (microMIPS)
+                  mips_fpu.c mips_dsp.c (the DSP ASE) umips_dsp.h mips.h (private)
 isa/arm/          arm_lift.c (A32 and the shared emitters) arm_thumb.c (T16/T32) arm_system.c
                   arm.h (private)
 isa/ppc32/        ppc_lift.c ppc_fpu.c ppc_mmu.c ppc_booke.c ppc_system.c ppc.h (private)
@@ -155,16 +160,16 @@ isa/m6502/        m6502_lift.c m6502_system.c m6502.h (private)
 isa/z80/          z80_lift.c z80_system.c z80.h (private)
 isa/xtensa/       xtensa_decode.c xtensa_opc.h (generated) xtensa_lift.c xtensa_system.c
                   xtensa_fpu.c xtensa.h (private)
-isa/x86/          x86_decode.c x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
+isa/x86/          x86_decode.c x86_decode.h x86_lift*.c x86_string.c x86_sse*.c x86_x87.c x86_f80.c x86_helpers.c
                   x86_mmu.c x86_seg.c x86_task.c x86_msr.c x86_smm.c x86_gdb.c x86_system.c
                   x86.h (private)
 devices/          clint.c plic.c gic.c uart16550.c test_finisher.c unknown_mmio.c unimp.c
                   mmio_stub.c virtio_net.c i8259.c i8254.c mc146818.c lapic.c ioapic.c hpet.c
                   i8042.c acpi_pm.c pc_misc.c pci.c ata_core.c ahci.c ide.c nvme.c cfi_flash.c
                   ipi.c i8237.c fdc.c vga.c lpt.c gptimer.c avr32_intc.c mcs51_timer.c
-                  mcs51_serial.c mcs51_port.c z80_ctc.c
+                  mcs51_serial.c mcs51_port.c z80_ctc.c pic32_intc.c ata_core.h (private)
 boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c avr_ref.c avr32_ref.c
-                  mcs51_ref.c m6502_ref.c z80_ref.c xtensa_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
+                  pic_ref.c pic32_ref.c mcs51_ref.c m6502_ref.c z80_ref.c xtensa_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
                   stock_exts.c (the runner extensions uam_run_main uses)
@@ -179,8 +184,9 @@ tests/boards/     test_boards.c uam-test-run.c  (x86_64-test and rv32-test: refe
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
-                  test_smp.c test_ppc.c test_avr.c test_pic.c test_mcs51.c test_m6502.c
-                  test_z80.c test_xtensa.c test_xtensa_fpu.c test_f80.c
+                  test_smp.c test_f80.c test_xtensa_fpu.c, and one per ISA: test_riscv.c
+                  test_mips.c test_arm.c test_x86.c test_ppc.c test_avr.c test_avr32.c
+                  test_pic.c test_mcs51.c test_m6502.c test_z80.c test_xtensa.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
@@ -192,13 +198,17 @@ tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dum
                   --trace-after, traces with --jit, --guard/--watch)
 tests/gdb/        gdb-check.py  (the gdb stub over the remote protocol, four processors)
 tests/smp/        smp_test.h  (one multiprocessor self-test for RISC-V, MIPS, ARM, PowerPC)
-tests/bench/      bench.c x86-start.S x86.ld  (one C benchmark for every guest ISA; make
+tests/bench/      bench.c x86-start.S x86.ld pic32.ld  (one C benchmark for every guest ISA but
+                  the 8-bit PIC; make
                   bench-test checks it, tools/xbench.sh times it)
-tests/firmware/       start.S selftest.c nettest.c link.ld  (RISC-V)
+tests/firmware/       start.S selftest.c nettest.c smpstart.S smptest.c fuzztarget.c consoletest.c
+                      consoletest.script link.ld  (RISC-V; the console test: scripted input)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
-tests/firmware-mips/  start.S selftest.c link.ld  (MIPS32)
-tests/firmware-arm/   start.S selftest.c fuzztarget.c link.ld  (ARMv7: ARM and Thumb-2 builds)
-tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (32-bit PowerPC)
+tests/firmware-mips/  start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (MIPS32)
+tests/firmware-arm/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (ARMv7: ARM and
+                      Thumb-2 builds)
+tests/firmware-ppc/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld start-booke.S
+                      link-booke.ld  (32-bit PowerPC; Book E: the self-test for that model)
 tests/firmware-avr/   selftest.c gen_vectors.py fuzztarget.c  (8-bit AVR, one build per core
                       family, with avr-libc's start-up code)
 tests/firmware-avr32/ start.S selftest.c fuzztarget.c link-a.ld link-b.ld  (AVR32A and AVR32B)
@@ -216,7 +226,12 @@ tests/firmware-xtensa/ selftest.S model.h gen_vectors.py window.inc start.S link
 tests/isa-xtensa/     opcodes.py gen-opcodes.py xt-dec.c xt-check.py le2be.py gen-fpu-vectors.py
                       (the opcode table, the decoder against the GNU disassemblers, the
                       big-endian layout of a little-endian build)
-                      start-booke.S link-booke.ld  (the self-test for the Book E model)
+tests/firmware-pic32/ start.S probe.S selftest.c fptest.c dsptest.c gen_fpvectors.py
+                      gen_dspvectors.py fuzztarget.c link.ld  (PIC32 MX/MM/MZ: MIPS16e,
+                      microMIPS, the FPU and DSP against generated vectors)
+tests/isa-mips/       mips16-dec.c mips16-check.py umips-dec.c umips-check.py dsp-dec.c
+                      dsp-check.py gen-umips-dsp.py  (the MIPS16e, microMIPS and DSP decoders
+                      against the GNU disassemblers)
 tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bios-check.py
                       (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
 ```
@@ -290,10 +305,11 @@ devices.
   generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
   virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
   `rv32-test`, registered only by the test runner `build/uam-test-run`.
-- **Multiprocessor machines** (`-o cpus=N` on every reference board): processors share the
+- **Multiprocessor machines** (`-o cpus=N` on `rv32-ref`, `mips-ref`/`mipsel-ref`,
+  `arm-ref`/`armeb-ref`, `ppc-ref`, `x86_64-ref` and `xtensa-ref`/`xtensaeb-ref`): processors share the
   bus and the clock and run in deterministic instruction slices (`--quantum`). Every processor
   starts at the reset address and firmware tells them apart by its architectural number:
-  `mhartid`; EBase.CPUNum; MPIDR.Aff0; PIR on PowerPC; the x86 initial APIC ID, where the
+  `mhartid`; EBase.CPUNum; MPIDR.Aff0; PIR on PowerPC; PRID on Xtensa; the x86 initial APIC ID, where the
   others wait for INIT/SIPI. Per-processor interrupts come from generic parts that know several CPUs: the
   CLINT (a msip and mtimecmp per hart) and PLIC contexts on RISC-V, IPI doorbells
   (`devices/ipi.c`) on MIPS, the GIC on ARM (banked SGIs/PPIs, SGI sources, ITARGETSR-routed
@@ -636,7 +652,8 @@ devices.
 
 Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
 short-descriptor MMU, generic timer, a GIC, little-endian and BE8), x86-64, 32-bit PowerPC (FPU,
-OEA MMU, decrementer), host networking, a gdb stub, the library build with
+OEA MMU, decrementer; and Book E), 8-bit AVR, AVR32, 8-bit PIC, PIC32, the 8051, the 6502,
+the Z80, Xtensa, host networking, a gdb stub, the library build with
 an ABI handshake. ARMv7-M (the M-profile NVIC exception model) is still planned.
 
 ## 8. Verification
@@ -677,8 +694,8 @@ Implemented (`make test`):
   definitions, loads and stores, branches, register windows with overflow and underflow
   through the manual's handlers, loops including a loop end in code translated before the
   loop, booleans, MAC16, the FPU, S32C1I, every exception and interrupt level, the NMI,
-  Region Protection), and its decoder against the GNU disassemblers; and a multiprocessor self-test on four processors of each
-  architecture (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
+  Region Protection), and its decoder against the GNU disassemblers; and a multiprocessor self-test on four processors of
+  RISC-V, MIPS, ARM, PowerPC and x86 (`tests/smp/`, `tests/firmware-x86/smp.asm`), also split by snapshots;
   `tests/firmware-x86/legacy.asm` (task switches, gates, the I/O bitmap, virtual-8086 mode,
   A20, MMX) and `biosrom.asm`, a BIOS-style ROM from the reset vector through VGA, floppy (DMA),
   IDE and the printer into a boot sector (`bios-check.py`).
@@ -721,8 +738,8 @@ Implemented (`make test`):
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
   the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and
-  ARMv7 (ARM and Thumb-2), 32-bit PowerPC, 8-bit AVR and AVR32
-  under the interpreter and the JIT with and without chaining, block mode, rejected sites,
+  ARMv7 (ARM and Thumb-2), 32-bit PowerPC, 8-bit AVR, AVR32, PIC18, the 8051, the 6502, the
+  Z80 and Xtensa under the interpreter and the JIT with and without chaining, block mode, rejected sites,
   coverage off, and the exception observer on an illegal instruction on each ISA that has
   exceptions.
   `tests/cov/cov-check.sh` runs the self-tests with block coverage on every backend and
@@ -733,6 +750,25 @@ Implemented (`make test`):
   (LVL1VEC, the compact vector table), the wake rule, the CPU models, and the
   general-purpose timer. The decoder was checked against `avr-objdump` on all 65536 first
   words for every model (the same instructions, the same lengths).
+- One unit test per ISA (`tests/unit/test_<arch>.c`) for what the self-test firmware cannot
+  reach on its reference board, on a bare machine: `test_riscv` (reset state, which CSRs exist and their WARL
+  bits, trap entry and mtval per fault, vectored interrupts and priority, WFI, the CLINT and
+  PLIC through their registers, two harts on `rv32-ref`), `test_mips` (the models and reset
+  state, CP0 writable bits, every vector including BEV, EBase and the refill vector under EXL,
+  BD in delay slots, compatibility, vectored and EIC interrupts with shadow sets, Count/Compare,
+  the TLB and fixed mapping, MIPS16e and microMIPS modes, both byte orders), `test_arm` (the
+  banked registers of every mode, exception entry in ARM and Thumb state, VBAR/SCTLR.V/TE/EE,
+  IRQ and FIQ, WFI, the generic timer, translation-table formats the self-test does not build,
+  BE8, the GIC on `arm-ref`), `test_x86` (reset and INIT/SIPI, the interrupt shadow, HLT, real,
+  32- and 64-bit delivery with error codes and double faults, #PF and CR2, ring 3, SMM on the
+  Intel and AMD save maps, MSRs, CPUID, A20M#), `test_avr32` (the models, interrupt levels,
+  NMI and their masks, what A stacks and B saves in RSR/RAR, the INT3 shadow bank, rete, SLEEP,
+  COUNT/COMPARE, the MPU and the MMU, the interrupt controller on `avr32-ref`), `test_pic`,
+  `test_mcs51`, `test_m6502`, `test_z80` and `test_xtensa` (special registers per model, one
+  privilege ring, interrupt lines and levels, CCOMPARE, window exceptions, faults, BREAK, the
+  ERI, big-endian layout). The six newest (RISC-V, MIPS, ARM, x86, AVR32, Xtensa) run their
+  programs interpreted and under the JIT and also check the debugger view and a snapshot of
+  the ISA state.
 - PowerPC board interface (`test_ppc`): the soft-reset and machine-check pins and checkstop,
   the wired-OR external inputs, the decrementer while MSR[EE] is clear, the implementation SPR
   handlers and every CPU model option; on Book E the watchdog's reset sink and TSR[WRS], the
@@ -745,7 +781,8 @@ Implemented (`make test`):
   backends and across restores, paired and begin-only modes, the exception-class policy,
   routes, resets, the frontend protocol, abort, and the replay frontend.
   `tests/fuzz/fuzz-check.sh` does the same through `uam-run --fuzz-replay` on C firmware
-  (`fuzztarget.h`) on every stock board (Thumb-2 code on `arm-ref`), including replaying a
+  (`fuzztarget.h`) on every stock board but `x86_64-ref` and `xtensaeb-ref` (Thumb-2 code on
+  `arm-ref`), including replaying a
   crash file on its own. Neither AVR is in `test_fuzz`: 8-bit AVR has no exceptions for its
   exception-policy and interrupt checks, and AVR32 has no hand-assembled target there yet.
   `fuzz-check.sh` covers both (8-bit AVR without the exception-policy step,
@@ -755,7 +792,7 @@ Implemented (`make test`):
   covers the LCV3/LCVB1 readers (every rejection of suzzer's reader checklist), base
   resolution, boundaries, site naming, the site-byte check and the LCVS region's ownership
   rules. `tests/suzzer/suzzer-check.sh` runs `--cov-sites`/`--cov-boundary` end to end on
-  every stock board, including N=3 and N=8 with rotation, and the LCVS export read back by suzzer's
+  RV32, MIPS32 BE/LE, ARM (Thumb-2, LE and BE8) and PowerPC, including N=3 and N=8 with rotation, and the LCVS export read back by suzzer's
   reader; `gen-check.sh` does it with suzzer's own generators; `tests/szr/` checks the SZR1
   executor frame by frame and in a session with suzzer's brain, whose saved crash directory
   replays without its `.info` notes.
@@ -764,8 +801,9 @@ Implemented (`make test`):
   the suzzer tests are skipped.
 - The external-board example is built and run against the library.
 - Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
-  board (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, and AVR32A and
-  AVR32B with an AVR32 toolchain) and natively, and
+  board but `pic-ref` (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, AVR32A
+  and AVR32B with an AVR32 toolchain, PIC32 MX/MM/MZ, Xtensa LX106/LX6/LX7 with their
+  toolchains, the 8051, the 6502 and 65C02, and the Z80) and natively, and
   requires each guest's checksums, under the interpreter and the JIT, to equal the host
   build's (docs/jit-perf.md, "Parity across ISAs").
 - `test_jitdiff` checks the JIT against the interpreter block by block: every pure op at

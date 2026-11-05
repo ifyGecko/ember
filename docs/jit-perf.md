@@ -183,7 +183,8 @@ and branch, and the chain path back to itself.
 ## Parity across ISAs
 
 The reference workloads say little about how the guests compare. `tests/bench/bench.c`
-is one C benchmark built for every reference board and natively: CRC-32, heapsort,
+is one C benchmark built for every reference board but `pic-ref` (PIC32 MX/MM/MZ included)
+and natively: CRC-32, heapsort,
 matrix multiply, string search, a switch-dispatch bytecode interpreter, pointer
 chasing, 64-bit arithmetic and number formatting, about 5e8 guest instructions in all.
 It uses fixed-width types only, so every build prints the same checksums.
