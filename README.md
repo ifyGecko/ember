@@ -547,7 +547,10 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    and its timer and serial devices, the 6502's arithmetic over every input,
                    its interrupt poll and models, the Z80's interrupt modes, NMI, the
                    repeating block instructions' flags, MEMPTR and the CTC, the Xtensa
-                   FPU against exact arithmetic (test_xtensa_fpu)
+                   system code (models, special registers per model, interrupt lines and
+                   levels, CCOMPARE, window exceptions, faults, BREAK, the ERI hook, the
+                   gdb view, snapshots, big-endian layout) and its FPU against exact
+                   arithmetic (test_xtensa_fpu)
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test and network-test images

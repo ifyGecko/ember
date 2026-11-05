@@ -209,6 +209,7 @@ TEST_PIC  := $(BUILD)/test_pic
 TEST_MCS51 := $(BUILD)/test_mcs51
 TEST_M6502 := $(BUILD)/test_m6502
 TEST_Z80   := $(BUILD)/test_z80
+TEST_XTENSA := $(BUILD)/test_xtensa
 TEST_XTENSA_FPU := $(BUILD)/test_xtensa_fpu
 TEST_FUZZ := $(BUILD)/test_fuzz
 TEST_SUZZER := $(BUILD)/test_suzzer
@@ -388,6 +389,9 @@ $(TEST_M6502): $(BUILD)/obj/tests/unit/test_m6502.o $(LIB)
 $(TEST_Z80): $(BUILD)/obj/tests/unit/test_z80.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(TEST_XTENSA): $(BUILD)/obj/tests/unit/test_xtensa.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # Its vectors are computed with exact arithmetic when it is built.
 $(BUILD)/gen/xtensa_fpu_vectors.h: tests/isa-xtensa/gen-fpu-vectors.py tests/isa-xtensa/opcodes.py
 	@mkdir -p $(dir $@)
@@ -503,7 +507,7 @@ endif
 $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
-           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA_FPU) \
+           $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA) $(TEST_XTENSA_FPU) \
            $(TEST_JITDIFF) $(TEST_F80) $(SUZZER_UNIT)
 	$(TEST_IR)
 	$(TEST_CORE)
@@ -522,6 +526,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_MCS51)
 	$(TEST_M6502)
 	$(TEST_Z80)
+	$(TEST_XTENSA)
 	$(TEST_XTENSA_FPU)
 	$(TEST_JITDIFF)
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
@@ -999,6 +1004,6 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
-         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \
+         $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \
          $(BUILD)/obj/tests/unit/test_f80.d \
          $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d
