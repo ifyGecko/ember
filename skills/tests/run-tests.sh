@@ -124,6 +124,19 @@ open(sys.argv[1], 'wb').write(rom)" "$T/m6502/build/halt.bin"
 python3 "$T/m6502/scripts/log_summary.py" "$T/m6502/build/halt.log" | grep -q "core halted at pc 0x8000: store to nothing at bus address 0x9000" \
     && ok "log_summary: a halted 8-bit core is reported" \
     || { bad "log_summary: a halted 8-bit core is reported"; tail -5 "$T/m6502/build/halt.log"; }
+# ember-fuzz: fuzz.sh's UNKNOWN_MMIO=fault is what turns a wild load into a crash
+python3 -c "
+import struct, sys
+open(sys.argv[1], 'wb').write(struct.pack('<5I', 0x13, 0x400005b7, 0x5a503, 0x13, 0x6f))" "$T/rv/build/wild.bin"
+mkdir -p "$T/rv/wild-in"; printf x > "$T/rv/wild-in/a"
+for v in "fault 20 crash-fault" "zero 0 ok"; do
+    read -r um want verdict <<< "$v"; rc=0
+    (cd "$T/rv" && IMAGE="$T/rv/build/wild.bin" UNKNOWN_MMIO="$um" TRACE= timeout -k 5 60 ./run.sh -n 100000 \
+        --fuzz-begin 0x80000000 --fuzz-end 0x8000000c --fuzz-input mem:0x80001000 --fuzz-replay "$T/rv/wild-in" \
+        > build/w.txt 2> build/w.log < /dev/null) || rc=$?
+    [[ $rc == "$want" ]] && grep -q ": $verdict" "$T/rv/build/w.txt" && ok "ember-fuzz: UNKNOWN_MMIO=$um gives $verdict" \
+        || { bad "ember-fuzz: UNKNOWN_MMIO=$um gives $verdict (exit $rc)"; cat "$T/rv/build/w.txt"; tail -3 "$T/rv/build/w.log"; }
+done
 # the PC template runs ember's x86 self-test as a raw stage (real mode at 0); its software
 # SMIs need the stand-in APM port
 X86ST="$UP/build/firmware-x86/selftest.bin"

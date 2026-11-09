@@ -173,8 +173,9 @@ For x86 SMM handlers, SMM code-fetch confinement (`uam_x86_set_smm_confine`; `-o
 smm-confine=1` on `x86_64-ref`) turns an SMM instruction fetch outside SMRAM - a call-out
 through a corrupted or NULL pointer - into a `fetch` crash at the first instruction outside.
 SMRAM that a board decodes through the SMM view is addressed as SMM sees it, at
-`UAM_X86_SMM_VIEW` (0x400000000000) + address: `p:0x400000000000+ADDR` for `mem:`,
-`--guard` and `--dump-mem`.
+`UAM_X86_SMM_VIEW` (0x400000000000) + address: `p:0x400000000000+ADDR` for `--guard` and
+`--dump-mem`. A `mem:` route takes a plain address, translated as the hart at the begin pc
+stores, so a begin pc inside SMM reaches SMRAM by itself.
 
 `--fuzz-crash-irq N` (repeatable, 0..63) makes taking an interrupt from line N a crash: a
 watchdog's warning interrupt, say. Lines are numbered as the ISA reports them: on RV32 the

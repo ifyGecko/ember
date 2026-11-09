@@ -66,8 +66,9 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
 4. **Configure the boundaries and oracles**: `--fuzz-begin` at the handler entry (before the
    input is read), optional `--fuzz-end`, `--fuzz-crash-pc` at the fatal-error reporter,
    `--fuzz-crash-exc` for the firmware's normal exceptions, `--fuzz-iter-insns` from a
-   measured ok run. Put them in a `fuzz.sh` next to `run.sh` that wraps it and sends the
-   guest console to a file, away from the replay lines.
+   measured ok run. Put them in a `fuzz.sh` next to `run.sh` that wraps it, sends the
+   guest console to a file, away from the replay lines, and sets `UNKNOWN_MMIO=fault`:
+   `run.sh`'s bring-up default answers wild accesses with 0, so no fault oracle would fire.
    **Add a memory oracle** whenever the handler parses lengths or offsets from the input:
    on flat memory an overflow faults nowhere, so without one it is an ok. On a `mem:` route
    use its redzones (`after:r`, plus `extent=@OFF:SZ` when the input carries its own
@@ -78,8 +79,8 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    stops at it and never reaches the begin pc.
    **An x86 SMM handler** also wants SMM code-fetch confinement (`uam_x86_set_smm_confine`,
    `-o smm-confine=1` on the PC template and `x86_64-ref`): a call-out of SMRAM becomes a `fetch` crash at its
-   first instruction; SMRAM decoded through the SMM view is addressed at
-   `p:0x400000000000+ADDR` ("Per ISA").
+   first instruction; a `--guard` in SMRAM decoded through the SMM view takes
+   `p:0x400000000000+ADDR`, and a processor shutdown reads as a `hang` ("Per ISA").
 5. **Smoke-test with replay**: a directory of hand-made inputs whose verdicts you can
    predict (an empty input, a valid request, an oversized one, one that reaches a known bad
    path if there is one). `--fuzz-replay` must give exactly those verdicts, twice, and with

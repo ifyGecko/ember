@@ -33,6 +33,7 @@ suzzer's files replace two of `fuzz.sh`'s options, and the runner refuses both a
 set -euo pipefail
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TRACE="${TRACE-}"
+export UNKNOWN_MMIO="${UNKNOWN_MMIO-fault}"
 exec "$PROJ/run.sh" -n 2000000000 \
     --console "file:$PROJ/build/fuzz-console.txt" \
     --cov-sites "$PROJ/fuzz/fw.lcv3" --cov-boundary "$PROJ/fuzz/fw.lcvb" --cov-strict \
@@ -54,7 +55,9 @@ IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
 ```
 
 - **Generate against the bytes the board places**: the stage being fuzzed, at the RECON base.
-  For a raw image, suzzer's `--raw --base <RECON base> --symbols ...`.
+  For a raw image, suzzer's `--raw --base <RECON base> --arch ARCH --bits N --endian E
+  --symbols FILE` (all but `--symbols` are required; `FILE` is `nm` output, `ADDR NAME` lines
+  or a Ghidra symbol-table CSV, so RECON's names work).
 - **Where the sites are.** The board places the image itself (`--image os=`), so the runner
   has no image of its own to take a link base from. A list generated from an ELF carries
   its base and needs nothing more; for a list generated from a raw image, add
@@ -64,6 +67,9 @@ IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
   match the patch list, 0 do not`) and catches a wrong base or byte order; always use it.
 - **The BEGIN marker must precede the input read**: `--strategy entry` (the MIPS default
   anyway; RV32's default puts a function's site after its first read).
+- **Recursion**: a marker spec is `SYM[:kind[:depth_filter]]`. `handle_request:begin:zero` and
+  a matching `:end:zero` keep nested arrivals inside one input; "any depth" markers end the
+  iteration at the first END.
 - **Thumb** (`arm-ref`): suzzer gives every site its even address and marks Thumb sites by
   their 2-byte length; the importer sets bit 0 on those, and on each boundary marker whose
   closest site at or below it is one, so a Thumb marker needs `--cov-sites` next to
@@ -74,7 +80,9 @@ IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
 - A site in a MIPS branch delay slot cannot be instrumented; the run stops naming the
   record. suzzer's generators never place one, so it means a wrong base or a hand-made list.
 - Match the device's libcov build when maps must compare with a device:
-  `--cov-scheme site|pc`, `--cov-ngram N`, `--cov-rotate`, `--cov-mode leapfrog` (default).
+  `--cov-scheme site|pc`, `--cov-ngram N`, `--cov-rotate`, `--cov-mode leapfrog`. The defaults
+  are libcov's (site, N=2, no rotation, leapfrog). For fuzzing with nothing to compare
+  against, the brain asks for N=3 with rotation (`--cov-ngram 3 --cov-rotate`).
 
 **Which ISAs.** ember's site-list path is tested end to end (`suzzer-check.sh`) on RV32,
 MIPS32 BE/LE, ARM (Thumb-2, LE and BE8) and 32-bit PowerPC; suzzer's generators describe
@@ -96,6 +104,11 @@ IMAGE=fw.bin ./fuzz-suzzer.sh --jit --fuzz-szr 127.0.0.1:7000 \
   describes the scheme, with `--cov-blocks` none. HELLO's arch is the ISA's (`rv32`,
   `mips32be`, `mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64`, `avr`, `avr32`, `pic`,
   `mcs51`, `m6502`, `z80`, `xtensa`, `xtensaeb`).
+- The brain keeps a resumable corpus in `--out`/`corpus` (a restart continues the campaign);
+  `--iters N` bounds a run, 0 (the default) runs until stopped. Set `--max-size` (default
+  65536) to what the route can deliver: `mem:`'s `max` (default 4096) or the UART's buffer. A
+  plain route tests only a longer input's prefix, and a `reject` route answers CRASH
+  `DELIVERY`, which the brain files under `crashes/` as if it were a finding.
 - Verdicts become CRASH frames (fault 5, oracle 6, hang 7, timeout 8, rejected 3; a crash
   (guard), from a redzone or a `--guard`, is sent as GUEST_FAULT 5 with the pc of the
   access, so only a replay tells it from a fault and names the guard); the brain

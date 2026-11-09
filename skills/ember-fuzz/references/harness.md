@@ -24,6 +24,7 @@ can cite it:
 set -euo pipefail
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TRACE="${TRACE-}"      # no per-input exception trace (TRACE=exc to get it back)
+export UNKNOWN_MMIO="${UNKNOWN_MMIO-fault}"   # a wild access faults instead of reading 0
 exec "$PROJ/run.sh" -n 2000000000 \
     --console "file:$PROJ/build/fuzz-console.txt" \
     --cov-blocks \
@@ -48,6 +49,13 @@ console off stdout: the replay lines go to stdout through a buffer while console
 written straight away, so a handler that prints (echo, a prompt) would land between the
 replay lines, and in the middle of one. The last `--console` given wins, so this overrides
 one in `run.sh`. Plain runs and triage keep the console on stdout.
+
+**`UNKNOWN_MMIO=fault` is what makes wild pointers crashes.** `run.sh` defaults to `zero` for
+bring-up (a PC project to `fault` already), and with `zero` an access no device or RAM claims
+reads 0 and goes on: the same load is `crash-fault` under `fault` and `ok` under `zero`. A
+boot that now stops at an unmodelled register has found a hole in the board: give it a
+device or a `board_windows[]` catch-all rather than going back to `zero`, and remember that
+a catch-all answers wild accesses inside its window too.
 
 The runner refuses (exit 2) `--fuzz-*` options without `--fuzz-begin` (or suzzer's
 `--cov-boundary`), fuzzing without a frontend (`--fuzz-replay`, or `--fuzz-szr`), and
@@ -92,6 +100,10 @@ taken is host state, not snapshot state: never leave a step pending into the ite
   `--fuzz-begin-skip N` (a boot that never arrives N+1 times stops with exit 2).
 - Several handlers: repeat `--fuzz-begin`; the snapshot is at whichever the boot reaches
   first, and each input goes wherever the firmware takes it.
+- Recursion: with `--fuzz-end` the first end reached ends the iteration, so a recursive
+  handler stops at its innermost return. Keeping it in one input takes nested boundaries:
+  depth-zero markers in suzzer's boundary file (`references/suzzer.md`), or
+  `uam_fuzz_config.nested` in a program.
 - Code between an end and the next begin (the RTOS loop that waits for the next request)
   runs once, at boot, never per input.
 - Sites and boundary pcs are guest **virtual** pcs; code reached through both kseg0 and
@@ -252,16 +264,25 @@ every class above exists; what the policy leaves out goes to the firmware's hand
   An SMM instruction fetch outside SMRAM (SMRR, and on AMD the TSeg/ASeg) is then a
   `fetch`-class crash at the first instruction outside - a call-out through a corrupted
   or NULL function pointer, a jump into memory the OS controls - instead of whatever that
-  memory happens to hold. It needs SMRAM defined (SMRR programmed, SMM_ADDR/SMM_MASK
+  memory happens to hold (`crash-fault pc=0x2000 (fetch-fault cause 0x80000000 tval
+  0x2000)`; without confinement the same input ran on and timed out). Firmware that
+  enables Intel's SMM_Code_Chk gets the same crash. It needs SMRAM defined (SMRR programmed, SMM_ADDR/SMM_MASK
   with TValid - `uam_x86_preset_amd_smm` where the security processor sets them - or the
-  board's SMRAM windows). Where the board decodes SMRAM through the SMM view, a buffer or
-  guard inside SMRAM is addressed as SMM sees it: `p:0x400000000000+ADDR`
-  (`UAM_X86_SMM_VIEW` + ADDR), for `--dump-mem`, `--guard` and `mem:` alike.
+  board's SMRAM windows). Where the board decodes SMRAM through the SMM view, a `--guard`
+  or `--dump-mem` inside SMRAM needs `p:0x400000000000+ADDR` (`UAM_X86_SMM_VIEW` + ADDR),
+  since an unprefixed address is translated as processor 0 maps data when the run starts,
+  outside SMM. A `mem:` route takes no `p:`: its plain address is translated as the hart
+  stores at the begin pc, so a begin pc inside SMM reaches SMRAM by itself.
+- **A processor shutdown is a `hang`, not a crash**: a triple fault, a machine check with
+  CR4.MCE clear, or an RSM whose saved state no processor could be in (a handler corrupting
+  its save area) all read `hang (deadlock (waiting with no interrupt source))`. Only stderr
+  tells them from a real wait (`x86: RSM with an invalid saved state (...) at pc=..: hart
+  shut down`), so replay each hang alone and read it.
 
 **Cores without exceptions** (8-bit AVR, 8-bit PIC, 8051, 6502, Z80): there is no handler
 and no class but the bus faults.
-- A fetch, load or store that nothing answers (with `--unknown-mmio fault`, the default) is
-  still seen by the policy as `fetch`/`load`/`store`: with the default it is a crash (fault)
+- A fetch, load or store that nothing answers (with `--unknown-mmio fault`, as `fuzz.sh`
+  sets it) is still seen by the policy as `fetch`/`load`/`store`: with the default it is a crash (fault)
   (`store-fault ... tval` = the bus address). Outside the policy the core halts, and the
   input reads as a hang (`deadlock (waiting with no interrupt source)`). So never narrow
   the policy on these cores; `--fuzz-crash-exc none` turns every wild access into a hang.
