@@ -146,7 +146,8 @@ void uam_machine_fini(uam_machine *m)
     uam_device *d = m->devices;
     while (d) {
         uam_device *n = d->next;
-        d->ops->destroy(d);
+        if (d->ops->destroy)   /* optional, like reset: a parent-owned device has none */
+            d->ops->destroy(d);
         d = n;
     }
     m->devices = NULL;

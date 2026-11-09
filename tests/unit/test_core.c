@@ -673,6 +673,34 @@ static const uam_device_ops rst_ops = {
     .read = rst_read, .write = rst_write, .reset = rst_reset, .destroy = rst_destroy,
 };
 
+/* destroy is optional: a device whose memory the machine does not own (a parent-owned
+ * sub-device, or a static one) leaves it NULL. uam_machine_fini must not call through it. */
+static uam_status nodestroy_read(uam_device *d, uint64_t off, unsigned size, uint64_t *val)
+{
+    (void)d; (void)off; (void)size; *val = 0; return UAM_OK;
+}
+static uam_status nodestroy_write(uam_device *d, uint64_t off, unsigned size, uint64_t val)
+{
+    (void)d; (void)off; (void)size; (void)val; return UAM_OK;
+}
+static const uam_device_ops nodestroy_ops = {
+    .type = "test,nodestroy", .read = nodestroy_read, .write = nodestroy_write,
+    .flags = UAM_DEVICE_STATELESS,     /* no reset, no destroy */
+};
+
+static void test_device_optional_destroy(void)
+{
+    uam_machine m;
+    mips_machine(&m);
+    uam_device dev;                    /* lives on the stack: the machine does not free it */
+    uam_device_init(&dev, &nodestroy_ops, "nodestroy");
+    uam_machine_add_device(&m, &dev);
+    CHECK(uam_bus_map_mmio(&m.bus, "nodestroy", 0x1F000000, 0x10, &dev) == UAM_OK,
+          "map a device with no destroy");
+    uam_machine_fini(&m);              /* must not dereference a NULL destroy op */
+    CHECK(true, "fini a machine holding a device with no destroy op");
+}
+
 static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
     (void)cpu; (void)pc;
@@ -1991,6 +2019,7 @@ int main(void)
     test_subpage_cache();
     test_timer_reset();
     test_device_reset();
+    test_device_optional_destroy();
     test_romd_exec();
     test_region_remap();
     test_cfi_flash();

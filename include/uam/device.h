@@ -71,7 +71,8 @@ typedef struct uam_device_ops {
     uam_status (*write_masked)(uam_device *dev, uint64_t off, unsigned size, uint64_t val,
                                uint64_t mask);
     void       (*reset)(uam_device *dev);    /* optional */
-    void       (*destroy)(uam_device *dev);  /* frees the device */
+    void       (*destroy)(uam_device *dev);  /* optional: frees the device, if the machine
+                                              * owns it (a parent-owned sub-device has none) */
     /* Optional, together: write / read back the device's state (state.h). */
     void       (*save)(uam_device *dev, uam_state_writer *w);
     void       (*restore)(uam_device *dev, uam_state_reader *r);
