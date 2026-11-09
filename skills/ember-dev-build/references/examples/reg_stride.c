@@ -8,6 +8,9 @@
  * load from any lane of a word reaches it as that word, and the board picks the word's
  * byte order with the mapping (uam_map_attrs.endian) - a big-endian SoC's "sb" to
  * base+3 lands in the low byte, as on the hardware.
+ *
+ * Ember's 16550 has this layout built in (uam_uart16550_create_cfg): use the adapter for
+ * a byte-register device with no spacing option. It also shows a device owning another.
  */
 #include <stdlib.h>
 

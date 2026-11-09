@@ -10,7 +10,7 @@ compiled and run against ember by `skills/tests/run-tests.sh` (in the ember repo
 | `soc_timer.c/.h` | a counter derived from virtual time, a one-shot `uam_timer` for compare-match, saving an armed timer |
 | `soc_intc.c/.h` | an interrupt controller: an input sink function + one output line; saving input levels |
 | `soc_reset.c/.h` | a reset/clock block: lock bits, self-clearing bits, non-zero dividers, a chip-reset line |
-| `reg_stride.c/.h` | wrapping a stock byte-register device (16550) for a word-spaced SoC bus; delegating snapshots to the inner device |
+| `reg_stride.c/.h` | wrapping a byte-register device for a word-spaced SoC bus (the stock 16550 has this built in, below); delegating snapshots to the inner device |
 | `nor_flash.c/.h` | flash as a ROMD region: XIP reads from the array, commands to the device; the array is memory, so snapshots cover it |
 
 Copy one into `emulation/`, rename, and change it to the semantics the firmware shows.
@@ -68,10 +68,13 @@ every device follows that shape.
   register, `mask` = 0xFF per enabled byte) if the device has one; otherwise the bus does
   read-merge-write, which **reads the register first**. Any register with read side effects
   (an RX FIFO pop, read-to-clear status) needs `write_masked`.
-- Ember's `uam_uart16550` has byte registers at consecutive offsets. Many MIPS SoCs space
-  them 4 bytes apart ("reg-shift 2"): wrap it with `reg_stride` (shift >= 2) and map it with
-  the SoC's byte order. The bus's lane extraction then puts a big-endian `sb` to `base+3` into
-  the register's low byte, as on the hardware.
+- Ember's `uam_uart16550` defaults to byte registers at consecutive offsets. Many MIPS SoCs
+  space them 4 bytes apart ("reg-shift 2"): create it with `uam_uart16550_create_cfg(name, cd,
+  &(uam_uart16550_cfg){ .reg_shift = 2, .endian = UAM_ACC_BE })` and map
+  `UAM_UART16550_REGS << reg_shift` bytes (`UAM_UART16550_SIZE` holds shifts up to 5). A
+  whole-slot access or a byte access to the register's low byte reaches it; the slot's other
+  bytes read 0 and drop writes. `reg_stride` is the same layout as an adapter, for a
+  byte-register device of your own that has no spacing option.
 
 ### Snapshots: every device saves its state
 Ember snapshots a whole machine (`--save-snapshot`, `--snapshot-at`; ember's fuzz harness
@@ -163,8 +166,9 @@ LED blink), read the **disassembly**.
   no Hz. A device that counts converts with a rate the **board** chooses: define one
   `BOARD_TICKS_PER_US` (ember's `--realtime` default paces 100 M ticks/s, i.e. 100) and derive
   every device's `ticks_per_count` from the counter's clock. The MIPS CP0 Count advances at
-  ticks/2, the PowerPC time base and decrementer every `tb_div` ticks, Xtensa CCOUNT and the
-  8051 timers one per tick (one per instruction), the Z80 CTC one per 16 or 256 ticks.
+  ticks/2, the PowerPC time base and decrementer every `tb_div` ticks, Xtensa CCOUNT, the ARM
+  generic timer's count, AVR32 COUNT, the CLINT's `mtime` and the 8051 timers one per tick (one
+  per instruction), the Z80 CTC one per 16 or 256 ticks.
 - Derive counters from `uam_sched_now()` (`examples/soc_timer.c`: `(now - base) /
   ticks_per_count`); never tick them in a loop.
 - `uam_timer_init` once at create; `uam_timer_arm(sched, &t, absolute_tick)` to (re)arm;

@@ -115,6 +115,15 @@ run_bare m6502 "$UP/build/firmware-6502/selftest-nmos.bin" "0x7f05"
 run_bare z80 "$UP/build/firmware-z80/selftest-nmos.bin" "phys 0x10000)" 125
 run_bare xtensa "$UP/build/firmware-xtensa/selftest-lx6.elf" "0x60000005"
 run_bare xtensaeb "$UP/build/firmware-xtensa/selftest-lx6-be.bin" "0x60000005"
+# an 8-bit core has no bus error: a store to ROM stops it, and log_summary must say so
+python3 -c "
+import sys
+rom = bytearray(b'\xea' * 0x8000); rom[:3] = b'\x8d\x00\x90'; rom[0x7ffc:0x7ffe] = b'\x00\x80'
+open(sys.argv[1], 'wb').write(rom)" "$T/m6502/build/halt.bin"
+(cd "$T/m6502" && IMAGE="$T/m6502/build/halt.bin" timeout -k 5 60 ./run.sh -n 100000 > build/c.txt 2> build/halt.log < /dev/null) || true
+python3 "$T/m6502/scripts/log_summary.py" "$T/m6502/build/halt.log" | grep -q "core halted at pc 0x8000: store to nothing at bus address 0x9000" \
+    && ok "log_summary: a halted 8-bit core is reported" \
+    || { bad "log_summary: a halted 8-bit core is reported"; tail -5 "$T/m6502/build/halt.log"; }
 # the PC template runs ember's x86 self-test as a raw stage (real mode at 0); its software
 # SMIs need the stand-in APM port
 X86ST="$UP/build/firmware-x86/selftest.bin"
@@ -125,6 +134,12 @@ if [[ -f "$X86ST" ]]; then
         grep -q "x86 selftest: real prot long PASS" "$T/pc/build/st.txt" && ok "pc: template runs the x86 self-test ${v:-(interp)}" \
             || { bad "pc: template runs the x86 self-test $v"; cat "$T/pc/build/st.txt"; tail -3 "$T/pc/build/st.log"; }
     done
+    # the AMD64 SMRAM save state and AMD's SMRAM registers, by board option
+    if [[ -f "$UP/build/firmware-x86/smm-amd.bin" ]]; then
+        (cd "$T/pc" && IMAGE="$UP/build/firmware-x86/smm-amd.bin" timeout -k 5 60 ./run.sh -o apm-smi=1 -o smm-map=amd64 -n 20000000 > build/amd.txt 2> build/amd.log < /dev/null) || true
+        grep -q "io+0x700: .*(last 0x5555)" "$T/pc/build/amd.log" && ok "pc: template runs the AMD64 SMM self-test" \
+            || { bad "pc: template runs the AMD64 SMM self-test"; cat "$T/pc/build/amd.txt"; tail -3 "$T/pc/build/amd.log"; }
+    fi
     # without the APM port the SMI goes nowhere: log_summary must say so
     (cd "$T/pc" && IMAGE="$X86ST" timeout -k 5 60 ./run.sh -n 20000000 > build/nosmi.txt 2> build/nosmi.log < /dev/null) || true
     python3 "$T/pc/scripts/log_summary.py" "$T/pc/build/nosmi.log" | grep -q "software SMI lost" \

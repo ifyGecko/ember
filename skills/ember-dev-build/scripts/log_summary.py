@@ -4,8 +4,9 @@ catch-all windows / --unknown-mmio zero) into the next blocker.
 
 Prints, in order:
   1. how the run ended (stop reason, pc, instruction count, exit-code meaning) and stats;
-     an x86 shutdown (triple fault, machine check, RSM with an invalid saved state) is
-     called out here
+     an x86 shutdown (triple fault, machine check, RSM with an invalid saved state) and an
+     8-bit core halted by an access nothing answers (AVR, PIC, 8051, 6502, Z80) or a 6502
+     JAM are called out here
   2. the first N distinct events in time order: first access to each unmodelled offset
      (unimp windows; x86 I/O ports by port number and name) or address (unknown-mmio),
      exceptions, resets, errors - read these top-down, the first one is usually the blocker
@@ -99,6 +100,8 @@ RE_STUB_SUM = re.compile(r"\] mmio-stub: (\S+): (\d+) reads, (\d+) writes, (\d+)
 RE_LOGPC = re.compile(r"^\S+: pc 0x([0-9a-f]+) reached \(hit (\d+), icount (\d+)(?:, cpu (\d+))?\)")
 RE_TRIPLE = re.compile(r"^x86: triple fault at pc=(0x[0-9a-f]+)")
 RE_SHUTDOWN = re.compile(r"^x86: (.+) at pc=(0x[0-9a-f]+): hart shut down")
+RE_HALT = re.compile(r"\] (\w+): pc=(0x[0-9a-f]+): (fetch fault|load from nothing|store to nothing) at (0x[0-9a-f]+): core halted")
+RE_JAM = re.compile(r"\] m6502: pc=(0x[0-9a-f]+): JAM")
 RE_MSR = re.compile(r"^x86: (rdmsr|wrmsr) (0x[0-9a-f]+) (?:->|<-) (0x[0-9a-f]+)")
 RE_POST = re.compile(r"\] post: code (0x[0-9a-f]+)")
 RE_GUARD = re.compile(r"^(?:\S+: )?guard (\S+) \((stop|fault|log)\): cpu (\d+) pc (0x[0-9a-f]+) (read|write) (\d+) at (0x[0-9a-f]+)")
@@ -184,6 +187,7 @@ def main(argv=None):
     stubs, abi, snap = {}, [], []
     cpus = Counter()
     triple = None
+    halted = None
     smi_lost = None                  # first write to port 0xB2 that only a catch-all saw
     msrs = {}                        # (op, msr) -> [count, last value]
     posts = []
@@ -266,6 +270,16 @@ def main(argv=None):
             # invalid saved state: the processor stopped the same way
             note(i, "x86 SHUTDOWN at pc %s: %s" % (m.group(2), m.group(1)))
             continue
+        m = RE_HALT.search(ln)
+        if m:
+            halted = m.groups()
+            note(i, "%s CORE HALTED at pc %s: %s at bus address %s" % m.groups())
+            continue
+        m = RE_JAM.search(ln)
+        if m:
+            halted = ("m6502", m.group(1), "JAM opcode", None)
+            note(i, "m6502 JAM at pc %s: the core stops until reset" % m.group(1))
+            continue
         m = RE_MSR.match(ln)
         if m:
             op, msr, val = m.groups()
@@ -327,6 +341,13 @@ def main(argv=None):
         print("   -> x86 triple fault at pc %s: an exception while delivering a double fault (no or a\n"
               "      broken IDT/GDT, a stack in memory that is not there). The processor stopped, so the\n"
               "      run ended idle (125/128). The FIRST exception below started it." % triple)
+    if halted and halted[3]:
+        print("   -> %s core halted at pc %s: %s at bus address %s. This core has no bus error to\n"
+              "      take, so the hart stopped and the run ended idle: give that address a device, RAM\n"
+              "      or a catch-all window. No timer or interrupt is missing." % halted)
+    elif halted:
+        print("   -> 6502 JAM at pc %s: execution went astray (wrong base, bad jump) or the CPU model\n"
+              "      is wrong. The run ended idle: no timer or interrupt is missing." % halted[1])
     if smi_lost:
         print("   -> software SMI lost (log line %d: port 0xB2 = %s reached a catch-all): no APM/SMI\n"
               "      device decodes 0xB2, so SMM never ran. Everything behind an SMI fails quietly\n"

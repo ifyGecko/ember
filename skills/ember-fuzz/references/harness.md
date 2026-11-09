@@ -248,7 +248,7 @@ every class above exists; what the policy leaves out goes to the firmware's hand
   time: there, crash pcs at the firmware's exception handler are the oracle. ember's own
   fuzz-check does not run on `x86_64-ref`.
 - **SMM handlers (SW SMI through port 0xB2, a comm buffer)**: turn on SMM code-fetch
-  confinement (`uam_x86_set_smm_confine` in the board; `-o smm-confine=1` on `x86_64-ref`).
+  confinement (`uam_x86_set_smm_confine` in the board; `-o smm-confine=1` on the PC template and `x86_64-ref`).
   An SMM instruction fetch outside SMRAM (SMRR, and on AMD the TSeg/ASeg) is then a
   `fetch`-class crash at the first instruction outside - a call-out through a corrupted
   or NULL function pointer, a jump into memory the OS controls - instead of whatever that

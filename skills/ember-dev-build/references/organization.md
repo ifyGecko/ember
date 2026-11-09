@@ -96,7 +96,7 @@ coverage or the fuzz harness either: the most ember-fuzz adds to one is a plain 
 arrived" feed function, which the board publishes.
 
 Reuse ember's stock models (`include/uam/dev/`) instead of re-implementing them:
-`uam_uart16550` (byte-spaced 16550; behind `reg_stride` for word-spaced ones), `uam_unimp`
+`uam_uart16550` (`uam_uart16550_create_cfg` for word-spaced registers and big-endian slots), `uam_unimp`
 (catch-all windows), `uam_unknown_mmio`, `uam_mmio_stub` (per-register rules; use
 `--mmio-rule`), `uam_cfi_flash`, `uam_gptimer` (a generic down-counter), `uam_ipi`
 (doorbells between processors), `uam_clint` / `uam_plic` (SiFive layouts), `uam_gic`,

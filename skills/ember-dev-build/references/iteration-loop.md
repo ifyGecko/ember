@@ -54,7 +54,9 @@ input give **the same run, instruction for instruction**. Consequences:
   that off, and must agree too). `--jit` compiles on x86-64 and AArch64 hosts; elsewhere it
   falls back to the interpreter. The JIT is much faster for long boots, but if a run
   behaves differently with and without `--jit`, that is an ember bug: stop and report it
-  with both logs instead of working around it.
+  with both logs instead of working around it. To narrow it for the report, `--no-chain`,
+  `--no-opt` and `--block-insns 1` each change only how blocks are formed and run, and
+  `--trace ir` prints what was translated.
 - A run can be cut anywhere with `--save-snapshot` and resumed with `--load-snapshot`,
   bit-identically. Once the boot is long, take a snapshot past the part you are no longer
   changing and start every run from it (`snapshots.md`, section 2); re-take it
@@ -107,6 +109,8 @@ reports it: the prompt never came). Patterns only match output of the current ru
 | `[error] abi: ...` (exit 2) | board and libuam built from different ember headers: `scripts/build-ember.sh` |
 | `exc: kind=K pc=.. cause=.. tval=..` | `--trace exc`: every synchronous exception (kind 0 = guest trap; cause is ISA-defined: the MIPS ExcCode, RISC-V mcause, x86 vector, ...; `uam/isa/*.h`) |
 | `guard NAME (stop\|fault\|log): cpu N pc .. read\|write S at ..` | a `--guard` / `--watch` hit |
+| `[error] z80: pc=..: load from nothing at 0x..: core halted` | an AVR, 8-bit PIC, 8051, 6502 or Z80 stopped: it has no bus-error exception to take |
+| `[warn] m6502: pc=..: JAM: the core stops until reset` | an NMOS 6502 executed a JAM opcode |
 | `[warn] chardev: console input: N byte(s) never sent, waiting for '...'` | scripted console input whose prompt never came |
 | `irq: entered handler at ..`, `reset: system` | `--trace exc`: interrupt entries, device-requested resets |
 | `<runner>: <reason> (status N) at pc=.. after N instructions` | how the run ended |
@@ -125,6 +129,8 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 | exit 129 (guarded memory access) | a data access touched a `--guard` range; the guard line names pc, access and address | the code at that pc (who writes there, and why) |
 | exit 125 (deadlock) | the guest executed WAIT and nothing can wake it: the tick timer or the interrupt it waits for is not modelled or not wired | model the timer / wire its line through the interrupt controller to the right CPU input |
 | exit 128 (livelock) | WAIT while a timer keeps firing but its interrupt is never delivered (unwired line, masked in the intc, wrong Cause.IP / mip bit), or a device re-arms a timer by itself | as for exit 125: follow the timer's line to the CPU input the guest enabled |
+| `core halted` in the log, then exit 125 | an AVR, 8-bit PIC, 8051, 6502 or Z80 reached an access nothing answers (`--unknown-mmio fault`, a write to ROM, a fetch where no memory is). These cores have no bus error to raise, so the hart stops; no timer is missing | the line's address is a bus address (`board-skeleton.md`, "Address spaces"): give it a device, RAM or a catch-all window |
+| `JAM` in the log, or `JAMMED` / `STOPPED` in `-d`, then exit 125 | an NMOS JAM opcode or a 65C02 STP: execution went astray (wrong base, bad jump) or the model is wrong (a 65C02 opcode run on `nmos`) | the pc in Ghidra; re-check the base and `--model` |
 | killed by `timeout` while idle | waiting for console/network input (stdin not `/dev/null`, a pty/tcp console, a host `--nic`) | that is the guest waiting for you: script the input, or run unattended |
 | `exc: kind=0 cause=9` (MIPS Bp) early, no output | compiler divide-by-zero trap (`break 7`): a clock/divider register reads 0 | decompile the function at pc; give the register a sane reset value |
 | `exc: kind=2/3` (LOAD/STORE_FAULT, MIPS DBE) with tval in an MMIO range | an access outside every window with `--unknown-mmio fault`, or a write to a ROM region | add the window, or use ROMD for flash that takes commands |

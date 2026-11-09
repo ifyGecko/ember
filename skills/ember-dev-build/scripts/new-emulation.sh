@@ -185,7 +185,8 @@ static void watchdog_reset(void *ctx, uam_cpu *cpu, unsigned kind)
      * FPU, isel, TLB0 512 x 4-way, TLB1 16 entries, MAS interface v1, the boot page
      * 0xFFFFF000 mapped at reset around the reset vector 0xFFFFFFFC). Implementation SPRs
      * (HID0, L1CSR0, ...): uam_ppc_set_spr_ops; device control registers:
-     * uam_ppc_set_dcr_ops. Each processor reads its number in PIR. The decrementer, the
+     * uam_ppc_set_dcr_ops; a TLB interface other than MAS: uam_ppc_set_tlb_ops. Each
+     * processor reads its number in PIR. The decrementer, the
      * fixed-interval timer and the watchdog are inside the processor. */
     uam_ppc_config cpu_model = uam_ppc_booke_ref;
     cpu_model.name = \"@BOARD@-cpu\";
@@ -454,7 +455,8 @@ static void core_reset(void *ctx, uam_pic_reset_cause cause)
         banking=""
         [[ $MODEL == cip51 ]] && banking="
      * CIP-51: SFR paging (SFRPAGE at 0x84) and code banking from 0x8000: the bank-select
-     * register is a board device (uam_mcs51_reg_create) calling uam_mcs51_set_code_bank."
+     * register is a board device (uam_mcs51_reg_create) calling uam_mcs51_set_code_bank.
+     * Automatic SFR paging on interrupts: uam_mcs51_set_sfr_autopage, uam_mcs51_set_irq_sfrpage."
         CPU_MODEL="    /* CPU model (RECON: the part): a board-local copy of ember's reference model
      * (uam_mcs51_${MODEL}_ref: iram_size, interrupt sources and their enable/priority SFRs,
      * dual DPTR, the MOVX @Ri page register, SFR paging, code banking).$banking

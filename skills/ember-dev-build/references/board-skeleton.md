@@ -66,7 +66,7 @@ static const struct board_reg { ... } board_entry_regs[] = {      /* RECON entry
    reset (it takes effect at a reset). The config is copied, so a board-local variation of
    the reference model is fine. MIPS:
    ```c
-   uam_mips_config cpu = uam_mips_24kc;      /* then change what the firmware checks */
+   uam_mips_config cpu = uam_mips_ref;        /* then change what the firmware checks */
    cpu.name = "74Kc"; cpu.prid = 0x00019750; cpu.tlb_entries = 32;
    if ((st = uam_mips_configure(&m->cpu, &cpu)) != UAM_OK) return st;
    ```

@@ -119,8 +119,10 @@ and, when the pin moved, the skills' end-to-end test against it:
    Exit codes help: 124 budget or `--max-ticks` used (look at hot offsets), 125 deadlock (a
    timer/interrupt not modelled or wired), 128 livelock (a timer fires but its interrupt
    never reaches the CPU), 126 fetch-fault loop, internal error, or a reset nothing handles,
-   127 breakpoint or debug trap, 129 a `--guard` hit, 2 setup error (`abi:` = rebuild with
-   `build-ember.sh`). On
+   127 breakpoint or debug trap, 129 a `--guard` hit, 130 interrupted, 2 setup error (`abi:` =
+   rebuild with `build-ember.sh`); any other status is the firmware's own, through a finisher.
+   An AVR, 8-bit PIC, 8051, 6502 or Z80 has no bus error: a `core halted` line before a 125
+   names the address nothing answered, and no timer is missing. On
    x86 an `x86: ... hart shut down` line means the processor shut down (the run then ends
    idle, 125 or 128): after a triple fault the *first* exception before it is the blocker;
    it also follows a machine check (SMM code fetch outside SMRAM) or an RSM with an

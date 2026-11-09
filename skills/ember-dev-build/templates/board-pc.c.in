@@ -31,6 +31,13 @@
  * Options:
  *   -o cpus=N          processors (1..BOARD_MAX_CPUS); the others wait for INIT/SIPI
  *   -o apic-hz=HZ      local APIC timer input clock (default 1 GHz)
+ *   -o smm-map=MAP     SMRAM save-state map: intel64 or amd64 (default: amd64 when
+ *                      BOARD_CPU_VENDOR is AMD's or Hygon's); amd64 also brings AMD's
+ *                      SMM_ADDR/SMM_MASK/HWCR.SMMLOCK
+ *   -o smm-code-chk=1  offer Intel's SMM code-access check (UAM_X86_FEAT_SMM_CODE_CHK)
+ *   -o smm-blocked=1   offer Intel's MSR_SMM_BLOCKED/MSR_SMM_DELAYED
+ *                      (UAM_X86_FEAT_SMM_BLOCKED; all processors are one package)
+ *   -o smm-confine=1   an SMM fetch outside SMRAM is a machine check, on either vendor
  *   -o persist=1       write flash programs/erases back to the image files
  *   -o debugcon=PORT   a debug console port writing to the console (edk2: 0x402)
  *   -o msr-trace=1     log every MSR access no device answers ("x86: rdmsr/wrmsr" lines)
@@ -534,8 +541,25 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
     /* each processor's view of the platform */
     const char *mt = uam_board_config_option(cfg, "msr-trace");
     const char *mp = uam_board_config_option(cfg, "msr");
+    const char *smap = uam_board_config_option(cfg, "smm-map");
+    uam_x86_smm_map smm_map = strcmp(BOARD_CPU_VENDOR, "AuthenticAMD") == 0
+                                      || strcmp(BOARD_CPU_VENDOR, "HygonGenuine") == 0
+                                  ? UAM_X86_SMM_MAP_AMD64 : UAM_X86_SMM_MAP_INTEL64;
+    if (smap && strcmp(smap, "amd64") == 0)
+        smm_map = UAM_X86_SMM_MAP_AMD64;
+    else if (smap && strcmp(smap, "intel64") == 0)
+        smm_map = UAM_X86_SMM_MAP_INTEL64;
+    else if (smap) {
+        uam_log(UAM_LOG_ERROR, m->board_name, "smm-map must be intel64 or amd64, not '%s'", smap);
+        return UAM_ERR_INVALID;
+    }
+    const char *chk = uam_board_config_option(cfg, "smm-code-chk");
+    const char *blocked = uam_board_config_option(cfg, "smm-blocked");
+    const char *confine = uam_board_config_option(cfg, "smm-confine");
+    uam_cpu *pkg[BOARD_MAX_CPUS];   /* every processor in one package */
     for (unsigned i = 0; i < b->ncpu; i++) {
         uam_cpu *cpu = uam_machine_cpu(m, i);
+        pkg[i] = cpu;
         uam_x86_platform plat = { .ctx = &b->pcpu[i], .inta = board_inta, .rdmsr = board_rdmsr,
                                   .wrmsr = board_wrmsr, .smm_changed = board_smm_changed };
         uam_x86_set_platform(cpu, &plat);
@@ -550,11 +574,17 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
         if (BOARD_CPU_BRAND[0])
             snprintf(id.brand, sizeof(id.brand), "%s", BOARD_CPU_BRAND);
         id.phys_addr_bits = BOARD_CPU_PHYS_BITS;
-        id.features |= UAM_X86_FEAT_X2APIC | UAM_X86_FEAT_TSC_DEADLINE;
+        id.features |= UAM_X86_FEAT_X2APIC | UAM_X86_FEAT_TSC_DEADLINE |
+                       (chk && strcmp(chk, "0") != 0 ? UAM_X86_FEAT_SMM_CODE_CHK : 0) |
+                       (blocked && strcmp(blocked, "0") != 0 ? UAM_X86_FEAT_SMM_BLOCKED : 0);
         id.logical_cpus = b->ncpu;
         id.initial_apic_id = i;
         uam_x86_set_cpuid(cpu, &id);
+        uam_x86_set_smm_map(cpu, smm_map);
+        uam_x86_set_smm_confine(cpu, confine && strcmp(confine, "0") != 0);
     }
+    if ((st = uam_x86_set_package(pkg, b->ncpu)) != UAM_OK)
+        return st;
 
     /* Addresses no region claims: master abort as on a PC (reads all ones, writes dropped),
      * each first access logged unless -o abort-log=0; --unknown-mmio zero|echo instead reads
