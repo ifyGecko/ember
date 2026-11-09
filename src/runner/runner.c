@@ -985,7 +985,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
         host_net |= uam_netdev_fd(nics[i].nd) >= 0;
     }
 
+    /* Zeroed, because a board may refuse its options before uam_machine_init. */
     uam_machine m;
+    memset(&m, 0, sizeof(m));
     uam_status st = board->build(&m, &cfg);
     if (st != UAM_OK) {
         fprintf(stderr, "uam-run: building board '%s' failed: %s\n", board_name, uam_status_str(st));

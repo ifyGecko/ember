@@ -118,6 +118,8 @@ void uam_machine_guards_fini(uam_machine *m);   /* guard.c */
 
 void uam_machine_fini(uam_machine *m)
 {
+    if (!m->cpu.isa)        /* zeroed and never initialized: a board that failed early */
+        return;
     uam_machine_guards_fini(m);
     if (m->board_fini)
         m->board_fini(m);

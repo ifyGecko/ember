@@ -2,6 +2,7 @@
 # runner-check.sh RUNNER X86_SELFTEST_BIN - checks of uam-run's debugging options on
 # x86_64-test (RUNNER is build/uam-test-run) with the raw x86 self-test (loaded at 0,
 # entered at 0):
+#   bad board options  a setup error (exit 2), not a crash, however early the board refuses
 #   --log-pc     more than 64 addresses all take effect
 #   --dump-mem   at --break: the bytes are the image's (raw file and hex dump, virtual and
 #                p: physical); an unreadable range is reported with the reason (unmapped,
@@ -20,6 +21,18 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 X="$RUN -b x86_64-test --raw-base 0 --entry 0"
 fail() { echo "runner-check: FAIL: $*" >&2; exit 1; }
+
+# a board that refuses its options is a setup error (exit 2), whether it fails before
+# uam_machine_init (most of these) or after it (pic32-ref)
+for bad in "avr-ref -o model=none" "avr-ref -o cpus=2" "pic-ref -o cpus=2" "mcs51-ref -o cpus=2" \
+           "6502-ref -o cpus=2" "z80-ref -o cpus=2" "xtensa-ref -o cpus=99" "xtensaeb-ref -o cpus=99" \
+           "z80-ref --ram 0x20000" "mcs51-ref --ram 0x20000" "rv32-ref -o cpus=99" "pic32-ref -o model=none"; do
+    rc=0
+    # shellcheck disable=SC2086
+    $RUN -b $bad </dev/null >/dev/null 2>"$T/bad" || rc=$?
+    [ "$rc" -eq 2 ] || fail "-b $bad: exit $rc, expected 2"
+    grep -q "building board" "$T/bad" || fail "-b $bad: no build failure reported"
+done
 
 # --log-pc: the 100 block starts the trace reports first, all of them reached
 $X -t blocks -n 20000 "$FW" </dev/null 2>"$T/tr" >/dev/null || true

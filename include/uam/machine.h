@@ -165,6 +165,7 @@ bool uam_abi_check(const uam_abi_layout *caller, const char *entry);
 
 uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_abi_layout *abi);
 #define uam_machine_init(m, isa) uam_machine_init_abi((m), (isa), UAM_ABI_LAYOUT)
+/* Does nothing to a zeroed machine that uam_machine_init never saw. */
 void       uam_machine_fini(uam_machine *m);
 /* Take ownership of a device (reset/destroy with the machine). */
 void       uam_machine_add_device_abi(uam_machine *m, uam_device *dev, const uam_abi_layout *abi);
@@ -248,6 +249,8 @@ void       uam_machine_reset_sink(void *machine, unsigned input, int level);
 typedef struct uam_board {
     const char *name;
     const char *description;
+    /* m is zeroed. On failure the caller calls uam_machine_fini, so build may fail
+     * before or after uam_machine_init. */
     uam_status (*build)(uam_machine *m, const uam_board_config *cfg);
 } uam_board;
 
