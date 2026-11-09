@@ -52,7 +52,7 @@ stub (one thread per processor) work on multiprocessor machines too. Machine sna
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
 `--watch`), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
 pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
-dependencies beyond libc.
+dependencies beyond libc and libm.
 
 ## Hosts
 
@@ -60,8 +60,9 @@ Ember builds and runs on any POSIX host with a C11 compiler (GCC or Clang) that 
 `__int128`; the interpreter needs nothing more. The JIT has a code generator for x86-64
 (`src/exec/jit_x86.c`) and one for little-endian AArch64 (`src/exec/jit_a64.c`), both on
 the host-independent core in `src/exec/jit.c`; on any other host `--jit` falls back to the
-interpreter. Guest behaviour does not depend on the host: the x87 model computes in
-software (`isa/x86/x86_f80.c`), and `make test` passes the same checks on both JIT hosts.
+interpreter. Guest behaviour does not depend on the host, apart from the precision of x87
+transcendentals (macOS note below): the x87 model computes in software
+(`isa/x86/x86_f80.c`), and `make test` passes the same checks on both JIT hosts.
 
 - **Linux on x86-64 and on AArch64**: everything, tested.
 - **macOS** (Apple silicon and Intel): written for and not yet tested there. The code arena
@@ -80,7 +81,7 @@ host-independent.
 ## Build and test
 
 ```bash
-make                 # build/uam-run and the libraries
+make                 # build/uam-run and the libraries (build/uam-test-run: make build/uam-test-run)
 make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
@@ -106,7 +107,8 @@ The PowerPC self-test needs a GCC for PowerPC: by default `powerpc64le-linux-gnu
 builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works too
 (`make CROSS=powerpc-linux-gnu- ppc-test`).
 
-The x86 self-tests are assembled with `nasm`; the BIOS boot and gdb stub checks need `python3`.
+The x86 self-tests are assembled with `nasm`; the BIOS boot and gdb stub checks need `python3`,
+as do the 8051, 6502, Z80, Xtensa and PIC32 firmware builds and their checks.
 
 The AVR self-tests (one per core family) and the AVR builds of the fuzz target and the
 benchmark need `avr-gcc` and avr-libc (Debian: `gcc-avr`, `binutils-avr`, `avr-libc`), and
@@ -179,9 +181,11 @@ build/uam-run --help
 Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
 names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `avr32-ref`, `pic-ref`,
 `pic32-ref`, `mcs51-ref`, `6502-ref` and `z80-ref`,
-`-o cpus=N`
+`-o cpus=N` (up to 8; `x86_64-ref` 64, Xtensa 4)
 (`--quantum N`: instructions each processor runs before the next, default 4096); `ppc-ref` takes
-`-o model=classic|booke`. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
+`-o model=classic|booke` (default `classic`). `--map` prints any board's map on stderr. Default
+RAM is 128 MiB at 0x80000000 on `rv32-ref`, 32 MiB at physical 0 on `mips-ref`, 64 MiB at 0 on
+`arm-ref` and `ppc-ref` (which also has a 1 MiB boot ROM at 0xfff00000), and 512 MiB on `x86_64-ref`. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
 with the memory layout of a common part of that core family, so firmware built for that part
 runs (`e` ATmega328P, `eplus` ATmega2560, `xm` ATxmega128A1U, `xt` ATmega4809, `rc`
 ATtiny40; boards/avr_ref.c has the map); its devices (a 16550, a timer, the test finisher) are
@@ -190,9 +194,9 @@ generic, not those parts' peripherals, and `--ram` sets the size of its SRAM. `a
 memory at physical 0, reset through P2 at 0xa0000000, RAM at physical 0x10000000), with its
 interrupt controller, a 16550 and the test finisher at 0xffff0800, 0xffff1400 and 0xffff1800.
 `pic-ref` takes `-o model=baseline|mid|enhanced|pic18` (default `pic18`; the program memory and
-data space of a PIC16F59, PIC16F877, PIC16F19197 and PIC18F4620) and `-o xinst=1` (PIC18's
-extended instruction set); its data space is RAM wherever the core has no register, with a
-16550, a timer and the test finisher (boards/pic_ref.c has the map). gpasm writes Intel hex:
+data space of a PIC16F59, PIC16F877 and PIC16F19197, and the program memory of a PIC18F4620) and `-o xinst=1` (PIC18's
+extended instruction set); its data space is RAM wherever the core has no register (except PIC18's 0x800-0xF5F, unmapped),
+with a 16550, the test finisher and, except on `baseline`, a timer (boards/pic_ref.c has the map). gpasm writes Intel hex:
 tests/firmware-pic/hex2elf.py turns a hex file and its listing into an ELF image with the
 listing's labels as symbols.
 `mcs51-ref` takes `-o model=8051|8052|cip51` (default `8052`): 64 KiB of program memory (128
@@ -213,7 +217,7 @@ test finisher at 0x60003000; designer-defined TIE (the ESP32-S3's AI instruction
 double-precision helpers) is not modelled.
 `pic32-ref` is a MIPS32 microcontroller with the PIC32 memory map (boot flash at 0x1fc00000,
 program flash at 0x1d000000, RAM at physical 0) and a PIC32-style vectored interrupt controller;
-`-o model=mx|mm|mz` picks the core (mx: MIPS16e-capable, fixed mapping; mm: microMIPS-only; mz:
+`-o model=mx|mm|mz` (default `mx`) picks the core (mx: MIPS16e-capable, fixed mapping; mm: microMIPS-only; mz:
 MIPS32 + microMIPS, a TLB, FPU and DSP), and on mz `-o bootisa=micromips` resets into microMIPS.
 MIPS32, MIPS16e and microMIPS firmware runs (mx and mz switch between their two ISAs through
 JALX and jumps to odd addresses; mm is microMIPS only), and mz has the FPU (FR = 0 and 1, in
@@ -224,7 +228,7 @@ its size), an I/O page at 0x7F00 with a 16550 (the console, IRQ line 0), the tes
 0x8000 with the vectors at its top; a raw image is loaded at 0x8000 and the core starts at its
 reset vector.
 `x86_64-ref` takes the images `flash` (a CFI boot flash of up to 16 MiB ending at 4 GiB; `-o persist=1` writes programs and erases back to the file) and `bios`
-(a legacy BIOS ROM of up to 1 MiB, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
+(a legacy BIOS ROM of 64 KiB to 1 MiB in 4 KiB steps, its last 128 KiB also just below 1 MiB), `-o apic-hz=HZ`
 (the local APIC timer clock, default 1 GHz), `-o smm-map=intel64|amd64` (the SMRAM
 save-state layout the firmware's SMM handler expects; `amd64` also brings AMD's SMM_ADDR,
 SMM_MASK and HWCR.SMMLOCK: the TSeg closed outside SMM, locked until RESET),
@@ -236,7 +240,7 @@ vendor: a crash oracle for SMM call-outs).
 
 With `--jit`, compiled blocks jump straight into each other (block chaining) instead of
 returning to the run loop after every block, which pays off most on firmware with short
-blocks: an RTOS boot on a MIPS32 board ran 7.5x faster (19.8 s to 2.6 s for 3e9 instructions).
+blocks: an RTOS boot on a MIPS32 board ran 7.6x faster (19.8 s to 2.6 s for 3e9 instructions).
 Results are bit-identical with and without it, and to the interpreter. `--stats` reports how
 many blocks were entered by chaining.
 
@@ -265,7 +269,8 @@ emit stream), `--cov-boundary fw.lcvb` replaces `--fuzz-begin`/`--fuzz-end`, and
 lets suzzer's brain drive ember in place of `suzzer-relay`, and `--cov-shm PATH` publishes
 the maps in an LCVS region for suzzer's readers.
 
-A run always ends. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual
+A run is as bounded as you make it: with neither option, a guest that spins forever runs
+until it is stopped. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual
 time, which also advances while the hart idles in WFI/WAIT (both exit 124). When a hart
 waits for an interrupt that the device timers can never deliver (an interrupt line left
 unwired, say), `--max-stall N` timer events with no instruction retired (default 4194304)
@@ -274,7 +279,7 @@ input arrives (typing still wakes the guest, SIGINT/SIGTERM still stop it); with
 nothing can ever wake the hart and the run stops as a livelock (exit 128). Idle time costs next to
 nothing (the default 4194304 events take about 0.1 s). Virtual time never passes 2^62 ticks.
 All of these are counted in virtual time, so runs stay deterministic.
-The other exit statuses: the firmware's own status when it ends the run, 2 usage or setup error
+The other exit statuses: the firmware's own status when it ends the run (0-123 or 130; any other value exits 1), 2 usage or setup error
 (including a library/header ABI mismatch), 125 deadlock (waiting with nothing that could wake it),
 126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 129 a `--guard` stopped the
 run, 130 SIGINT/SIGTERM. `--fuzz-replay` has its own (20-25, above).
@@ -321,15 +326,16 @@ build/uam-run --console pty fw.elf            # console on a pseudo-terminal (al
                                               # script:FILE, null)
 build/uam-run --console 'string:ls\n,after=# ' fw.elf  # type "ls" once the shell's prompt is printed
 build/uam-run --realtime fw.elf               # pace virtual time to the host clock
-build/uam-run --map -b mips-ref               # print the bus map
+build/uam-run --map -b mips-ref               # print the bus map on stderr, then run (no image: exit 126)
 ```
 
 `--dump-mem` and gdb read memory without side effects. A device region (a ROM or flash window
 served by a read handler, a frame buffer) is readable only if its device implements
 `uam_device_ops.peek`, a side-effect-free read (ember's VGA memory and PCI option ROMs do);
-otherwise the dump names the region and its device and writes no file. On PC boards an access
-no device claims reads all ones (master abort), as on hardware; the first one at each memory
-page or I/O port is logged as a warning, and the most frequent are listed at the end of the run.
+otherwise the dump names the region and its device and writes no file. On PC boards a memory access
+no device claims reads all ones (master abort), as on hardware; an unclaimed I/O port on
+`x86_64-ref` reads as zero and ignores writes. The first access at each memory page or port is
+logged as a warning, and the most frequent are listed at the end of the run.
 
 `--guard [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log][,name=NAME]` guards the bytes
 `[ADDR-BEFORE, ADDR+AFTER)` (a bare ADDR is one byte; ADDR is virtual unless `p:`). A data access
@@ -448,7 +454,7 @@ int main(int argc, char **argv)
 ```
 
 Build with `make -C path/to/uam BUILD=$PWD/build/uam lib` and link
-`build/uam/libuam.a` (or `pkg-config --cflags --libs uam` after `make install`).
+`build/uam/libuam.a -lm` (or `pkg-config --cflags --libs uam` after `make install`).
 Compile against the headers of the same tree the library was built from. A board
 built from different headers is stopped at `uam_board_register` / `uam_machine_init`
 with an `abi:` error that names each struct whose size differs and exit status 2, instead
@@ -476,7 +482,7 @@ include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
                    pic.h mcs51.h m6502.h z80.h xtensa.h)
-src/ir/            IR builder, verifier, printer
+src/ir/            IR builder, verifier, printer, block optimizer, pass pipeline
 src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
                    linking; code generators jit_x86.c and jit_a64.c), coverage, spin-loop
@@ -581,8 +587,8 @@ tests/boards/      x86_64-test and rv32-test: reference boards plus components o
                    use (storage, VGA, printer, virtio-net), run by build/uam-test-run
 tests/firmware/    bare-metal RV32 self-test, network-test, multiprocessor, fuzz-target and
                    scripted-console images
-tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian)
-tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8) and fuzz target
+tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian), fuzz target, multiprocessor test
+tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8), fuzz target, multiprocessor test
 tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E builds), multiprocessor
                    test and fuzz target
 tests/firmware-avr/ 8-bit AVR self-test, one build per core family (flag vectors from the
@@ -605,7 +611,7 @@ tests/firmware-xtensa/ Xtensa self-test, one build per model (computational vect
 tests/isa-xtensa/  the opcode table (opcodes.py) and its generator, the decoder check against
                    the GNU disassemblers (xt-check.py), the big-endian layout (le2be.py)
 tests/firmware-pic32/ self-test for the pic32-ref board (MIPS32 and microMIPS on mz, MIPS16e
-                   on mx, microMIPS on mm)
+                   on mx, microMIPS on mm) and fuzz targets
 tests/isa-mips/    the MIPS16e, microMIPS and DSP decoders checked against binutils
 tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), AMD SMM and BIOS
                    ROM tests (nasm)

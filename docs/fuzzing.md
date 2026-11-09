@@ -67,7 +67,7 @@ interpreter +4%.
    (`uam_fuzz_config.begin_skip`) lets the boot pass the begin pc N times first, for
    firmware that runs its handler during start-up (a self-test, a first request of its
    own): the snapshot is taken at arrival N+1, and everything before it, the skipped
-   passes included, is INIT. It is ember's `LIBCOV_BOUNDARY_INIT_GRACE`.
+   passes included, is INIT. It is the counterpart of libcov's `LIBCOV_BOUNDARY_INIT_GRACE`.
 2. **Snapshot** there.
 3. **Each input**: restore the snapshot, clear the map and `prev`, deliver the input, run
    until the iteration ends, a crash check fires or the budget runs out, then classify.
@@ -147,7 +147,7 @@ the campaign goes on. Any other error from a route is a harness error and stops 
 | crash (fault) | an exception of a crashing class (`--fuzz-crash-exc`), a fetch fault loop | faulting pc | 20 |
 | crash (guard) | a STOP guard was touched: a route's redzone, a `--guard` | pc of the access | 25 |
 | crash (oracle) | a `--fuzz-crash-pc` reached, a `--fuzz-crash-irq` interrupt taken, a reset during the iteration, a non-zero halt, a debug trap | the pc (0 for a reset, the status for a halt, the crashing lines for an interrupt) | 21 |
-| hang | deadlock or livelock | the stop reason (`uam_stop_reason`: `UAM_STOP_DEADLOCK` or `UAM_STOP_LIVELOCK`, numbered as in `uam/exec.h` of this ember) | 22 |
+| hang | deadlock or livelock (also an x86 processor shutdown: a triple fault or an RSM with an invalid saved state leaves the hart idle, and only the `x86: ... hart shut down` line on stderr tells it from a wait) | the stop reason (`uam_stop_reason`: `UAM_STOP_DEADLOCK` or `UAM_STOP_LIVELOCK`, numbered as in `uam/exec.h` of this ember) | 22 |
 | timeout | `--fuzz-iter-insns` (default 1e7) exhausted | 0 | 23 |
 | rejected | the input route refused the input (`UAM_ERR_REJECTED`); nothing ran | 0 | 24 |
 

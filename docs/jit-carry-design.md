@@ -4,9 +4,9 @@ Status: **approved** (2026-10-28). Stage N is implemented (§9); stages C1 and C
 
 ## 1. What it is, in one paragraph
 
-On ember's cross-ISA benchmark, x86-64 still takes 1.4–1.8× the time of RV32 per kernel, though it executes about as many guest instructions (crc: 187 M against 196 M). Two things make up nearly all of the difference, and neither is about x86 as such:
+Before stage N, on ember's cross-ISA benchmark, x86-64 took 1.4–1.8× the time of RV32 per kernel (`jit-perf.md` has the figures after it), though it executes about as many guest instructions (crc: 187 M against 196 M). Two things make up nearly all of the difference, and neither is about x86 as such:
 1. **Writes live at a block exit.** Step 9 removes a register write that a later instruction of the same block overwrites. It cannot remove the last write before an exit, because the next block might read it. In a hot loop every pass ends at an exit, so the last flag-setting instruction of each pass computes and stores all six flags. The next pass then overwrites all six before reading any.
-2. **Narrow reads of a register that was just written whole.** The optimizer forwards a register value to a later read only on an exact offset and width match. So `get.32 {reg+56}` after `put.64 {rdi}` reads memory again, and the folds that would follow are lost.
+2. **Narrow reads of a register that was just written whole.** Before stage N (`lookup_wider` in `src/ir/opt.c`), the optimizer forwarded a register value to a later read only on an exact offset and width match. So `get.32 {reg+56}` after `put.64 {rdi}` reads memory again, and the folds that would follow are lost.
 
 This step fixes both generically:
 - **Stage N:** forward a narrow read from a known wider value. This is an IR optimization.
@@ -40,7 +40,7 @@ All runs are the per-kernel medians of 5, under the same conditions as RV32. The
 - **E1** forwards narrow reads (stage N).
 - **E2** drops every flag write. It is wrong in general and only bounds what stage C can gain.
 
-| x86 time / RV32 time | today | E1 + E2 |
+| x86 time / RV32 time | before stage N | E1 + E2 |
 |---|---:|---:|
 | crc | 1.76 | 1.13 |
 | matmul | 1.72 | 1.13 |
@@ -74,7 +74,7 @@ The register file is little-endian by definition, so this holds for every guest 
 - Only the source of a GET's value changes, and the replacement computes exactly the bytes the GET would read.
 
 **Tests:**
-- test_ir checks the rewrite. Cases: same offset; higher offset; a narrower PUT in between, which must block it; a helper in between, which must block it; a guarded wider PUT.
+- `test_jitdiff` checks the rewrite (pattern 9, `check_narrow_reads`; planned for test_ir). Cases: same offset; higher offset; a narrower PUT in between, which must block it; a helper in between, which must block it; a guarded wider PUT.
 - test_jitdiff level C gets the same shapes, run against the unoptimized interpreter.
 
 **Expected:** 3–5% on x86 kernels. On other ISAs it should be neutral or slightly positive: ARM byte loads into a register that is then read whole do not match, but PowerPC and x86 sub-register reads do.
@@ -113,7 +113,7 @@ The condition is checked when the link is made (§4.4). It is exact, so everythi
 
 **Leaving native code** (an exit that does not chain, a stop stub, a fault): either B's carried writes were materialized at a soft point of S, or the code that leaves materializes them first. The run loop, hooks, snapshots, gdb and the other CPUs never see a pending carry. Nothing outside the JIT changes: the analysis goes into its core (`jit.c`, `jit_defer_analyze`), the materializer and its calls into each code generator (`jit_x86.c`, `jit_a64.c`).
 
-### 4.2 Analysis (extends `defer_analyze`)
+### 4.2 Analysis (extends `jit_defer_analyze`)
 
 **Exits become replay points.** Today an EXIT is a hard point: the backward pass clears K there, so no write is pending at an exit. In stage C it becomes a soft point of its own kind:
 - Backward pass, at an unguarded EXIT: K := C(E).
@@ -228,7 +228,7 @@ The comparison covers the register file, RAM, icount and the device log.
 **Unit tests and end to end:**
 - test_jit: a hop count that shows carried links happen on a looping guest.
 - `make test` (every firmware self-test on the interpreter and the JIT).
-- Both end-to-end workloads: identical consoles and identical interpreter-vs-JIT `-d` state, and `ovmf-check`. `secureboot-check` after C2.
+- Both end-to-end workloads: identical consoles and identical interpreter-vs-JIT `-d` state, and the UEFI boot check of an external x86 board if one is available, with secure boot after C2 (ember has no such make target).
 
 **Measurement:**
 - The op map labels materializers and carry stores as their own region kinds, `carry`, so `tools/jitprof.py` can show their share.

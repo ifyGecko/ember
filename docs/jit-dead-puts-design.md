@@ -100,8 +100,8 @@ An IR-level alternative (a `uam_finalize` pass that writes stub lists into the b
 
 **Forward pass.** It walks the block keeping a list of pending deferred writes.
 - At a deferred PUT: add it to the list.
-- At any PUT: drop pending writes it fully covers.
-- **Overlap rule.** A non-deferred PUT that only partly overlaps a pending one would be clobbered by a later replay. When that happens, the pending write is un-deferred (it is done in place, as today). Un-deferring only restores original behaviour, so it is always safe.
+- At an unguarded PUT: drop pending writes it fully covers.
+- **Overlap rule.** A non-deferred PUT that is guarded, or only partly overlaps a pending one, would be clobbered by a later replay. When that happens, the pending write is un-deferred (it is done in place, as today). Un-deferring only restores original behaviour, so it is always safe.
 - At each soft point: record the pending list as that point's stub.
 - At a hard point: the list is empty by construction (the backward pass emptied K).
 
@@ -145,7 +145,7 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
   - a CONT IMARK in between (no stop) versus a plain IMARK (stop).
 - **Mutation checks**, as in earlier steps: drop a replay, replay out of order, ignore the overlap rule, forget a soft point.
 - **Bisecting:** `UAM_JIT_NODEFER=1`. `--stats` gets counters for deferred writes, sunk ops and stub bytes.
-- **End to end:** both workloads keep identical consoles and identical interpreter-vs-JIT state, and `ovmf-check` / `secureboot-check` pass.
+- **End to end:** both workloads keep identical consoles and identical interpreter-vs-JIT state, and the UEFI boot and secure-boot checks of an external x86 board pass, if one is available (ember has no such make target).
 
 ## 6. Risks
 

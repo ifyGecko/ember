@@ -101,7 +101,7 @@ with another size is made anew under the same name, since macOS sizes such an ob
 once).
 
 and `make test` adds `test_suzzer` (the format readers and the conformance vectors) and
-`suzzer-test`: the options end to end on RV32, MIPS32 BE/LE, ARMv7 Thumb-2 and 32-bit PowerPC (with lists
+`suzzer-test`: the options end to end on RV32, MIPS32 BE/LE, ARMv7 Thumb-2 (LE and BE8) and 32-bit PowerPC (with lists
 from suzzer's own generators too, when rizin and rzpipe are installed), the LCVS region read back by
 suzzer's `test/shm_bitmap.py` and an independent reader, the SZR1 executor against a
 scripted brain (`tests/szr/fake_brain.py`), and a session with suzzer's own
@@ -159,4 +159,4 @@ What ember does differently from libcov on a device, by design or for now:
   `LIBCOV_BOUNDARY_REARM` and marker emulation. `--cov-map-size` stands in for libcov's
   map-size knobs, and `--fuzz-begin-skip N` for `LIBCOV_BOUNDARY_INIT_GRACE` (it counts
   arrivals at the BEGIN marker, where libcov counts every boundary that fires).
-- **Single hart.** libcov's MT variant has no counterpart; ember never sets `MT`.
+- **One map for all processors.** libcov's MT variant has no counterpart: with `-o cpus=N` ember's processors share one map, each counting in its own history, and ember never sets `MT`.

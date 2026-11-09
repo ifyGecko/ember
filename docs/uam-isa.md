@@ -96,8 +96,8 @@ Each ISA module publishes a table of the registers it keeps in the register file
 { name, offset, width, class }    class ∈ { GPR, FLAG, SYS_SHADOW, OTHER }
 ```
 
-`GET`/`PUT` address the register file by `(offset, width)`. The table exists for debuggers
-(GDB stub), snapshots, trace printing and verification. The IR itself only sees offsets.
+`GET`/`PUT` address the register file by `(offset, width)`. The table gives
+names for trace printing (the gdb stub has its own, `uam_gdb_arch`). The IR itself only sees offsets.
 Hardwired registers such as RISC-V `x0` are the lifter's job: `GET x0` is replaced by the
 immediate 0, and writes to `x0` are dropped.
 
@@ -131,10 +131,10 @@ Every instruction has the same shape:
 |---------|---------|
 | `op`    | Opcode (§5). |
 | `W`     | Operating width. |
-| `guard` | Optional 1-bit temporary. Only effectful ops accept a guard (§4.1). |
+| `guard` | Optional 1-bit operand: a temporary, or an immediate the optimizer folds. Only effectful ops accept a guard (§4.1). |
 | `dst`   | Result temporary, or none. |
 | `a,b,c` | Source operands. |
-| `aux`   | Opcode-specific 32-bit field: register offset, system register id, helper id, AMO sub-op, trap class, exit kind or instruction length. |
+| `aux`   | Opcode-specific 32-bit field: register offset, system register id, helper id, AMO sub-op, trap class, exit kind, fence kind or instruction length. |
 | `flags` | Memory access attributes (§6.1) or opcode modifiers. |
 
 ### 4.1 Guards
@@ -187,11 +187,12 @@ out keeps every backend smaller. A peephole pass can always fuse common patterns
 | `ALIGNED`         | A misaligned address raises an alignment fault instead of being split by the bus. |
 | `X`               | Exclusive: load-reserved or store-conditional (§6.3). |
 | `ACQ` / `REL`     | Acquire and/or release ordering. Both together mean sequentially consistent. |
-| `UNPRIV`          | Perform the access at the ISA's *user* privilege level (ARM `LDRT`, RISC-V `MPRV`-style). |
-| `PHYS`            | Bypass address translation. Used by page-table-walk helpers. |
+| `UNPRIV`          | Reserved: the verifier accepts it and the JIT keeps such an access off its fast path, but the executor gives it no meaning and no lifter emits it. |
+| `PHYS`            | Bypass address translation. Lifters use it for accesses to a space of its own: AVR `LPM`, PIC `TBLRD`, x86 `IN`/`OUT`. |
 
-The bus combines these attributes with the hart's current privilege (maintained by the ISA
-module) when it decides whether to translate, permit, fault, or dispatch to a device.
+The executor translates an address through `isa->translate`, which sees the hart's privilege
+(`cpu->priv`). The bus then decodes the physical address, and uses only the byte order,
+`ALIGNED` and the core-only fetch and debug attributes.
 
 Address operands have the hart's **address width** (AW = 32 or 64), which the ISA module declares.
 
@@ -203,7 +204,7 @@ Address operands have the hart's **address width** (AW = 32 or 64), which the IS
 | `ST` | `ST.W addr, val {flags}` | Write W bits. May fault. With `X`: `dst:1 = ST.W.X addr, val` (§6.3). |
 | `AMO` | `dst:W = AMO.W addr, val {aux=subop, flags}` | Atomically: `old = mem[addr]; mem[addr] = subop(old, val); dst = old`. Sub-ops: `XCHG ADD AND OR XOR SMIN SMAX UMIN UMAX`. |
 | `CAS` | `dst:W = CAS.W addr, expected, new {flags}` | Atomically: `old = mem[addr]; if old == expected: mem[addr] = new; dst = old`. |
-| `FENCE` | `FENCE {aux=kind}` | Ordering barrier. Kinds: `ACQ`, `REL`, `FULL`, `INSN`. `INSN` synchronises the instruction stream: the translation cache revalidates the hart's code pages, and the op must be followed by the block's `EXIT`. |
+| `FENCE` | `FENCE {aux=kind}` | Ordering barrier. Kinds: `ACQ`, `REL`, `FULL`, `INSN`. `INSN` synchronises the instruction stream. The op does nothing itself, since a write to translated code already invalidates it; it must be directly followed by the block's terminator, so the next block is looked up afresh. |
 
 ### 6.3 Exclusive access
 
@@ -211,8 +212,9 @@ Address operands have the hart's **address width** (AW = 32 or 64), which the IS
 - `ST.X` succeeds only if the hart holds a reservation covering `(addr, W)`. It returns
   `dst = 1` on success (the store is performed) and `0` on failure (no store). Either way the
   reservation is cleared.
-- Any store by *another* agent (hart or DMA) that overlaps the reservation granule clears it.
-  So do `TRAP` and interrupt entry.
+- A reservation is not snooped. With several processors it is dropped at the end of each
+  scheduling slice, so a store-conditional may always fail; stores from devices do not clear
+  it. The ISA's exception and interrupt entry and return clear it.
 
 Guest conventions differ (RISC-V `sc` writes 0 on success). Lifters invert as needed.
 
@@ -220,7 +222,7 @@ Guest conventions differ (RISC-V `sc` writes 0 on success). Lifters invert as ne
 
 Any memory op may fault: unmapped address, permission, alignment, or a device error. A fault
 aborts the block precisely (§9). The ISA module turns the fault into a guest exception through
-`take_exception(cause, tval)`.
+`isa->take_exception`, which receives a `uam_exception` (§9).
 
 ---
 
@@ -247,7 +249,7 @@ Notation: `u(x)` and `s(x)` read the W-bit value `x` as unsigned or two's-comple
 
 The division edge cases match RISC-V. ARM (x/0 = 0) adds a `SELECT`, and x86 (#DE) adds a
 guarded `TRAP`. The shift rule is "mathematical" (no implicit masking). ISAs that mask the
-amount (RISC-V, x86) emit an explicit `AND n, W−1`, and ISAs that saturate (ARM register
+amount emit an explicit `AND` (RISC-V 31; x86 31, or 63 at 64 bits, whatever the operand width), and ISAs that saturate (ARM register
 shifts) use the rule as it is.
 
 ### 7.2 Compare, flags, bits, conversion, select
@@ -275,29 +277,29 @@ Comparisons and flag ops take W-bit operands and produce a 1-bit result.
 
 | Op | Form | Semantics |
 |---|---|---|
-| `IMARK` | `IMARK pc {aux=len}` | Starts guest instruction `pc` of `len` bytes. Records the *current instruction pc* for faults, increments `icount`, and is the point where pending exit requests are honoured (§9). |
+| `IMARK` | `IMARK pc {aux=len}` | Starts guest instruction `pc` of `len` bytes. Records the *current instruction pc* for faults, increments `icount`, and is the point where pending exit requests are honoured (§9), except at the block's first `IMARK`, so every block makes progress, and at continuations. |
 | `GET` | `dst:W = GET {aux=offset}` | Read the register file. Pure storage, no side effects. |
 | `PUT` | `[g] PUT val {aux=offset}` | Write the register file. Pure storage, no side effects. |
 | `SYSRD` | `[g] dst:W = SYSRD {aux=id}` | Read system register `id` through the ISA module's handler. May have side effects (counters, read-to-clear) and may fault (illegal or privileged). |
 | `SYSWR` | `[g] SYSWR val {aux=id}` | Write system register `id` through the ISA handler. May fault. The handler may raise an *exit request* (for example, interrupts enabled or translation regime changed). |
 | `HELPER` | `[g] dst = HELPER a,b,c {aux=id}` | Call a native function registered by an ISA module or analysis pass (§7.4). |
-| `TRAP` | `[g] TRAP cause, tval {aux=class}` | Raise a synchronous event. Ends the block. Classes: `EXCEPTION` (guest exception, passed to `isa->take_exception(cause, tval)` with an ISA-defined `cause`), `DEBUG` (stop into the emulator's debugger, not the guest), `HALT` (stop emulation, e.g. semihosting exit). |
-| `WAIT` | `WAIT next_pc` | The hart idles until the ISA's interrupt-accept rule is satisfied. The scheduler may fast-forward virtual time to the next event, and execution resumes at `next_pc`. Terminator. |
-| `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, which the cache may chain to the next block. A temporary target is an *indirect* exit. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN` are hints for analysis (call graphs, shadow stacks) and do not change semantics. |
+| `TRAP` | `[g] TRAP cause, tval {aux=class}` | Raise a synchronous event. Ends the block. Classes: `EXCEPTION` (guest exception, passed to `isa->take_exception` in a `uam_exception` with an ISA-defined `cause`), `DEBUG` (stop into the emulator's debugger, not the guest), `HALT` (stop emulation, e.g. semihosting exit). |
+| `WAIT` | `WAIT next_pc` | The hart idles until `isa->irq_wakeup` is true (an interrupt pending and enabled, whether or not interrupts are globally on). The scheduler may fast-forward virtual time to the next event, and execution resumes at `next_pc`. Terminator. |
+| `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, a temporary target an *indirect* one; the JIT may chain both. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN` are hints for analysis (call graphs, shadow stacks) and do not change semantics. |
 
 ### 7.4 Helpers
 
 Each helper is registered with a descriptor:
 
 ```
-{ id, name, arg_widths[3], result_width, effect }
+{ name, n_args, arg_width[3], result_width, effect, fn }     (HELPER's aux indexes the table)
 effect ∈ { PURE, READS_STATE, WRITES_STATE, MAY_FAULT }   (a bitmask)
 ```
 
 - `PURE` helpers are deterministic functions of their arguments. They do not accept guards,
   and optimisers may move or remove them.
-- Any helper with `WRITES_STATE` or `MAY_FAULT` is treated like a store for ordering and for the
-  commit rule (§8).
+- `MAY_FAULT` helpers count as faulting ops for the commit rule (§8). The optimizer never moves
+  or removes a `HELPER`, and forgets what it knew about register values across one.
 - Instrumentation that needs host code (cmp-logging, taint) is inserted as helpers. Edge
   coverage is the exception: it has its own opcode (§7.5), because it runs on every
   instrumented instruction and must stay inline in native code.
@@ -364,10 +366,24 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
    completed multi-store instructions are allowed, as real hardware does the same.)
 6. **Coverage.** A block covers guest code from at most two pages, and it records which pages
    those are so that self-modifying code can invalidate it.
-7. **Length.** At most `MAX_BLOCK_INSNS` guest instructions per block (a tunable that bounds
-   interrupt latency).
+7. **Length.** At most `max_block_insns` guest instructions per block (default 32,
+   `--block-insns`), which bounds interrupt latency.
 8. **Coverage op.** `COV` has width 32, two immediate operands and no guard, and comes
    directly after an `IMARK` that is not a continuation (`UAM_IMARK_CONT`).
+9. **`IMARK` shape.** Its pc is an immediate of address width, its length is non-zero, its only
+   flags are `CONT` and `BREAK`, and a `CONT` mark cannot start a block. `n_guest` equals the
+   number of `IMARK`s.
+10. **Operand limits.** `W = 1` is legal only for `AND`, `OR`, `XOR`, `EQ`, `NE`, `SELECT` and as
+    a `TRUNC` destination; everything else, memory and `GET`/`PUT` included, needs `W >= 8`
+    (`BSWAP` 16). A conversion's source is a temporary, never an immediate. `TRAP` and `WAIT`
+    operands are address-width. The fetch and debug access attributes are core-only and are
+    rejected in IR.
+
+The verifier runs after the lifter, again after the optimizer, and after each pass. The
+optimizer (`uam_optimize`) keeps side effects, `IMARK`s and the order of the remaining `PUT`s;
+it removes unreachable and dead code and a `PUT` that a later `PUT` of the same guest
+instruction overwrites. A pass (`uam/pass.h`) may only insert ops, and never removes or
+reorders guest-semantic ops or `IMARK`s.
 
 ---
 
@@ -395,10 +411,11 @@ physical address). Alignment is checked before translation.
 every op. Any interrupt line change, `SYSWR` handlers that change interrupt enables, software
 interrupt bits or the privilege level, translation changes, writes to translated code, stop
 and reset requests, and a timer armed earlier than the current deadline all set
-`cpu->exit_request`. The executor checks it at each `IMARK`, and before chaining into another
-block. Because of the commit rule, stopping at an `IMARK` is always a clean architectural
-boundary. Interrupt acceptance (`isa->irq_take`) runs between blocks, and is only re-evaluated
-after an exit request, so an ISA must raise one on every change that can make an interrupt
+`cpu->exit_request`. The executor checks it at each `IMARK` but a block's first and continuations, and before
+chaining into another block. Because of the commit rule, stopping at an `IMARK` is always a clean architectural
+boundary. Interrupt acceptance (`isa->irq_take`) runs between blocks, and is guaranteed to be
+re-evaluated only after an exit request (chained native code does not return to the loop
+otherwise), so an ISA must raise one on every change that can make an interrupt
 deliverable.
 
 ---
@@ -448,8 +465,9 @@ all are ISA-neutral and unused by ISAs that do not need them.
   address error, TLB refill, TLB invalid, TLB modified). Translated code stays
   valid while the hart runs at the same `cpu->priv` and, for code fetched
   through a mapping the ISA did not mark `fixed`, while `cpu->xlate_gen` is
-  unchanged; the ISA bumps it with `uam_cpu_xlate_changed()` on TLB writes and
-  address-space switches. A data access that crosses a page boundary is translated at
+  unchanged or, after it changes, while the block's pages still translate to the frames it
+  was fetched from; the ISA bumps it with `uam_cpu_xlate_changed()` on TLB writes and
+  address-space switches. A load or store (not an `AMO` or `CAS`) that crosses a page boundary is translated at
   both ends (its pages may map to unrelated frames); unless they turn out physically
   contiguous the executor moves its bytes one at a time, in the access's byte order, and
   a translation fault on the second page reports that page's first byte as `tval`.
@@ -511,8 +529,8 @@ ARM needed no new IR; these are conventions of its lifter (`isa/arm`).
   (`BX`, `LDR pc`, `POP {pc}`) is an ordinary computed `EXIT` to
   `SELECT (addr & 1), addr, addr & ~3`. Code is fetched at the even address.
 - **Conditional execution is guards.** An instruction's condition becomes the
-  guard of each of its side effects; a conditional branch is a guarded `EXIT`
-  and the block falls through after it. Flags live in the register file, one
+  guard of each of its side effects; a conditional branch is a guarded `EXIT`,
+  followed by the block's unguarded `EXIT` to the next instruction. Flags live in the register file, one
   byte each, so a condition is one or two pure ops.
 - **IT blocks are continuations.** The instructions an IT instruction covers are
   lifted with `UAM_IMARK_CONT` under their own conditions, so no interrupt is
@@ -528,7 +546,7 @@ PowerPC needed no new IR either; these are conventions of its lifter (`isa/ppc32
 
 - **Flags as bytes.** Each CR field is one byte of the register file (LT GT EQ SO in
   bits 3..0), and XER's SO, OV and CA one byte each, so a compare is one `PUT` of a
-  `SELECT`, a conditional branch tests one byte, and `mfcr`/`mtcrf`/`mfxer` assemble
+  `SELECT` ORed with SO, a conditional branch tests one byte, and `mfcr`/`mtcrf`/`mfxer` assemble
   or scatter the bytes. Carry and overflow of three-operand sums (`adde`, `subfe`,
   ...) are `CARRY` of each addition and the sign rule on the result.
 - **The MSR bits code depends on are in `cpu->priv`.** Problem state, floating point
@@ -540,7 +558,8 @@ PowerPC needed no new IR either; these are conventions of its lifter (`isa/ppc32
   fixed per hart.
 - **Floating point is one helper.** FP arithmetic, rounding, conversions, compares and
   the FPSCR instructions call one `HELPER` with the instruction word, which reads and
-  writes FPRs, the FPSCR and CR1 itself; FP loads, stores and the sign moves stay IR.
+  writes FPRs, the FPSCR and CR1 itself; FP loads, stores and the sign moves stay IR (`lfs`/`stfs` convert
+  between single and double through a helper).
 - **No delay slots, no IT state**: every branch ends its block with guarded `EXIT`s;
   `bc` decrements CTR with a `PUT` before them.
 
@@ -734,7 +753,7 @@ Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
 - **Zero-overhead loops through a lift-time loop end.** The loop-back happens when an
   instruction falls through to LEND with LCOUNT not zero and PS.EXCM clear. A block is lifted
   with LEND's value at the time and ends there when LEND is one of its boundaries, followed by
-  the loop-back: `[LENDA == LEND] PUT LCOUNT - 1; [..] EXIT LBEG`. LENDA, a register-file word,
+  the loop-back: `[LENDA == LEND] PUT LCOUNT - 1; [..] PUT LENDA; [..] EXIT LBEG`. LENDA, a register-file word,
   is LEND while a loop-back can happen and all ones otherwise. On entry every block checks that
   LENDA is not at another of its boundaries; if it is (the loop end moved into code translated
   before), the hart runs one instruction per block (a bit of `cpu->priv`) with the loop-back
@@ -760,6 +779,18 @@ Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
   retranslates code. FP arithmetic, conversions and compares are one helper on the register
   file; FP loads, stores and moves stay IR. MAC16's 40-bit accumulator is IR on 64-bit values.
 
+## 10k. Privilege as translation state, and interrupt shadows (x86-64)
+
+- **`cpu->priv` holds everything decoding and translation depend on**: CPL (bits 0-1), mode
+  (bits 2-3: real, protected, IA-32e, virtual-8086), SMM (4), default code size (5-6), 32-bit
+  stack (7), paging (8), A20M# (9), an interrupt shadow carried into the block (10) and the SMM
+  code-fetch check (11). Translated code is never reused across a change of any of them.
+- **`CONT` for the interrupt shadow.** The instruction after `STI` or `MOV SS` is a
+  continuation, so no interrupt lands between them. Unlike a delay slot, its fault is its own:
+  the parent has completed.
+- **I/O ports are memory.** `IN` and `OUT` are `PHYS` `LD`/`ST` at `UAM_X86_PIO_BASE` + port.
+- **128-bit division is a helper**, as is everything that touches descriptors or system state.
+
 ## 11. Opcode numbering and extension profiles
 
 | Range | Profile |
@@ -769,34 +800,39 @@ Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
 | `0x80–0xBF` | **V**: 128-bit and vector lanes (reserved) |
 | `0xC0–0xFF` | Implementation-private (debug and experimental only; never emitted by shipped lifters) |
 
-A backend states which profiles it implements. A block that uses an unsupported profile is
-rejected at translation time. It never fails silently at run time.
+Only Core is implemented; the verifier rejects any opcode at or above `UAM_OP__COUNT`.
 
 ---
 
 ## 12. Text form
 
 The canonical printed form is used for traces, tests and documentation. One op per line, with
-attributes after the mnemonic and auxiliary fields in braces:
+attributes after the mnemonic, then the width, and auxiliary fields in braces (an `AMO`'s sub-op
+is a dotted suffix). There is no parser: the form is output only.
 
 ```
 imark   0x80000010 {len=4}
-t0:32 = get     {x10}
-t1:32 = add     t0, 0x10
-t2:32 = ld.le   t1
-        put     t2 {x11}
-t3:1  = eq      t2, 0
-[t3]    exit    0x80000100 {jump}
-        exit    0x80000014 {jump}
+t0:32 = get.32  {a0}
+t1:32 = add.32  t0, 0x10
+t2:32 = ld.le.32 t1
+        put.32  t2 {a1}
+t3:1  = eq.32   t2, 0
+[t3]    exit.32 0x80000100 {jump}
+        exit.32 0x80000014 {jump}
 ```
 
-Register offsets print by name, using the ISA's register descriptor table, when one is available.
+Each block starts with a `block 0x...: N guest insns, N ops, N temps` line. An `imark` shows
+`,cont` or `,break`. Further access attributes print as `.al`, `.sc`, `.unpriv` and `.phys`.
+Immediates below 10 are decimal and the rest hex. A register offset prints by name when the
+ISA's table has one of that width (`{reg+N}` otherwise), and a system register as `{sys 0xN}`.
 
 ---
 
 ## 13. Worked examples: RISC-V (RV32IMAC)
 
-`pc` is the instruction's address. `#imm` is the decoded immediate.
+`pc` is the instruction's address. `#imm` is the decoded immediate. `{rs1}`, `{rd}` and `{csr}`
+stand for the operand's name, and the listings leave out the `.W` width suffix a trace prints
+on every op (`get.32`, `ld.le.8`), except where it matters.
 
 **`add rd, rs1, rs2`**
 ```
@@ -835,29 +871,29 @@ t0:32 = get {rs1}
 t1:32 = add t0, #imm
 t2:32 = and t1, 0xFFFFFFFE
         put pc+4 {rd}
-        exit t2 {ret if rd==x0 && rs1==ra, call if rd==ra, else jump}
+        exit t2 {ret if rd==x0 && rs1 is ra or t0, call if rd is ra or t0, else jump}
 ```
 
 **`lr.w.aq rd, (rs1)` / `sc.w rd, rs2, (rs1)`**
 ```
-t1:32 = ld.le.x.acq t0          ;  put t1 {rd}
-t2:1  = st.le.x     t0, t1      ;  t3:32 = zext.32 t2
+t1:32 = ld.le.x.al.acq.32 t0    ;  put t1 {rd}
+t2:1  = st.le.x.al.32 t0, t1    ;  t3:32 = zext.32 t2
 t4:32 = xor t3, 1               ;  put t4 {rd}      # RISC-V: 0 = success
 ```
 
-**`amoadd.w rd, rs2, (rs1)`** — `t2:32 = amo.le t0, t1 {add}` then `put t2 {rd}`.
+**`amoadd.w rd, rs2, (rs1)`** — `t2:32 = amo.le.al.add.32 t0, t1` then `put t2 {rd}`.
 
 **`csrrw rd, csr, rs1`** — ends the block, because a CSR write can change interrupt enables or privilege.
 ```
 t0:32 = get {rs1}
-t1:32 = sysrd {csr}            # omitted when rd == x0 (no read side effects)
-        syswr t0 {csr}
+t1:32 = sysrd {sys csr}        # omitted when rd == x0 (no read side effects)
+        syswr t0 {sys csr}
         put t1 {rd}
         exit pc+4 {jump}
 ```
 
-**`ecall`** — `trap RV_CAUSE_ECALL, 0 {exception}`. The ISA module maps this to cause 8, 9 or 11
-depending on the current privilege level.
+**`ecall`** — `trap RV_EXC_ECALL_U, 0 {exception}`. The ISA module adds the privilege level to
+get the cause; the modelled hart is M-mode only, so that is 11.
 
 **`wfi`** — `wait pc+4`.
 
@@ -865,7 +901,7 @@ depending on the current privilege level.
 
 **`mret`** — a mode switch with many coupled CSR effects, so it is a helper:
 ```
-t0:32 = helper {rv_mret}       # effect: READS_STATE|WRITES_STATE; restores MIE/MPP, returns mepc
+t0:32 = helper {rv_mret}       # effect: READS_STATE|WRITES_STATE|MAY_FAULT; restores MIE/MPP, returns mepc
         exit t0 {exc_return}
 ```
 
@@ -893,10 +929,15 @@ typedef struct {
 
 typedef struct {
     uint64_t  guest_pc;
+    uint8_t   addr_width;              /* guest address width (32 or 64) */
     uint32_t  n_insn, n_temp, n_imm;
+    uint32_t  n_guest;                 /* guest instructions (IMARKs) */
     uam_insn *insn;
     uint8_t  *temp_width;              /* per-temporary width */
     uint64_t *imm;                     /* immediate pool */
-    uint64_t  page[2], page_gen[2];    /* code pages covered, for invalidation */
+    uint32_t  n_pages;                 /* code pages covered, at most 2 */
+    uint64_t  page[2], page_gen[2];    /* for invalidation */
+    void     *backend;                 /* owned by an execution backend (compiled code) */
+    void    (*backend_free)(void *backend);
 } uam_block;
 ```
