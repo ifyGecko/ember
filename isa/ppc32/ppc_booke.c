@@ -1006,6 +1006,7 @@ uam_status ppc_booke_sysreg_write(uam_cpu *cpu, uint32_t id, uint32_t v)
         if (wrc)
             b->tcr = (b->tcr & ~(3u << TCR_WRC_SHIFT)) | wrc << TCR_WRC_SHIFT;
         timers_arm(cpu);
+        uam_cpu_request_exit(cpu);   /* DIE, FIE or WIE may have enabled a latched TSR bit */
         break;
     }
     case SPR_TSR:

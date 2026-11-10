@@ -428,6 +428,18 @@ static void test_booke_timers(void)
     EQ64(m.cpu.pc, 0xD00, "watchdog interrupt (IVOR12) after two rises");
     EQ64(sysr(&m, CSRR0), 0x2000, "critical class: CSRR0");
     uam_machine_fini(&m);
+
+    /* Enabling an interrupt whose TSR bit is already latched asks for an exit: the
+     * run loop (and chained native code) takes it now. */
+    booke_machine(&m, NULL, MSR_ME);
+    sysw(&m, TSR, 0xFFFFFFFFu);
+    sysw(&m, 22 /* DEC */, 5);
+    run(&m, 100);
+    CHECK(sysr(&m, TSR) & 1u << 27, "the decrementer latched TSR[DIS] with DIE clear");
+    m.cpu.exit_request = false;
+    sysw(&m, TCR, 1u << 26);                 /* DIE */
+    CHECK(m.cpu.exit_request, "a TCR write that enables a latched interrupt requests an exit");
+    uam_machine_fini(&m);
 }
 
 static void test_booke_inputs(void)

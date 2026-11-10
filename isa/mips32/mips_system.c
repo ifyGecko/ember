@@ -871,6 +871,7 @@ static uint64_t helper_eret(void *env, uint64_t a, uint64_t b, uint64_t c, uam_s
     }
     cpu->resv.valid = false;
     mode_update(cpu);
+    uam_cpu_request_exit(cpu);   /* EXL or ERL is clear again: a pending interrupt is taken now */
     return pc;   /* bit 0 is the ISA mode to return to */
 }
 

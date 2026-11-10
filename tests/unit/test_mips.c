@@ -604,6 +604,44 @@ static void test_irq_compat(void)
 }
 
 /* Vectored interrupts (Config3.VInt without a controller), with shadow sets. */
+/* ERET clears EXL while an interrupt is pending: it is taken at once, also by native
+ * code that has linked the ERET's exit to the interrupted loop. The handler raises the
+ * software interrupt again on every other entry, so some returns find nothing pending
+ * (they link) and the others must not run on into the loop. */
+static void eret_run(int mode, uint32_t *rounds, uint32_t *entries, uint64_t *icount)
+{
+    enum { S0 = 16, S1 = 17 };
+    uam_machine m;
+    machine(&m, &uam_isa_mips32le, NULL, mode != 0);
+    m.exec.chain = mode == 2;
+    PROG(&m, CODE, ADDIU(S0, S0, 1), I(0x0C, S0, T0, 0x3FF) /* andi */, BNE(T0, 0, -3), NOP,
+         MTC0(T1, 13, 0) /* every 1024 rounds: raise it */, BEQ(0, 0, -6), NOP);
+    PROG(&m, GENERAL, ADDIU(S1, S1, 1), MTC0(0, 13, 0) /* lower it */, I(0x0C, S1, T2, 1),
+         BEQ(T2, 0, 2), NOP, MTC0(T1, 13, 0) /* odd entries: raise it again */, ERET);
+    setr(&m, T1, 1u << 8);                         /* Cause.IP0 */
+    setr(&m, S0, 0);
+    setr(&m, S1, 0);
+    sysw(&m, CP0_STATUS, 1u << 8 | 1u);            /* IM0, IE */
+    run(&m, CODE, 40000);
+    *rounds = gpr(&m, S0);
+    *entries = gpr(&m, S1);
+    *icount = m.cpu.icount;
+    uam_machine_fini(&m);
+}
+
+static void test_eret_pending(void)
+{
+    uint32_t rounds[3], entries[3];
+    uint64_t icount[3];
+    for (int mode = 0; mode < 3; mode++)   /* interpreter, native, native and chained */
+        eret_run(mode, &rounds[mode], &entries[mode], &icount[mode]);
+    CHECK(entries[0] >= 10, "the handler ran (%u entries)", entries[0]);
+    for (int mode = 1; mode < 3; mode++)
+        CHECK(rounds[mode] == rounds[0] && entries[mode] == entries[0] && icount[mode] == icount[0],
+              "ERET with an interrupt pending, %s: %u rounds, %u entries (interpreter %u, %u)",
+              mode == 1 ? "native" : "chained", rounds[mode], entries[mode], rounds[0], entries[0]);
+}
+
 static void test_irq_vectored(bool jit)
 {
     uam_mips_config c = uam_mips_ref;
@@ -1093,6 +1131,7 @@ int main(void)
     test_timer();
     test_gdb();
     test_snapshot();
+    test_eret_pending();
     for (int jit = 0; jit < 2; jit++) {
         test_vectors(jit);
         test_delay_slots(jit);
