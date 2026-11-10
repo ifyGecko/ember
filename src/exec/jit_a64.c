@@ -14,7 +14,8 @@
  * Host register use (AAPCS64; x18 is the platform register on macOS and is never
  * touched):
  *   x19 = jc    x20 = jc->temps    x21 = jc->cpu    x22 = jc->cpu->regfile
- *   x23 = icount (flushed to cpu->icount before bridges and at the epilogue)
+ *   x23 = icount - jc->ic_base (cpu->icount is brought up to date before bridges and
+ *         at the epilogue; see jit_x86.c on the IMARK check)
  *   x24..x28, x9..x13 = guest temporaries (register allocation, jit.c)
  *   x0 = every op's result; x1, x2 (memory address), x3 (store value), x17 = scratch;
  *   x16 = the address of a far field or temp slot, a bridge's address
@@ -55,7 +56,7 @@ static const int ra_regs[RA_POOL_MAX] = { X24, X25, X26, X27, X28, X9, X10, X11,
 
 /* Condition codes. */
 enum { CC_EQ = 0, CC_NE = 1, CC_HS = 2, CC_LO = 3, CC_VS = 6, CC_HI = 8, CC_LS = 9, CC_LT = 11,
-       CC_LE = 13 };
+       CC_GT = 12, CC_LE = 13 };
 
 #define A64_NOP 0xD503201Fu
 #define A64_BRK 0xD4200000u
@@ -310,11 +311,17 @@ static size_t cbz_fwd(uam_jit *j, bool nz, int rt)
     g32(j, 0x34000000u | (uint32_t)nz << 24 | (uint32_t)rt);
     return p;
 }
-/* tbnz rt, #bit (+-32 KiB: only within the code-page store stubs) */
+/* tbnz / tbz rt, #bit (+-32 KiB: only within the code-page store stubs and an EXIT) */
 static size_t tbnz_fwd(uam_jit *j, int rt, unsigned bit)
 {
     size_t p = j->n;
     g32(j, 0x37000000u | (bit >> 5) << 31 | (bit & 31) << 19 | (uint32_t)rt);
+    return p;
+}
+static size_t tbz_fwd(uam_jit *j, int rt, unsigned bit)
+{
+    size_t p = j->n;
+    g32(j, 0x36000000u | (bit >> 5) << 31 | (bit & 31) << 19 | (uint32_t)rt);
     return p;
 }
 static size_t adr_fwd(uam_jit *j, int rd) { size_t p = j->n; g32(j, 0x10000000u | (uint32_t)rd); return p; }
@@ -583,6 +590,25 @@ void jit_host_stubs(uam_jit *j, size_t off[16])
     }
 }
 
+/* cpu->icount = x23 + jc->ic_base: before a bridge (it may read time) and at the
+ * epilogue. Clobbers x17. */
+static void ic_flush(uam_jit *j)
+{
+    ld64(j, X17, JC, OFF(ic_base));
+    addsub_reg(j, false, true, false, X17, X17, IC, 0);
+    st64(j, X17, CPUR, CPU(icount));
+}
+/* After a bridge, which may have asked the block to stop (uam_cpu_request_exit): take
+ * cpu->icount_stop as the new jc->ic_base, x23 following. Clobbers x16. */
+static void ic_rebase(uam_jit *j)
+{
+    ld64(j, X16, JC, OFF(ic_base));
+    addsub_reg(j, false, true, false, IC, IC, X16, 0);
+    ld64(j, X16, CPUR, CPU(icount_stop));
+    st64(j, X16, JC, OFF(ic_base));
+    addsub_reg(j, true, true, false, IC, IC, X16, 0);
+}
+
 /* Before a bridge call that may fault: jc->site = the current instruction's site
  * record (one per instruction, emitted after the code). Clobbers x0. */
 static void emit_site(uam_jit *j)
@@ -705,9 +731,7 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigne
     if (!fixed)
         load_operand(j, X1, blk, target, aw);              /* x1 = the target pc */
     /* if (icount >= icount_stop (exit request or deadline) || !chain_left) goto out */
-    ld64(j, X17, CPUR, CPU(icount_stop));
-    addsub_reg(j, true, true, true, XZR, IC, X17, 0);      /* cmp x23, x17 */
-    const size_t stop = bcond_fwd(j, CC_HS);
+    const size_t stop = tbz_fwd(j, IC, 63);                /* x23 is not negative */
     mem(j, 2, true, X17, JC, OFF(chain_left));
     const size_t spent = cbz_fwd(j, false, X17);
     if (fixed) {
@@ -1176,7 +1200,7 @@ static bool emit_replays(uam_jit *j, const uam_block *blk, uint32_t i, unsigned 
  * call-clobbered temps. */
 static void bridge_enter(uam_jit *j)
 {
-    st64(j, IC, CPUR, CPU(icount));
+    ic_flush(j);
     emit_site(j);
     jit_ra_save(j, false);
 }
@@ -1185,6 +1209,7 @@ static void bridge_enter(uam_jit *j)
 static void bridge_leave(uam_jit *j, size_t *epi, unsigned *n_epi)
 {
     epi[(*n_epi)++] = cbz_fwd(j, true, X0);               /* cbnz w0: fault */
+    ic_rebase(j);
     jit_ra_save(j, true);
 }
 
@@ -1207,7 +1232,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     ld64(j, TMP, JC, OFF(temps));
     ld64(j, CPUR, JC, OFF(cpu));
     ld64(j, RF, JC, OFF(regfile));
-    ld64(j, IC, CPUR, CPU(icount));                        /* x23 = icount (kept in a register) */
+    ld64(j, IC, CPUR, CPU(icount));                        /* x23 = icount - ic_base (kept in a register) */
+    ld64(j, X17, JC, OFF(ic_base));
+    addsub_reg(j, true, true, false, IC, IC, X17, 0);
     j->body_off = j->n;                                    /* chained jumps enter here */
 
     /* epilogue branches: at most 1 per op */
@@ -1266,17 +1293,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             uint64_t pc = blk->imm[uam_ref_index(in->a)];
             bool cont = in->flags & UAM_IMARK_CONT;
             imark_pc = pc;
-            if (!first && !cont) {
-                if (in->flags & UAM_IMARK_BREAK) {
-                    set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
-                    epi[n_epi++] = b_fwd(j);
-                } else {
-                    /* if (icount >= icount_stop) stop here: an out-of-line stub, which
-                     * first replays the deferred writes still pending */
-                    ld64(j, X17, CPUR, CPU(icount_stop));
-                    addsub_reg(j, true, true, true, XZR, IC, X17, 0);
-                    jit_stub_add(j, blk, bcond_fwd(j, CC_HS), pc, i);
-                }
+            const bool brk = in->flags & UAM_IMARK_BREAK;
+            const bool check = !first && !cont && !brk;
+            if (!first && !cont && brk) {
+                set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
+                epi[n_epi++] = b_fwd(j);
             }
             first = false;
             /* A continuation keeps the parent of the instruction it continues. */
@@ -1285,7 +1306,13 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             j->cur.cont = cont;
             j->cur_emitted = false;
             jit_mark(j, MK_IMARK_PC, i);
-            addsub_imm(j, false, true, false, IC, IC, 1, false);   /* icount++ (keeps the flags) */
+            /* icount++; and if (icount >= icount_stop) stop here, before this instruction:
+             * x23 was not negative, so it is positive now. An out-of-line stub, which
+             * takes the count back and replays the deferred writes still pending. Without
+             * the check the add keeps the flags (a CONT imark). */
+            addsub_imm(j, false, true, check, IC, IC, 1, false);
+            if (check)
+                jit_stub_add(j, blk, bcond_fwd(j, CC_GT), pc, i);
             break;
         }
         case UAM_OP_GET:
@@ -1318,7 +1345,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                     patch(j, miss[k]);
             }
             jit_mark(j, MK_SLOW, i);
-            st64(j, IC, CPUR, CPU(icount));             /* flush icount: the bridge may read time */
+            ic_flush(j);                                /* the bridge may read time */
             if (emit_replays(j, blk, i, MK_SLOW) || ra != X2)
                 load(j, X2, ao, aw);                    /* x2 = addr (again) */
             emit_site(j);
@@ -1386,7 +1413,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                 done_code = cbz_fwd(j, false, X0);
             }
             jit_mark(j, MK_SLOW, i);
-            st64(j, IC, CPUR, CPU(icount));
+            ic_flush(j);
             if (emit_replays(j, blk, i, MK_SLOW))       /* x3 (the value) is kept */
                 load(j, X2, ao, aw);                    /* x2 = addr again */
             emit_site(j);
@@ -1521,6 +1548,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     jit_mark(j, MK_STUB, 0);
     for (uint32_t k = 0; k < j->n_stubs; k++) {
         patch(j, j->stubs[k].pos);
+        addsub_imm(j, true, true, false, IC, IC, 1, false);    /* x23--: not executed */
         /* the replay, with the temps it reads where they were at the IMARK (a replay of
          * immediates reads none) */
         jit_stub_regs(j, k, true);
@@ -1535,7 +1563,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
         patch(j, epi[k]);
     free(epi);
     jit_mark(j, MK_EPILOGUE, 0);
-    st64(j, IC, CPUR, CPU(icount));                        /* flush icount */
+    ic_flush(j);
     for (int r = 4; r >= 0; r--)
         stp_ldp(j, true, PAIR_OFF, X19 + 2 * r, X20 + 2 * r, 2 + 2 * r);
     stp_ldp(j, true, PAIR_POST, X29, X30, 12);             /* ldp x29, x30, [sp], #96 */

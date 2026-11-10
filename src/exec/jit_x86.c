@@ -15,16 +15,19 @@
  *
  * Host register use (System V AMD64):
  *   rbx = jc    rbp = jc->temps    r14 = jc->cpu    r15 = jc->cpu->regfile
- *   r13 = icount (flushed to cpu->icount before bridges and at the epilogue)
+ *   r13 = icount - jc->ic_base (cpu->icount is brought up to date before bridges and
+ *         at the epilogue)
  *   r12, rsi, rdi, r8, r9, r10 = guest temporaries (register allocation, jit.c)
  *   rax, rcx, rdx, r11 = scratch
  * The fixed ones and r12 are callee-saved, so they survive bridge calls. Temporaries
  * are kept zero-extended to their width (the interpreter's invariant) in a register or,
  * when spilled, in jc->temps[]; they are dead at every block exit, so only the register
  * file, memory and icount are guest-visible state.
- * Every IMARK that may stop compares r13 with cpu->icount_stop (exit_request ? 0 :
- * icount_deadline, set on entry and zeroed by uam_cpu_request_exit) and leaves through
- * an out-of-line stub, so the common path is one compare and an untaken branch.
+ * jc->ic_base is cpu->icount_stop (exit_request ? 0 : icount_deadline, set on entry and
+ * zeroed by uam_cpu_request_exit) as native code last read it: on entry and after every
+ * bridge, the only places it can change under a running block. So r13 is negative until
+ * the block must stop, and every IMARK that may stop counts and tests in one add and an
+ * untaken branch to an out-of-line stub, with nothing read from memory.
  *
  * Layout of a compiled block: prologue | body | epilogue | link slots. Every block
  * keeps the same frame and register assignment, so a chained jump (jit.h) goes from an
@@ -576,6 +579,24 @@ static void patch(uam_jit *j, size_t pos)
         memcpy(&j->cb[pos], &rel, 4);
 }
 
+/* cpu->icount = r13 + jc->ic_base: before a bridge (it may read time) and at the
+ * epilogue. Clobbers rax. */
+static void ic_flush(uam_jit *j)
+{
+    ld_mem(j, RAX, RBX, OFF(ic_base));
+    rex(j, 1, 1, 0, 0); g8(j, 0x01); modrm_reg(j, R13, RAX);       /* add rax, r13 */
+    st_mem(j, RAX, R14, CPU(icount));
+}
+/* After a bridge, which may have asked the block to stop (uam_cpu_request_exit): take
+ * cpu->icount_stop as the new jc->ic_base, r13 following. Clobbers rax. */
+static void ic_rebase(uam_jit *j)
+{
+    rex(j, 1, 1, 0, 0); g8(j, 0x03); modrm_mem(j, R13, RBX, OFF(ic_base));   /* add r13, [ic_base] */
+    ld_mem(j, RAX, R14, CPU(icount_stop));
+    st_mem(j, RAX, RBX, OFF(ic_base));
+    rex(j, 1, 0, 0, 1); g8(j, 0x29); modrm_reg(j, RAX, R13);       /* sub r13, rax */
+}
+
 /* Before a bridge call that may fault: jc->site = the current instruction's site
  * record (one per instruction, emitted after the code). Clobbers rax. */
 static void emit_site(uam_jit *j)
@@ -683,8 +704,8 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigne
     if (!fixed)
         load_operand(j, RCX, blk, target, aw);                      /* rcx = the target pc */
     /* if (icount >= icount_stop (exit request or deadline)) goto out */
-    rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop)); /* cmp r13, [stop] */
-    const size_t stop = jcc_fwd(j, 0x83);                           /* jae */
+    g8(j, 0x4D); g8(j, 0x85); g8(j, 0xED);                          /* test r13, r13 */
+    const size_t stop = jcc_fwd(j, 0x89);                           /* jns */
     /* if (!chain_left--) goto spent: the hop is counted here, and given back on a miss */
     g8(j, 0x83); modrm_mem(j, 5, RBX, OFF(chain_left)); g8(j, 1);   /* sub dword [chain_left], 1 */
     const size_t spent = jcc_fwd(j, 0x82);                          /* jb */
@@ -1228,7 +1249,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     ld_mem(j, RBP, RBX, OFF(temps));
     ld_mem(j, R14, RBX, OFF(cpu));
     ld_mem(j, R15, RBX, OFF(regfile));
-    ld_mem(j, R13, R14, CPU(icount));              /* r13 = icount (kept in a register) */
+    ld_mem(j, R13, R14, CPU(icount));              /* r13 = icount - ic_base (kept in a register) */
+    rex(j, 1, 1, 0, 0); g8(j, 0x2B); modrm_mem(j, R13, RBX, OFF(ic_base));
     j->body_off = j->n;                            /* chained jumps enter here */
 
     /* epilogue jumps: at most 1 per op */
@@ -1290,16 +1312,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             uint64_t pc = blk->imm[uam_ref_index(in->a)];
             bool cont = in->flags & UAM_IMARK_CONT;
             imark_pc = pc;
-            if (!first && !cont) {
-                if (in->flags & UAM_IMARK_BREAK) {
-                    set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
-                    epi[n_epi++] = jmp_fwd(j);
-                } else {
-                    /* if (icount >= icount_stop) stop here: an out-of-line stub, which
-                     * first replays the deferred writes still pending */
-                    rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop));
-                    jit_stub_add(j, blk, jcc_fwd(j, 0x83), pc, i);               /* jae */
-                }
+            const bool brk = in->flags & UAM_IMARK_BREAK;
+            const bool check = !first && !cont && !brk;
+            if (!first && !cont && brk) {
+                set_res_pc_imm(j, UAM_BR_INTERRUPTED, pc);
+                epi[n_epi++] = jmp_fwd(j);
             }
             first = false;
             /* A continuation keeps the parent of the instruction it continues. */
@@ -1313,6 +1330,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             } else {
                 g8(j, 0x49); g8(j, 0xFF); modrm_reg(j, 0, R13);      /* inc r13 (icount) */
             }
+            /* if (icount >= icount_stop) stop here, before this instruction: r13 was not
+             * negative, so it is positive now. An out-of-line stub, which takes the count
+             * back and replays the deferred writes still pending. */
+            if (check)
+                jit_stub_add(j, blk, jcc_fwd(j, 0x8F), pc, i);       /* jg */
             break;
         }
         case UAM_OP_GET:
@@ -1350,7 +1372,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                     patch(j, miss[k]);
             }
             jit_mark(j, MK_SLOW, i);
-            st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
+            ic_flush(j);                                /* the bridge may read time */
             if (emit_replays(j, blk, i, MK_SLOW) || ra != RDX)
                 load(j, RDX, ao, aw);                   /* rdx = addr (again) */
             emit_site(j);
@@ -1362,6 +1384,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             call_bridge(j, jit_br_load);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);            /* jnz epilogue (fault) */
+            ic_rebase(j);
             jit_ra_save(j, true);
             ld_mem(j, rd, RBX, OFF(scratch));
             if (fast)
@@ -1372,7 +1395,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             if (in->flags & UAM_ACC_X) {               /* store-conditional: always the bridge */
                 load_operand(j, R11, blk, in->b, W);
                 load_operand(j, RDX, blk, in->a, aw);
-                st_mem(j, R13, R14, CPU(icount));
+                ic_flush(j);
                 emit_site(j);
                 jit_ra_save(j, false);
                 mov_rr(j, RSI, RDX);
@@ -1383,6 +1406,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                 call_bridge(j, jit_br_store_x);
                 g8(j, 0x85); modrm_reg(j, RAX, RAX);
                 epi[n_epi++] = jcc_fwd(j, 0x85);
+            ic_rebase(j);
+                ic_rebase(j);
                 jit_ra_save(j, true);
                 if (has_dst)
                     ld_mem(j, rd, RBX, OFF(scratch));
@@ -1429,7 +1454,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                 done_code = jcc_fwd(j, 0x84);                      /* je done */
             }
             jit_mark(j, MK_SLOW, i);
-            st_mem(j, R13, R14, CPU(icount));
+            ic_flush(j);
             if (emit_replays(j, blk, i, MK_SLOW))       /* r11 (the value) is kept */
                 load(j, RDX, ao, aw);                   /* rdx = addr again */
             emit_site(j);
@@ -1442,6 +1467,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             call_bridge(j, jit_br_store);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
+            ic_rebase(j);
             jit_ra_save(j, true);
             if (fast) {
                 patch(j, done);
@@ -1458,7 +1484,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             else
                 mov_imm(j, RCX, 0);
             load_operand(j, R11, blk, in->a, aw);       /* addr */
-            st_mem(j, R13, R14, CPU(icount));
+            ic_flush(j);
             emit_site(j);
             jit_ra_save(j, false);
             mov_rr(j, RSI, R11);
@@ -1468,6 +1494,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             call_bridge(j, jit_br_rmw);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
+            ic_rebase(j);
             jit_ra_save(j, true);
             if (has_dst)
                 ld_mem(j, rd, RBX, OFF(scratch));
@@ -1488,7 +1515,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             }
             break;
         case UAM_OP_SYSRD:
-            st_mem(j, R13, R14, CPU(icount));
+            ic_flush(j);
             emit_site(j);
             jit_ra_save(j, false);
             mov_rr(j, RDI, RBX);
@@ -1496,13 +1523,14 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             call_bridge(j, jit_br_sysrd);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
+            ic_rebase(j);
             jit_ra_save(j, true);
             ld_mem(j, rd, RBX, OFF(scratch));
             mask_reg(j, rd, W);
             break;
         case UAM_OP_SYSWR:
             load_operand(j, RDX, blk, in->a, W);
-            st_mem(j, R13, R14, CPU(icount));
+            ic_flush(j);
             emit_site(j);
             jit_ra_save(j, false);
             mov_rr(j, RDI, RBX);
@@ -1510,6 +1538,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             call_bridge(j, jit_br_syswr);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);
+            ic_rebase(j);
             jit_ra_save(j, true);
             break;
         case UAM_OP_HELPER: {
@@ -1517,7 +1546,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
              * after the live registers are saved */
             const uam_ref args[3] = { in->a, in->b, in->c };
             const int regs[3] = { RDX, RCX, R8 };
-            st_mem(j, R13, R14, CPU(icount));
+            ic_flush(j);
             emit_site(j);
             jit_ra_save(j, false);
             for (unsigned k = 0; k < 3; k++) {
@@ -1531,6 +1560,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             call_bridge(j, jit_br_helper);
             g8(j, 0x85); modrm_reg(j, RAX, RAX);
             epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
+            ic_rebase(j);
             jit_ra_save(j, true);
             if (has_dst)
                 ld_mem(j, rd, RBX, OFF(scratch));
@@ -1585,6 +1615,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     jit_mark(j, MK_STUB, 0);
     for (uint32_t k = 0; k < j->n_stubs; k++) {
         patch(j, j->stubs[k].pos);
+        g8(j, 0x49); g8(j, 0xFF); modrm_reg(j, 1, R13);              /* dec r13: not executed */
         /* the replay, with the temps it reads where they were at the IMARK (a replay of
          * immediates reads none) */
         jit_stub_regs(j, k, true);
@@ -1599,7 +1630,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
         patch(j, epi[k]);
     free(epi);
     jit_mark(j, MK_EPILOGUE, 0);
-    st_mem(j, R13, R14, CPU(icount));                   /* flush icount */
+    ic_flush(j);
     g8(j, 0x48); g8(j, 0x83); g8(j, 0xC4); g8(j, 0x08);  /* add rsp, 8 */
     g8(j, 0x41); g8(j, 0x5F);                            /* pop r15 */
     g8(j, 0x41); g8(j, 0x5E);                            /* pop r14 */

@@ -339,8 +339,11 @@ uam_status      uam_exec_init(uam_exec *x, uam_cpu *cpu, uam_sched *sched);
 void            uam_exec_fini(uam_exec *x);
 /* Run until something stops the hart. max_insns = 0 means no limit. */
 uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns);
-/* Request a stop at the next instruction boundary. Safe to call from a
- * device, a hook, or a signal handler. */
+/* Request a stop. Safe to call from a device, a hook, or a signal handler. From
+ * a device or a hook the hart stops at the next instruction boundary. So it does
+ * for a signal handler under the interpreter; native code learns of a request made
+ * behind its back when it next comes back to the run loop, at a block boundary at
+ * most a few thousand blocks on. */
 void            uam_exec_stop(uam_exec *x, int64_t status);
 /*
  * For a data access the bus refused on purpose (a guard, guard.h), made while x's

@@ -11,11 +11,15 @@
  * re-enables (DI/EI) while a CP0 timer fires, and an MMIO device. Between runs the
  * host rewrites code, adds and removes PC hooks, and takes and restores snapshots.
  * A last check stores into the page of the block being run just after that page
- * became a code page.
+ * became a code page. And a stop requested from a signal handler must end a run of
+ * native code that never calls out of it.
  */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include "uam/isa/mips32.h"
 #include "uam/machine.h"
@@ -506,12 +510,73 @@ static void test_store_to_new_code_page(void)
     }
 }
 
+/*
+ * uam_exec_stop from a signal handler. The guest is a loop that counts in a register:
+ * no device, no timer, no instruction limit, so nothing but the request brings native
+ * code back to the run loop - which the JIT guarantees by bounding its chains. The
+ * request repeats every 20 ms and must be seen well before the eleventh; a run that has
+ * not ended after 2 s never will.
+ */
+static uam_exec *volatile alarm_exec;
+static volatile sig_atomic_t alarms;
+
+static void on_alarm(int sig)
+{
+    (void)sig;
+    if (++alarms > 100) {
+        static const char msg[] = "FAIL test_jit: a stop requested from a signal handler was never seen\n";
+        if (write(2, msg, sizeof(msg) - 1) < 0)
+            _exit(1);
+        _exit(1);
+    }
+    uam_exec_stop(alarm_exec, 9);
+}
+
+static void test_async_stop(void)
+{
+    for (mode md = INTERP; md <= JIT_CHAIN; md++) {
+        uam_machine m;
+        CHECK(uam_machine_init(&m, &uam_isa_mips32be) == UAM_OK, "machine init");
+        m.board_name = "jit-test";
+        CHECK(uam_bus_map_ram(&m.bus, "ram", 0, 1u << 20) == UAM_OK, "map ram");
+        const uint32_t B = 0x80000000u;
+        const uint32_t prog[] = { ADDIU(T0, T0, 1), BEQ(ZERO, ZERO, B + 4, B), ADDIU(T1, T1, 3) };
+        put_prog(&m, 0, prog, UAM_ARRAY_LEN(prog));
+        uam_machine_reset(&m, B);
+        if (md != INTERP) {
+            CHECK(uam_exec_enable_jit(&m.exec), "jit available");
+            m.exec.chain = md >= JIT_CHAIN;
+        }
+        alarm_exec = &m.exec;
+        alarms = 0;
+        struct sigaction sa, old;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_alarm;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGALRM, &sa, &old);
+        const struct itimerval every = { .it_interval = { 0, 20000 }, .it_value = { 0, 20000 } };
+        const struct itimerval never = { { 0, 0 }, { 0, 0 } };
+        setitimer(ITIMER_REAL, &every, NULL);
+        const uam_stop_reason why = uam_exec_run(&m.exec, 0);
+        setitimer(ITIMER_REAL, &never, NULL);
+        sigaction(SIGALRM, &old, NULL);
+        CHECK(why == UAM_STOP_REQUEST && m.exec.stop_status == 9,
+              "%s: a signal handler's stop ends the run (why=%d)", mode_name[md], (int)why);
+        CHECK(alarms <= 10, "%s: the stop is seen soon (after %d requests)", mode_name[md], (int)alarms);
+        /* at an instruction boundary: maybe before the last pass's delay slot */
+        CHECK(gpr(&m, T0) > 0 && (gpr(&m, T1) == 3 * gpr(&m, T0) || gpr(&m, T1) + 3 == 3 * gpr(&m, T0)),
+              "%s: the loop ran up to the stop (%u, %u)", mode_name[md], gpr(&m, T0), gpr(&m, T1));
+        uam_machine_fini(&m);
+    }
+}
+
 int main(void)
 {
     test_equivalence();
     test_trace_disables();
     test_stop_in_chain();
     test_store_to_new_code_page();
+    test_async_stop();
     printf("test_jit: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

@@ -11,6 +11,11 @@
 #include "spin.h"
 
 #define DEFAULT_MAX_BLOCK_INSNS 32u
+/* Without a host poll to bound it, the blocks native code may chain through before it
+ * comes back to the run loop. Nothing a block does needs the bound (whatever the run loop
+ * must act on stops the chain); a stop requested from a signal handler does, as native
+ * code sees it only here. */
+#define CHAIN_MAX 4096u
 
 const char *uam_stop_reason_str(uam_stop_reason r)
 {
@@ -858,7 +863,7 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         if (blk->backend && blk->backend != UAM_JIT_INTERP) {
             uam_jit_chain ch = { .budget = 0, .link = false };
             if (x->chain && !(x->trace & UAM_TRACE_BLOCKS)) {
-                ch.budget = !c->host.poll ? UINT32_C(1) << 30
+                ch.budget = !c->host.poll ? CHAIN_MAX
                           : c->blocks_since_poll < c->host.poll_interval
                               ? c->host.poll_interval - 1 - c->blocks_since_poll : 0;
                 /* A spin loop's EXIT back to itself must come back here (6b). */

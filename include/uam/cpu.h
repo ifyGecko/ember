@@ -138,8 +138,9 @@ typedef struct uam_cpu {
     uint64_t              icount;          /* instructions issued (IMARKs executed) */
     uint64_t              icount_deadline; /* stop at an IMARK once icount reaches this */
     bool                  exit_request;    /* stop at the next IMARK (section 9) */
-    /* For native code: exit_request ? 0 : icount_deadline, so one compare per IMARK
-     * covers both. The JIT sets it on entry; uam_cpu_request_exit zeroes it. */
+    /* For native code: exit_request ? 0 : icount_deadline, so that one test per IMARK
+     * covers both. The JIT sets it on entry and reads it there and after every call it
+     * makes out of native code; uam_cpu_request_exit zeroes it. */
     uint64_t              icount_stop;
     bool                  waiting;         /* idle in WAIT until isa->irq_wakeup() */
     unsigned              priv;            /* current privilege level (ISA-defined); translated
@@ -171,7 +172,7 @@ static inline void uam_cpu_dtlb_flush(uam_cpu *cpu)
 static inline void uam_cpu_request_exit(uam_cpu *cpu)
 {
     cpu->exit_request = true;
-    cpu->icount_stop = 0;   /* native code compares icount with it at every instruction */
+    cpu->icount_stop = 0;   /* native code reads it after the call that led here */
 }
 
 /* The ISA's virtual-to-physical mapping changed (e.g. a TLB write or an

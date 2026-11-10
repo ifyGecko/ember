@@ -1079,6 +1079,8 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
     return true;
 }
 
+#define JIT_IC_FAR (UINT64_C(1) << 62)
+
 void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chain *chain,
                  uam_block_result *res)
 {
@@ -1120,7 +1122,14 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
     jc->dgen = cpu->bus->direct_gen;
     jc->priv = cpu->priv;
     jc->next_when = uam_sched_next(x->sched);
-    cpu->icount_stop = cpu->exit_request ? 0 : cpu->icount_deadline;
+    /* Where native code stops at an IMARK: at once after an exit request, else at the
+     * deadline, or sooner than a deadline too far for icount - icount_stop to be a
+     * signed number (2^62 instructions on: never reached, and stopping there is
+     * harmless). */
+    uint64_t stop = cpu->exit_request ? 0 : cpu->icount_deadline;
+    if (stop > cpu->icount && stop - cpu->icount > JIT_IC_FAR)
+        stop = cpu->icount + JIT_IC_FAR;
+    cpu->icount_stop = jc->ic_base = stop;
     ((void (*)(uam_jit_ctx *))blk->backend)(jc);
     *res = jc->res;
     chain->hops = jc->chain_budget - jc->chain_left;

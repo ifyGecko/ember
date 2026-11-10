@@ -42,6 +42,14 @@
  * this relies on everything that can make isa->irq_take() newly succeed (a line
  * change, an interrupt-enable or software-interrupt write) requesting an exit, as an
  * IMARK would need anyway (isa.h).
+ *
+ * Stopping. Native code keeps icount in a register, relative to where it must stop
+ * (cpu->icount_stop: the deadline, or 0 after an exit request), so an IMARK counts and
+ * tests in one add and a branch on its sign. It reads icount_stop on entry and after
+ * every call it makes into C, which is where a block's own doing can change it: a
+ * request made there stops the block at the next IMARK, as on the interpreter. One made
+ * from outside the run (a signal handler: uam_exec_stop) is seen when native code next
+ * comes back to the run loop, which the chain budget bounds.
  */
 #ifndef UAM_JIT_H
 #define UAM_JIT_H

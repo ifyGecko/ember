@@ -69,6 +69,10 @@ typedef struct uam_jit_ctx {
     const jit_site         *site;        /* the faulting call's instruction */
     uint64_t                scratch;     /* bridge load destination */
     uam_block_result        res;
+    /* Native code keeps icount in a register as icount - ic_base, where ic_base is
+     * cpu->icount_stop as it last read it (on entry, after every bridge): negative until
+     * the block must stop at an IMARK, so that check is a test of the sign. */
+    uint64_t                ic_base;
     /* chaining */
     uint64_t                epoch;       /* links made in another epoch are dead */
     jit_slot               *link_slot;   /* out: the EXIT slot that missed (to be linked) */
