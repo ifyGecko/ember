@@ -873,13 +873,13 @@ bool jit_defer_analyze(uam_jit *j, const uam_block *blk)
 
 /* ---- the code arena ------------------------------------------------------------ */
 
-static void *arena_map(void)
+static void *arena_map(size_t size)
 {
 #if defined(__APPLE__)
-    void *m = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+    void *m = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 #else
-    void *m = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+    void *m = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
     return m == MAP_FAILED ? NULL : m;
@@ -905,20 +905,29 @@ static void arena_sync(void *p, size_t n)
 
 uam_jit *uam_jit_create(uam_exec *x)
 {
-    void *mem = arena_map();
+    /* UAM_JIT_ARENA=bytes sizes the code arena (at least ARENA_MIN): a small one is
+     * recycled often, to test that. */
+    size_t size = ARENA_SIZE;
+    const char *as = getenv("UAM_JIT_ARENA");
+    if (as && *as) {
+        const unsigned long long v = strtoull(as, NULL, 0);
+        size = v < ARENA_MIN ? ARENA_MIN : v < ARENA_SIZE ? (size_t)v : ARENA_SIZE;
+    }
+    void *mem = arena_map(size);
     if (!mem)
         return NULL;
     uam_jit *j = calloc(1, sizeof(*j));
     if (!j) {
-        munmap(mem, ARENA_SIZE);
+        munmap(mem, size);
         return NULL;
     }
     j->x = x;
     j->arena = mem;
+    j->arena_size = size;
     /* Host features and registers. UAM_JIT_BASELINE=1 turns optional features off (to
      * test the fallbacks). */
     if (!jit_host_init(j)) {
-        munmap(mem, ARENA_SIZE);
+        munmap(mem, size);
         free(j);
         return NULL;
     }
@@ -1000,7 +1009,7 @@ void uam_jit_destroy(uam_jit *j)
 {
     if (!j)
         return;
-    munmap(j->arena, ARENA_SIZE);
+    munmap(j->arena, j->arena_size);
     if (j->perf_map)
         fclose(j->perf_map);
     if (j->opmap)
@@ -1057,9 +1066,9 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
         blk->backend = UAM_JIT_INTERP;
         return true;
     }
-    if (j->n > ARENA_SIZE - j->arena_base)
+    if (j->n > j->arena_size - j->arena_base)
         return false;   /* a single block larger than the arena: impossible in practice */
-    if (j->arena_used + j->n > ARENA_SIZE) {
+    if (j->arena_used + j->n > j->arena_size) {
         /* Arena full: drop every compiled block (and every link), then restart this one. */
         uam_tcache_flush(&j->x->tc);
         j->arena_used = j->arena_base;   /* the shared stubs stay */
@@ -1090,10 +1099,19 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
 
 #define JIT_IC_FAR (UINT64_C(1) << 62)
 
-/* Point the jump of a constant EXIT (slot s) at `target`, or unlink it (NULL). */
-static void link_direct(const jit_slot *s, const uint8_t *target)
+/* Point the jump of a constant EXIT (slot s) at `target`, or unlink it (NULL). The jump
+ * must be in the code placed since the arena was last recycled, and be such a jump:
+ * anything else would be a JIT bug that writes into code it does not own, silently, so
+ * it stops the process instead. */
+static void link_direct(const uam_jit *j, const jit_slot *s, const uint8_t *target)
 {
     uint8_t *site = (uint8_t *)(uintptr_t)s->entry;
+    if (site < j->arena + j->arena_base || site + 4 > j->arena + j->arena_used
+        || !jit_host_link_site(site)) {
+        fprintf(stderr, "uam: jit: link at %p is not a jump of the arena's current code\n",
+                (void *)site);
+        abort();
+    }
     arena_write(true);
     jit_host_link(site, target);
     arena_write(false);
@@ -1120,7 +1138,8 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
         || cpu->priv != j->key_priv) {
         jc->epoch++;
         for (uint32_t k = 0; k < j->n_linked; k++)
-            link_direct(j->linked[k], NULL);
+            if (j->linked[k].gen == j->arena_gen)   /* else gone with its code */
+                link_direct(j, j->linked[k].slot, NULL);
         j->n_linked = 0;
         j->key_valid = true;
         j->key_tc = x->tc.gen;
@@ -1136,9 +1155,11 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
             const uint8_t *body = (const uint8_t *)blk->backend + j->body_off;
             if (j->pend_slot->epoch == LINK_DIRECT) {
                 /* a constant EXIT that missed is unlinked: not in the list yet */
-                if (jit_grow(j, &j->linked, &j->cap_linked, j->n_linked + 1, sizeof(jit_slot *))) {
-                    j->linked[j->n_linked++] = j->pend_slot;
-                    link_direct(j->pend_slot, body);
+                if (jit_grow(j, &j->linked, &j->cap_linked, j->n_linked + 1,
+                             sizeof(struct jit_linked))) {
+                    j->linked[j->n_linked].slot = j->pend_slot;
+                    j->linked[j->n_linked++].gen = j->arena_gen;
+                    link_direct(j, j->pend_slot, body);
                 }
             } else {
                 arena_write(true);

@@ -12,7 +12,8 @@
  * host rewrites code, adds and removes PC hooks, and takes and restores snapshots.
  * A last check stores into the page of the block being run just after that page
  * became a code page. And a stop requested from a signal handler must end a run of
- * native code that never calls out of it.
+ * native code that never calls out of it, and a code arena recycled many times while
+ * blocks are linked must change nothing.
  */
 #include <signal.h>
 #include <stdio.h>
@@ -156,8 +157,12 @@ static void put_prog(uam_machine *m, uint32_t at, const uint32_t *w, size_t n)
         put32(m, at + 4 * i, w[i]);
 }
 
-typedef enum mode { INTERP, JIT_NOCHAIN, JIT_CHAIN, JIT_TAB1 } mode;
-static const char *const mode_name[] = { "interp", "jit (no chain)", "jit", "jit (2-entry jump table)" };
+typedef enum mode { INTERP, JIT_NOCHAIN, JIT_CHAIN, JIT_TAB1, JIT_SMALL } mode;
+static const char *const mode_name[] = { "interp", "jit (no chain)", "jit", "jit (2-entry jump table)",
+                                         "jit (small arena)" };
+/* JIT_SMALL's code arena: the least the JIT takes (4 * 64 KiB), recycled every few
+ * hundred thousand bytes of code, with links made and unlinked in between */
+#define SMALL_ARENA (256u << 10)
 
 /*
  * main (0x80000000):
@@ -258,8 +263,14 @@ static tickdev *build(uam_machine *m, mode md)
     if (md != INTERP) {
         if (md == JIT_TAB1)
             setenv("UAM_JIT_JTAB_BITS", "1", 1);
+        if (md == JIT_SMALL) {
+            char v[32];
+            snprintf(v, sizeof(v), "%u", SMALL_ARENA);
+            setenv("UAM_JIT_ARENA", v, 1);
+        }
         CHECK(uam_exec_enable_jit(&m->exec), "jit available");
         unsetenv("UAM_JIT_JTAB_BITS");
+        unsetenv("UAM_JIT_ARENA");
         m->exec.chain = md >= JIT_CHAIN;
     }
     return t;
@@ -301,7 +312,7 @@ static uint64_t state_hash(uam_machine *m, const tickdev *t)
 typedef struct outcome {
     uint64_t hash[8];
     unsigned n_hash;
-    uint64_t hook_hits, blocks, chained, interrupts, polls;
+    uint64_t hook_hits, blocks, chained, interrupts, polls, code_bytes;
 } outcome;
 
 static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
@@ -384,6 +395,7 @@ static outcome scenario(mode md)
 
     o.blocks = m.exec.stats.blocks_executed;
     o.chained = m.exec.stats.blocks_chained;
+    o.code_bytes = m.exec.stats.code_bytes;
     o.interrupts = m.exec.stats.interrupts;
     CHECK(gpr(&m, K0) > 100, "%s: timer interrupts were taken (%u)", mode_name[md], gpr(&m, K0));
     uam_machine_fini(&m);
@@ -393,7 +405,7 @@ static outcome scenario(mode md)
 static void test_equivalence(void)
 {
     outcome ref = scenario(INTERP);
-    for (mode md = JIT_NOCHAIN; md <= JIT_TAB1; md++) {
+    for (mode md = JIT_NOCHAIN; md <= JIT_SMALL; md++) {
         outcome o = scenario(md);
         CHECK(o.n_hash == ref.n_hash, "%s: same number of checkpoints", mode_name[md]);
         for (unsigned i = 0; i < ref.n_hash && i < o.n_hash; i++)
@@ -413,6 +425,11 @@ static void test_equivalence(void)
         else if (md == JIT_TAB1)
             CHECK(o.chained > o.blocks / 2, "chained: %llu of %llu blocks entered by chaining",
                   (unsigned long long)o.chained, (unsigned long long)o.blocks);
+        else if (md == JIT_SMALL)   /* the arena was recycled, chaining all along */
+            CHECK(o.code_bytes > (uint64_t)SMALL_ARENA && o.chained > o.blocks / 2,
+                  "small arena: %llu bytes of code compiled, %llu of %llu blocks chained",
+                  (unsigned long long)o.code_bytes, (unsigned long long)o.chained,
+                  (unsigned long long)o.blocks);
         else
             CHECK(o.chained == 0, "no chaining when it is off");
     }
@@ -570,6 +587,34 @@ static void test_async_stop(void)
     }
 }
 
+/*
+ * The code arena recycled over and over with links live. The guest rewrites code every
+ * 256 iterations, which drops translations (and so unlinks every direct jump) and makes
+ * the JIT compile again; with a small arena that keeps filling it, so it is recycled
+ * while blocks are linked to each other, and the links made before must never be
+ * written again (jit.c aborts if one would be). The run must end as on the interpreter.
+ */
+static void test_arena_recycle(void)
+{
+    uint64_t h[2] = { 0, 0 }, code = 0, chained = 0;
+    for (int k = 0; k < 2; k++) {
+        const mode md = k ? JIT_SMALL : INTERP;
+        uam_machine m;
+        tickdev *t = build(&m, md);
+        uam_exec_run(&m.exec, 30000000);
+        h[k] = state_hash(&m, t);
+        if (md == JIT_SMALL) {
+            code = m.exec.stats.code_bytes;
+            chained = m.exec.stats.blocks_chained;
+        }
+        uam_machine_fini(&m);
+    }
+    CHECK(h[1] == h[0], "small arena: the same state as the interpreter");
+    CHECK(code > 20 * (uint64_t)SMALL_ARENA, "small arena: recycled about %llu times",
+          (unsigned long long)(code / SMALL_ARENA));
+    CHECK(chained > 0, "small arena: chained (%llu)", (unsigned long long)chained);
+}
+
 int main(void)
 {
     test_equivalence();
@@ -577,6 +622,7 @@ int main(void)
     test_stop_in_chain();
     test_store_to_new_code_page();
     test_async_stop();
+    test_arena_recycle();
     printf("test_jit: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

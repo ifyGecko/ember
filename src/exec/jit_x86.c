@@ -1688,6 +1688,8 @@ bool jit_host_init(uam_jit *j)
     return true;
 }
 
+bool jit_host_link_site(const uint8_t *site) { return site[-1] == 0xE9; }   /* jmp rel32 */
+
 void jit_host_link(uint8_t *site, const uint8_t *target)
 {
     /* site is the rel32 of a jmp: 0 falls through to the miss path */

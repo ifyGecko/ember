@@ -785,7 +785,10 @@ Implemented (`make test`):
   code patches, PC hooks and snapshot restores in between, and requires identical state (also
   with a two-entry jump table, `UAM_JIT_JTAB_BITS=1`, so its links collide); and
   code rewritten on a page that has just become a code page again must run as rewritten. A stop
-  requested from a signal handler must end a loop that never calls out of native code.
+  requested from a signal handler must end a loop that never calls out of native code. With a
+  small code arena (`UAM_JIT_ARENA=bytes`, default 64 MiB) recycled some 70 times while blocks are
+  linked, a run must end as on the interpreter; the JIT stops the process rather than patch a
+  jump that is not one of the arena's current code.
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
   the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and

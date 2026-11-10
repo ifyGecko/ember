@@ -1603,6 +1603,13 @@ bool jit_host_init(uam_jit *j)
     return true;
 }
 
+bool jit_host_link_site(const uint8_t *site)
+{
+    uint32_t in;
+    memcpy(&in, site, 4);
+    return (in & 0xFC000000u) == 0x14000000u;                 /* b */
+}
+
 void jit_host_link(uint8_t *site, const uint8_t *target)
 {
     /* site is a b: to the next instruction, the miss path, when unlinked */
