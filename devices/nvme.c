@@ -94,12 +94,15 @@ static uint16_t prp_segs(nvme *c, uint64_t prp1, uint64_t prp2, uint64_t len, se
         return SC_OK;
     }
     uint64_t list = prp2;
+    unsigned pages = 0;   /* list pages followed: each holds an entry, or the list is a loop */
     while (rem) {
         uint8_t e[8];
         if (uam_pci_dma_read(&c->fn, list, e, 8) != UAM_OK)
             return SC_DATA_XFER;
         uint64_t a = le_get(e, 8);
         if ((list & (ps - 1)) == ps - 8 && rem > ps) {   /* last slot: the next list page */
+            if (++pages > MAX_SEGS)
+                return SC_INVALID_FIELD;
             list = a;
             continue;
         }

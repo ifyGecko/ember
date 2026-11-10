@@ -173,6 +173,10 @@ static void load_read_block(ide_ch *c)
 {
     ata_drive *d = cur(c);
     uint32_t n = c->remaining < c->block ? c->remaining : c->block;
+    if (!d->bd) {                             /* the guest selected an absent drive mid-command */
+        finish(c, ST_DRDY | ST_ERR, ATA_ERR_ABRT);
+        return;
+    }
     if (uam_blockdev_read(d->bd, c->next_lba, c->buf, n) != UAM_OK) {
         finish(c, ST_DRDY | ST_ERR, 0x40);   /* uncorrectable */
         return;
@@ -261,6 +265,10 @@ static void run_dma(ide_ch *c);
 static void packet(ide_ch *c)
 {
     ata_drive *d = cur(c);
+    if (!d->bd) {                             /* an absent drive selected since PACKET */
+        finish(c, ST_DRDY | ST_ERR, ATA_ERR_ABRT);
+        return;
+    }
     if (c->feat & 1) {                        /* DMA: when the bus master starts */
         c->dma_pending = true;
         c->dma_atapi = true;
@@ -333,6 +341,11 @@ static void run_dma(ide_ch *c)
         return;
     c->dma_pending = false;
     ata_drive *d = cur(c);
+    if (!d->bd) {                             /* an absent drive selected since the command */
+        c->bm_status = (uint8_t)((c->bm_status & ~BM_ACTIVE) | BM_ERR);
+        finish(c, ST_DRDY | ST_ERR, ATA_ERR_ABRT);
+        return;
+    }
     prd_walk w = { c, 0, true };
     ata_io io = { .ctx = &w, .copy = prd_copy, .bounce = c->h->bounce };
     ata_result r = { 0 };
@@ -520,6 +533,10 @@ static void data_write(ide_ch *c, unsigned size, uint64_t v)
     }
     ata_drive *d = cur(c);
     uint32_t n = c->len / 512;
+    if (!d->bd) {                             /* an absent drive selected mid-command */
+        finish(c, ST_DRDY | ST_ERR, ATA_ERR_ABRT);
+        return;
+    }
     if (uam_blockdev_write(d->bd, c->next_lba, c->buf, n) != UAM_OK) {
         finish(c, ST_DRDY | ST_ERR, 0x40);
         return;
