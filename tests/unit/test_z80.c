@@ -253,6 +253,23 @@ static void test_ei_shadow(void)
     EQ64(mem(&m, r16(&m, R_SP)), 0x02, "the interrupt returns to the second INC B");
     EQ64(m.exec.stats.interrupts, 1, "one interrupt");
     uam_machine_fini(&m);
+
+    /* a run of EIs longer than a block: no interrupt until an instruction after the last */
+    machine(&m, &uam_z80_nmos_ref);
+    uint8_t eis[70 + 3];
+    memset(eis, 0xFB, 70);
+    eis[70] = 0x04; eis[71] = 0x18; eis[72] = 0xFE;                  /* INC B; JR $ */
+    code(&m, 0x2000, eis, sizeof(eis));
+    code(&m, 0x0038, (const uint8_t[]){ 0x18, 0xFE }, 2);
+    sysw(&m, SYS_IM, 1);
+    line(&m, UAM_Z80_LINE_INT, 1);
+    m.cpu.pc = 0x2000;
+    m.cpu.regfile[1] = 0;
+    EQ64(uam_exec_run(&m.exec, 80), UAM_STOP_INSN_LIMIT, "a run of EIs is not an error");
+    EQ64(m.cpu.regfile[1], 1, "the instruction after the last EI ran");
+    EQ64(mem(&m, r16(&m, R_SP)), 0x47, "the interrupt returns to the instruction after it");
+    EQ64(m.exec.stats.interrupts, 1, "one interrupt, after the run");
+    uam_machine_fini(&m);
 }
 
 static void test_r(void)

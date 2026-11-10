@@ -182,6 +182,18 @@ static void test_ie_shadow(void)
     step(&m, 3);                                          /* MOV, NOP, then the entry */
     EQ64(uam_mcs51_iram_read(&m.cpu, 0x08), 0x04, "the return address is the second NOP");
     uam_machine_fini(&m);
+
+    /* the IE write as a full block's last instruction still takes the next one along */
+    machine(&m, &uam_mcs51_8051_ref);
+    uint8_t late[31 + 6];
+    memset(late, NOP, 31);
+    memcpy(late + 31, (const uint8_t[]){ 0x75, 0xA8, 0x82, NOP, SJMP, 0xFE }, 6);
+    code(&m, 0x200, late, sizeof(late));
+    m.cpu.pc = 0x200;
+    line(&m, 1, 1);
+    EQ64(uam_exec_run(&m.exec, 34), UAM_STOP_INSN_LIMIT, "an IE write in the last slot is not an error");
+    EQ64(uam_mcs51_iram_read(&m.cpu, 0x08), 0x23, "the return address is after the NOP behind it");
+    uam_machine_fini(&m);
 }
 
 static void test_sfr_pages(void)

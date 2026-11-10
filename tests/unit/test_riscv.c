@@ -619,6 +619,59 @@ static uint64_t dev_rd(uam_device *d, uint64_t off, unsigned size)
 }
 static void dev_wr(uam_device *d, uint64_t off, unsigned size, uint64_t v) { d->ops->write(d, off, size, v); }
 
+/* MRET sets MIE again while an interrupt is pending: it is taken at once, also by
+ * native code that has linked the MRET's exit to the interrupted loop. The handler
+ * raises the software interrupt again on every other entry, so some returns find
+ * nothing pending (they link) and the others must not run on into the loop. */
+static void mret_run(int mode, uint32_t *count, uint32_t *entries, uint64_t *icount)
+{
+    uam_machine m;
+    machine(&m, mode != 0);
+    m.exec.chain = mode == 2;
+    uam_cpu *c = &m.cpu;
+    add_clint(&m, 1);
+    const uint32_t w[] = {
+        0x02000437u,   /*          lui  s0, 0x2000     the CLINT's msip */
+        0x00100913u,   /*          addi s2, zero, 1 */
+        0x00800293u,   /*          addi t0, zero, 8 */
+        0x30429073u,   /*          csrw mie, t0        MSIE */
+        0x30046073u,   /*          csrsi mstatus, 8    MIE */
+        0x00198993u,   /* loop:    addi s3, s3, 1 */
+        0x3ff9f293u,   /*          andi t0, s3, 1023 */
+        0xfe029ce3u,   /*          bnez t0, loop */
+        0x01242023u,   /*          sw   s2, 0(s0)      every 1024 rounds: raise it */
+        0xff1ff06fu,   /*          j    loop */
+        0x001a0a13u,   /* handler: addi s4, s4, 1 */
+        0x00042023u,   /*          sw   zero, 0(s0)    lower it */
+        0x001a7313u,   /*          andi t1, s4, 1 */
+        0x00030463u,   /*          beqz t1, 1f */
+        0x01242023u,   /*          sw   s2, 0(s0)      odd entries: raise it again */
+        MRET,          /* 1: */
+    };
+    prog(&m, CODE, w, sizeof(w) / sizeof(w[0]));
+    csrw(c, CSR_MTVEC, CODE + 4 * 10);
+    for (unsigned r = 19; r <= 20; r++)
+        setx(c, r, 0);
+    run(&m, CODE, 40000);
+    *count = x(c, 19);
+    *entries = x(c, 20);
+    *icount = c->icount;
+    uam_machine_fini(&m);
+}
+
+static void test_mret_pending(void)
+{
+    uint32_t count[3], entries[3];
+    uint64_t icount[3];
+    for (int mode = 0; mode < 3; mode++)   /* interpreter, native, native and chained */
+        mret_run(mode, &count[mode], &entries[mode], &icount[mode]);
+    CHECK(entries[0] >= 20, "the handler ran (%u entries)", entries[0]);
+    for (int mode = 1; mode < 3; mode++)
+        CHECK(count[mode] == count[0] && entries[mode] == entries[0] && icount[mode] == icount[0],
+              "MRET with an interrupt pending, %s: %u rounds, %u entries (interpreter %u, %u)",
+              mode == 1 ? "native" : "chained", count[mode], entries[mode], count[0], entries[0]);
+}
+
 static void test_clint(void)
 {
     uam_machine m;
@@ -872,6 +925,7 @@ int main(void)
         test_faults(jit);
         test_wfi(jit);
     }
+    test_mret_pending();
     printf("test_riscv: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

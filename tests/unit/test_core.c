@@ -701,6 +701,33 @@ static void test_device_optional_destroy(void)
     CHECK(true, "fini a machine holding a device with no destroy op");
 }
 
+/* A second register view inside its parent's allocation, listed after the parent (the
+ * GIC's CPU interface): uam_machine_fini must not read it once the parent is destroyed. */
+typedef struct { uam_device dev, view; } parent_dev;
+static void parent_destroy(uam_device *d)
+{
+    parent_dev *p = UAM_CONTAINER_OF(d, parent_dev, dev);
+    p->view.ops = NULL;                /* what the memory may hold once it is freed (the */
+    p->view.next = (uam_device *)(uintptr_t)1;   /* test keeps it, so that this is defined) */
+}
+static const uam_device_ops parent_ops = {
+    .type = "test,parent", .read = nodestroy_read, .write = nodestroy_write,
+    .destroy = parent_destroy, .flags = UAM_DEVICE_STATELESS,
+};
+
+static void test_device_view_after_parent(void)
+{
+    uam_machine m;
+    mips_machine(&m);
+    parent_dev p;
+    uam_device_init(&p.dev, &parent_ops, "parent");
+    uam_device_init(&p.view, &nodestroy_ops, "parent-view");
+    uam_machine_add_device(&m, &p.dev);
+    uam_machine_add_device(&m, &p.view);
+    uam_machine_fini(&m);
+    CHECK(p.view.ops == NULL, "fini destroyed the parent and never read its view again");
+}
+
 static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
     (void)cpu; (void)pc;
@@ -2027,6 +2054,7 @@ int main(void)
     test_timer_reset();
     test_device_reset();
     test_device_optional_destroy();
+    test_device_view_after_parent();
     test_romd_exec();
     test_region_remap();
     test_cfi_flash();

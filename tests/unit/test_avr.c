@@ -150,6 +150,19 @@ static void test_classic(void)
     CHECK(take(&m), "rc: taken");
     EQ64(m.cpu.pc, 6 * 2, "rc: vector 6, 2 bytes each");
     uam_machine_fini(&m);
+
+    /* SEI as a full block's last instruction still takes the next one along */
+    machine(&m, &uam_avr_e_ref);
+    for (unsigned k = 0; k < 31; k++)
+        put16(&m, 0x1000 + 2 * k, NOP);
+    put16(&m, 0x1000 + 62, 0x9478);                                   /* SEI */
+    put16(&m, 0x1000 + 64, NOP);
+    put16(&m, 0x1000 + 66, RJMP_SELF);
+    m.cpu.pc = 0x1000;
+    line(&m, 2, 1);
+    EQ64(uam_exec_run(&m.exec, 34), UAM_STOP_INSN_LIMIT, "e: SEI in the last slot is not an error");
+    EQ64(data(&m, 0x08FF) | data(&m, 0x08FE) << 8, (0x1000 + 66) / 2, "e: the interrupt came after the instruction behind SEI");
+    uam_machine_fini(&m);
 }
 
 static void test_pmic(void)

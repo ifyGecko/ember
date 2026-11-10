@@ -854,6 +854,21 @@ static void test_isa_modes(bool jit)
     free(d);
     uam_machine_fini(&m);
 
+    /* the longest SAVE: ra, seven xsregs, s1, s0 and four static argument registers */
+    machine(&m, &uam_isa_mips32le, &uam_mips_m16_ref, jit);
+    static const uint8_t saved[14] = { 31, 30, 23, 22, 21, 20, 19, 18, 17, 16, 7, 6, 5, 4 };
+    for (unsigned k = 0; k < 14; k++)
+        setr(&m, saved[k], 0xA5000000u + saved[k]);
+    setr(&m, 29, 0x80008000u);
+    put16(&m, put16(&m, put16(&m, m16, 0xF70B), 0x64F8), M16_B_SELF);   /* save 64, ra, s0-s8, a0-a3 */
+    run(&m, m16 | 1, 1);
+    EQ64(m.cpu.pc, (m16 + 4) | 1, "SAVE with fourteen registers ran");
+    EQ64(gpr(&m, 29), 0x80008000u - 64, "SAVE: the frame");
+    for (unsigned k = 0; k < 14; k++)
+        CHECK(mem32(&m, 0x80008000u - 4 * (k + 1)) == 0xA5000000u + saved[k],
+              "SAVE: register %u in slot %u (0x%x)", saved[k], k, mem32(&m, 0x80008000u - 4 * (k + 1)));
+    uam_machine_fini(&m);
+
     /* microMIPS only: handlers in microMIPS, no MIPS32 */
     machine(&m, &uam_isa_mips32le, &uam_mips_umips_ref, jit);
     put16(&m, put16(&m, put16(&m, put16(&m, CODE, 0x0000), 0x8B7C), UM_B16_SELF), UM_NOP16);

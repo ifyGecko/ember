@@ -443,6 +443,19 @@ static void test_shadow(bool jit)
     run(&m, CODE, 1);
     EQ64(m.cpu.pc, CODE + 3, "MOV SS: stopped after the shadowed instruction");
     EQ64(gpr(&m, X86_RAX), 1, "MOV SS: the next instruction ran with it");
+
+    /* a run of STIs longer than a block: each opens a shadow over the next */
+    uint8_t stis[70];
+    memset(stis, 0xFB, sizeof(stis));
+    put_bytes(&m, CODE, stis, sizeof(stis));
+    PUT(&m, CODE + sizeof(stis), 0x40, 0x43, SPIN);   /* inc ax; inc bx */
+    setgpr(&m, X86_RAX, 0);
+    setgpr(&m, X86_RBX, 0);
+    m.cpu.pc = CODE;
+    EQ64(uam_exec_run(&m.exec, sizeof(stis) + 1), UAM_STOP_INSN_LIMIT, "a run of STIs is not an error");
+    EQ64(m.cpu.pc, CODE + sizeof(stis) + 1, "it ran to its end and one instruction on");
+    EQ64(gpr(&m, X86_RAX), 1, "and no further");
+    EQ64(gpr(&m, X86_RBX), 0, "and no further (bx)");
     uam_machine_fini(&m);
 }
 
