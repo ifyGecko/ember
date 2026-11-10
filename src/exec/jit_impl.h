@@ -129,7 +129,7 @@ struct uam_jit {
     const int   *pool;
     unsigned     pool_max, pool_kept;
     unsigned     n_pool;     /* registers to allocate temps to (UAM_JIT_REGS, default all) */
-    int          res_reg;    /* where every op leaves its result */
+    int          res_reg;    /* scratch: where a result goes that gets no register */
     size_t       body_off;   /* prologue length: chained jumps enter here */
     unsigned     jtab_bits;  /* jump table entries used: 1 << jtab_bits (UAM_JIT_JTAB_BITS) */
     uint32_t     arena_gen;  /* bumped when the arena is recycled */
@@ -232,9 +232,17 @@ bool     jit_ra_begin(uam_jit *j, const uam_block *blk);
 unsigned jit_insn_reads(const uam_jit *j, const uam_block *blk, uint32_t i);
 /* After an insn: free the registers of the temps it read for the last time. */
 void     jit_ra_free_dead(uam_jit *j, const uam_block *blk);
-/* Define temp dst (of width w) from j->res_reg: give it a register, spilling the temp
- * read furthest in the future if none is free, or leave it in its slot. */
-void     jit_ra_def(uam_jit *j, uam_ref dst, unsigned w);
+/* Before the code of an insn that defines temp dst (and before its guard's branch: this
+ * may emit a spill): the register its result is to be left in. That is want0 or want1 (a
+ * register of the pool, or -1) if it is free or holds a temp the insn reads for the last
+ * time, else a free register, else one of a temp read here for the last time - so the
+ * result's register may be an operand's, and the code must write it only after its last
+ * read of that operand - else that of the temp read furthest in the future, spilled now.
+ * j->res_reg if the temp is never read or is to stay in its slot. */
+int      jit_ra_dst(uam_jit *j, uam_ref dst, int want0, int want1);
+/* After the insn's code and jit_ra_free_dead: temp dst is in `reg`, as jit_ra_dst said
+ * (j->res_reg: store it to its slot). */
+void     jit_ra_def(uam_jit *j, uam_ref dst, int reg);
 /* Around a call: store / reload the call-clobbered registers whose temps are still read
  * after the current insn. */
 void     jit_ra_save(uam_jit *j, bool restore);
@@ -262,9 +270,8 @@ void     jit_host_stubs(uam_jit *j, size_t off[16]);
 bool     jit_host_compile(uam_jit *j, const uam_block *blk);
 /* Pure opcodes the code generator emits inline; any other is a call to jit_br_eval. */
 bool     jit_host_pure_inline(const uam_jit *j, uam_opcode op);
-/* For the register allocator: jc->temps[t] = reg; reg = jc->temps[t]; dst = res_reg. */
+/* For the register allocator: jc->temps[t] = reg; reg = jc->temps[t]. */
 void     jit_host_spill(uam_jit *j, uint32_t t, int reg);
 void     jit_host_fill(uam_jit *j, uint32_t t, int reg);
-void     jit_host_def(uam_jit *j, int dst, unsigned w);
 
 #endif /* UAM_JIT_IMPL_H */

@@ -308,14 +308,17 @@ void jit_stub_regs(uam_jit *j, uint32_t k, bool enter)
 /* ---- register allocation ---------------------------------------------------------
  *
  * Temps are block-local SSA values that no one sees after the block, so they can live
- * in host registers. A linear scan in instruction order: every op leaves its result
- * in res_reg, and jit_ra_def then gives the temp a free register (or, with none free,
- * takes the one whose temp is read furthest in the future, storing that temp to its slot
- * in jc->temps, or keeps the new temp in its slot if it is read later than all of them);
- * a register is freed after its temp's last read. A temp once stored is never stored
- * again (SSA), so a spilled temp is simply read from memory from then on. Guarded
- * ops define their result after the guard's paths join, and calls save and restore
- * the live call-clobbered registers, so the allocation is the same on every path.
+ * in host registers. A linear scan in instruction order: before an op's code, jit_ra_dst
+ * picks the register its result goes to - a free one, or one whose temp the op itself
+ * reads for the last time, so that the op computes in place and no move follows it (or,
+ * with none of either, the one whose temp is read furthest in the future, storing that
+ * temp to its slot in jc->temps, or none: the new temp stays in its slot if it is read
+ * later than all of them) - and after it jit_ra_def binds the temp to that register; a
+ * register is freed after its temp's last read. A temp once stored is never stored
+ * again (SSA), so a spilled temp is simply read from memory from then on. The register
+ * of a guarded op's result is picked before the guard's branch and bound after its
+ * paths join, and calls save and restore the live call-clobbered registers, so the
+ * allocation is the same on every path.
  * A deferred PUT or a cold op (jit_defer_analyze) reads nothing where it stands; instead
  * the values a replay needs - the writes' values and guards, the operands of the cold
  * ops it recomputes - are read at every soft point that replays them, so they stay
@@ -448,15 +451,29 @@ void jit_ra_free_dead(uam_jit *j, const uam_block *blk)
     }
 }
 
-void jit_ra_def(uam_jit *j, uam_ref dst, unsigned w)
+/* Can an insn's result go to pool register r: is it free, or does it hold a temp the
+ * current insn reads for the last time? */
+static bool reg_avail(const uam_jit *j, int r)
+{
+    const uint32_t t = j->holder[r];
+    return t == NO_TEMP || j->last_use[t] <= j->cur_i;
+}
+
+int jit_ra_dst(uam_jit *j, uam_ref dst, int want0, int want1)
 {
     if (j->last_use[dst] == NO_TEMP)
-        return;                                    /* never read */
-    int reg = -1;
-    for (unsigned k = 0; k < j->n_pool && reg < 0; k++)
+        return j->res_reg;                         /* never read */
+    if (want0 >= 0 && reg_avail(j, want0))
+        return want0;
+    if (want1 >= 0 && reg_avail(j, want1))
+        return want1;
+    for (unsigned k = 0; k < j->n_pool; k++)
         if (j->holder[j->pool[k]] == NO_TEMP)
-            reg = j->pool[k];
-    if (reg < 0 && j->n_pool) {
+            return j->pool[k];
+    for (unsigned k = 0; k < j->n_pool; k++)
+        if (reg_avail(j, j->pool[k]))
+            return j->pool[k];
+    if (j->n_pool) {
         int victim = j->pool[0];
         uint32_t far = 0;
         for (unsigned k = 0; k < j->n_pool; k++) {
@@ -473,15 +490,22 @@ void jit_ra_def(uam_jit *j, uam_ref dst, unsigned w)
                 j->in_mem[t] = 1;
             }
             j->reg_of[t] = -1;
-            reg = victim;
+            j->holder[victim] = NO_TEMP;
+            return victim;
         }
     }
-    if (reg < 0) {                                 /* stays in its slot */
-        jit_host_spill(j, dst, j->res_reg);
+    return j->res_reg;                             /* stays in its slot */
+}
+
+void jit_ra_def(uam_jit *j, uam_ref dst, int reg)
+{
+    if (j->last_use[dst] == NO_TEMP)
+        return;                                    /* never read */
+    if (reg == j->res_reg) {
+        jit_host_spill(j, dst, reg);
         j->in_mem[dst] = 1;
         return;
     }
-    jit_host_def(j, reg, w);
     j->holder[reg] = dst;
     j->reg_of[dst] = (int8_t)reg;
 }
