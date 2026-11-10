@@ -263,7 +263,9 @@ static bool m16_is_ext_or_jal(uint16_t i) { unsigned op = i >> 11; return op == 
 
 static void lift_save_restore(ml *L, const m16_insn *d)
 {
-    uint8_t regs[12];
+    /* ra, up to seven xsregs, s1, s0 and up to four static argument registers */
+    enum { M16_SAVE_MAX = 1 + 7 + 2 + 4 };
+    uint8_t regs[M16_SAVE_MAX];
     unsigned nr = 0;
     if (d->ra)
         regs[nr++] = RA;
@@ -289,7 +291,7 @@ static void lift_save_restore(ml *L, const m16_insn *d)
     } else {
         /* every load before any register write (the commit rule) */
         uam_ref top = mips_bin(L, UAM_OP_ADD, sp, mips_imm(L, d->framesize));
-        uam_ref v[12];
+        uam_ref v[M16_SAVE_MAX];
         for (unsigned k = 0; k < nr; k++)
             v[k] = uam_ld(L->b, 32, fl, mips_bin(L, UAM_OP_SUB, top, mips_imm(L, 4 * (k + 1))), NONE);
         for (unsigned k = 0; k < nr; k++)
