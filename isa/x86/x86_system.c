@@ -369,7 +369,7 @@ static uam_status deliver_prot(uam_cpu *cpu, unsigned vec, bool has_err, uint32_
         return x86_raise(cpu, X86_EXC_GP, true, sel & ~3u);
     if (!(cattr & SEGA_P))
         return x86_raise(cpu, X86_EXC_NP, true, sel & ~3u);
-    unsigned ncpl = (cattr & 0x4) ? cpl : ((cattr & SEGA_DPL) >> 5);   /* conforming keeps CPL */
+    unsigned ncpl = (cattr & 0x4) ? cpl : (unsigned)((cattr & SEGA_DPL) >> 5);   /* conforming keeps CPL */
     if (ncpl > cpl)
         return x86_raise(cpu, X86_EXC_GP, true, sel & ~3u);
     /* out of virtual-8086 mode: only to a non-conforming CPL 0 handler */

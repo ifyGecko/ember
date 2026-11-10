@@ -1541,7 +1541,10 @@ static void test_vga(void)
     EQ64(rgb[0], 0xFFFFFF, "glyph pixel: white");
     EQ64(rgb[640], 0x0000AA, "below it: the blue background");
     vout(&bus, 0x3C7, 0x01);                        /* the DAC reads back */
-    EQ64(vin(&bus, 0x3C9) | vin(&bus, 0x3C9) << 8 | vin(&bus, 0x3C9) << 16, 0x2A0000, "DAC read back");
+    uint32_t dac = vin(&bus, 0x3C9);                /* red, green, blue: one read each, in order */
+    dac |= (uint32_t)vin(&bus, 0x3C9) << 8;
+    dac |= (uint32_t)vin(&bus, 0x3C9) << 16;
+    EQ64(dac, 0x2A0000, "DAC read back");
     vout(&bus, 0x3D4, 0x11); vout(&bus, 0x3D5, 0x80);   /* protect CRTC 0-7 */
     vout(&bus, 0x3D4, 0x01); vout(&bus, 0x3D5, 0x27);
     EQ64(vin(&bus, 0x3D5), 0x4F, "CRTC write protection");
@@ -1634,8 +1637,12 @@ static void test_i8237(void)
     EQ64(ib(&bus, D1 + 8) & 0x04, 0x04, "status: channel 2 TC");
     EQ64(ib(&bus, D1 + 8) & 0x04, 0, "TC bits clear on read");
     ob(&bus, D1 + 0xC, 0);
-    EQ64(ib(&bus, D1 + 4) | ib(&bus, D1 + 4) << 8, 0x1238, "current address advanced");
-    EQ64(ib(&bus, D1 + 5) | ib(&bus, D1 + 5) << 8, 0xFFFF, "count wrapped");
+    unsigned cur = ib(&bus, D1 + 4);                /* low byte, then high: the flip-flop */
+    cur |= (unsigned)ib(&bus, D1 + 4) << 8;
+    EQ64(cur, 0x1238, "current address advanced");
+    cur = ib(&bus, D1 + 5);
+    cur |= (unsigned)ib(&bus, D1 + 5) << 8;
+    EQ64(cur, 0xFFFF, "count wrapped");
     EQ64(uam_i8237_transfer(dma, 2, buf, 8, NULL), 0, "masked again after TC");
 
     /* channel 5 (words): read 4 bytes from 0x20200 */

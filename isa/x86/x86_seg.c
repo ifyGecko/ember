@@ -252,7 +252,7 @@ void x86_null_outer_segs(uam_cpu *cpu)
     for (unsigned i = 0; i < UAM_ARRAY_LEN(segs); i++) {
         uint16_t a = x86_seg_attr(cpu, segs[i]);
         bool conforming_code = (a & 0x8) && (a & 0x4);
-        if ((a & SEGA_S) && !conforming_code && ((a & SEGA_DPL) >> 5) < cpl)
+        if ((a & SEGA_S) && !conforming_code && (unsigned)((a & SEGA_DPL) >> 5) < cpl)
             x86_seg_set(cpu, segs[i], 0, 0, 0, 0);
     }
 }
@@ -396,7 +396,7 @@ static uam_status far_gate(uam_cpu *cpu, uint16_t sel, uint64_t lo, uint64_t hi,
             return x86_raise(cpu, X86_EXC_TS, true, nss & ~3u);
         x86_desc_unpack(slo, &sd.base, &sd.limit, &sd.attr);
         if ((nss & 3u) != cdpl || !(sd.attr & SEGA_S) || (sd.attr & 0x8) || !(sd.attr & 0x2) ||
-            ((sd.attr & SEGA_DPL) >> 5) != cdpl)
+            (unsigned)((sd.attr & SEGA_DPL) >> 5) != cdpl)
             return x86_raise(cpu, X86_EXC_TS, true, nss & ~3u);
         if (!(sd.attr & SEGA_P))
             return x86_raise(cpu, X86_EXC_SS, true, nss & ~3u);
