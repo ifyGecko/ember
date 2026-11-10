@@ -145,8 +145,11 @@ struct uam_jit {
     uint8_t      cb[CBUF_MAX];
     size_t       n;
     bool         overflow;
-    struct { size_t pos; uint64_t pc; } slot[MAX_SLOTS];  /* where to patch its address, target */
+    uint64_t     slot_pc[MAX_SLOTS];   /* each link slot's target (LINK_NONE: computed) */
     unsigned     n_slots;
+    struct { size_t pos; uint16_t slot, off; } slot_ref[3 * MAX_SLOTS];   /* pc-relative
+                                        * references to a slot's field, to patch */
+    unsigned     n_slot_refs;
     jit_site     cur;        /* the guest instruction being compiled */
     bool         cur_emitted;/* cur has a site record (sites[n_sites - 1]) */
     jit_site    *sites;      /* site records, emitted after the slots */
@@ -258,6 +261,16 @@ void     jit_stub_add(uam_jit *j, const uam_block *blk, size_t pos, uint64_t pc,
 /* Around a stub's replay: make reg_of show the temps' registers at the stub's IMARK
  * (enter), then restore the current allocation (leave). */
 void     jit_stub_regs(uam_jit *j, uint32_t k, bool enter);
+
+/* Note that the code at offset `pos` refers, pc-relative, to the field at offset `off` of
+ * the newest link slot (the slots follow the code: the code generator patches these). */
+static inline void jit_slot_ref(uam_jit *j, size_t pos, unsigned off)
+{
+    j->slot_ref[j->n_slot_refs].pos = pos;
+    j->slot_ref[j->n_slot_refs].slot = (uint16_t)(j->n_slots - 1);
+    j->slot_ref[j->n_slot_refs].off = (uint16_t)off;
+    j->n_slot_refs++;
+}
 
 /* ---- what a code generator provides (jit_x86.c, jit_a64.c) --------------------- */
 

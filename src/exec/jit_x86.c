@@ -663,69 +663,83 @@ static void set_res_pc_imm(uam_jit *j, uint32_t kind, uint64_t pc)
 }
 
 /*
- * After an EXIT has stored res (NEXT, pc): jump straight into the next block if its
- * link is current and the run loop has nothing to do (jit.h), else go to the epilogue.
- * A miss records the slot in jc->link_slot so uam_jit_run can link it. `target` is the
- * EXIT's pc operand: for a constant the slot only ever links that pc. A computed one's
- * slot caches its first target of the epoch (compared against res.pc); any other target
- * is looked up in, and on a miss linked into, the jump table.
+ * An EXIT to `target` (its pc operand): jump straight into the next block if its link is
+ * current and the run loop has nothing to do (jit.h); else store the block's result,
+ * res = (NEXT, pc), and go to the epilogue. Only those ways out store the result: a
+ * chained jump leaves none behind. A miss also records the slot in jc->link_slot so
+ * uam_jit_run can link it. For a constant target the slot only ever links that pc, and
+ * the path taken reads its two fields rip-relative. A computed one's slot caches its
+ * first target of the epoch (compared against the pc, in rcx); any other target is
+ * looked up in, and on a miss linked into, the jump table.
  */
-static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t *epi,
-                       unsigned *n_epi)
+static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigned aw,
+                       size_t *epi, unsigned *n_epi)
 {
-    bool fixed = uam_ref_is_imm(target);
-    /* if (icount >= icount_stop (exit request or deadline) || !chain_left) goto epilogue */
+    const bool fixed = uam_ref_is_imm(target);
+    const uint64_t pc = fixed ? blk->imm[uam_ref_index(target)] & uam_mask(blk->addr_width) : LINK_NONE;
+    size_t miss[4];
+    unsigned n_miss = 0;
+    j->slot_pc[j->n_slots++] = pc;
+    if (!fixed)
+        load_operand(j, RCX, blk, target, aw);                      /* rcx = the target pc */
+    /* if (icount >= icount_stop (exit request or deadline)) goto out */
     rex(j, 1, 1, 0, 1); g8(j, 0x3B); modrm_mem(j, R13, R14, CPU(icount_stop)); /* cmp r13, [stop] */
-    epi[(*n_epi)++] = jcc_fwd(j, 0x83);                             /* jae */
-    g8(j, 0x83); modrm_mem(j, 7, RBX, OFF(chain_left)); g8(j, 0);   /* cmp dword [chain_left], 0 */
-    epi[(*n_epi)++] = jcc_fwd(j, 0x84);                             /* je */
-    /* rax = &slot (rip-relative; the slot follows the code, patched at the end) */
-    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x05);
-    j->slot[j->n_slots].pos = j->n;
-    j->slot[j->n_slots].pc = fixed ? blk->imm[uam_ref_index(target)] & uam_mask(blk->addr_width)
-                                   : LINK_NONE;
-    j->n_slots++;
-    g32(j, 0);
+    const size_t stop = jcc_fwd(j, 0x83);                           /* jae */
+    /* if (!chain_left--) goto spent: the hop is counted here, and given back on a miss */
+    g8(j, 0x83); modrm_mem(j, 5, RBX, OFF(chain_left)); g8(j, 1);   /* sub dword [chain_left], 1 */
+    const size_t spent = jcc_fwd(j, 0x82);                          /* jb */
     if (fixed) {
-        ld_mem(j, RCX, RBX, OFF(epoch));
-        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(epoch));    /* cmp rcx, [slot.epoch] */
-        size_t miss = jcc_fwd(j, 0x85);
-        g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));         /* dec dword [chain_left] */
+        ld_mem(j, RAX, RBX, OFF(epoch));
+        g8(j, 0x48); g8(j, 0x3B); g8(j, 0x05);                      /* cmp rax, [rip + slot.epoch] */
+        jit_slot_ref(j, j->n, SLOT(epoch)); g32(j, 0);
+        miss[n_miss++] = jcc_fwd(j, 0x85);
+        g8(j, 0xFF); g8(j, 0x25);                                   /* jmp [rip + slot.entry] */
+        jit_slot_ref(j, j->n, SLOT(entry)); g32(j, 0);
+        patch(j, miss[0]);
+        g8(j, 0x48); g8(j, 0x8D); g8(j, 0x05);                      /* lea rax, [rip + slot] */
+        jit_slot_ref(j, j->n, 0); g32(j, 0);
+    } else {
+        g8(j, 0x48); g8(j, 0x8D); g8(j, 0x05);                      /* lea rax, [rip + slot] */
+        jit_slot_ref(j, j->n, 0); g32(j, 0);
+        ld_mem(j, RDX, RBX, OFF(epoch));
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [slot.pc] */
+        size_t other = jcc_fwd(j, 0x85);
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [slot.epoch] */
+        miss[n_miss++] = jcc_fwd(j, 0x85);
         g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));             /* jmp [slot.entry] */
-        patch(j, miss);
-        st_mem(j, RAX, RBX, OFF(link_slot));
-        epi[(*n_epi)++] = jmp_fwd(j);
-        return;
+        /* Another target: if the slot is unused this epoch, link it there. */
+        patch(j, other);
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [slot.epoch] */
+        miss[n_miss++] = jcc_fwd(j, 0x85);
+        /* rax = &jtab[(uint32_t)(pc * JTAB_HASH) >> (32 - bits)] */
+        g8(j, 0x69); g8(j, 0xC1); g32(j, JTAB_HASH);                    /* imul eax, ecx, JTAB_HASH */
+        g8(j, 0xC1); g8(j, 0xE8); g8(j, (uint8_t)(32 - j->jtab_bits));  /* shr eax, 32 - bits */
+        g8(j, 0x48); g8(j, 0x8D); g8(j, 0x04); g8(j, 0x40);             /* lea rax, [rax + rax*2] */
+        g8(j, 0x48); g8(j, 0x8D); g8(j, 0x84); g8(j, 0xC3);             /* lea rax, [rbx + rax*8 + jtab] */
+        g32(j, (uint32_t)OFF(jtab));
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [e.pc] */
+        miss[n_miss++] = jcc_fwd(j, 0x85);
+        rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [e.epoch] */
+        miss[n_miss++] = jcc_fwd(j, 0x85);
+        g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));             /* jmp [e.entry] */
+        for (unsigned k = 0; k < n_miss; k++)
+            patch(j, miss[k]);
     }
-    ld_mem(j, RCX, RBX, RES(pc));
-    ld_mem(j, RDX, RBX, OFF(epoch));
-    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [slot.pc] */
-    size_t other = jcc_fwd(j, 0x85);
-    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [slot.epoch] */
-    size_t miss1 = jcc_fwd(j, 0x85);
-    g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));             /* dec dword [chain_left] */
-    g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));                 /* jmp [slot.entry] */
-    /* Another target: if the slot is unused this epoch, link it there. */
-    patch(j, other);
-    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [slot.epoch] */
-    size_t miss2 = jcc_fwd(j, 0x85);
-    /* rax = &jtab[(uint32_t)(pc * JTAB_HASH) >> (32 - bits)] */
-    g8(j, 0x69); g8(j, 0xC1); g32(j, JTAB_HASH);                    /* imul eax, ecx, JTAB_HASH */
-    g8(j, 0xC1); g8(j, 0xE8); g8(j, (uint8_t)(32 - j->jtab_bits));  /* shr eax, 32 - bits */
-    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x04); g8(j, 0x40);             /* lea rax, [rax + rax*2] */
-    g8(j, 0x48); g8(j, 0x8D); g8(j, 0x84); g8(j, 0xC3);             /* lea rax, [rbx + rax*8 + jtab] */
-    g32(j, (uint32_t)OFF(jtab));
-    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [e.pc] */
-    size_t miss3 = jcc_fwd(j, 0x85);
-    rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RDX, RAX, SLOT(epoch));    /* cmp rdx, [e.epoch] */
-    size_t miss4 = jcc_fwd(j, 0x85);
-    g8(j, 0xFF); modrm_mem(j, 1, RBX, OFF(chain_left));             /* dec dword [chain_left] */
-    g8(j, 0xFF); modrm_mem(j, 4, RAX, SLOT(entry));                 /* jmp [e.entry] */
-    patch(j, miss1);
-    patch(j, miss2);
-    patch(j, miss3);
-    patch(j, miss4);
-    st_mem(j, RAX, RBX, OFF(link_slot));                            /* the slot or the entry */
+    /* a miss: no hop after all; rax = the slot, or the jump table entry, to link */
+    g8(j, 0xFF); modrm_mem(j, 0, RBX, OFF(chain_left));             /* inc dword [chain_left] */
+    st_mem(j, RAX, RBX, OFF(link_slot));
+    const size_t missed = jmp_fwd(j);
+    patch(j, spent);
+    g8(j, 0xC7); modrm_mem(j, 0, RBX, OFF(chain_left)); g32(j, 0);  /* chain_left = 0 again */
+    patch(j, stop);
+    patch(j, missed);
+    /* out: res = (NEXT, pc) */
+    if (fixed) {
+        set_res_pc_imm(j, UAM_BR_NEXT, pc);
+    } else {
+        st_mem(j, RCX, RBX, RES(pc));
+        g8(j, 0xC7); modrm_mem(j, 0, RBX, RES(kind)); g32(j, UAM_BR_NEXT);
+    }
     epi[(*n_epi)++] = jmp_fwd(j);
 }
 
@@ -1217,8 +1231,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     ld_mem(j, R13, R14, CPU(icount));              /* r13 = icount (kept in a register) */
     j->body_off = j->n;                            /* chained jumps enter here */
 
-    /* epilogue jumps: up to 4 per EXIT (chain checks), 1 per other op */
-    size_t *epi = malloc(sizeof(size_t) * (4 * blk->n_insn + 1));
+    /* epilogue jumps: at most 1 per op */
+    size_t *epi = malloc(sizeof(size_t) * (blk->n_insn + 1));
     if (!epi || !jit_defer_analyze(j, blk) || !jit_ra_begin(j, blk)) {
         free(epi);
         return false;
@@ -1465,12 +1479,13 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
              * writes invalidate translations and the block ends here (see interp.c). */
             break;
         case UAM_OP_EXIT:
-            set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
             jit_mark(j, MK_CHAIN, i);
-            if (j->n_slots < MAX_SLOTS)
-                emit_chain(j, blk, in->a, epi, &n_epi);
-            else
+            if (j->n_slots < MAX_SLOTS) {
+                emit_chain(j, blk, in->a, aw, epi, &n_epi);
+            } else {
+                set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
                 epi[n_epi++] = jmp_fwd(j);
+            }
             break;
         case UAM_OP_SYSRD:
             st_mem(j, R13, R14, CPU(icount));
@@ -1598,13 +1613,17 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     jit_mark(j, MK_SLOTS, 0);
     while (j->n & 7)
         g8(j, 0xCC);                                     /* int3 padding */
+    for (unsigned k = 0; k < j->n_slot_refs; k++) {
+        const size_t pos = j->slot_ref[k].pos;
+        int32_t rel = (int32_t)(j->n + sizeof(jit_slot) * j->slot_ref[k].slot + j->slot_ref[k].off
+                                - (pos + 4));
+        if (pos + 4 <= CBUF_MAX)
+            memcpy(&j->cb[pos], &rel, 4);
+    }
     for (unsigned k = 0; k < j->n_slots; k++) {
-        int32_t rel = (int32_t)(j->n - (j->slot[k].pos + 4));
-        if (j->slot[k].pos + 4 <= CBUF_MAX)
-            memcpy(&j->cb[j->slot[k].pos], &rel, 4);
         g64(j, 0);                                       /* entry */
         g64(j, LINK_NONE);                               /* epoch: never linked */
-        g64(j, j->slot[k].pc);                           /* pc */
+        g64(j, j->slot_pc[k]);                           /* pc */
     }
     /* fault sites (8-aligned too: slots are 24 bytes) */
     size_t sites_at = j->n;

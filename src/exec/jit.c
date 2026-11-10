@@ -1041,7 +1041,7 @@ static void compile_reset(uam_jit *j, const uam_block *blk)
 {
     j->n = 0;
     j->overflow = false;
-    j->n_slots = 0;
+    j->n_slots = j->n_slot_refs = 0;
     j->n_marks = 0;
     j->n_sites = j->n_site_refs = j->n_stubs = j->n_snaps = 0;
     j->flag_temp = UAM_REF_NONE;

@@ -329,8 +329,9 @@ static void patch_to(uam_jit *j, size_t pos, size_t target)
     const uint32_t d = (uint32_t)((int64_t)target - (int64_t)pos);
     if ((in & 0x7C000000u) == 0x14000000u)             /* b, bl */
         in = (in & 0xFC000000u) | ((d >> 2) & 0x3FFFFFFu);
-    else if ((in & 0xFF000010u) == 0x54000000u || (in & 0x7E000000u) == 0x34000000u)
-        in = (in & ~(0x7FFFFu << 5)) | ((d >> 2) & 0x7FFFFu) << 5;   /* b.cond, cbz, cbnz */
+    else if ((in & 0xFF000010u) == 0x54000000u || (in & 0x7E000000u) == 0x34000000u
+             || (in & 0xFF000000u) == 0x58000000u)
+        in = (in & ~(0x7FFFFu << 5)) | ((d >> 2) & 0x7FFFFu) << 5;   /* b.cond, cbz, cbnz, ldr literal */
     else if ((in & 0x7E000000u) == 0x36000000u)        /* tbz, tbnz */
         in = (in & ~(0x3FFFu << 5)) | ((d >> 2) & 0x3FFFu) << 5;
     else                                               /* adr */
@@ -665,80 +666,103 @@ static void set_res_pc_imm(uam_jit *j, uint32_t kind, uint64_t pc)
     st32(j, X0, JC, RES(kind));
 }
 
-/* chain_left-- (w17 holds it) and jump to the body at [x0 + entry]. */
-static void chain_jump(uam_jit *j)
+/* chain_left-- (w17 holds it): the hop is taken. */
+static void chain_hop(uam_jit *j)
 {
     addsub_imm(j, true, false, false, X17, X17, 1, false);
     st32(j, X17, JC, OFF(chain_left));
+}
+/* Jump to the body at [x0 + entry]. */
+static void chain_jump(uam_jit *j)
+{
+    chain_hop(j);
     ld64(j, X16, X0, SLOT(entry));
     g32(j, 0xD61F0000u | X16 << 5);                        /* br x16 */
 }
+/* ldr x<rt>, <a field of the newest link slot> (pc-relative, patched at the end) */
+static void ld_slot(uam_jit *j, int rt, unsigned off)
+{
+    jit_slot_ref(j, j->n, off);
+    g32(j, 0x58000000u | (uint32_t)rt);
+}
 
 /*
- * After an EXIT has stored res (NEXT, pc): jump straight into the next block if its
- * link is current and the run loop has nothing to do (jit.h), else go to the epilogue,
- * as on x86-64 (jit_x86.c, emit_chain). A miss records the slot (or the jump table
- * entry) in jc->link_slot so uam_jit_run can link it.
+ * An EXIT to `target` (its pc operand): jump straight into the next block if its link is
+ * current and the run loop has nothing to do (jit.h); else store the block's result,
+ * res = (NEXT, pc), and go to the epilogue, as on x86-64 (jit_x86.c, emit_chain). Only
+ * those ways out store the result. A miss also records the slot (or the jump table
+ * entry) in jc->link_slot so uam_jit_run can link it. A constant target's path reads the
+ * slot's two fields pc-relative; a computed one keeps the pc in x1.
  */
-static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, size_t *epi,
-                       unsigned *n_epi)
+static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigned aw,
+                       size_t *epi, unsigned *n_epi)
 {
-    bool fixed = uam_ref_is_imm(target);
-    /* if (icount >= icount_stop (exit request or deadline) || !chain_left) goto epilogue */
+    const bool fixed = uam_ref_is_imm(target);
+    const uint64_t pc = fixed ? blk->imm[uam_ref_index(target)] & uam_mask(blk->addr_width) : LINK_NONE;
+    size_t miss[4];
+    unsigned n_miss = 0;
+    j->slot_pc[j->n_slots++] = pc;
+    if (!fixed)
+        load_operand(j, X1, blk, target, aw);              /* x1 = the target pc */
+    /* if (icount >= icount_stop (exit request or deadline) || !chain_left) goto out */
     ld64(j, X17, CPUR, CPU(icount_stop));
     addsub_reg(j, true, true, true, XZR, IC, X17, 0);      /* cmp x23, x17 */
-    epi[(*n_epi)++] = bcond_fwd(j, CC_HS);
+    const size_t stop = bcond_fwd(j, CC_HS);
     mem(j, 2, true, X17, JC, OFF(chain_left));
-    epi[(*n_epi)++] = cbz_fwd(j, false, X17);
-    /* x0 = &slot (pc-relative; the slot follows the code, patched at the end) */
-    j->slot[j->n_slots].pos = adr_fwd(j, X0);
-    j->slot[j->n_slots].pc = fixed ? blk->imm[uam_ref_index(target)] & uam_mask(blk->addr_width)
-                                   : LINK_NONE;
-    j->n_slots++;
+    const size_t spent = cbz_fwd(j, false, X17);
     if (fixed) {
-        ld64(j, X1, JC, OFF(epoch));
+        ld64(j, X0, JC, OFF(epoch));
+        ld_slot(j, X16, SLOT(epoch));
+        addsub_reg(j, true, true, true, XZR, X0, X16, 0);
+        miss[n_miss++] = bcond_fwd(j, CC_NE);
+        chain_hop(j);
+        ld_slot(j, X16, SLOT(entry));
+        g32(j, 0xD61F0000u | X16 << 5);                    /* br x16 */
+        patch(j, miss[0]);
+        jit_slot_ref(j, adr_fwd(j, X0), 0);                /* x0 = &slot */
+    } else {
+        jit_slot_ref(j, adr_fwd(j, X0), 0);                /* x0 = &slot */
+        ld64(j, X2, JC, OFF(epoch));
+        ld64(j, X16, X0, SLOT(pc));
+        addsub_reg(j, true, true, true, XZR, X1, X16, 0);  /* cmp pc, slot.pc */
+        size_t other = bcond_fwd(j, CC_NE);
         ld64(j, X16, X0, SLOT(epoch));
-        addsub_reg(j, true, true, true, XZR, X1, X16, 0);
-        size_t miss = bcond_fwd(j, CC_NE);
+        addsub_reg(j, true, true, true, XZR, X2, X16, 0);
+        miss[n_miss++] = bcond_fwd(j, CC_NE);
         chain_jump(j);
-        patch(j, miss);
-        st64(j, X0, JC, OFF(link_slot));
-        epi[(*n_epi)++] = b_fwd(j);
-        return;
+        /* Another target: if the slot is unused this epoch, link it there. */
+        patch(j, other);
+        ld64(j, X16, X0, SLOT(epoch));
+        addsub_reg(j, true, true, true, XZR, X2, X16, 0);
+        miss[n_miss++] = bcond_fwd(j, CC_NE);
+        /* x0 = &jtab[(uint32_t)(pc * JTAB_HASH) >> (32 - bits)] */
+        mov_imm(j, X16, JTAB_HASH);
+        madd(j, false, false, X16, X1, X16, XZR);          /* w16 = w1 * HASH */
+        lsr_imm(j, false, X16, X16, 32 - j->jtab_bits);
+        addsub_reg(j, false, true, false, X16, X16, X16, 1);   /* x16 *= 3 */
+        add_imm(j, X0, JC, (uint32_t)OFF(jtab));
+        addsub_reg(j, false, true, false, X0, X0, X16, 3);     /* x0 += x16 * 8 */
+        ld64(j, X16, X0, SLOT(pc));
+        addsub_reg(j, true, true, true, XZR, X1, X16, 0);
+        miss[n_miss++] = bcond_fwd(j, CC_NE);
+        ld64(j, X16, X0, SLOT(epoch));
+        addsub_reg(j, true, true, true, XZR, X2, X16, 0);
+        miss[n_miss++] = bcond_fwd(j, CC_NE);
+        chain_jump(j);
+        for (unsigned k = 0; k < n_miss; k++)
+            patch(j, miss[k]);
     }
-    ld64(j, X1, JC, RES(pc));
-    ld64(j, X2, JC, OFF(epoch));
-    ld64(j, X16, X0, SLOT(pc));
-    addsub_reg(j, true, true, true, XZR, X1, X16, 0);      /* cmp pc, slot.pc */
-    size_t other = bcond_fwd(j, CC_NE);
-    ld64(j, X16, X0, SLOT(epoch));
-    addsub_reg(j, true, true, true, XZR, X2, X16, 0);
-    size_t miss1 = bcond_fwd(j, CC_NE);
-    chain_jump(j);
-    /* Another target: if the slot is unused this epoch, link it there. */
-    patch(j, other);
-    ld64(j, X16, X0, SLOT(epoch));
-    addsub_reg(j, true, true, true, XZR, X2, X16, 0);
-    size_t miss2 = bcond_fwd(j, CC_NE);
-    /* x0 = &jtab[(uint32_t)(pc * JTAB_HASH) >> (32 - bits)] */
-    mov_imm(j, X16, JTAB_HASH);
-    madd(j, false, false, X16, X1, X16, XZR);              /* w16 = w1 * HASH */
-    lsr_imm(j, false, X16, X16, 32 - j->jtab_bits);
-    addsub_reg(j, false, true, false, X16, X16, X16, 1);   /* x16 *= 3 */
-    add_imm(j, X0, JC, (uint32_t)OFF(jtab));
-    addsub_reg(j, false, true, false, X0, X0, X16, 3);     /* x0 += x16 * 8 */
-    ld64(j, X16, X0, SLOT(pc));
-    addsub_reg(j, true, true, true, XZR, X1, X16, 0);
-    size_t miss3 = bcond_fwd(j, CC_NE);
-    ld64(j, X16, X0, SLOT(epoch));
-    addsub_reg(j, true, true, true, XZR, X2, X16, 0);
-    size_t miss4 = bcond_fwd(j, CC_NE);
-    chain_jump(j);
-    patch(j, miss1);
-    patch(j, miss2);
-    patch(j, miss3);
-    patch(j, miss4);
-    st64(j, X0, JC, OFF(link_slot));                       /* the slot or the entry */
+    st64(j, X0, JC, OFF(link_slot));                       /* a miss: the slot or the entry */
+    patch(j, stop);
+    patch(j, spent);
+    /* out: res = (NEXT, pc) */
+    if (fixed) {
+        set_res_pc_imm(j, UAM_BR_NEXT, pc);
+    } else {
+        st64(j, X1, JC, RES(pc));
+        mov_imm(j, X0, UAM_BR_NEXT);
+        st32(j, X0, JC, RES(kind));
+    }
     epi[(*n_epi)++] = b_fwd(j);
 }
 
@@ -1186,8 +1210,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     ld64(j, IC, CPUR, CPU(icount));                        /* x23 = icount (kept in a register) */
     j->body_off = j->n;                                    /* chained jumps enter here */
 
-    /* epilogue branches: up to 3 per EXIT (chain checks), 1 per other op */
-    size_t *epi = malloc(sizeof(size_t) * (4 * blk->n_insn + 1));
+    /* epilogue branches: at most 1 per op */
+    size_t *epi = malloc(sizeof(size_t) * (blk->n_insn + 1));
     if (!epi || !jit_defer_analyze(j, blk) || !jit_ra_begin(j, blk)) {
         free(epi);
         return false;
@@ -1405,12 +1429,13 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
              * writes invalidate translations and the block ends here (see interp.c). */
             break;
         case UAM_OP_EXIT:
-            set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
             jit_mark(j, MK_CHAIN, i);
-            if (j->n_slots < MAX_SLOTS)
-                emit_chain(j, blk, in->a, epi, &n_epi);
-            else
+            if (j->n_slots < MAX_SLOTS) {
+                emit_chain(j, blk, in->a, aw, epi, &n_epi);
+            } else {
+                set_res_pc(j, UAM_BR_NEXT, blk, in->a, aw);
                 epi[n_epi++] = b_fwd(j);
+            }
             break;
         case UAM_OP_SYSRD:
             bridge_enter(j);
@@ -1520,11 +1545,13 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     jit_mark(j, MK_SLOTS, 0);
     while (j->n & 7)
         g32(j, A64_BRK);
+    for (unsigned k = 0; k < j->n_slot_refs; k++)
+        patch_to(j, j->slot_ref[k].pos,
+                 j->n + sizeof(jit_slot) * j->slot_ref[k].slot + j->slot_ref[k].off);
     for (unsigned k = 0; k < j->n_slots; k++) {
-        patch_to(j, j->slot[k].pos, j->n);
         g64(j, 0);                                         /* entry */
         g64(j, LINK_NONE);                                 /* epoch: never linked */
-        g64(j, j->slot[k].pc);                             /* pc */
+        g64(j, j->slot_pc[k]);                             /* pc */
     }
     /* fault sites (8-aligned too: slots are 24 bytes) */
     size_t sites_at = j->n;
