@@ -421,32 +421,47 @@ static size_t skip_false(uam_jit *j, opnd o)
 
 /* ---- memory fast paths ---------------------------------------------------------- */
 
-/* rd = [x1 + x2], `size` bytes, zero-extended; byte-swapped if big-endian. */
-static void emit_fast_load(uam_jit *j, unsigned size, bool be, int rd)
+/* rd = [x1 + ra], `size` bytes, zero-extended; byte-swapped if big-endian. */
+static void emit_fast_load(uam_jit *j, unsigned size, bool be, int rd, int ra)
 {
-    mem_rr(j, sz_of(size), true, rd, X1, X2, false);
+    mem_rr(j, sz_of(size), true, rd, X1, ra, false);
     if (be && size > 1)
         dp1(j, size == 2 ? DP_REV16 : size == 4 ? DP_REV32 : DP_REV64, size == 8, rd, rd);
 }
 
-/* [x1 + x2] = x3, `size` bytes; byte-swapped (into x17) first if big-endian. */
-static void emit_fast_store(uam_jit *j, unsigned size, bool be)
+/* [x1 + ra] = rv (a register, or xzr), `size` bytes; byte-swapped (into x17) first if
+ * big-endian. */
+static void emit_fast_store(uam_jit *j, unsigned size, bool be, int rv, int ra)
 {
-    int v = X3;
-    if (be && size > 1) {
-        dp1(j, size == 2 ? DP_REV16 : size == 4 ? DP_REV32 : DP_REV64, size == 8, X17, X3);
+    int v = rv;
+    if (be && size > 1 && rv != XZR) {
+        dp1(j, size == 2 ? DP_REV16 : size == 4 ? DP_REV32 : DP_REV64, size == 8, X17, rv);
         v = X17;
     }
-    mem_rr(j, sz_of(size), false, v, X1, X2, false);
+    mem_rr(j, sz_of(size), false, v, X1, ra, false);
 }
 
-/* Emit the data-TLB probe: x2 = addr. On a hit, x1 = host base (data at [x1 + x2]) and
- * control falls through; on a miss, branches are taken to be patched to the bridge
- * path. `tag_off`/`base_off` select the read or write set. Returns miss-branch positions
- * in miss[] (up to 3) and their count in *n_miss. Uses x0, x1, x16 and x17; x2, x3 and
- * every register that holds a temp are preserved. */
+/* The probe reaches an entry's tag and base from one register, x16 = cpu + 8 * index,
+ * with an immediate offset. */
+#define DTLB_NEAR(f) (offsetof(uam_cpu, f) % 8 == 0 && offsetof(uam_cpu, f) / 8 < 0x1000)
+_Static_assert(DTLB_NEAR(dtlb_rt) && DTLB_NEAR(dtlb_rb) && DTLB_NEAR(dtlb_wt) && DTLB_NEAR(dtlb_wb),
+               "the data-TLB arrays must be within a load's immediate offset of the cpu");
+
+/* Emit the data-TLB probe of the access at the address in register ra (x2, or a temp's
+ * register: preserved). On a hit, x1 = host base (data at [x1 + ra]) and control falls
+ * through; on a miss, branches are taken to be patched to the bridge path. `tag_off`/
+ * `base_off` select the read or write set. Returns miss-branch positions in miss[] (up
+ * to 2) and their count in *n_miss. Uses x0, x1, x16 and x17; ra, x3 and every register
+ * that holds a temp are preserved.
+ *
+ * The entry is that of the first byte's page, and the tag compared with it the page of
+ * the last byte: an access that crosses into the next page finds another tag there (an
+ * entry's tag is a page of that entry's index, or none) and misses, with no test of its
+ * own. An access that must be aligned (ACC_ALIGNED) cannot cross a page once it is
+ * aligned, so that test is all it needs. */
 static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag_off,
-                            int32_t base_off, const opnd *addr, size_t *miss, unsigned *n_miss)
+                            int32_t base_off, const opnd *addr, int ra, size_t *miss,
+                            unsigned *n_miss)
 {
     uint32_t f;
     *n_miss = 0;
@@ -463,26 +478,23 @@ static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag
         ld64(j, X1, CPUR, base_off + e);                   /* x1 = host base */
         return;
     }
-    lsr_imm(j, true, X0, X2, UAM_PAGE_SHIFT);              /* x0 = vpage */
-    logimm(UAM_DTLB_SIZE - 1, true, &f);
-    logic_imm(j, LG_AND, true, X1, X0, f);                 /* x1 = index */
-    add_imm(j, X16, CPUR, (uint32_t)tag_off);
-    mem_rr(j, 3, true, X17, X16, X1, true);                /* x17 = tag[index] */
-    addsub_reg(j, true, true, true, XZR, X17, X0, 0);      /* cmp x17, x0 */
-    miss[(*n_miss)++] = bcond_fwd(j, CC_NE);
-    if (size > 1) {
-        logimm(UAM_PAGE_SIZE - 1, false, &f);
-        logic_imm(j, LG_AND, false, X17, X2, f);           /* w17 = page offset */
-        cmp_imm(j, false, X17, UAM_PAGE_SIZE - size);
-        miss[(*n_miss)++] = bcond_fwd(j, CC_HI);           /* page cross */
-        if (aligned) {
-            logimm(size - 1, false, &f);
-            logic_imm(j, LG_ANDS, false, XZR, X2, f);      /* tst w2, size-1 */
-            miss[(*n_miss)++] = bcond_fwd(j, CC_NE);       /* misaligned */
-        }
+    int last = ra;                                         /* the last byte's address */
+    if (size > 1 && !aligned) {
+        addsub_imm(j, false, true, false, X0, ra, size - 1, false);
+        last = X0;
     }
-    add_imm(j, X16, CPUR, (uint32_t)base_off);
-    mem_rr(j, 3, true, X1, X16, X1, true);                 /* x1 = base[index] */
+    bfm(j, 2, true, X1, ra, UAM_PAGE_SHIFT, UAM_PAGE_SHIFT + UAM_DTLB_BITS - 1);   /* ubfx: x1 = index */
+    addsub_reg(j, false, true, false, X16, CPUR, X1, 3);   /* x16 = cpu + 8 * index */
+    ld64(j, X17, X16, tag_off);                            /* x17 = tag[index] */
+    g32(j, 0xEB400000u | (uint32_t)last << 16 | UAM_PAGE_SHIFT << 10 | X17 << 5 | XZR);
+                                                           /* cmp x17, last, lsr #12 */
+    miss[(*n_miss)++] = bcond_fwd(j, CC_NE);
+    if (size > 1 && aligned) {
+        logimm(size - 1, false, &f);
+        logic_imm(j, LG_ANDS, false, XZR, ra, f);          /* tst w<ra>, size-1 */
+        miss[(*n_miss)++] = bcond_fwd(j, CC_NE);           /* misaligned */
+    }
+    ld64(j, X1, X16, base_off);                            /* x1 = base[index] */
 }
 
 /*
@@ -560,7 +572,7 @@ void jit_host_stubs(uam_jit *j, size_t off[16])
         size_t miss[5];
         unsigned n_miss;
         emit_code_probe(j, size, aligned, miss, &n_miss);
-        emit_fast_store(j, size, be);
+        emit_fast_store(j, size, be, X3, X2);
         mov_imm(j, X0, 0);
         g32(j, A64_RET);
         for (unsigned k = 0; k < n_miss; k++)
@@ -1266,13 +1278,16 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
             const opnd ao = opnd_of(j, blk, in->a, aw);
-            load(j, X2, ao, aw);                        /* x2 = addr */
             fast = fast && !(ao.kind == O_IMM && jit_const_slow(ao.imm, size, in->flags));
-            size_t done = 0, miss[3]; unsigned n_miss = 0;
+            /* the address: in its own register on the inline path, in x2 for the bridge */
+            const int ra = fast && ao.kind == O_REG ? ao.reg : X2;
+            if (ra == X2)
+                load(j, X2, ao, aw);
+            size_t done = 0, miss[2]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_rt), CPU(dtlb_rb),
-                                &ao, miss, &n_miss);
-                emit_fast_load(j, size, be, rd);        /* rd = value: written last, as rd
+                                &ao, ra, miss, &n_miss);
+                emit_fast_load(j, size, be, rd, ra);    /* rd = value: written last, as rd
                                                          * may be the address's register */
                 done = b_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
@@ -1280,8 +1295,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             }
             jit_mark(j, MK_SLOW, i);
             st64(j, IC, CPUR, CPU(icount));             /* flush icount: the bridge may read time */
-            if (emit_replays(j, blk, i, MK_SLOW))
-                load(j, X2, ao, aw);                    /* x2 = addr again */
+            if (emit_replays(j, blk, i, MK_SLOW) || ra != X2)
+                load(j, X2, ao, aw);                    /* x2 = addr (again) */
             emit_site(j);
             jit_ra_save(j, false);
             mov_rr(j, X1, X2);                          /* miss / slow path: the bridge */
@@ -1315,20 +1330,33 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             unsigned size = W / 8;
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
-            load_operand(j, X3, blk, in->b, W);         /* x3 = value */
+            const opnd vo = opnd_of(j, blk, in->b, W);
             const opnd ao = opnd_of(j, blk, in->a, aw);
-            load(j, X2, ao, aw);                        /* x2 = addr */
             fast = fast && !(ao.kind == O_IMM && jit_const_slow(ao.imm, size, in->flags));
-            size_t done = 0, done_code = 0, miss[5]; unsigned n_miss = 0;
+            /* On the inline path the address and the value stay where they are: a
+             * temp's register, the zero register. The stubs and the bridge take them
+             * in x2 and x3. */
+            const int ra = fast && ao.kind == O_REG ? ao.reg : X2;
+            const int rv = !fast ? X3 : vo.kind == O_REG ? vo.reg
+                         : vo.kind == O_IMM && vo.imm == 0 ? XZR : X3;
+            if (rv == X3)
+                load(j, X3, vo, W);
+            if (ra == X2)
+                load(j, X2, ao, aw);
+            size_t done = 0, done_code = 0, miss[2]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_wt), CPU(dtlb_wb),
-                                &ao, miss, &n_miss);
-                emit_fast_store(j, size, be);
+                                &ao, ra, miss, &n_miss);
+                emit_fast_store(j, size, be, rv, ra);
                 done = b_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
                     patch(j, miss[k]);
                 /* not in the write set: maybe a page that holds code, away from it */
                 jit_mark(j, MK_CODE_ST, i);
+                if (rv != X3)
+                    load(j, X3, vo, W);
+                if (ra != X2)
+                    load(j, X2, ao, aw);
                 ld64(j, X16, JC, OFF(cstub) + 8 * (int32_t)code_stub(size, be, in->flags & UAM_ACC_ALIGNED));
                 g32(j, 0xD63F0000u | X16 << 5);         /* blr x16 */
                 done_code = cbz_fwd(j, false, X0);

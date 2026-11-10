@@ -327,6 +327,18 @@ static void setcc(uam_jit *j, int reg, uint8_t cc)
     zext_rr(j, reg, reg, 8);
 }
 
+/* lea rd, [base + disp] / [base + index], at operand size os (32 zero-extends). */
+static void lea_disp(uam_jit *j, unsigned os, int rd, int base, int32_t disp)
+{
+    rex(j, os == 64, rd >= 8, 0, base >= 8);
+    g8(j, 0x8D); modrm_mem(j, rd, base, disp);
+}
+static void lea_index(uam_jit *j, unsigned os, int rd, int base, int index)
+{
+    rex(j, os == 64, rd >= 8, index >= 8, base >= 8);
+    g8(j, 0x8D); modrm_sib(j, rd, base, index, 0, 0);
+}
+
 static size_t jmp_fwd(uam_jit *j);
 static size_t jcc_fwd(uam_jit *j, uint8_t cc);
 static void   patch(uam_jit *j, size_t pos);
@@ -349,56 +361,91 @@ static void call_bridge(uam_jit *j, const void *fn)
     g8(j, 0xFF); modrm_reg(j, 2, RAX);             /* call rax */
 }
 
-/* rd = [rcx + rdx], `size` bytes, zero-extended; byte-swapped if big-endian. */
-static void emit_fast_load(uam_jit *j, unsigned size, bool be, int rd)
+/* rd = [rcx + ra], `size` bytes, zero-extended; byte-swapped if big-endian. */
+static void emit_fast_load(uam_jit *j, unsigned size, bool be, int rd, int ra)
 {
-    const int r = rd >= 8;
+    const int r = rd >= 8, x = ra >= 8;
     switch (size) {
-    case 1: rex(j, 0, r, 0, 0); g8(j, 0x0F); g8(j, 0xB6); modrm_sib(j, rd, RCX, RDX, 0, 0); break; /* movzx r32,byte */
+    case 1: rex(j, 0, r, x, 0); g8(j, 0x0F); g8(j, 0xB6); modrm_sib(j, rd, RCX, ra, 0, 0); break; /* movzx r32,byte */
     case 2:
-        rex(j, 0, r, 0, 0); g8(j, 0x0F); g8(j, 0xB7); modrm_sib(j, rd, RCX, RDX, 0, 0);   /* movzx r32,word */
+        rex(j, 0, r, x, 0); g8(j, 0x0F); g8(j, 0xB7); modrm_sib(j, rd, RCX, ra, 0, 0);    /* movzx r32,word */
         if (be) { g8(j, 0x66); rex(j, 0, 0, 0, r); g8(j, 0xC1); modrm_reg(j, 0, rd); g8(j, 8); } /* rol r16,8 */
         break;
     case 4:
-        rex(j, 0, r, 0, 0); g8(j, 0x8B); modrm_sib(j, rd, RCX, RDX, 0, 0);                /* mov r32,[..] */
+        rex(j, 0, r, x, 0); g8(j, 0x8B); modrm_sib(j, rd, RCX, ra, 0, 0);                 /* mov r32,[..] */
         if (be) { rex(j, 0, 0, 0, r); g8(j, 0x0F); g8(j, (uint8_t)(0xC8 + (rd & 7))); }   /* bswap r32 */
         break;
     default:
-        rex(j, 1, r, 0, 0); g8(j, 0x8B); modrm_sib(j, rd, RCX, RDX, 0, 0);                /* mov r64,[..] */
+        rex(j, 1, r, x, 0); g8(j, 0x8B); modrm_sib(j, rd, RCX, ra, 0, 0);                 /* mov r64,[..] */
         if (be) { rex(j, 1, 0, 0, r); g8(j, 0x0F); g8(j, (uint8_t)(0xC8 + (rd & 7))); }   /* bswap r64 */
         break;
     }
 }
 
-/* [rcx + rdx] = r11, `size` bytes; r11 is byte-swapped first if big-endian. */
-static void emit_fast_store(uam_jit *j, unsigned size, bool be)
+/* [rcx + ra] = rv, `size` bytes. A big-endian store swaps rv in place first: the caller
+ * passes r11 then, a copy. */
+static void emit_fast_store(uam_jit *j, unsigned size, bool be, int rv, int ra)
 {
+    const int r = rv >= 8, x = ra >= 8;
     switch (size) {
-    case 1: rex(j, 0, 1, 0, 0); g8(j, 0x88); modrm_sib(j, R11, RCX, RDX, 0, 0); break;  /* mov [..],r11b */
+    case 1:
+        if (r || x || rv >= 4)                                 /* sil, dil need the prefix */
+            g8(j, (uint8_t)(0x40 | (r << 2) | (x << 1)));
+        g8(j, 0x88); modrm_sib(j, rv, RCX, ra, 0, 0);          /* mov [..],r8 */
+        break;
     case 2:
-        if (be) { g8(j, 0x66); rex(j, 0, 0, 0, 1); g8(j, 0xC1); modrm_reg(j, 0, R11); g8(j, 8); } /* rol r11w,8 */
-        g8(j, 0x66); rex(j, 0, 1, 0, 0); g8(j, 0x89); modrm_sib(j, R11, RCX, RDX, 0, 0);    /* mov [..],r11w */
+        if (be) { g8(j, 0x66); rex(j, 0, 0, 0, r); g8(j, 0xC1); modrm_reg(j, 0, rv); g8(j, 8); } /* rol r16,8 */
+        g8(j, 0x66); rex(j, 0, r, x, 0); g8(j, 0x89); modrm_sib(j, rv, RCX, ra, 0, 0);    /* mov [..],r16 */
         break;
     case 4:
-        if (be) { rex(j, 0, 0, 0, 1); g8(j, 0x0F); g8(j, 0xCB); }                    /* bswap r11d */
-        rex(j, 0, 1, 0, 0); g8(j, 0x89); modrm_sib(j, R11, RCX, RDX, 0, 0);          /* mov [..],r11d */
+        if (be) { rex(j, 0, 0, 0, r); g8(j, 0x0F); g8(j, (uint8_t)(0xC8 + (rv & 7))); }   /* bswap r32 */
+        rex(j, 0, r, x, 0); g8(j, 0x89); modrm_sib(j, rv, RCX, ra, 0, 0);                 /* mov [..],r32 */
         break;
     default:
-        if (be) { rex(j, 1, 0, 0, 1); g8(j, 0x0F); g8(j, 0xCB); }                    /* bswap r11 */
-        rex(j, 1, 1, 0, 0); g8(j, 0x89); modrm_sib(j, R11, RCX, RDX, 0, 0);          /* mov [..],r11 */
+        if (be) { rex(j, 1, 0, 0, r); g8(j, 0x0F); g8(j, (uint8_t)(0xC8 + (rv & 7))); }   /* bswap r64 */
+        rex(j, 1, r, x, 0); g8(j, 0x89); modrm_sib(j, rv, RCX, ra, 0, 0);                 /* mov [..],r64 */
         break;
     }
 }
 
-/* Emit the data-TLB probe: rdx = addr. On a hit, rcx = host base (data at [rcx+rdx]) and
- * control falls through; on a miss, jumps are taken to be patched to the bridge path.
- * `tag_off`/`base_off` select the read or write set. Returns miss-jump positions in
- * miss[] (up to 3) and their count in *n_miss. */
-static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag_off,
-                            int32_t base_off, const opnd *addr, size_t *miss, unsigned *n_miss)
+/* Can a store of the constant v be one instruction with an immediate? (A 64-bit one
+ * takes a sign-extended 32-bit immediate; byte-swapped, only 0 and -1 stay that.) */
+static bool store_imm_ok(uint64_t v, unsigned size, bool be)
 {
-    /* Uses only rax and rcx as scratch; rdx (addr) and r11 (store value) are preserved,
-     * and so is every register that holds a temp. rcx ends holding the host base. */
+    return size < 8 || (be ? v == 0 || v == UINT64_MAX : fits_s32(v));
+}
+
+/* [rcx + ra] = v, `size` bytes (store_imm_ok), the bytes in guest order if big-endian. */
+static void emit_fast_store_imm(uam_jit *j, unsigned size, bool be, uint64_t v, int ra)
+{
+    const int x = ra >= 8;
+    if (be && size == 2) v = __builtin_bswap16((uint16_t)v);
+    if (be && size == 4) v = __builtin_bswap32((uint32_t)v);
+    if (size == 2) g8(j, 0x66);
+    rex(j, size == 8, 0, x, 0);
+    g8(j, size == 1 ? 0xC6 : 0xC7); modrm_sib(j, 0, RCX, ra, 0, 0);                       /* mov [..],imm */
+    if (size == 1) g8(j, (uint8_t)v);
+    else if (size == 2) { g8(j, (uint8_t)v); g8(j, (uint8_t)(v >> 8)); }
+    else g32(j, (uint32_t)v);
+}
+
+/* Emit the data-TLB probe of the access at the address in register ra (rdx, or a temp's
+ * register: preserved). On a hit, rcx = host base (data at [rcx + ra]) and control falls
+ * through; on a miss, jumps are taken to be patched to the bridge path. `tag_off`/
+ * `base_off` select the read or write set. Returns miss-jump positions in miss[] (up to
+ * 2) and their count in *n_miss.
+ *
+ * The entry is that of the first byte's page, and the tag compared with it the page of
+ * the last byte: an access that crosses into the next page finds another tag there (an
+ * entry's tag is a page of that entry's index, or none) and misses, with no test of its
+ * own. An access that must be aligned (ACC_ALIGNED) cannot cross a page once it is
+ * aligned, so that test is all it needs. */
+static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag_off,
+                            int32_t base_off, const opnd *addr, int ra, size_t *miss,
+                            unsigned *n_miss)
+{
+    /* Uses only rax and rcx as scratch; ra and r11 (a store's value) are preserved, and
+     * so is every register that holds a temp. rcx ends holding the host base. */
     *n_miss = 0;
     if (addr->kind == O_IMM) {
         /* A constant address: its entry, page and alignment are known, so the probe
@@ -416,21 +463,22 @@ static void emit_dtlb_probe(uam_jit *j, unsigned size, bool aligned, int32_t tag
         ld_mem(j, RCX, R14, base_off + e);                 /* rcx = host base */
         return;
     }
-    mov_rr(j, RAX, RDX);                                   /* rax = addr */
-    rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 5, RAX); g8(j, UAM_PAGE_SHIFT); /* shr rax,12 (vpage) */
-    g8(j, 0x89); modrm_reg(j, RAX, RCX);                   /* mov ecx, eax */
+    if (size > 1 && !aligned) {
+        lea_disp(j, 64, RAX, ra, (int32_t)size - 1);       /* rax = the last byte's address */
+        rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 5, RAX); g8(j, UAM_PAGE_SHIFT); /* shr rax,12 */
+        mov_rr32(j, RCX, ra);                              /* ecx = addr (index bits) */
+        g8(j, 0xC1); modrm_reg(j, 5, RCX); g8(j, UAM_PAGE_SHIFT);                 /* shr ecx,12 */
+    } else {
+        mov_rr(j, RAX, ra);                                /* rax = addr */
+        rex(j, 1, 0, 0, 0); g8(j, 0xC1); modrm_reg(j, 5, RAX); g8(j, UAM_PAGE_SHIFT); /* shr rax,12 (vpage) */
+        g8(j, 0x89); modrm_reg(j, RAX, RCX);               /* mov ecx, eax */
+    }
     g8(j, 0x81); modrm_reg(j, 4, RCX); g32(j, UAM_DTLB_SIZE - 1);  /* and ecx, SIZE-1 (index) */
     rex(j, 1, 0, 0, 1); g8(j, 0x3B); modrm_sib(j, RAX, R14, RCX, 3, tag_off);  /* cmp rax,[r14+rcx*8+tag] */
     miss[(*n_miss)++] = jcc_fwd(j, 0x85);                  /* jne miss */
-    if (size > 1) {
-        g8(j, 0x89); modrm_reg(j, RDX, RAX);               /* mov eax, edx */
-        g8(j, 0x25); g32(j, UAM_PAGE_SIZE - 1);            /* and eax, 0xfff */
-        g8(j, 0x3D); g32(j, UAM_PAGE_SIZE - size);         /* cmp eax, 0x1000-size */
-        miss[(*n_miss)++] = jcc_fwd(j, 0x87);              /* ja miss (page cross) */
-        if (aligned) {
-            g8(j, 0xF7); modrm_reg(j, 0, RDX); g32(j, size - 1);       /* test edx, size-1 */
-            miss[(*n_miss)++] = jcc_fwd(j, 0x85);          /* jne miss (misaligned) */
-        }
+    if (size > 1 && aligned) {
+        rex(j, 0, 0, 0, ra >= 8); g8(j, 0xF7); modrm_reg(j, 0, ra); g32(j, size - 1); /* test r32, size-1 */
+        miss[(*n_miss)++] = jcc_fwd(j, 0x85);              /* jne miss (misaligned) */
     }
     rex(j, 1, 0, 0, 1); g8(j, 0x8B); modrm_sib(j, RCX, R14, RCX, 3, base_off);  /* mov rcx,[r14+rcx*8+base] */
 }
@@ -508,7 +556,7 @@ void jit_host_stubs(uam_jit *j, size_t off[16])
         size_t miss[5];
         unsigned n_miss;
         emit_code_probe(j, size, aligned, miss, &n_miss);
-        emit_fast_store(j, size, be);
+        emit_fast_store(j, size, be, R11, RDX);
         g8(j, 0x31); modrm_reg(j, RAX, RAX);               /* xor eax, eax (ZF = 1) */
         g8(j, 0xC3);                                       /* ret */
         for (unsigned k = 0; k < n_miss; k++)
@@ -712,18 +760,6 @@ static bool op_supported(uam_opcode op)
     /* pure ops (inline or via jit_br_eval) */
     const uam_opinfo *oi = &uam_opinfo_table[op];
     return !(oi->props & (UAM_P_EFFECT | UAM_P_GUARD)) && op != UAM_OP_GET;
-}
-
-/* lea rd, [base + disp] / [base + index], at operand size os (32 zero-extends). */
-static void lea_disp(uam_jit *j, unsigned os, int rd, int base, int32_t disp)
-{
-    rex(j, os == 64, rd >= 8, 0, base >= 8);
-    g8(j, 0x8D); modrm_mem(j, rd, base, disp);
-}
-static void lea_index(uam_jit *j, unsigned os, int rd, int base, int index)
-{
-    rex(j, os == 64, rd >= 8, index >= 8, base >= 8);
-    g8(j, 0x8D); modrm_sib(j, rd, base, index, 0, 0);
 }
 
 /* The register of the pool an operand is in, or -1. */
@@ -1284,13 +1320,16 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
             const opnd ao = opnd_of(j, blk, in->a, aw);
-            load(j, RDX, ao, aw);                       /* rdx = addr */
             fast = fast && !(ao.kind == O_IMM && jit_const_slow(ao.imm, size, in->flags));
-            size_t done = 0, miss[3]; unsigned n_miss = 0;
+            /* the address: in its own register on the inline path, in rdx for the bridge */
+            const int ra = fast && ao.kind == O_REG ? ao.reg : RDX;
+            if (ra == RDX)
+                load(j, RDX, ao, aw);
+            size_t done = 0, miss[2]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_rt), CPU(dtlb_rb),
-                                &ao, miss, &n_miss);
-                emit_fast_load(j, size, be, rd);        /* rd = value: its last instruction,
+                                &ao, ra, miss, &n_miss);
+                emit_fast_load(j, size, be, rd, ra);    /* rd = value: its last instruction,
                                                          * as rd may be the address's register */
                 done = jmp_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
@@ -1298,8 +1337,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             }
             jit_mark(j, MK_SLOW, i);
             st_mem(j, R13, R14, CPU(icount));           /* flush icount: the bridge may read time */
-            if (emit_replays(j, blk, i, MK_SLOW))
-                load(j, RDX, ao, aw);                   /* rdx = addr again */
+            if (emit_replays(j, blk, i, MK_SLOW) || ra != RDX)
+                load(j, RDX, ao, aw);                   /* rdx = addr (again) */
             emit_site(j);
             jit_ra_save(j, false);
             mov_rr(j, RSI, RDX);                        /* miss / slow path: the bridge */
@@ -1339,20 +1378,38 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             unsigned size = W / 8;
             bool be = in->flags & UAM_ACC_BE;
             bool fast = !(in->flags & (UAM_ACC_X | UAM_ACC_PHYS | UAM_ACC_UNPRIV));
-            load_operand(j, R11, blk, in->b, W);        /* r11 = value */
+            const opnd vo = opnd_of(j, blk, in->b, W);
             const opnd ao = opnd_of(j, blk, in->a, aw);
-            load(j, RDX, ao, aw);                       /* rdx = addr */
             fast = fast && !(ao.kind == O_IMM && jit_const_slow(ao.imm, size, in->flags));
-            size_t done = 0, done_code = 0, miss[5]; unsigned n_miss = 0;
+            /* On the inline path the address and the value stay where they are: a
+             * temp's register, an immediate in the store itself. A big-endian store of a
+             * register swaps a copy, in r11. The stubs and the bridge take them in rdx
+             * and r11. */
+            const bool swap = be && size > 1;
+            const bool vimm = fast && vo.kind == O_IMM && store_imm_ok(vo.imm, size, be);
+            const int ra = fast && ao.kind == O_REG ? ao.reg : RDX;
+            const int rv = fast && vo.kind == O_REG && !swap ? vo.reg : R11;
+            if (rv == R11 && !vimm)
+                load(j, R11, vo, W);
+            if (ra == RDX)
+                load(j, RDX, ao, aw);
+            size_t done = 0, done_code = 0, miss[2]; unsigned n_miss = 0;
             if (fast) {
                 emit_dtlb_probe(j, size, in->flags & UAM_ACC_ALIGNED, CPU(dtlb_wt), CPU(dtlb_wb),
-                                &ao, miss, &n_miss);
-                emit_fast_store(j, size, be);
+                                &ao, ra, miss, &n_miss);
+                if (vimm)
+                    emit_fast_store_imm(j, size, be, vo.imm, ra);
+                else
+                    emit_fast_store(j, size, be, rv, ra);
                 done = jmp_fwd(j);
                 for (unsigned k = 0; k < n_miss; k++)
                     patch(j, miss[k]);
                 /* not in the write set: maybe a page that holds code, away from it */
                 jit_mark(j, MK_CODE_ST, i);
+                if (rv != R11 || vimm)
+                    load(j, R11, vo, W);
+                if (ra != RDX)
+                    load(j, RDX, ao, aw);
                 g8(j, 0xFF); modrm_mem(j, 2, RBX, OFF(cstub)       /* call [jc.cstub[v]] */
                                        + 8 * (int32_t)code_stub(size, be, in->flags & UAM_ACC_ALIGNED));
                 done_code = jcc_fwd(j, 0x84);                      /* je done */
