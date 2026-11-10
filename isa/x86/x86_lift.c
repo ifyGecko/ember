@@ -1041,6 +1041,13 @@ uam_status x86_lift(uam_lift_ctx *lc)
             uam_exit(lc->b, NONE, uam_imm(lc->b, x.next), UAM_EXIT_JUMP);
             return UAM_OK;
         }
+        if (x.sti_shadow && shadow && n + 1 >= lc->max_insns) {
+            /* A run of shadow openers (STI STI ..., MOV SS after STI) has used the slot
+             * kept free above: the block ends here and carries the shadow to the next. */
+            uam_syswr(lc->b, 64, X86_SR_SHADOW, uam_imm(lc->b, 1), NONE);
+            uam_exit(lc->b, NONE, uam_imm(lc->b, x.next), UAM_EXIT_JUMP);
+            return UAM_OK;
+        }
         shadow = x.sti_shadow;
         pc = x.next;
         if (n == 0 && in_shadow && !shadow) {   /* a held interrupt is taken right here */

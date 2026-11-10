@@ -930,7 +930,9 @@ uam_status z80_lift(uam_lift_ctx *lc)
     bool clear_shadow = false; /* it follows an EI */
     int qv = -1;               /* QV as the last instruction left it, -1 unknown */
     for (uint32_t n = 0;; n++) {
-        if (n >= lc->max_insns && !cont) {
+        /* Also in the middle of a run of EIs or prefixes, which could otherwise grow
+         * without bound: an EI's shadow is carried by the core's flag (irq_take). */
+        if (n >= lc->max_insns) {
             uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
             return UAM_OK;
         }

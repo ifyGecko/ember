@@ -839,7 +839,9 @@ uam_status avr_lift(uam_lift_ctx *lc)
     bool cont = false;
 
     for (uint32_t n = 0;; n++) {
-        if (n >= lc->max_insns && !cont) {
+        /* one slot stays free: an instruction that holds interrupts off takes the next
+         * one into the block */
+        if (n && n + 1 >= lc->max_insns && !cont) {
             uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
             return UAM_OK;
         }
