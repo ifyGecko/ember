@@ -329,6 +329,10 @@ const char *uam_state_next(uam_state_reader *r)
     uint64_t plen = get_le(r, 8);
     if (r->err)
         return NULL;
+    if (n >= sizeof(r->name)) {
+        uam_state_fail(r, "record name too long");
+        return NULL;
+    }
     if (plen > r->len - r->pos) {
         uam_state_fail(r, "record overruns the stream");
         return NULL;

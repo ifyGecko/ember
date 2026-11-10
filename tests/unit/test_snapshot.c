@@ -137,6 +137,23 @@ static void tie_fire(void *ctx)
     tt->log[n + 1] = 0;
 }
 
+/* A record name longer than the reader's buffer (a crafted file) fails the stream. */
+static void test_long_name(void)
+{
+    enum { N = 4000 };
+    uint8_t *s = calloc(1, 2 + N + 8);
+    CHECK(s != NULL, "allocate");
+    s[0] = (uint8_t)N;
+    s[1] = (uint8_t)(N >> 8);
+    memset(s + 2, 'A', N);                          /* then a payload length of 0 */
+    uam_state_reader *r = uam_state_reader_new(s, 2 + N + 8, NULL);
+    CHECK(r != NULL, "reader");
+    fprintf(stderr, "(an expected state error follows)\n");
+    CHECK(uam_state_next(r) == NULL, "a 4000-byte record name is refused");
+    uam_state_reader_free(r);
+    free(s);
+}
+
 static void test_timer_ties(void)
 {
     uint64_t icount = 0;
@@ -801,6 +818,7 @@ static void test_hook_restore(bool jit)
 int main(void)
 {
     test_stream();
+    test_long_name();
     test_timer_ties();
     test_restore_loop(false);
     test_restore_loop(true);

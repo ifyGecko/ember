@@ -109,8 +109,11 @@ static uam_status load_elf_buf(uam_bus *bus, uam_cpu *cpu, const uint8_t *d, siz
     info->elf_class = is64 ? 64 : 32;
 
     for (unsigned i = 0; i < phnum; i++) {
+        /* every bound as a subtraction: the fields are the file's, and 64 bits wide */
+        if (phoff > len)
+            return UAM_ERR_INVALID;
         uint64_t o = phoff + (uint64_t)i * phentsize;
-        if (o + (is64 ? 56u : 32u) > len)
+        if (o > len || len - o < (is64 ? 56u : 32u))
             return UAM_ERR_INVALID;
         const uint8_t *ph = d + o;
         uint32_t type = (uint32_t)rd(ph, 4, be);
@@ -124,7 +127,7 @@ static uam_status load_elf_buf(uam_bus *bus, uam_cpu *cpu, const uint8_t *d, siz
         }
         if (type != PT_LOAD || memsz == 0)
             continue;
-        if (off + filesz > len || filesz > memsz)
+        if (off > len || filesz > len - off || filesz > memsz)
             return UAM_ERR_INVALID;
         uam_status st = UAM_OK;
         if (filesz)

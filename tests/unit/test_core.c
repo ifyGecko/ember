@@ -33,6 +33,7 @@
 #include "uam/isa.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/x86.h"
+#include "uam/loader.h"
 #include "uam/machine.h"
 #include "uam/signal.h"
 
@@ -1205,6 +1206,11 @@ static void test_nvme(void)
     EQ64(rd(&bus, 0x61000 + 508, 4, UAM_ACC_LE), 0xA5A5A5A5u, "written data read back");
     IO(0x02, 23, 0x61000, 0, 128, 1);
     EQ64(rd(&bus, 0x12000 + 3 * 16 + 12, 4, UAM_ACC_LE) >> 17, 0x80, "LBA out of range");
+    /* a PRP list whose last slot names its own page is refused, not followed for ever */
+    wr64(&bus, 0x70FF8, 0x70FF8);
+    IO(0x02, 24, 0x40000, 0x70FF8, 3, 24);
+    EQ64(rd(&bus, 0x12000 + 12, 4, UAM_ACC_LE) & 0xFFFF, 24, "a looping PRP list: the command completes");
+    CHECK(rd(&bus, 0x12000 + 12, 4, UAM_ACC_LE) >> 17, "a looping PRP list: with an error");
     #undef ADMIN
     #undef IO
 
@@ -1483,6 +1489,20 @@ static void test_ide(void)
     EQ64(ib(&bus, IDE_CMD(0) + 3), 1, "after SRST: signature");
     ob(&bus, IDE_CMD(0) + 7, 0xEC);
     CHECK(irq_level == 0, "nIEN masks INTRQ");
+    ide_in(&bus, 0, b, 512);
+
+    /* the absent slave selected in the middle of a command: the command is aborted */
+    ide_lba(&bus, 0, 5, 1, 0x30);                   /* WRITE SECTORS */
+    ob(&bus, IDE_CMD(0) + 6, 0xB0);
+    for (unsigned i = 0; i < 512; i += 2)
+        uam_bus_write(&bus, IDE_CMD(0), 2, UAM_ACC_LE, 0x5A5A);
+    ob(&bus, IDE_CMD(0) + 6, 0xA0);
+    EQ64(ib(&bus, IDE_CMD(0) + 7) & 0x89, 0x01, "write to a drive that is gone: ERR, no DRQ");
+    ide_lba(&bus, 0, 5, 2, 0x20);                   /* READ SECTORS, two */
+    ob(&bus, IDE_CMD(0) + 6, 0xB0);
+    ide_in(&bus, 0, b, 512);                        /* the second sector would be loaded */
+    ob(&bus, IDE_CMD(0) + 6, 0xA0);
+    EQ64(ib(&bus, IDE_CMD(0) + 7) & 0x89, 0x01, "read from a drive that is gone: ERR, no DRQ");
 
     uam_pci_bus_device(pb)->ops->destroy(uam_pci_bus_device(pb));
     dev->ops->destroy(dev);
@@ -2021,6 +2041,39 @@ static void test_x86_cpuid_hook(void)
     }
 }
 
+/* An ELF64 program header whose offset and size wrap past the end of the file. */
+static void test_elf_bounds(void)
+{
+    uam_machine m;
+    mips_machine(&m);
+    uint8_t e[64 + 56] = { 0x7F, 'E', 'L', 'F', 2 /* ELFCLASS64 */, 1 /* little-endian */, 1 };
+    e[32] = 64;                                     /* e_phoff */
+    e[54] = 56;                                     /* e_phentsize */
+    e[56] = 1;                                      /* e_phnum */
+    uint8_t *ph = e + 64;
+    ph[0] = 1;                                      /* PT_LOAD */
+    memset(ph + 8, 0xFF, 8);                        /* p_offset = 2^64 - 0x100 */
+    ph[8] = 0x00;
+    ph[24 + 1] = 0x10;                              /* p_paddr 0x1000 */
+    ph[32] = 0x40; ph[32 + 1] = 0x01;               /* p_filesz 0x140: the sum wraps to 0x40 */
+    ph[40] = 0x40; ph[40 + 1] = 0x01;               /* p_memsz */
+    char path[] = "/tmp/uam-test-elf-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0 && write(fd, e, sizeof(e)) == (ssize_t)sizeof(e), "write the image");
+    if (fd >= 0)
+        close(fd);
+    uam_image_info info;
+    EQ64(uam_load_elf(&m.bus, NULL, path, &info), UAM_ERR_INVALID, "a wrapping p_offset + p_filesz is refused");
+    memset(e + 32, 0xFF, 8);                        /* e_phoff = 2^64 - 1 */
+    fd = open(path, O_WRONLY);
+    CHECK(fd >= 0 && write(fd, e, sizeof(e)) == (ssize_t)sizeof(e), "rewrite the image");
+    if (fd >= 0)
+        close(fd);
+    EQ64(uam_load_elf(&m.bus, NULL, path, &info), UAM_ERR_INVALID, "a wrapping e_phoff is refused");
+    unlink(path);
+    uam_machine_fini(&m);
+}
+
 static void test_abi(void)
 {
     EQ64(uam_abi_version(), UAM_ABI_VERSION, "library ABI version");
@@ -2062,6 +2115,7 @@ int main(void)
     test_pci_cam();
     test_pci_msi_mem();
     test_nvme();
+    test_elf_bounds();
     test_ahci();
     test_pci_rom();
     test_ide();
