@@ -286,6 +286,8 @@ static uint64_t helper_mret(void *env, uint64_t a, uint64_t b, uint64_t c, uam_s
     s->mstatus = (s->mstatus & ~(MSTATUS_MIE | MSTATUS_MPP)) | (mpie ? MSTATUS_MIE : 0)
                | MSTATUS_MPIE | (RV_PRIV_M << 11); /* MPP <- least privileged mode (M only) */
     cpu->resv.valid = false;
+    if (mpie)
+        uam_cpu_request_exit(cpu); /* MIE is set again: a pending interrupt is taken now */
     return s->mepc;
 }
 
