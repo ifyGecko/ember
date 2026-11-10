@@ -676,7 +676,6 @@ static void ide_destroy(uam_device *dv)
     free(h);
 }
 
-static void cmdv_destroy(uam_device *dv) { (void)dv; }
 
 static void ide_save(uam_device *dv, uam_state_writer *w)
 {
@@ -765,12 +764,12 @@ static const uam_device_ops bm_ops = {
     .destroy = ide_destroy, .save = ide_save, .restore = ide_restore,
 };
 static const uam_device_ops cmd_ops = {
-    .type = "ide-command", .read = cmd_read, .write = cmd_write, .destroy = cmdv_destroy,
+    .type = "ide-command", .read = cmd_read, .write = cmd_write,
     .flags = UAM_DEVICE_STATELESS,
 };
 static const uam_device_ops ctl_ops = {
     .type = "ide-control", .impl_min = 1, .impl_max = 1, .read = ctl_read, .write = ctl_write,
-    .destroy = cmdv_destroy, .flags = UAM_DEVICE_STATELESS,
+    .flags = UAM_DEVICE_STATELESS,
 };
 
 uam_device *uam_ide_create(const char *name, uint16_t vendor, uint16_t device, uint8_t revision)

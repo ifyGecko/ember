@@ -414,7 +414,6 @@ static void gic_destroy(uam_device *d)
     free(g);
 }
 
-static void cpu_destroy(uam_device *d) { (void)d; }   /* owned by the distributor */
 
 /*
  * The layout of a one-CPU GIC, then (with several) the rest. Word 0 of each
@@ -541,7 +540,7 @@ static const uam_device_ops cpu_ops = {
     .impl_min = 4, .impl_max = 4,
     .read = cpu_read,
     .write = cpu_write,
-    .destroy = cpu_destroy,
+    /* no destroy: owned by the distributor */
     .flags = UAM_DEVICE_STATELESS,
 };
 

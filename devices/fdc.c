@@ -512,7 +512,6 @@ static void fdc_reset(uam_device *dv)
 }
 
 static void fdc_destroy(uam_device *dv) { free(from_dev(dv)); }
-static void dir_destroy(uam_device *dv) { (void)dv; }
 
 static void fdc_save(uam_device *dv, uam_state_writer *w)
 {
@@ -557,7 +556,7 @@ static const uam_device_ops regs_ops = {
 };
 static const uam_device_ops dir_ops = {
     .type = "pc,82077-fdc-dir", .impl_min = 1, .impl_max = 1, .read = dir_read, .write = dir_write,
-    .destroy = dir_destroy, .flags = UAM_DEVICE_STATELESS,
+    .flags = UAM_DEVICE_STATELESS,
 };
 
 uam_device *uam_fdc_create(const char *name, uam_device *dma, unsigned dma_channel)

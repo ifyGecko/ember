@@ -143,11 +143,19 @@ void uam_machine_fini(uam_machine *m)
     m->n_aps = 0;
     m->exec.smp = NULL;
     m->exec.n_smp = 0;
+    /* A device without a destroy op is owned by another one (a second register view
+     * inside its parent's allocation), which may be anywhere in the list: take those
+     * out first, so that no destroy frees a node this walk has yet to read. */
+    for (uam_device **pp = &m->devices; *pp;) {
+        if ((*pp)->ops->destroy)
+            pp = &(*pp)->next;
+        else
+            *pp = (*pp)->next;
+    }
     uam_device *d = m->devices;
     while (d) {
         uam_device *n = d->next;
-        if (d->ops->destroy)   /* optional, like reset: a parent-owned device has none */
-            d->ops->destroy(d);
+        d->ops->destroy(d);
         d = n;
     }
     m->devices = NULL;

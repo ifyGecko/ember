@@ -430,7 +430,6 @@ static void vga_reset(uam_device *d)
 }
 
 static void vga_destroy(uam_device *d) { free(from_io(d)); }
-static void mem_destroy(uam_device *d) { (void)d; }
 
 static void vga_save(uam_device *d, uam_state_writer *w)
 {
@@ -472,7 +471,7 @@ static const uam_device_ops io_ops = {
     .reset = vga_reset, .destroy = vga_destroy, .save = vga_save, .restore = vga_restore,
 };
 static const uam_device_ops mem_ops = {
-    .type = "vga-memory", .read = mem_read, .write = mem_write, .destroy = mem_destroy,
+    .type = "vga-memory", .read = mem_read, .write = mem_write,
     .flags = UAM_DEVICE_STATELESS, .peek = mem_peek,
 };
 
