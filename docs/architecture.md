@@ -567,7 +567,9 @@ devices.
   block jumps straight into it instead of returning to the run loop, for as long as the run loop
   would have nothing to do in between: no exit request, deadline not reached, links current.
   Each EXIT owns a link slot after its code; a slot is linked when the run loop next runs the
-  block the EXIT went to. A computed EXIT's slot holds its first target of the epoch, and its
+  block the EXIT went to. An EXIT to a constant pc ends in a direct jump that linking patches to
+  the next block's body; the JIT lists the jumps it has patched and unlinks them all when the
+  epoch moves. A computed EXIT's slot holds its first target of the epoch, and its
   other targets (a switch, a return to many callers) go through a jump table shared by all
   blocks, indexed by a hash of the target pc and linked the same way. Links belong to an epoch that
   moves on whenever a linked block may be invalid (a block freed or a code page written, a

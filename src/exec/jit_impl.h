@@ -32,14 +32,19 @@
 
 /* ---- runtime context ----------------------------------------------------------- */
 
-/* A chaining link, one per EXIT, stored after the block's code. */
+/* A chaining link, one per EXIT, stored after the block's code. A computed EXIT's slot
+ * and the jump table's entries are read by native code: (pc, entry), valid in one epoch.
+ * A constant EXIT's slot (epoch LINK_DIRECT, for good) is only its record: the EXIT ends
+ * in a direct jump, and linking patches that jump (jit_host_link). */
 typedef struct jit_slot {
-    uint64_t entry;   /* host address of the target block's body (valid if epoch matches) */
-    uint64_t epoch;   /* jc.epoch when linked; LINK_NONE when empty */
+    uint64_t entry;   /* host address of the target block's body (valid if epoch matches);
+                       * LINK_DIRECT: the address of the EXIT's jump instruction */
+    uint64_t epoch;   /* jc.epoch when linked; LINK_NONE when empty; or LINK_DIRECT */
     uint64_t pc;      /* guest pc of the target */
 } jit_slot;
 
-#define LINK_NONE UINT64_MAX
+#define LINK_NONE   UINT64_MAX
+#define LINK_DIRECT (UINT64_MAX - 1)
 
 /* A write-set data-TLB tag with this bit is a page that holds translated code: the
  * inline probe (tag == vpage) never matches it; the store's miss path does, and stores
@@ -150,7 +155,12 @@ struct uam_jit {
     size_t       n;
     bool         overflow;
     uint64_t     slot_pc[MAX_SLOTS];   /* each link slot's target (LINK_NONE: computed) */
+    size_t       slot_site[MAX_SLOTS]; /* a constant EXIT's jump instruction (code offset) */
     unsigned     n_slots;
+    size_t       slots_off;  /* where the slots are in the code (set by the code generator) */
+    /* the constant EXITs now linked: their jumps are unlinked when the epoch moves */
+    jit_slot   **linked;
+    uint32_t     n_linked, cap_linked;
     struct { size_t pos; uint16_t slot, off; } slot_ref[3 * MAX_SLOTS];   /* pc-relative
                                         * references to a slot's field, to patch */
     unsigned     n_slot_refs;
@@ -287,6 +297,10 @@ void     jit_host_stubs(uam_jit *j, size_t off[16]);
 bool     jit_host_compile(uam_jit *j, const uam_block *blk);
 /* Pure opcodes the code generator emits inline; any other is a call to jit_br_eval. */
 bool     jit_host_pure_inline(const uam_jit *j, uam_opcode op);
+/* Point a constant EXIT's jump instruction, at `site` in the arena, to `target` (a
+ * block's body), or with target NULL back to the miss path that follows it. jit.c makes
+ * the arena writable around it and syncs the instruction cache after. */
+void     jit_host_link(uint8_t *site, const uint8_t *target);
 /* For the register allocator: jc->temps[t] = reg; reg = jc->temps[t]. */
 void     jit_host_spill(uam_jit *j, uint32_t t, int reg);
 void     jit_host_fill(uam_jit *j, uint32_t t, int reg);

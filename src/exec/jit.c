@@ -1032,6 +1032,7 @@ void uam_jit_destroy(uam_jit *j)
     free(j->use_start);
     free(j->use_cur);
     free(j->use_pos);
+    free(j->linked);
     free(j);
 }
 
@@ -1063,10 +1064,18 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
         uam_tcache_flush(&j->x->tc);
         j->arena_used = j->arena_base;   /* the shared stubs stay */
         j->arena_gen++;
+        j->n_linked = 0;                 /* the linked jumps are gone with their code */
         if (j->opmap)
             fputs("R\n", j->opmap);   /* the addresses below are reused from here on */
     }
     uint8_t *code = j->arena + j->arena_used;
+    /* a constant EXIT's slot records where its jump instruction is */
+    for (unsigned k = 0; k < j->n_slots; k++) {
+        if (j->slot_pc[k] == LINK_NONE)
+            continue;
+        const uint64_t site = (uint64_t)(uintptr_t)code + j->slot_site[k];
+        memcpy(&j->cb[j->slots_off + sizeof(jit_slot) * k + offsetof(jit_slot, entry)], &site, 8);
+    }
     arena_write(true);
     memcpy(code, j->cb, j->n);
     arena_write(false);
@@ -1081,6 +1090,16 @@ bool uam_jit_compile(uam_jit *j, uam_block *blk)
 
 #define JIT_IC_FAR (UINT64_C(1) << 62)
 
+/* Point the jump of a constant EXIT (slot s) at `target`, or unlink it (NULL). */
+static void link_direct(const jit_slot *s, const uint8_t *target)
+{
+    uint8_t *site = (uint8_t *)(uintptr_t)s->entry;
+    arena_write(true);
+    jit_host_link(site, target);
+    arena_write(false);
+    arena_sync(site, 4);
+}
+
 void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chain *chain,
                  uam_block_result *res)
 {
@@ -1092,10 +1111,17 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
      * permissions depend on it (a user-mode access to a kernel page must fault). */
     if (cpu->priv != j->key_priv)
         uam_cpu_dtlb_flush(cpu);
-    /* A linked block may have become invalid since the epoch was set: kill all links. */
+    /* A linked block may have become invalid since the epoch was set: kill all links.
+     * Those native code compares (computed EXITs, the jump table) die with the epoch;
+     * the direct jumps of constant EXITs are unlinked here, one by one. Native code runs
+     * between two such points with the links it had at the first or made since, exactly
+     * as it does with slots compared against jc->epoch. */
     if (!j->key_valid || x->tc.gen != j->key_tc || cpu->xlate_gen != j->key_xgen
         || cpu->priv != j->key_priv) {
         jc->epoch++;
+        for (uint32_t k = 0; k < j->n_linked; k++)
+            link_direct(j->linked[k], NULL);
+        j->n_linked = 0;
         j->key_valid = true;
         j->key_tc = x->tc.gen;
         j->key_xgen = cpu->xlate_gen;
@@ -1107,11 +1133,20 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
      * may be in the arena (a block's own) or in jc (the jump table). */
     if (j->pend_slot) {
         if (chain->link && j->pend_arena == j->arena_gen && blk->guest_pc == j->pend_pc) {
-            arena_write(true);
-            j->pend_slot->entry = (uint64_t)(uintptr_t)blk->backend + j->body_off;
-            j->pend_slot->pc = blk->guest_pc;
-            j->pend_slot->epoch = jc->epoch;
-            arena_write(false);
+            const uint8_t *body = (const uint8_t *)blk->backend + j->body_off;
+            if (j->pend_slot->epoch == LINK_DIRECT) {
+                /* a constant EXIT that missed is unlinked: not in the list yet */
+                if (jit_grow(j, &j->linked, &j->cap_linked, j->n_linked + 1, sizeof(jit_slot *))) {
+                    j->linked[j->n_linked++] = j->pend_slot;
+                    link_direct(j->pend_slot, body);
+                }
+            } else {
+                arena_write(true);
+                j->pend_slot->entry = (uint64_t)(uintptr_t)body;
+                j->pend_slot->pc = blk->guest_pc;
+                j->pend_slot->epoch = jc->epoch;
+                arena_write(false);
+            }
         }
         j->pend_slot = NULL;
     }

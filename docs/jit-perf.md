@@ -164,6 +164,7 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 15: data-TLB probe | - | - | the probe reads the address in its temp's register and a store its value there (or as an immediate); the page-crossing test is folded into the tag compare (first byte's entry, last byte's page), and an ACC_ALIGNED access keeps only its alignment test |
 | 16: exit path | - | - | an EXIT stores res only on the ways out of native code (stop, budget spent, link miss); a constant target reads its slot's epoch and entry pc-relative; one `sub` on memory tests and counts the chain budget |
 | 17: icount against the stop point | - | - | the icount register holds icount - icount_stop as last read (on entry, after every bridge): an IMARK is `inc r13; jg stub`, an EXIT tests the sign; nothing read from memory. A stop from a signal handler is seen at the next return to the run loop (chains without a host poll are bounded to 4096 blocks) |
+| 18: direct links | - | - | an EXIT to a constant pc ends in `jmp rel32` (AArch64: `b`), patched to the next block's body when linked and back to the miss path when the epoch moves (the JIT lists the linked jumps); no epoch compare, no indirect jump: 5 host instructions per exit on x86-64, 6 on AArch64 |
 
 ## Where it stands (after step 8c)
 
@@ -416,6 +417,13 @@ A VxWorks boot (3e9 instructions) ends with the same console and `-d` state on t
 interpreter, the JIT before and the JIT after. Its time barely moves (6.8 s to 6.6 s):
 in its current state the board spends that run in 261 M bridge calls to devices.
 
+### After step 18
+
+Full-run time on an x86-64 host over step 17 (medians of 9 interleaved runs): RV32 1.06x,
+MIPS 1.05x, ARM 1.05x, Thumb 1.08x, PPC 1.03x, x86 1.04x. Host instructions per guest
+instruction on AArch64, counted as above: RV32 8.0 to 7.2, MIPS 8.3 to 7.5, ARM 11.6 to
+10.7, Thumb 11.7 to 10.7, PPC 10.1 to 9.3, x86 12.6 to 12.0.
+
 Not done yet:
 - **The x86 gap** (x86 at about 1.35-1.65x RV32's kernel time): writes live at block exits.
   Step 13, stages C1 and C2 in docs/jit-carry-design.md (approved; stage N done).
@@ -423,9 +431,8 @@ Not done yet:
 - **"Option B" for icount.** Count and check the deadline once at block entry instead of
   an add and a branch per instruction (step 17). It changes how stopping at a deadline is
   implemented, so it needs sign-off.
-- **Direct links.** An EXIT still compares an epoch and jumps through its slot (8 host
-  instructions on x86-64, 11 on AArch64). Patching a direct jump needs every link
-  unlinked when its target goes, and links that survive a privilege change (today each
-  one moves the epoch and flushes the data TLB).
+- **Links that survive a privilege change.** Each one moves the epoch, which unlinks
+  every direct jump (step 18) and kills every slot, and flushes the data TLB. The bench
+  never changes privilege, so this is unmeasured.
 - **Slow paths out of line**, and one flag-setting instruction shared by the compares of
   the same operands (ARM and x86 guests' flags).
