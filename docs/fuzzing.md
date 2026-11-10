@@ -300,7 +300,8 @@ with id 0, then one report per input, `bye`).
   between processors are not counted.
 - Interrupts are reported only when taken, and only as a crash (`--fuzz-crash-irq`); an
   interrupt line that is raised but masked is invisible to the harness.
-- `uam_fuzz_abort` (SIGINT in the runner) ends a campaign at the next instruction boundary.
+- `uam_fuzz_abort` (SIGINT in the runner) ends a campaign at the next instruction boundary
+  under the interpreter, and with the JIT at a block boundary at most a few thousand blocks on.
 
 ## suzzer
 

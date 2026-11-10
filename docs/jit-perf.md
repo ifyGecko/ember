@@ -5,7 +5,7 @@ analyses, the arena, linking) and its code generators, `src/exec/jit_x86.c` for 
 `src/exec/jit_a64.c` for AArch64. It covers the tools for measuring the JIT, a log of what
 each change bought, and how the guest ISAs compare. The log was measured on x86-64 and names
 x86-64 registers; the AArch64 code generator emits the same design op for op (one
-compare and an untaken branch per instruction, the same register allocation, flag fusion,
+add and an untaken branch per instruction, the same register allocation, flag fusion,
 deferred writes, data-TLB probes, code-page store stubs and chaining), so every step there
 applies to both. When the core was split out of `jit_x86.c`, the x86-64 code stayed
 identical: every block of every self-test has the same size and region offsets in the op
@@ -160,6 +160,10 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 11: spin loops | 1.69 s | 0.51 s | not a code generation change: the run loop adds the passes of a block that waits on memory (jumps back to itself, only loads, pure ops and register writes) up to the next deadline or host poll to icount at once, after evaluating one pass without effect shows it would change nothing (src/exec/spin.h; both backends). Measured against 1.68 s / 1.72 s in the same session; VxWorks under the interpreter 40.2 s -> 4.4 s; xbench unchanged (no kernel spins). `UAM_SPIN_SKIP=0` turns it off. Consoles, block counts and the interpreter-vs-JIT state identical on both |
 | 12: stores next to code | 1.74 s | 0.54 s | a page holding translated code goes into the data-TLB write set under a tag the inline probe never matches; a store that misses calls one of 16 shared stubs (size, byte order, alignment) that read the page's 64-byte code-line mask and store inline unless a byte falls in a code line (src/exec/jit_x86.c, emit_code_probe; `uam_bus_page_host_code`). Unchanged against 1.74 s / 0.53 s in the same session (bridge stores 76 K -> 38 K / 1.56 M -> 1.56 M, the rest device writes); code +1.1% / +1.5% (inline probes instead of stubs were +11% / +17% for 1-2% more on the bench). Consoles and the interpreter-vs-JIT state identical on both |
 | 13N: narrow register reads | 1.61 s | 8.22 s* | a GET of the low bytes of a register whose wider value the block already knows (from a PUT or a GET) becomes a TRUNC of that value instead of a register-file read, and folds from there (src/ir/opt.c, `lookup_wider`; docs/jit-carry-design.md, stage N). Only x86 has such reads (455 sites on the bench, 7802 on OVMF; none on the other guests, whose IR is unchanged). Measured against 1.64 s / 8.37 s in the same session; OVMF code +0.2%. *VxWorks is not comparable with the rows above: its board sources (~/tplink-qwen-emu, uncommitted GMAC work) changed since, and the baseline build of the same board sources gives the same console. Consoles and the interpreter-vs-JIT state identical on both |
+| 14: results in place | - | - | the allocator picks a result's register before the op is emitted (a free one, or that of an operand read for the last time) and the op computes there: no move through rax / x0 afterwards, `lea` for a three-operand add on x86-64 |
+| 15: data-TLB probe | - | - | the probe reads the address in its temp's register and a store its value there (or as an immediate); the page-crossing test is folded into the tag compare (first byte's entry, last byte's page), and an ACC_ALIGNED access keeps only its alignment test |
+| 16: exit path | - | - | an EXIT stores res only on the ways out of native code (stop, budget spent, link miss); a constant target reads its slot's epoch and entry pc-relative; one `sub` on memory tests and counts the chain budget |
+| 17: icount against the stop point | - | - | the icount register holds icount - icount_stop as last read (on entry, after every bridge): an IMARK is `inc r13; jg stub`, an EXIT tests the sign; nothing read from memory. A stop from a signal handler is seen at the next return to the run loop (chains without a host poll are bounded to 4096 blocks) |
 
 ## Where it stands (after step 8c)
 
@@ -374,10 +378,54 @@ The other guests' IR is identical before and after, so their runs only showed no
 (up to 12% on single kernels in a full run). x86 over RV32 per kernel is now about 1.35-1.65x (full run, same session).
 Stages C1 and C2 (writes carried across chained exits) are next.
 
+### After steps 14 to 17
+
+Four changes to the code both generators emit, none to what a block does. The two
+external workloads are not measurable at the moment, so these were judged on the bench
+alone. Full-run time on an x86-64 host, each step over the build before step 14 (one
+pinned core, medians of 9 interleaved runs; every run's checksums match the host
+build's):
+
+| Guest | before | 14 | 15 | 16 | 17 | code bytes after |
+|---|---:|---:|---:|---:|---:|---:|
+| RV32 | 0.232 s | 1.12x | 1.15x | 1.26x | **1.40x** | 104% |
+| MIPS | 0.256 s | 1.13x | 1.18x | 1.28x | **1.40x** | 103% |
+| ARM | 0.325 s | 1.24x | 1.25x | 1.35x | **1.49x** | 101% |
+| Thumb | 0.321 s | 1.24x | 1.25x | 1.35x | **1.47x** | 101% |
+| PPC | 0.301 s | 1.18x | 1.21x | 1.27x | **1.43x** | 101% |
+| x86 | 0.344 s | 1.28x | 1.29x | 1.33x | **1.43x** | 96% |
+
+Code shrinks through step 15 (92-95%) and grows again with step 17, whose bridge sites
+form cpu->icount and re-read the stop point: cold code.
+
+On AArch64 no timing was taken (no AArch64 machine at hand). Counting the host
+instructions executed under an instruction-level emulator, joined with the op map, gives
+host instructions per guest instruction, before and after the four steps:
+
+| | RV32 | MIPS | ARM | Thumb | PPC | x86 |
+|---|---:|---:|---:|---:|---:|---:|
+| before | 13.5 | 13.7 | 19.9 | 19.9 | 16.5 | 21.5 |
+| after | 8.0 | 8.3 | 11.6 | 11.7 | 10.1 | 12.6 |
+
+Counts are not time: on x86-64 the memory fast paths were 20% of the instructions but
+38% of the sampled time before these steps. After them an RV32 guest instruction on
+AArch64 costs 2.1 host instructions of EXIT and chaining (11 per exit), 1.8 of icount,
+1.6 of memory access.
+
+A VxWorks boot (3e9 instructions) ends with the same console and `-d` state on the
+interpreter, the JIT before and the JIT after. Its time barely moves (6.8 s to 6.6 s):
+in its current state the board spends that run in 261 M bridge calls to devices.
+
 Not done yet:
 - **The x86 gap** (x86 at about 1.35-1.65x RV32's kernel time): writes live at block exits.
   Step 13, stages C1 and C2 in docs/jit-carry-design.md (approved; stage N done).
 - **Translation cost on OVMF**: about 0.23 s of 1.6-1.7 s (last measured at step 9).
-- **"Option B" for icount.** Drop `inc r13` per instruction and check the deadline
-  once at block entry. It changes how stopping at a deadline is implemented, so it
-  needs sign-off.
+- **"Option B" for icount.** Count and check the deadline once at block entry instead of
+  an add and a branch per instruction (step 17). It changes how stopping at a deadline is
+  implemented, so it needs sign-off.
+- **Direct links.** An EXIT still compares an epoch and jumps through its slot (8 host
+  instructions on x86-64, 11 on AArch64). Patching a direct jump needs every link
+  unlinked when its target goes, and links that survive a privilege change (today each
+  one moves the epoch and flushes the data TLB).
+- **Slow paths out of line**, and one flag-setting instruction shared by the compares of
+  the same operands (ARM and x86 guests' flags).

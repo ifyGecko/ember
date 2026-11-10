@@ -573,7 +573,12 @@ devices.
   moves on whenever a linked block may be invalid (a block freed or a code page written, a
   translation or privilege change). Interrupts are still taken only by the run loop, so an ISA
   must request an exit on anything that can make `irq_take` newly succeed (`isa.h`). Chained runs
-  are bit-identical to unchained ones and to the interpreter; `--no-chain` turns it off.
+  are bit-identical to unchained ones and to the interpreter; `--no-chain` turns it off. Native
+  code counts instructions in a register against the point where it must stop, and rereads that
+  point after every call it makes into C, so a stop or exit requested by a device, a helper or a
+  hook takes effect at the next instruction, as on the interpreter. A stop requested from a
+  signal handler (`uam_exec_stop`) is seen when native code next returns to the run loop: within
+  the host poll interval, or 4096 blocks without one.
 - **Stores next to code** (JIT): the bus records which 64-byte lines of a page hold translated
   code, and only a write to such a line drops that code. The JIT's data-TLB keeps a page that
   holds code in its write set under a tag the inline probe cannot match; a store that misses
@@ -777,7 +782,8 @@ Implemented (`make test`):
   it rewrites, branches, self-modifying code, DI/EI with a timer, MMIO) through the interpreter and the JIT with and without chaining, with host
   code patches, PC hooks and snapshot restores in between, and requires identical state (also
   with a two-entry jump table, `UAM_JIT_JTAB_BITS=1`, so its links collide); and
-  code rewritten on a page that has just become a code page again must run as rewritten.
+  code rewritten on a page that has just become a code page again must run as rewritten. A stop
+  requested from a signal handler must end a loop that never calls out of native code.
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
   the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and
