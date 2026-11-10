@@ -32,14 +32,19 @@
 
 /* ---- runtime context ----------------------------------------------------------- */
 
-/* A chaining link, one per EXIT, stored after the block's code. */
+/* A chaining link, one per EXIT, stored after the block's code. A computed EXIT's slot
+ * and the jump table's entries are read by native code: (pc, entry), valid in one epoch.
+ * A constant EXIT's slot (epoch LINK_DIRECT, for good) is only its record: the EXIT ends
+ * in a direct jump, and linking patches that jump (jit_host_link). */
 typedef struct jit_slot {
-    uint64_t entry;   /* host address of the target block's body (valid if epoch matches) */
-    uint64_t epoch;   /* jc.epoch when linked; LINK_NONE when empty */
+    uint64_t entry;   /* host address of the target block's body (valid if epoch matches);
+                       * LINK_DIRECT: the address of the EXIT's jump instruction */
+    uint64_t epoch;   /* jc.epoch when linked; LINK_NONE when empty; or LINK_DIRECT */
     uint64_t pc;      /* guest pc of the target */
 } jit_slot;
 
-#define LINK_NONE UINT64_MAX
+#define LINK_NONE   UINT64_MAX
+#define LINK_DIRECT (UINT64_MAX - 1)
 
 /* A write-set data-TLB tag with this bit is a page that holds translated code: the
  * inline probe (tag == vpage) never matches it; the store's miss path does, and stores
@@ -107,7 +112,8 @@ uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64_t y, u
 
 /* ---- the compiler's state ------------------------------------------------------ */
 
-#define ARENA_SIZE (64u << 20)
+#define ARENA_SIZE (64u << 20)    /* the default; UAM_JIT_ARENA=bytes sets another */
+#define ARENA_MIN  (4u * CBUF_MAX) /* the least UAM_JIT_ARENA may ask for */
 #define CBUF_MAX   (64u << 10)   /* scratch code buffer per block */
 #define MAX_SLOTS  64u           /* EXITs per block that get a link (more just return) */
 #define MAX_HOST_REGS 32u
@@ -124,6 +130,7 @@ typedef struct jit_snap { uint32_t t; int8_t reg; } jit_snap;
 struct uam_jit {
     uam_exec    *x;
     uint8_t     *arena;
+    size_t       arena_size;
     size_t       arena_used;
     size_t       arena_base; /* the shared stubs at the start of the arena (kept on recycle) */
     uam_jit_ctx  jc;         /* reused across block runs */
@@ -150,7 +157,15 @@ struct uam_jit {
     size_t       n;
     bool         overflow;
     uint64_t     slot_pc[MAX_SLOTS];   /* each link slot's target (LINK_NONE: computed) */
+    size_t       slot_site[MAX_SLOTS]; /* a constant EXIT's jump instruction (code offset) */
     unsigned     n_slots;
+    size_t       slots_off;  /* where the slots are in the code (set by the code generator) */
+    /* the constant EXITs now linked: their jumps are unlinked when the epoch moves. Each
+     * records the arena generation it was linked in: one from before the arena was
+     * recycled is gone with its code and must never be written (the list is emptied on
+     * a recycle as well). */
+    struct jit_linked { jit_slot *slot; uint32_t gen; } *linked;
+    uint32_t     n_linked, cap_linked;
     struct { size_t pos; uint16_t slot, off; } slot_ref[3 * MAX_SLOTS];   /* pc-relative
                                         * references to a slot's field, to patch */
     unsigned     n_slot_refs;
@@ -287,6 +302,13 @@ void     jit_host_stubs(uam_jit *j, size_t off[16]);
 bool     jit_host_compile(uam_jit *j, const uam_block *blk);
 /* Pure opcodes the code generator emits inline; any other is a call to jit_br_eval. */
 bool     jit_host_pure_inline(const uam_jit *j, uam_opcode op);
+/* Is `site` (in the arena) a constant EXIT's jump instruction, as jit_host_link patches?
+ * A check against writing anywhere else. */
+bool     jit_host_link_site(const uint8_t *site);
+/* Point a constant EXIT's jump instruction, at `site` in the arena, to `target` (a
+ * block's body), or with target NULL back to the miss path that follows it. jit.c makes
+ * the arena writable around it and syncs the instruction cache after. */
+void     jit_host_link(uint8_t *site, const uint8_t *target);
 /* For the register allocator: jc->temps[t] = reg; reg = jc->temps[t]. */
 void     jit_host_spill(uam_jit *j, uint32_t t, int reg);
 void     jit_host_fill(uam_jit *j, uint32_t t, int reg);

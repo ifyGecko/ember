@@ -567,7 +567,9 @@ devices.
   block jumps straight into it instead of returning to the run loop, for as long as the run loop
   would have nothing to do in between: no exit request, deadline not reached, links current.
   Each EXIT owns a link slot after its code; a slot is linked when the run loop next runs the
-  block the EXIT went to. A computed EXIT's slot holds its first target of the epoch, and its
+  block the EXIT went to. An EXIT to a constant pc ends in a direct jump that linking patches to
+  the next block's body; the JIT lists the jumps it has patched and unlinks them all when the
+  epoch moves. A computed EXIT's slot holds its first target of the epoch, and its
   other targets (a switch, a return to many callers) go through a jump table shared by all
   blocks, indexed by a hash of the target pc and linked the same way. Links belong to an epoch that
   moves on whenever a linked block may be invalid (a block freed or a code page written, a
@@ -783,7 +785,10 @@ Implemented (`make test`):
   code patches, PC hooks and snapshot restores in between, and requires identical state (also
   with a two-entry jump table, `UAM_JIT_JTAB_BITS=1`, so its links collide); and
   code rewritten on a page that has just become a code page again must run as rewritten. A stop
-  requested from a signal handler must end a loop that never calls out of native code.
+  requested from a signal handler must end a loop that never calls out of native code. With a
+  small code arena (`UAM_JIT_ARENA=bytes`, default 64 MiB) recycled some 70 times while blocks are
+  linked, a run must end as on the interpreter; the JIT stops the process rather than patch a
+  jump that is not one of the arena's current code.
 - Coverage: `test_cov` covers `UAM_OP_COV` (verifier, printer, optimizer, saturation, prev
   chaining), passes (no-op and counting passes change nothing; failing or invalid ones stop
   the run), expected hit counts and edge buckets for a known loop on RV32, MIPS32 BE/LE and

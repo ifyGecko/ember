@@ -710,13 +710,11 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigne
     g8(j, 0x83); modrm_mem(j, 5, RBX, OFF(chain_left)); g8(j, 1);   /* sub dword [chain_left], 1 */
     const size_t spent = jcc_fwd(j, 0x82);                          /* jb */
     if (fixed) {
-        ld_mem(j, RAX, RBX, OFF(epoch));
-        g8(j, 0x48); g8(j, 0x3B); g8(j, 0x05);                      /* cmp rax, [rip + slot.epoch] */
-        jit_slot_ref(j, j->n, SLOT(epoch)); g32(j, 0);
-        miss[n_miss++] = jcc_fwd(j, 0x85);
-        g8(j, 0xFF); g8(j, 0x25);                                   /* jmp [rip + slot.entry] */
-        jit_slot_ref(j, j->n, SLOT(entry)); g32(j, 0);
-        patch(j, miss[0]);
+        /* the link: a direct jump, to the next block's body once linked (jit_host_link),
+         * until then to the miss path right after it */
+        g8(j, 0xE9);                                                /* jmp rel32 */
+        j->slot_site[j->n_slots - 1] = j->n;
+        g32(j, 0);
         g8(j, 0x48); g8(j, 0x8D); g8(j, 0x05);                      /* lea rax, [rip + slot] */
         jit_slot_ref(j, j->n, 0); g32(j, 0);
     } else {
@@ -736,6 +734,7 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigne
         g8(j, 0x69); g8(j, 0xC1); g32(j, JTAB_HASH);                    /* imul eax, ecx, JTAB_HASH */
         g8(j, 0xC1); g8(j, 0xE8); g8(j, (uint8_t)(32 - j->jtab_bits));  /* shr eax, 32 - bits */
         g8(j, 0x48); g8(j, 0x8D); g8(j, 0x04); g8(j, 0x40);             /* lea rax, [rax + rax*2] */
+        _Static_assert(sizeof(jit_slot) == 24, "the jump table index is scaled by 24");
         g8(j, 0x48); g8(j, 0x8D); g8(j, 0x84); g8(j, 0xC3);             /* lea rax, [rbx + rax*8 + jtab] */
         g32(j, (uint32_t)OFF(jtab));
         rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, SLOT(pc));       /* cmp rcx, [e.pc] */
@@ -1651,9 +1650,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
         if (pos + 4 <= CBUF_MAX)
             memcpy(&j->cb[pos], &rel, 4);
     }
+    j->slots_off = j->n;
     for (unsigned k = 0; k < j->n_slots; k++) {
-        g64(j, 0);                                       /* entry */
-        g64(j, LINK_NONE);                               /* epoch: never linked */
+        const bool fixed = j->slot_pc[k] != LINK_NONE;
+        g64(j, 0);                                       /* entry (constant: jit.c sets the site) */
+        g64(j, fixed ? LINK_DIRECT : LINK_NONE);         /* epoch: never linked */
         g64(j, j->slot_pc[k]);                           /* pc */
     }
     /* fault sites (8-aligned too: slots are 24 bytes) */
@@ -1685,6 +1686,15 @@ bool jit_host_init(uam_jit *j)
     j->pool_kept = 1;                              /* r12 */
     j->res_reg = RAX;
     return true;
+}
+
+bool jit_host_link_site(const uint8_t *site) { return site[-1] == 0xE9; }   /* jmp rel32 */
+
+void jit_host_link(uint8_t *site, const uint8_t *target)
+{
+    /* site is the rel32 of a jmp: 0 falls through to the miss path */
+    const int32_t rel = target ? (int32_t)(target - (site + 4)) : 0;
+    memcpy(site, &rel, 4);
 }
 
 void jit_host_spill(uam_jit *j, uint32_t t, int reg) { st_temp(j, t, reg); }

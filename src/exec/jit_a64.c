@@ -705,12 +705,6 @@ static void chain_jump(uam_jit *j)
     ld64(j, X16, X0, SLOT(entry));
     g32(j, 0xD61F0000u | X16 << 5);                        /* br x16 */
 }
-/* ldr x<rt>, <a field of the newest link slot> (pc-relative, patched at the end) */
-static void ld_slot(uam_jit *j, int rt, unsigned off)
-{
-    jit_slot_ref(j, j->n, off);
-    g32(j, 0x58000000u | (uint32_t)rt);
-}
 
 /*
  * An EXIT to `target` (its pc operand): jump straight into the next block if its link is
@@ -735,14 +729,14 @@ static void emit_chain(uam_jit *j, const uam_block *blk, uam_ref target, unsigne
     mem(j, 2, true, X17, JC, OFF(chain_left));
     const size_t spent = cbz_fwd(j, false, X17);
     if (fixed) {
-        ld64(j, X0, JC, OFF(epoch));
-        ld_slot(j, X16, SLOT(epoch));
-        addsub_reg(j, true, true, true, XZR, X0, X16, 0);
-        miss[n_miss++] = bcond_fwd(j, CC_NE);
+        /* the link: a direct branch, to the next block's body once linked
+         * (jit_host_link), until then to the miss path right after it, which gives the
+         * hop back */
         chain_hop(j);
-        ld_slot(j, X16, SLOT(entry));
-        g32(j, 0xD61F0000u | X16 << 5);                    /* br x16 */
-        patch(j, miss[0]);
+        j->slot_site[j->n_slots - 1] = j->n;
+        g32(j, 0x14000001u);                               /* b .+4 */
+        addsub_imm(j, false, false, false, X17, X17, 1, false);
+        st32(j, X17, JC, OFF(chain_left));
         jit_slot_ref(j, adr_fwd(j, X0), 0);                /* x0 = &slot */
     } else {
         jit_slot_ref(j, adr_fwd(j, X0), 0);                /* x0 = &slot */
@@ -1576,9 +1570,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     for (unsigned k = 0; k < j->n_slot_refs; k++)
         patch_to(j, j->slot_ref[k].pos,
                  j->n + sizeof(jit_slot) * j->slot_ref[k].slot + j->slot_ref[k].off);
+    j->slots_off = j->n;
     for (unsigned k = 0; k < j->n_slots; k++) {
-        g64(j, 0);                                         /* entry */
-        g64(j, LINK_NONE);                                 /* epoch: never linked */
+        const bool fixed = j->slot_pc[k] != LINK_NONE;
+        g64(j, 0);                                         /* entry (constant: jit.c sets the site) */
+        g64(j, fixed ? LINK_DIRECT : LINK_NONE);           /* epoch: never linked */
         g64(j, j->slot_pc[k]);                             /* pc */
     }
     /* fault sites (8-aligned too: slots are 24 bytes) */
@@ -1605,6 +1601,20 @@ bool jit_host_init(uam_jit *j)
     j->pool_kept = 5;                                      /* x24..x28 */
     j->res_reg = X0;
     return true;
+}
+
+bool jit_host_link_site(const uint8_t *site)
+{
+    uint32_t in;
+    memcpy(&in, site, 4);
+    return (in & 0xFC000000u) == 0x14000000u;                 /* b */
+}
+
+void jit_host_link(uint8_t *site, const uint8_t *target)
+{
+    /* site is a b: to the next instruction, the miss path, when unlinked */
+    const uint32_t in = 0x14000000u | ((uint32_t)((target ? target - site : 4) >> 2) & 0x3FFFFFFu);
+    memcpy(site, &in, 4);
 }
 
 void jit_host_spill(uam_jit *j, uint32_t t, int reg) { st_temp(j, t, reg); }
