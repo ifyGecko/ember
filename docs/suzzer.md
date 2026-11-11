@@ -143,12 +143,9 @@ analyzeHeadless <dir> <project> -process fw.elf -noanalysis -scriptPath suzzer/t
 Their first argument is the output file (the program is the one Ghidra has open; give an
 absolute path), and a raw image's processor and base are chosen at import instead of with
 `--raw --base ...`. suzzer's `tools/ghidra/README.md` has the rest, including the Jython
-extension that Ghidra 11.4 and later need. `analyzeHeadless` exits 0 even when a script did
-not run, so check that the files were written: on a Ghidra that hands `.py` scripts to
-PyGhidra the log says `Ghidra was not started with PyGhidra`, and copies of the two scripts
-with a `#@runtime Jython` line in their header run under Jython. Make both files with the
-same tool: the two analyses cut basic blocks differently (Ghidra ends one at a call), so
-their site sets are not the same.
+extension that Ghidra 11.4 and later need. Make both files with the same tool: the two
+analyses cut basic blocks differently (Ghidra ends one at a call), so their site sets are
+not the same.
 
 To let suzzer's brain drive ember directly, start the brain and point ember at it:
 

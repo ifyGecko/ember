@@ -75,7 +75,6 @@ H="$GHIDRA_HOME/support/analyzeHeadless"; P="${GHIDRA_PROJECTS:-$HOME/GhidraProj
 "$H" "$P" fw.bin_recon -process fw.bin -noanalysis -scriptPath suzzer/tools/ghidra \
     -postScript gen_boundary_ghidra.py "$PWD/fuzz/fw.lcvb" handle_request:begin \
     --strategy entry --patchlist "$PWD/fuzz/fw.lcv3"
-ls -l fuzz/fw.lcv3 fuzz/fw.lcvb        # analyzeHeadless exits 0 even if the script never ran
 IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
 ```
 
@@ -92,14 +91,7 @@ IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
   runs in Ghidra's directory, not yours.
 - **They are Jython 2.7 scripts.** Ghidra 11.4 and later no longer bundle Jython: install
   the Jython extension (`Extensions/Ghidra/ghidra_*_Jython.zip`, unzipped into
-  `Ghidra/Extensions/`) first. If the headless log then says `Ghidra was not started with
-  PyGhidra. Python is not available`, Ghidra gave the `.py` file to PyGhidra instead and
-  nothing was written: run copies that name their runtime, and point `-scriptPath` at them:
-
-  ```bash
-  mkdir -p build/suzzer-ghidra && cp suzzer/tools/ghidra/*.py build/suzzer-ghidra/
-  sed -i '1a #@runtime Jython' build/suzzer-ghidra/gen_*_ghidra.py
-  ```
+  `Ghidra/Extensions/`) first.
 - **Generate against the bytes the board places**: the stage being fuzzed, at the RECON base.
   For a raw image with the rizin tools, suzzer's `--raw --base <RECON base> --arch ARCH
   --bits N --endian E --symbols FILE` (all but `--symbols` are required; `FILE` is `nm`
