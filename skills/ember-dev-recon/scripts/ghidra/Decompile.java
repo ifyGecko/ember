@@ -23,8 +23,6 @@
 // Usage (headless; ghidra-query.sh does this):
 //   analyzeHeadless <proj_dir> <proj> -process [<program>] -readOnly -noanalysis \
 //     -scriptPath <this dir> -postScript Decompile.java <out.txt> <mode> [targets...]
-//
-// Authored in Java (not Jython) so it runs under plain headless without PyGhidra.
 //@category Analysis.Firmware
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;

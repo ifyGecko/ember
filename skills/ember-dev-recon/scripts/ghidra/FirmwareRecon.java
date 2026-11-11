@@ -7,8 +7,6 @@
 //   analyzeHeadless <proj_dir> <proj> -import <blob> -loader BinaryLoader \
 //     -loader-baseAddr 0x<base> -processor <lang> \
 //     -scriptPath <this dir> -postScript FirmwareRecon.java <out.txt | an existing directory>
-//
-// Authored in Java (not Jython) so it runs under plain headless without PyGhidra.
 //@category Analysis.Firmware
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
