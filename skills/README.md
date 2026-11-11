@@ -33,7 +33,7 @@ checkout a project pins is the authority on options and APIs; the skills say whe
 |---|---|
 | recon | python3 (stdlib only); optional `binwalk`; Ghidra for the analysis pass (headless `analyzeHeadless`, or a Ghidra MCP server for interactive work) |
 | build | git, a C11 compiler, make, python3, an ember git checkout or URL; `gdb-multiarch` for debugging (see ember-dev-build for which ISAs it can drive) |
-| fuzz | a working ember-dev-build project; optionally a suzzer checkout (plus rizin for its list generators) |
+| fuzz | a working ember-dev-build project; optionally a suzzer checkout, plus one of the two tools its list generators run on: rizin with python3's `rzpipe`, or headless Ghidra with the Jython extension (the Ghidra recon already uses) |
 | tests | the build requirements; `mips-linux-gnu-gcc` (fixture firmware) and gcc with `-m32` (the PC fixture); ember's own firmware builds (`make firmware firmware-mips ...` in the ember checkout) for the bare-board runs. Optional: gdb-multiarch, OVMF, Ghidra. Parts whose tools are missing are skipped |
 
 ## Install

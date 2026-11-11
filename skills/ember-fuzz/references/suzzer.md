@@ -45,8 +45,17 @@ exec "$PROJ/run.sh" -n 2000000000 \
 
 ## Site lists and boundaries
 
+suzzer has two sets of generators that write the same LCV3 and LCVB1 files: the rizin ones
+(`tools/gen_patchlist.py`, `tools/gen_boundary.py`; they need rizin and python3's `rzpipe`)
+and their Ghidra Jython ports (`tools/ghidra/gen_patchlist_ghidra.py`,
+`gen_boundary_ghidra.py`; headless Ghidra, no rizin). Use either, but make both files of one
+target with the same one: the two analyses cut basic blocks differently (Ghidra ends one at a
+call), so their site sets differ.
+
+With rizin:
+
 ```bash
-# suzzer side (needs rizin): sites and boundaries for the exact bytes the board runs
+# suzzer side: sites and boundaries for the exact bytes the board runs
 python3 suzzer/tools/gen_patchlist.py --strategy entry fw.elf fuzz/fw.lcv3
 python3 suzzer/tools/gen_boundary.py --strategy entry --patchlist fuzz/fw.lcv3 fw.elf \
     fuzz/fw.lcvb handle_request:begin
@@ -54,10 +63,48 @@ python3 suzzer/tools/gen_boundary.py --strategy entry --patchlist fuzz/fw.lcv3 f
 IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
 ```
 
+With headless Ghidra, on the project ember-dev-recon's `recon.sh` already made (the stage
+imported at the RECON base and analysed, `$GHIDRA_PROJECTS/<file name>_recon`), so nothing is
+analysed twice and RECON's function names are the ones the markers use:
+
+```bash
+H="$GHIDRA_HOME/support/analyzeHeadless"; P="${GHIDRA_PROJECTS:-$HOME/GhidraProjects}"
+# -process takes the program's name in the project: the stage file as recon imported it
+"$H" "$P" fw.bin_recon -process fw.bin -noanalysis -scriptPath suzzer/tools/ghidra \
+    -postScript gen_patchlist_ghidra.py "$PWD/fuzz/fw.lcv3" --strategy entry
+"$H" "$P" fw.bin_recon -process fw.bin -noanalysis -scriptPath suzzer/tools/ghidra \
+    -postScript gen_boundary_ghidra.py "$PWD/fuzz/fw.lcvb" handle_request:begin \
+    --strategy entry --patchlist "$PWD/fuzz/fw.lcv3"
+ls -l fuzz/fw.lcv3 fuzz/fw.lcvb        # analyzeHeadless exits 0 even if the script never ran
+IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
+```
+
+  (Without a recon project: `"$H" <dir> <name> -import fw.elf -scriptPath ... -postScript
+  gen_patchlist_ghidra.py ...` imports and analyses first; later calls use `-process`.)
+
+- **The Ghidra ports differ from the rizin tools in their command line** (suzzer's
+  `tools/ghidra/README.md` is the authority): the first argument is the output file, since
+  the program is the one Ghidra has open; there is no `--raw/--base/--arch/--bits/--endian`,
+  since the processor, base and byte order are those of the import (recon's, here);
+  function names are Ghidra's bare ones (no `sym.` prefix), and default-named `FUN_xxxx`
+  functions are skipped unless `--include-fcn` (stripped firmware is mostly those: pass it,
+  or name the functions first, in the project or with `--symbols`). Output paths must be absolute: the script
+  runs in Ghidra's directory, not yours.
+- **They are Jython 2.7 scripts.** Ghidra 11.4 and later no longer bundle Jython: install
+  the Jython extension (`Extensions/Ghidra/ghidra_*_Jython.zip`, unzipped into
+  `Ghidra/Extensions/`) first. If the headless log then says `Ghidra was not started with
+  PyGhidra. Python is not available`, Ghidra gave the `.py` file to PyGhidra instead and
+  nothing was written: run copies that name their runtime, and point `-scriptPath` at them:
+
+  ```bash
+  mkdir -p build/suzzer-ghidra && cp suzzer/tools/ghidra/*.py build/suzzer-ghidra/
+  sed -i '1a #@runtime Jython' build/suzzer-ghidra/gen_*_ghidra.py
+  ```
 - **Generate against the bytes the board places**: the stage being fuzzed, at the RECON base.
-  For a raw image, suzzer's `--raw --base <RECON base> --arch ARCH --bits N --endian E
-  --symbols FILE` (all but `--symbols` are required; `FILE` is `nm` output, `ADDR NAME` lines
-  or a Ghidra symbol-table CSV, so RECON's names work).
+  For a raw image with the rizin tools, suzzer's `--raw --base <RECON base> --arch ARCH
+  --bits N --endian E --symbols FILE` (all but `--symbols` are required; `FILE` is `nm`
+  output, `ADDR NAME` lines or a Ghidra symbol-table CSV, so RECON's names work). With the
+  Ghidra ports the import already has the base; `--symbols FILE` still names functions.
 - **Where the sites are.** The board places the image itself (`--image os=`), so the runner
   has no image of its own to take a link base from. A list generated from an ELF carries
   its base and needs nothing more; for a list generated from a raw image, add

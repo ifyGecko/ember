@@ -201,7 +201,8 @@ tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c t
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
 tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
-                  runner) gen-check.sh  (lists from suzzer's own generators, with rizin)
+                  runner) gen-check.sh  (lists from suzzer's own rizin generators; its Ghidra
+                  ports write the same files and are not run here)
 tests/szr/        szr-check.sh fake_brain.py  (the SZR1 executor against a scripted brain)
                   brain-check.sh  (a session with suzzer's own brain)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)

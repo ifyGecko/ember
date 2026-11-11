@@ -21,7 +21,8 @@ inputs a frontend sends (suzzer's brain over `--fuzz-szr`, or your own program o
 
 Read `references/harness.md` before configuring a target (routes, boundaries, oracles,
 per-ISA notes, verdicts, coverage, triage), and `references/suzzer.md` when suzzer is
-involved. This skill ships in ember's repository (`skills/ember-fuzz/`, beside
+involved (its site and boundary lists come from suzzer's rizin generators or, without
+rizin, from their Ghidra ports run by headless Ghidra on the recon project). This skill ships in ember's repository (`skills/ember-fuzz/`, beside
 `skills/ember-dev-recon/` and `skills/ember-dev-build/`), but the project links the ember
 it pins: that checkout's `docs/fuzzing.md`, `docs/suzzer.md` and `build/<board>-run --help`
 are the authority on option details, and a pin older than this skill may lack options used

@@ -333,7 +333,10 @@ pick a site strategy per architecture; on RV32 the default (`terminator`) puts a
 site on its last instruction, which in the fuzz target is *after* the UART status read, so
 every input would run as "no data". Generate both lists with `--strategy entry` (the MIPS
 default anyway) and name the input handler: `gen_patchlist.py --strategy entry fw.elf fw.lcv3`
-and `gen_boundary.py --strategy entry --patchlist fw.lcv3 fw.elf fw.lcvb handler:begin`.
+and `gen_boundary.py --strategy entry --patchlist fw.lcv3 fw.elf fw.lcvb handler:begin`
+(or suzzer's Ghidra ports of the two, `tools/ghidra/gen_patchlist_ghidra.py` and
+`gen_boundary_ghidra.py`, run by headless Ghidra instead of rizin with the same
+`--strategy entry`: [`suzzer.md`](suzzer.md)).
 ember accepts a marker that is not a patch-list site (it simply has no coverage of its own);
 libcov would never fire such a marker, so keep the two lists from one generator run.
 

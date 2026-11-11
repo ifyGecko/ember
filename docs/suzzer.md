@@ -102,7 +102,7 @@ once).
 
 and `make test` adds `test_suzzer` (the format readers and the conformance vectors) and
 `suzzer-test`: the options end to end on RV32, MIPS32 BE/LE, ARMv7 Thumb-2 (LE and BE8) and 32-bit PowerPC (with lists
-from suzzer's own generators too, when rizin and rzpipe are installed), the LCVS region read back by
+from suzzer's own rizin generators too, when rizin and rzpipe are installed; its Ghidra ports are not run by the tests), the LCVS region read back by
 suzzer's `test/shm_bitmap.py` and an independent reader, the SZR1 executor against a
 scripted brain (`tests/szr/fake_brain.py`), and a session with suzzer's own
 `tools/suzzer_brain.py` (`tests/szr/brain-check.sh`). See
@@ -120,12 +120,35 @@ build/uam-run -b mips-ref --cov-sites fw.lcv3 --cov-boundary fw.lcvb --cov-stric
     --fuzz-input uart0 --fuzz-crash-pc 0x80102000 --fuzz-replay corpus/ fw.elf
 ```
 
-(The generators and their options belong to suzzer; see its `HOWTO.md`. They need rizin.
+(The generators and their options belong to suzzer; see its `HOWTO.md`. These two need rizin
+and python3's `rzpipe`; the Ghidra alternative is below.
 `--strategy entry` puts the BEGIN marker at the handler's first instruction, before it reads
 any input, which is where ember snapshots; on RV32 the generators' default would place it
 after the read. `--fuzz-crash-pc` names the firmware's fatal-error routine, e.g. from
 `nm fw.elf`. For a raw image, generate with suzzer's `--raw --base ... --symbols ...` and run
 it with `--raw-base` and, if its reset code is not at its first byte, `--entry`.)
+
+**Ghidra instead of rizin.** suzzer also has Ghidra Jython ports of both generators
+(`tools/ghidra/`), which write the same two files from a program analysed in Ghidra, so
+headless Ghidra can make the lists and rizin is not needed:
+
+```bash
+analyzeHeadless <dir> <project> -import fw.elf -scriptPath suzzer/tools/ghidra \
+    -postScript gen_patchlist_ghidra.py $PWD/fw.lcv3 --strategy entry
+analyzeHeadless <dir> <project> -process fw.elf -noanalysis -scriptPath suzzer/tools/ghidra \
+    -postScript gen_boundary_ghidra.py $PWD/fw.lcvb handle_request:begin \
+    --strategy entry --patchlist $PWD/fw.lcv3
+```
+
+Their first argument is the output file (the program is the one Ghidra has open; give an
+absolute path), and a raw image's processor and base are chosen at import instead of with
+`--raw --base ...`. suzzer's `tools/ghidra/README.md` has the rest, including the Jython
+extension that Ghidra 11.4 and later need. `analyzeHeadless` exits 0 even when a script did
+not run, so check that the files were written: on a Ghidra that hands `.py` scripts to
+PyGhidra the log says `Ghidra was not started with PyGhidra`, and copies of the two scripts
+with a `#@runtime Jython` line in their header run under Jython. Make both files with the
+same tool: the two analyses cut basic blocks differently (Ghidra ends one at a call), so
+their site sets are not the same.
 
 To let suzzer's brain drive ember directly, start the brain and point ember at it:
 

@@ -955,8 +955,9 @@ else
 endif
 
 # suzzer's formats and the SZR1 executor through the runner (lists written by
-# tests/suzzer/mk_lists.py, and by suzzer's own generators when rizin is installed): the
-# LCVS export read back by suzzer's test/shm_bitmap.py,
+# tests/suzzer/mk_lists.py, and by suzzer's own rizin generators when rizin is installed;
+# its Ghidra ports, which write the same files with headless Ghidra, are not run here):
+# the LCVS export read back by suzzer's test/shm_bitmap.py,
 # a session with suzzer's own brain (tools/suzzer_brain.py), and the protocol frame by
 # frame against a scripted brain (tests/szr/fake_brain.py).
 ifeq ($(HAVE_SUZZER),1)

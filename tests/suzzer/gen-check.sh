@@ -6,6 +6,8 @@
 # LCVB1 begin marker at fuzz_iteration for FIRMWARE, a build of
 # tests/fuzz/fuzztarget.h, with the entry strategy (docs/suzzer.md). ember must find
 # every site's bytes in memory (--cov-strict) and give the planted bugs' verdicts.
+# (suzzer's Ghidra ports of the two, tools/ghidra/, write the same files with headless
+# Ghidra instead of rizin; this check does not run them.)
 set -eu
 run=$1
 board=$2
