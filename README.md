@@ -50,7 +50,8 @@ boards have one processor) takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
-`--watch`), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
+`--watch`), bring-up traces that are off until asked for (device accesses, system registers,
+interrupt lines, the register and value a polling loop waits for, stamped console lines), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
 pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
 dependencies beyond libc and libm.
 
@@ -306,8 +307,40 @@ build/uam-run --mmio-rule 0x18040000=fixed:0x1 fw.elf                 # a status
 build/uam-run --mmio-rule 0x18020000+0x100=echo,set=0x60 fw.elf       # read back writes, bits 5-6 set
 build/uam-run --mmio-rule 0x18060010=input,width=1 --mmio-input case.bin fw.elf
 ```
+Every trace is off unless asked for; a normal run prints only the catch-all windows'
+to-do list and how it ended. `--trace LIST` (repeatable, comma-separated) turns on the
+ones a bring-up step needs, all on stderr:
+
+| kind | what it shows | for |
+|---|---|---|
+| `exc` | exceptions, interrupts taken, resets | where control went |
+| `blocks`, `ir` | every block executed; the IR of each translated block | control flow, the lifter |
+| `mmio` | every access a device serves (MMIO, a ROM device in device mode, an unmapped address, x86 ports): `mmio: r 1 0x10000005 uart0+0x5 = 0x60 pc=0x8000025e icount=141` | the register protocol a driver speaks: what to model, in which order, with which values |
+| `sysreg` | the first read and the first write of each system register (CSR, CP0, CP15, SPR, MSR, ...) with value and pc, every access that faults, and a per-register summary at the stop; `sysreg-all`: every access | which core and implementation registers the firmware relies on |
+| `irq` | each change of a processor's interrupt input lines; at the stop, each line's rises and falls and whether an interrupt is pending and enabled | "was the interrupt raised, did it reach the CPU, is it masked" |
+| `polls` | loops that wait on a device register, with the value they wait for: `poll: waiting: pc 0x80000004: loop at 0x80000004 reads 4 bytes at 0x20000014 (rule@0x20000014+0x0), last 0x0; leaves the loop if bit 5 (0x20) becomes 1`; a `done:` line with the value that ended a long wait, and a summary at the stop (`STILL POLLING at the stop: ...`) | the next blocker of a stalled run, and the `--mmio-rule` or device behaviour that clears it |
+| `console` | each line the guest prints, with the icount and pc of its first byte | lining console output up with `--trace-after`, `--snapshot-at`, `-n N -d` |
+| `all` | `exc,mmio,sysreg,irq,polls,console` | a first look at a short run |
+
+`--trace-mmio-range LO:HI` limits the `mmio` trace to physical addresses in [LO, HI);
+`--poll-report N` is how many passes in a row a loop makes before `polls` reports it
+(default 10000). Polls are found among single-block loops that read one device register
+and count nothing (a `readl()` that is not inlined, or a loop with a timeout counter, is not
+one); the value they wait for is worked out by re-running one pass, without effects, with
+other values for the register. The catch-all logs (`unknown-mmio`, `unimp`, `mmio-stub`,
+the PC `master-abort`) name the instruction of each first access (`pc=0x... icount=N`), and
+`--log-stamp` starts every log line made while the guest runs with `@ICOUNT`. All of it is
+the same with and without `--jit`.
+
+```bash
+build/uam-run -t polls -n 50000000 fw.elf     # a stalled boot: what is it waiting for?
+build/uam-run -t mmio --trace-mmio-range 0x18040000:0x18041000 fw.elf   # one peripheral's protocol
+build/uam-run -t sysreg,irq,console fw.elf    # system registers, interrupt lines, stamped console
+```
+
 `--trace ir` prints every translated block in the IR's text form; `--trace blocks`
-can be narrowed with `--trace-range LO:HI` and `--trace-after N`. A block trace lists every
+can be narrowed with `--trace-range LO:HI` and `--trace-after N` (which also holds back
+the `mmio`, `sysreg`, `irq` and `console` traces). A block trace lists every
 block also with `--jit`: blocks are not chained while it is on. `--trace-after N` is an
 absolute instruction count, like the `icount` the runner prints, and a snapshot keeps that
 count; `--trace-after +N` counts from where the run starts. `-n` and `--max-ticks` always
@@ -620,7 +653,8 @@ tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted ru
 tests/cov/ tests/fuzz/  block-coverage maps across backends; the fuzz harness on planted bugs
 tests/suzzer/ tests/szr/  suzzer's formats and the SZR1 executor (with a suzzer checkout)
 tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
-tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch
+tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch;
+                   trace-check.sh: --trace mmio/sysreg/irq/polls/console, --log-stamp
 tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC (make bench-test,
                    make xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces

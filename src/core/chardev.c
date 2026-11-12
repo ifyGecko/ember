@@ -17,6 +17,8 @@ size_t uam_chardev_write(uam_chardev *cd, const void *buf, size_t len)
 {
     if (!cd)
         return len; /* no backend: output is discarded */
+    if (cd->tap)
+        cd->tap(cd->tap_ctx, buf, len);
     return cd->ops->write ? cd->ops->write(cd, buf, len) : len;
 }
 
@@ -115,4 +117,11 @@ void uam_chardev_destroy(uam_chardev *cd)
 {
     if (cd && cd->ops->destroy)
         cd->ops->destroy(cd);
+}
+
+void uam_chardev_set_tap(uam_chardev *cd, void (*fn)(void *ctx, const uint8_t *buf, size_t len),
+                         void *ctx)
+{
+    cd->tap = fn;
+    cd->tap_ctx = fn ? ctx : NULL;
 }

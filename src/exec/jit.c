@@ -111,6 +111,7 @@ int jit_br_load(uam_jit_ctx *jc, uint64_t addr, uint32_t flags, uint32_t size)
 {
     uint32_t xf = 0;
     uint64_t fva;
+    jc->cpu->insn_pc = jc->site->pc;
     uam_status st = uam_execops_load(jc->cpu, addr, flags, size, &jc->scratch, &xf, &fva);
     jc->stats->jit_load_calls++;
     chain_check(jc);
@@ -125,6 +126,7 @@ int jit_br_store(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t flags, u
 {
     uint32_t xf = 0;
     uint64_t fva;
+    jc->cpu->insn_pc = jc->site->pc;
     uam_status st = uam_execops_store(jc->cpu, addr, val, flags, size, &xf, &fva);
     jc->stats->jit_store_calls++;
     chain_check(jc);
@@ -139,6 +141,7 @@ int jit_br_store_x(uam_jit_ctx *jc, uint64_t addr, uint64_t val, uint32_t flags,
     uint32_t xf = 0;
     bool ok = false;
     uint64_t fva;
+    jc->cpu->insn_pc = jc->site->pc;
     uam_status st = uam_execops_store_x(jc->cpu, addr, val, flags, size, &ok, &xf, &fva);
     chain_check(jc);
     if (st != UAM_OK)
@@ -152,6 +155,7 @@ int jit_br_rmw(uam_jit_ctx *jc, uint64_t addr, uint64_t b, uint64_t c, uint32_t 
 {
     uint32_t xf = 0;
     const bool cas = (packed & 0xff) == UAM_OP_CAS;
+    jc->cpu->insn_pc = jc->site->pc;
     uam_status st = uam_execops_rmw(jc->cpu, cas, (uam_amo_op)((packed >> 8) & 0xff), addr, b, c,
                                     flags, (packed >> 16) & 0xff, &jc->scratch, &xf);
     chain_check(jc);
@@ -175,7 +179,11 @@ static int jit_fault_simple(uam_jit_ctx *jc, uam_exc_kind kind, uint64_t tval)
 int jit_br_sysrd(uam_jit_ctx *jc, uint32_t id)
 {
     uint64_t v = 0;
-    uam_status st = jc->cpu->isa->sysreg_read(jc->cpu, id, &v);
+    uam_cpu *cpu = jc->cpu;
+    cpu->insn_pc = jc->site->pc;
+    uam_status st = cpu->isa->sysreg_read(cpu, id, &v);
+    if (cpu->obs && cpu->obs->sysreg)
+        cpu->obs->sysreg(cpu->obs->ctx, cpu, id, false, v, st);
     chain_check(jc);
     if (st != UAM_OK)
         return jit_fault_simple(jc, UAM_EXC_SYSREG, id);
@@ -185,7 +193,11 @@ int jit_br_sysrd(uam_jit_ctx *jc, uint32_t id)
 
 int jit_br_syswr(uam_jit_ctx *jc, uint32_t id, uint64_t val)
 {
-    uam_status st = jc->cpu->isa->sysreg_write(jc->cpu, id, val);
+    uam_cpu *cpu = jc->cpu;
+    cpu->insn_pc = jc->site->pc;
+    uam_status st = cpu->isa->sysreg_write(cpu, id, val);
+    if (cpu->obs && cpu->obs->sysreg)
+        cpu->obs->sysreg(cpu->obs->ctx, cpu, id, true, val, st);
     chain_check(jc);
     return st == UAM_OK ? 0 : jit_fault_simple(jc, UAM_EXC_SYSREG, id);
 }
@@ -199,6 +211,7 @@ int jit_br_helper(uam_jit_ctx *jc, uint32_t id, uint64_t a, uint64_t b, uint64_t
     for (unsigned k = 0; k < hd->n_args; k++)
         v[k] = args[k] & uam_mask(hd->arg_width[k]);
     uam_status st = UAM_OK;
+    jc->cpu->insn_pc = jc->site->pc;
     uint64_t r = hd->fn(jc->cpu, v[0], v[1], v[2], &st);
     chain_check(jc);
     if (st != UAM_OK)

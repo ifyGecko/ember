@@ -110,6 +110,17 @@ typedef struct uam_watch {
     void        *ctx;
 } uam_watch;
 
+/*
+ * Device access observer, for tracing: called after every guest access a device
+ * serves - an MMIO region, a ROMD region in device mode, or the unmapped device
+ * (r == NULL) - with the access's absolute address, size, direction, the value read or
+ * written (as the CPU sees it) and the device's status. Not for side-effect-free
+ * accesses (fetches, debugger and loader peeks) or DMA. uam_origin_get says which
+ * instruction made the access.
+ */
+typedef void (*uam_dev_access_fn)(void *ctx, const uam_region *r, uint64_t addr, unsigned size,
+                                  bool is_write, uint64_t val, uam_status st);
+
 typedef struct uam_bus {
     uam_region       **regions;            /* sorted by priority, highest first */
     uint32_t           n_regions, cap_regions;
@@ -135,6 +146,12 @@ typedef struct uam_bus {
                                             * translations need not recheck their pages */
     uint32_t           gen_seq;            /* source of page generations (unique bus-wide) */
     bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
+    uam_dev_access_fn  dev_obs;            /* uam_bus_set_dev_observer */
+    void              *dev_obs_ctx;
+    /* The last guest read a device served (address, value as read): what a polling
+     * loop saw last, for the executor's poll reports. */
+    uint64_t           last_dev_read_addr, last_dev_read_val;
+    bool               last_dev_read_valid;
 } uam_bus;
 
 void       uam_bus_init(uam_bus *bus);
@@ -160,6 +177,8 @@ uam_status uam_bus_map_alias(uam_bus *bus, const char *name, uint64_t base, uint
                              const uam_map_attrs *attrs);
 void       uam_bus_set_unmapped(uam_bus *bus, struct uam_device *dev);
 void       uam_bus_set_code_write_hook(uam_bus *bus, uam_code_write_fn fn, void *ctx);
+/* One observer of the accesses devices serve (NULL: none); see uam_dev_access_fn. */
+void       uam_bus_set_dev_observer(uam_bus *bus, uam_dev_access_fn fn, void *ctx);
 
 /* Region handle by name (the name given when mapping), or NULL. */
 uam_region *uam_bus_region(uam_bus *bus, const char *name);

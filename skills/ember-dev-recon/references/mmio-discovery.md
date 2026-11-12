@@ -150,6 +150,12 @@ the register must count. Many hot registers are written at init and never read a
    revision), write-1-to-clear patterns in ISRs, fields used as divisors.
 3. Compare with the public register map of the SoC family named by the BSP strings, but keep
    the firmware's behavior as the authority.
+4. Once any ember board runs the code (even a bare one with catch-all windows), confirm
+   statically found registers at run time: the catch-all first-access lines name the
+   instruction (`pc=... icount=N`), `uam-run --trace mmio --trace-mmio-range LO:HI` gives the
+   real access order and values, and `--trace polls` turns a POLL row into "loop at pc reads
+   ADDR, leaves when bit B becomes 1". Static polls this table misses (computed addresses)
+   show up there.
 
 The **interrupt routing** is part of the MMIO picture. Find the RTOS's interrupt table (VxWorks
 `intPrioTable`-style `{cause bit, vector or demux, mask}` entries; Linux irq-domain setup) and

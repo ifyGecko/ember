@@ -52,19 +52,19 @@ plus opaque handles. Implementations are selected at run time by the board.
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
 | `isa.h` | `lift`, register descriptor table, `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: state the platform keeps once for all processors follows the running one, such as a chipset's SMIACT# tracking), optional `irq_lines` (what an interrupt observer sees). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51`, `isa/m6502`, `isa/z80`, `isa/xtensa` |
-| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on) | the core |
+| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on); one observer of every guest access a device serves (`uam_bus_set_dev_observer`: `--trace mmio`), and the last device read (what a polling loop saw) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`), optional `peek` (a side-effect-free read for `--dump-mem` and gdb); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
 | `sched.h` | Instruction-count clock (saturating at a 2^62-tick horizon), event queue with a per-call firing budget, a kick when the earliest deadline moves (the machine turns it into an exit request), cancel-all, list consistency checks | the core |
 | `signal.h` | Interrupt, GPIO and reset lines: connect a line to one sink, set its level (the sink is called on a change; a sink that needs edges detects them) | the core |
 | `blockdev.h` | Fixed-size sectors between a storage controller (AHCI, NVMe, IDE, floppy) and the host: read, write, flush; read-only and volatile (in-memory overlay) modes | core interface; the file backend in `src/host` |
-| `chardev.h` | Byte streams between a device and the host (UART consoles); input can be held back until the run starts (`uam_chardev_hold`) | core plumbing; backends in `src/host` |
+| `chardev.h` | Byte streams between a device and the host (UART consoles); input can be held back until the run starts (`uam_chardev_hold`); one tap on guest output (`uam_chardev_set_tap`: `--trace console`) | core plumbing; backends in `src/host` |
 | `netdev.h` | Ethernet frames between a device and the host (NICs, switches, radio "air") | core plumbing; backends in `src/host` |
 | `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports), extra snapshot state (`uam_machine_add_state`), named inputs a board publishes (`uam_machine_add_input`: a UART FIFO, a DMA buffer), extra processors (`uam_machine_add_cpus`: each with its own translation cache, sharing bus and clock; `uam_machine_current_cpu` for per-processor devices) and observers on all of them (`uam_machine_add_pc_hook`, `_set_exc_hook`, `_set_irq_hook`, `_add_pass`, `_set_coverage` with a coverage history per processor, `_get_stats`), ABI handshake | `src/machine`, `boards/*` |
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
-| `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into) and the core services ISA modules may call (`uam_cpu_xlate_changed`, ...) | the core |
+| `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into, and `insn_pc`, the instruction a bus, system register or helper access is made for), the core services ISA modules may call (`uam_cpu_xlate_changed`, ...), and observers of system register accesses and interrupt input lines (`uam_cpu_observer`: `--trace sysreg`, `--trace irq`) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics, device polls (`uam_poll`, with `UAM_TRACE_POLL`: one-block loops that re-read a device register, counted, and the value that ends them worked out by re-evaluating a pass with other values), the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
@@ -112,6 +112,9 @@ fuzz/suzzer/  → as fuzz/, plus suzzer's format header (src/lcv_formats.h of th
 The consequences are deliberate:
 
 - A device never knows which CPU is driving it, nor which host backend is behind its chardev.
+  For a log line it may ask `uam_origin_get` (`common.h`) which instruction is behind the
+  current access: a processor number, a pc and an icount the executor publishes while it
+  runs, never a processor object.
 - An ISA never knows which devices exist.
 - Byte order and access width are the bus's job: a device states its own and the bus adapts.
 - A device that resets the chip raises a reset *line*; the board wires it to the machine.
@@ -208,6 +211,8 @@ tests/szr/        szr-check.sh fake_brain.py  (the SZR1 executor against a scrip
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
 tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dump-mem,
                   --trace-after, traces with --jit, --guard/--watch)
+                  trace-check.sh  (the bring-up traces: mmio, sysreg, irq, polls, console,
+                  --log-stamp, pcs in the catch-all logs; interpreter and JIT alike)
 tests/gdb/        gdb-check.py  (the gdb stub over the remote protocol, four processors)
 tests/smp/        smp_test.h  (one multiprocessor self-test for RISC-V, MIPS, ARM, PowerPC)
 tests/bench/      bench.c Makefile x86-start.S x86.ld pic32.ld  (one C benchmark for every guest ISA but
@@ -257,9 +262,11 @@ devices.
 - **Unknown MMIO** has three layers, lowest priority first:
   - The global fallback (`devices/unknown_mmio.c`) for addresses no region covers. Unmapped
     accesses fault by default. With `--unknown-mmio zero|echo` this device answers them,
-    reading zero or echoing the last value written, and logs the first access to each address.
+    reading zero or echoing the last value written, and logs the first access to each address
+    (with the value written and the instruction: `pc=... icount=N`).
   - Per-block catch-alls (`devices/unimp.c`), mapped at `UAM_PRIO_BACKGROUND` under real
-    devices. They are read-as-zero, write-ignored, and report offsets relative to the block.
+    devices. They are read-as-zero, write-ignored, and report offsets relative to the block
+    (the first access to each with its instruction).
   - Per-register rules (`devices/mmio_stub.c`, `--mmio-rule`, `uam_board_add_mmio_rules`).
     Each rule is a range of `width`-byte registers with a policy: `zero`, `echo`,
     `fixed:VALUE`, `fault` (bus error), or `input`. An `input` register takes its next
@@ -765,7 +772,13 @@ Implemented (`make test`):
   self-test, with the interpreter and the JIT stopping at the same instruction.
 - Runner options: `tests/runner/runner-check.sh` (`make runner-test`) checks `--log-pc`,
   `--break`, `--dump-mem`, `--trace-after` (absolute and `+N`, across a snapshot) and block
-  traces with `--jit`.
+  traces with `--jit`; `tests/runner/trace-check.sh` (part of `make runner-test`) checks the
+  bring-up traces on the RISC-V self-test and on small polling images: every `mmio`,
+  `sysreg`, `irq` and `console` line identical under the interpreter, the JIT and the JIT
+  without chaining; `polls` finding the bit a loop waits for (and the whole value an
+  equality test waits for), `waiting:`/`done:` lines and the stop summary; the
+  instruction named by the `unknown-mmio` first-access line; `--log-stamp`; nothing extra
+  printed without `--trace`.
 - Snapshot determinism: `tests/snapshot/snapshot-check.sh` splits a run with `--save-snapshot`
   / `--load-snapshot` at several points and requires the same console output, pc and icount as
   the uninterrupted run, with the interpreter and the JIT on either side.

@@ -60,6 +60,9 @@ struct uam_chardev {
     /* the backend asks to end the session (escape key, EOF on a script) */
     void   (*on_quit)(void *ctx);
     void    *quit_ctx;
+    /* uam_chardev_set_tap: sees every byte the guest writes, before the backend */
+    void   (*tap)(void *ctx, const uint8_t *buf, size_t len);
+    void    *tap_ctx;
 };
 
 void   uam_chardev_init(uam_chardev *cd, const uam_chardev_ops *ops);
@@ -79,6 +82,9 @@ void   uam_chardev_quit(uam_chardev *cd);
 
 /* ---- owner side ---- */
 void   uam_chardev_set_quit_handler(uam_chardev *cd, void (*fn)(void *ctx), void *ctx);
+/* One observer of guest output (tracing: the runner's --trace console); NULL removes it. */
+void   uam_chardev_set_tap(uam_chardev *cd, void (*fn)(void *ctx, const uint8_t *buf, size_t len),
+                           void *ctx);
 int    uam_chardev_fd(uam_chardev *cd);
 /* Hold input back from the frontend (it stays queued), or release it and
  * deliver what is queued. */

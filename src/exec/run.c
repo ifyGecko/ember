@@ -585,10 +585,84 @@ void uam_exec_set_exc_hook(uam_exec *x, uam_exc_hook_fn fn, void *ctx)
     x->exc_hook_ctx = fn ? ctx : NULL;
 }
 
+void uam_exec_set_cpu_observer(uam_exec *x, const uam_cpu_observer *obs)
+{
+    x->cpu->obs = obs;
+}
+
+size_t uam_exec_polls(const uam_exec *x, const uam_poll **out)
+{
+    *out = x->polls;
+    return x->n_polls;
+}
+
 void uam_exec_set_irq_hook(uam_exec *x, uam_irq_hook_fn fn, void *ctx)
 {
     x->irq_hook = fn;
     x->irq_hook_ctx = fn ? ctx : NULL;
+}
+
+/* ---- device polls (uam_poll) ------------------------------------------- */
+
+/* The poll entry of the loop at pc; with add, a new one if there is room. */
+static uam_poll *poll_find(uam_exec *x, uint64_t pc, bool add)
+{
+    for (uint32_t i = 0; i < x->n_polls; i++)
+        if (x->polls[i].pc == pc)
+            return &x->polls[i];
+    if (!add || x->n_polls == UAM_EXEC_MAX_POLLS)
+        return NULL;
+    uam_poll *p = &x->polls[x->n_polls++];
+    *p = (uam_poll){ .pc = pc, .first_icount = x->cpu->icount };
+    return p;
+}
+
+static void poll_line(uam_exec *x, const uam_poll *p, const char *what)
+{
+    char d[320];
+    uam_poll_describe(p, x->cpu->bus, d, sizeof(d));
+    fprintf(x->trace_out, x->cpu->hartid ? "poll: %s %s (%llu passes) icount=%llu cpu=%u\n"
+                                         : "poll: %s %s (%llu passes) icount=%llu\n",
+            what, d, (unsigned long long)p->run, (unsigned long long)x->cpu->icount,
+            x->cpu->hartid);
+}
+
+/* After a pass of the poll block blk that continues at next_pc. */
+static void poll_account(uam_exec *x, const uam_block *blk, uint64_t next_pc)
+{
+    uam_poll *p = poll_find(x, blk->guest_pc, false);
+    if (!p)
+        return;
+    const uam_bus *bus = x->cpu->bus;
+    if (p->analysed && bus->last_dev_read_valid && bus->last_dev_read_addr == p->addr) {
+        p->value = bus->last_dev_read_val;
+        p->have_value = true;
+    }
+    p->last_icount = x->cpu->icount;
+    if (next_pc != blk->guest_pc) {   /* it left */
+        if (p->active && (x->trace & UAM_TRACE_POLL) && p->reported)
+            poll_line(x, p, "done:");
+        p->active = false;
+        p->reported = false;
+        p->run = 0;
+        return;
+    }
+    if (!p->active) {
+        p->active = true;
+        p->arrivals++;
+    }
+    p->passes++;
+    p->run++;
+    if (p->run > p->max_run)
+        p->max_run = p->run;
+    if (!p->analysed && blk->n_temp <= x->temps_cap)
+        uam_spin_poll_analyse(x->cpu, blk, x->temps, p);
+    const uint64_t at = x->poll_report ? x->poll_report : UAM_EXEC_DEFAULT_POLL_REPORT;
+    if (p->run >= at && !p->reported) {
+        p->reported = true;
+        if (x->trace & UAM_TRACE_POLL)
+            poll_line(x, p, "waiting:");
+    }
 }
 
 static bool trace_block(const uam_exec *x, uint64_t pc)
@@ -682,6 +756,9 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
     uam_exec *c = x->ctl ? x->ctl : x;
 
     for (;;) {
+        /* Between blocks the origin (uam_origin) is the next instruction: what timers,
+         * interrupts and hooks that run now act before. */
+        cpu->insn_pc = cpu->pc;
         if (c->stop_request)
             return UAM_STOP_REQUEST;
         if (smp && c->smp_resync)
@@ -847,9 +924,14 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
                     c->blocks_since_poll += (uint32_t)(k - 1);
                 continue;
             }
-            if (k)
+            if (k && never && uam_spin_never_dev && (x->trace & UAM_TRACE_POLL)
+                && poll_find(x, blk->guest_pc, true))
+                *spin = SPIN_POLL;   /* a device poll: count its passes (after the block) */
+            else if (k)
                 *spin = never || *spin - SPIN_CAND + 1 >= SPIN_GIVE_UP ? -1 : *spin + 1;
         }
+        /* Read now: running the block may free its cache entry (new code). */
+        const bool is_poll = spin && *spin == SPIN_POLL;
 
         if (x->trace && trace_block(x, blk->guest_pc))
             fprintf(x->trace_out, "blk 0x%llx icount=%llu\n", (unsigned long long)blk->guest_pc,
@@ -868,7 +950,7 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
                               ? c->host.poll_interval - 1 - c->blocks_since_poll : 0;
                 /* A spin loop's EXIT back to itself must come back here (6b). */
                 ch.link = !(x->n_hooks && uam_exec_has_pc_hook(x, blk->guest_pc))
-                          && !(spin && *spin > 0);
+                          && !(spin && *spin > 0) && !is_poll;
             }
             uam_jit_run(x->jit, blk, x->temps, &ch, &r);
             x->stats.blocks_native += 1 + ch.hops;
@@ -880,6 +962,8 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         else
             r = uam_interp_block(cpu, blk, &isa->helpers, x->temps);
         x->stats.blocks_executed++;
+        if (is_poll && r.kind == UAM_BR_NEXT)
+            poll_account(x, blk, r.pc);
 
         switch (r.kind) {
         case UAM_BR_NEXT:
@@ -1030,6 +1114,17 @@ static uam_stop_reason run_smp(uam_exec *x, uint64_t max_insns)
     return why;
 }
 
+/* uam_origin provider while this executor runs: its running processor. */
+static bool exec_origin(void *ctx, uam_origin *out)
+{
+    const uam_exec *x = ctx;
+    const uam_cpu *cpu = x->running ? x->running : x->cpu;
+    out->cpu = cpu->hartid;
+    out->pc = cpu->insn_pc;
+    out->icount = cpu->icount;
+    return true;
+}
+
 uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
 {
     for (uint32_t i = 0; i < (x->n_smp ? x->n_smp : 1); i++) {
@@ -1037,11 +1132,17 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
         e->fault_stop = false;     /* requests from outside a run are dropped */
         e->fault_stop_pc = NULL;
     }
-    if (x->n_smp > 1)
-        return run_smp(x, max_insns);
-    uint64_t before = x->cpu->icount;
-    uam_stop_reason r = run_loop(x, max_insns ? x->cpu->icount + max_insns : UINT64_MAX,
-                                 time_limit(x), false);
-    x->retired += x->cpu->icount - before;
+    uam_origin_fn prev_fn;
+    void *prev_ctx;
+    uam_origin_set_provider(exec_origin, x, &prev_fn, &prev_ctx);
+    uam_stop_reason r;
+    if (x->n_smp > 1) {
+        r = run_smp(x, max_insns);
+    } else {
+        uint64_t before = x->cpu->icount;
+        r = run_loop(x, max_insns ? x->cpu->icount + max_insns : UINT64_MAX, time_limit(x), false);
+        x->retired += x->cpu->icount - before;
+    }
+    uam_origin_set_provider(prev_fn, prev_ctx, NULL, NULL);
     return r;
 }

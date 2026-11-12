@@ -29,6 +29,8 @@
 #include "uam/loader.h"
 #include "uam/machine.h"
 #include "uam/runner.h"
+
+#include "trace.h"
 #include "uam/snapshot.h"
 
 #define MAX_LIST 64
@@ -252,12 +254,35 @@ static void usage(FILE *out)
         "                          implied by a --nic with a host interface\n"
         "      --virtual-time      keep virtual pacing even with host network interfaces\n"
         "      --block-insns N     max guest instructions per block (default 32)\n"
-        "  -t, --trace LIST        comma list of: blocks, ir, exc (blocks: every block executed,\n"
-        "                          also with --jit, which does not chain blocks while tracing)\n"
+        "  -t, --trace LIST        comma list (all off by default; repeatable) of:\n"
+        "                          blocks  every block executed (also with --jit, which does\n"
+        "                                  not chain blocks while tracing)\n"
+        "                          ir      the IR of each translated block\n"
+        "                          exc     exceptions, interrupts taken, resets\n"
+        "                          mmio    every access a device serves (MMIO, ROM devices,\n"
+        "                                  unmapped; x86 ports), with value, pc and icount\n"
+        "                          sysreg  the first read and write of each system register\n"
+        "                                  (CSR, CP0, CP15, SPR, MSR, ...) and every one that\n"
+        "                                  faults, with a summary at the stop; sysreg-all: all\n"
+        "                          irq     interrupt input lines of the processors changing\n"
+        "                                  level; at the stop, each line's counts and whether\n"
+        "                                  an interrupt is pending and enabled\n"
+        "                          polls   loops that wait on a device register: the value they\n"
+        "                                  wait for, once one goes round --poll-report times,\n"
+        "                                  and a summary at the stop (what it was still\n"
+        "                                  waiting for)\n"
+        "                          console each line the guest prints, with its icount and pc\n"
+        "                          all     exc, mmio, sysreg, irq, polls, console\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
-        "      --trace-after N     trace blocks only once the instruction count reaches N. N is\n"
-        "                          absolute, like every icount the runner prints (a snapshot\n"
-        "                          keeps the count); +N: N instructions after the run starts\n"
+        "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI)\n"
+        "      --trace-after N     trace blocks, mmio, sysreg, irq and console only once the\n"
+        "                          instruction count reaches N. N is absolute, like every\n"
+        "                          icount the runner prints (a snapshot keeps the count); +N:\n"
+        "                          N instructions after the run starts\n"
+        "      --poll-report N     passes in a row before --trace polls reports a loop\n"
+        "                          (default 10000)\n"
+        "      --log-stamp         start each log line made while the guest runs with\n"
+        "                          @ICOUNT (@ICOUNT:cpuN on other processors)\n"
         "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
         "      --guard SPEC        guard guest memory (repeatable): a data access that\n"
@@ -343,14 +368,19 @@ static uint64_t parse_size(const char *s)
     return v;
 }
 
-static unsigned parse_trace(const char *s)
+/* The executor's trace flags; the runner's own (trace.h, RT_*) go to *rt. */
+static unsigned parse_trace(const char *s, unsigned *rt)
 {
     unsigned t = 0;
     char *copy = strdup(s);
     for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
-        if (!strcmp(tok, "blocks"))   t |= UAM_TRACE_BLOCKS;
-        else if (!strcmp(tok, "ir"))  t |= UAM_TRACE_IR;
-        else if (!strcmp(tok, "exc")) t |= UAM_TRACE_EXC;
+        if (!strcmp(tok, "blocks"))     t |= UAM_TRACE_BLOCKS;
+        else if (!strcmp(tok, "ir"))    t |= UAM_TRACE_IR;
+        else if (!strcmp(tok, "exc"))   t |= UAM_TRACE_EXC;
+        else if (!strcmp(tok, "polls")) t |= UAM_TRACE_POLL;
+        else if (!strcmp(tok, "all"))   { t |= UAM_TRACE_EXC | UAM_TRACE_POLL;
+                                          *rt |= RT_MMIO | RT_SYSREG | RT_IRQ | RT_CONSOLE; }
+        else if (rtrace_flag(tok))      *rt |= rtrace_flag(tok);
         else fprintf(stderr, "uam-run: unknown trace flag '%s'\n", tok);
     }
     free(copy);
@@ -549,7 +579,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
-           OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_EXT_BASE = 1000 };
+           OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE, OPT_POLL_REPORT,
+           OPT_LOG_STAMP, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -573,6 +604,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "trace", required_argument, NULL, 't' },
         { "trace-range", required_argument, NULL, OPT_TRACE_RANGE },
         { "trace-after", required_argument, NULL, OPT_TRACE_AFTER },
+        { "trace-mmio-range", required_argument, NULL, OPT_TRACE_MMIO_RANGE },
+        { "poll-report", required_argument, NULL, OPT_POLL_REPORT },
+        { "log-stamp", no_argument, NULL, OPT_LOG_STAMP },
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
         { "guard", required_argument, NULL, OPT_GUARD },
@@ -642,6 +676,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     bool have_begin = false, fuzz_opts = false;
     const char *fuzz_input = NULL, *fuzz_replay = NULL;
     unsigned trace = 0, block_insns = 0;
+    uint64_t poll_report = 0;
+    static rtrace rt;   /* large (tables); static, one run per process */
+    memset(&rt, 0, sizeof(rt));
     uam_board_option options[MAX_LIST];
     uam_board_image images[MAX_LIST];
     uam_board_netdev nics[MAX_LIST];
@@ -686,7 +723,20 @@ static int run_main(int argc, char **argv, const ext_set *es)
         switch (c) {
         case 'b': board_name = optarg; break;
         case 'n': max_insns = strtoull(optarg, NULL, 0); break;
-        case 't': trace = parse_trace(optarg); break;
+        case 't': trace |= parse_trace(optarg, &rt.flags); break;
+        case OPT_TRACE_MMIO_RANGE: {
+            char *end;
+            rt.mmio_lo = strtoull(optarg, &end, 0);
+            rt.mmio_hi = *end == ':' ? strtoull(end + 1, NULL, 0) : 0;
+            if (rt.mmio_hi <= rt.mmio_lo) {
+                fprintf(stderr, "uam-run: --trace-mmio-range wants LO:HI with LO < HI\n");
+                return 2;
+            }
+            rt.flags |= RT_MMIO;
+            break;
+        }
+        case OPT_POLL_REPORT: poll_report = strtoull(optarg, NULL, 0); break;
+        case OPT_LOG_STAMP: uam_log_stamp = true; break;
         case 's': stats = true; break;
         case 'd': dump = true; break;
         case 'v': if (uam_log_threshold < UAM_LOG_DEBUG) uam_log_threshold++; break;
@@ -1074,6 +1124,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 "traced from the start; --trace-after +N counts from the snapshot\n",
                 (unsigned long long)trace_after, (unsigned long long)start_icount);
     m.exec.trace_after = trace_after;
+    m.exec.poll_report = poll_report;
+    rt.after = (trace_after || trace_after_rel) ? trace_after : 0;
+    rtrace_attach(&rt, &m, console, m.exec.trace_out);
     m.exec.verify = verify;
     m.exec.optimize = optimize;
     m.exec.chain = chain;
@@ -1266,6 +1319,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
                 uam_stop_reason_str(why), (long long)m.exec.stop_status,
                 (unsigned long long)m.cpu.pc, (unsigned long long)uam_machine_icount(&m));
+    if (!fuzzing)
+        rtrace_finish(&rt, trace);
     if (stats) {
         uam_exec_stats sum;
         uam_machine_get_stats(&m, &sum);
@@ -1352,6 +1407,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
 
     uam_host_destroy(host);  /* detach from the executor before it goes away */
     host = NULL;
+    rtrace_detach(&rt);
     uam_machine_fini(&m);
 out_host:
     uam_host_destroy(host);

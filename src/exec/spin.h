@@ -32,12 +32,22 @@ bool uam_spin_candidate(const uam_block *blk);
  * block can never qualify (a load that is not from plain RAM or ROM). */
 bool uam_spin_fixed(uam_cpu *cpu, const uam_block *blk, uint64_t *t, bool *never);
 
+/* `never` because of a device read (not plain RAM or ROM): the block may be a device
+ * poll (uam_poll). Set by uam_spin_fixed along with *never. */
+extern bool uam_spin_never_dev;
+
+/* After a pass of a poll block went round: fill p's load and exit fields (exec.h,
+ * uam_poll) by re-evaluating a pass with other values for the device read. `t`: temps
+ * as for uam_spin_fixed. False if the block is not a one-device-read loop after all. */
+bool uam_spin_poll_analyse(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uam_poll *p);
+
 /* Spin state of a cached block: 0 undecided, -1 never a candidate, SPIN_CAND + n a
  * candidate whose last n checks failed in a row. After SPIN_GIVE_UP failures it is
  * treated as never: a candidate that does not qualify (whatever the reason) gets its
  * self-link back, so it costs no more than before. */
 #define SPIN_CAND    1
 #define SPIN_GIVE_UP 16
+#define SPIN_POLL    (-2)   /* never skipped: a device poll, whose passes are counted */
 
 /* tcache.c: the block for pc, as uam_tcache_lookup, and the spin state of its entry,
  * reset whenever the entry gets a new block. */

@@ -55,6 +55,12 @@ during bring-up.) The board maps it (`uam_bus_map_mmio`), adds it to the machine
 reset and destroyed with it) and wires its lines. Read `examples/soc_uart.c` in full once:
 every device follows that shape.
 
+Write a device from what the firmware does to it, not from a guess: `--trace mmio
+--trace-mmio-range BASE:BASE+SIZE` lists every access the guest makes to the window (order,
+width, value, pc), first against the catch-all, then against your model to compare. A device
+that wants to say which code touched it (a first-access log) appends `uam_origin_format()`
+(`uam/common.h`: " pc=0x... icount=N"); it never asks for the processor itself.
+
 `uam/device.h` does not include `uam/access.h`: include it yourself for `UAM_ACC_BE`.
 
 ### Byte order and access width are the bus's job
@@ -197,7 +203,10 @@ uam_signal_connect(soc_timer_irq_line(timer), soc_intc_input, intc, 3);
 uam_signal_connect(soc_intc_output(intc), uam_cpu_irq_sink, &m->cpu, UAM_MIPS_IRQ_HW0);
 ```
 
-Sinks are called only when a level changes. A line has one sink: an output that must reach
+Sinks are called only when a level changes. `--trace irq` shows every change of a
+processor's interrupt inputs (and, at the stop, whether one is pending and enabled), so an
+interrupt that never arrives is either never raised there (follow the chain back with
+`--trace mmio` on the controller) or masked in the CPU. A line has one sink: an output that must reach
 two places needs a splitter. To find the routing (which CPU line, which status bit, which
 vector), look for the RTOS's interrupt table. VxWorks/MIPS keeps an `intPrioTable` of
 `{Cause IP bit, vector-or-demux function, SR mask, flag}`; Linux uses irq-domain setup in

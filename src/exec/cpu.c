@@ -8,6 +8,8 @@
 void uam_cpu_irq_sink(void *ctx, unsigned line, int level)
 {
     uam_cpu *cpu = ctx;
+    if (cpu->obs && cpu->obs->irq_input)
+        cpu->obs->irq_input(cpu->obs->ctx, cpu, line, level);
     cpu->isa->irq_input(cpu, line, level);
     /* Interrupt state changed: re-evaluate at the next instruction boundary. */
     uam_cpu_request_exit(cpu);

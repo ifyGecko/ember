@@ -101,9 +101,9 @@ reports it: the prompt never came). Patterns only match output of the current ru
 
 | line | source |
 |---|---|
-| `[warn] unimp: win+0xOFF (0xPHYS): first read/write ...` | first access to each offset of a catch-all window |
+| `[warn] unimp: win+0xOFF (0xPHYS): first read/write ... pc=0x.. icount=N` | first access to each offset of a catch-all window, with the instruction that made it (decompile it) |
 | `[warn] unimp:   win+0xOFF: R reads, W writes (last 0x..)` | per-window hottest offsets, printed at exit: polls |
-| `[warn] unknown-mmio: first read ... at 0xADDR` | an address no window or device covers |
+| `[warn] unknown-mmio: first read ... at 0xADDR pc=0x.. icount=N` | an address no window or device covers (a write shows its value), and who touched it |
 | `[info] mmio-stub: rule@0xADDR (fixed:0x1): first read ...` | `-v`: first access to each register an `--mmio-rule` answers; a per-rule summary at exit |
 | `[error] snapshot: device X ... has no save/restore` | a device that does not take part in snapshots (`device-anatomy.md`) |
 | `[error] abi: ...` (exit 2) | board and libuam built from different ember headers: `scripts/build-ember.sh` |
@@ -113,6 +113,12 @@ reports it: the prompt never came). Patterns only match output of the current ru
 | `[warn] m6502: pc=..: JAM: the core stops until reset` | an NMOS 6502 executed a JAM opcode |
 | `[warn] chardev: console input: N byte(s) never sent, waiting for '...'` | scripted console input whose prompt never came |
 | `irq: entered handler at ..`, `reset: system` | `--trace exc`: interrupt entries, device-requested resets |
+| `poll: STILL POLLING at the stop: pc ..: loop at .. reads N bytes at 0xADDR (dev+0xOFF), last 0x..; leaves the loop if bit B (0x..) becomes 1` | `--trace polls`: the loop the run was stuck in and the value it waits for; also `poll: waiting:` (a loop went round `--poll-report` times) and `poll: done:` (with the value that ended it) |
+| `mmio: r\|w SIZE 0xADDR dev+0xOFF = 0xVAL pc=.. icount=N` | `--trace mmio`: every access a device served (x86 ports at `0x10000000000 + port`) |
+| `irq-in: cpuN line L = 0\|1 icount=..`; `irq-in: cpuN line L: R rises, F falls, level V at the stop`; `irq: at the stop cpuN has an interrupt pending and enabled ...` | `--trace irq`: a processor's interrupt inputs |
+| `sysreg: first read\|write 0xID = 0xVAL pc=..`, `sysreg:   0xID: R reads, W writes` | `--trace sysreg`: system registers (ids as `uam/isa/<arch>.h` numbers them); a faulting access says so |
+| `console: icount=N pc=.. "text"` | `--trace console`: each console line and where in the run it was printed |
+| `@ICOUNT [warn] ...` | `--log-stamp`: the icount at which a log line was made |
 | `<runner>: <reason> (status N) at pc=.. after N instructions` | how the run ended |
 
 Hot offsets are only printed when the run ends normally (budget, deadlock, livelock, finisher,
@@ -123,11 +129,12 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 
 | Symptom | Likely cause | Next step |
 |---|---|---|
-| exit 124, one window offset read millions of times | spinning on a status/busy bit | make it read "ready"/self-clear |
+| exit 124, one window offset read millions of times | spinning on a status/busy bit | rerun with `--trace polls`: the `STILL POLLING` line names the register and the bit; make it read "ready"/self-clear (try `--mmio-rule ADDR=fixed:V` first) |
+| `poll: ... no value tried leaves the loop` | the loop waits for something besides the register (an interrupt handler's flag, a timeout), or the register is read through RAM-side state | decompile the loop; `--trace irq` for the interrupt it may wait on |
 | exit 124, no hot offset, pc in a small range | spinning on RAM or a register that is now storage, or a delay loop calibrated against a timer that never moves | `-n N -d` / gdb: find the loop (below) |
 | exit 124 "virtual time limit" (`--max-ticks`), few instructions | the hart mostly idled: a tick arrives, but too rarely or not where the guest looks | check the timer's rate (`ticks_per_count`) and which interrupt the guest enabled |
 | exit 129 (guarded memory access) | a data access touched a `--guard` range; the guard line names pc, access and address | the code at that pc (who writes there, and why) |
-| exit 125 (deadlock) | the guest executed WAIT and nothing can wake it: the tick timer or the interrupt it waits for is not modelled or not wired | model the timer / wire its line through the interrupt controller to the right CPU input |
+| exit 125 (deadlock) | the guest executed WAIT and nothing can wake it: the tick timer or the interrupt it waits for is not modelled or not wired | model the timer / wire its line through the interrupt controller to the right CPU input; `--trace irq` shows whether any CPU input line ever rose, and `--trace mmio` on the interrupt controller what the guest unmasked |
 | exit 128 (livelock) | WAIT while a timer keeps firing but its interrupt is never delivered (unwired line, masked in the intc, wrong Cause.IP / mip bit), or a device re-arms a timer by itself | as for exit 125: follow the timer's line to the CPU input the guest enabled |
 | `core halted` in the log, then exit 125 | an AVR, 8-bit PIC, 8051, 6502 or Z80 reached an access nothing answers (`--unknown-mmio fault`, a write to ROM, a fetch where no memory is). These cores have no bus error to raise, so the hart stops; no timer is missing | the line's address is a bus address (`board-skeleton.md`, "Address spaces"): give it a device, RAM or a catch-all window |
 | `JAM` in the log, or `JAMMED` / `STOPPED` in `-d`, then exit 125 | an NMOS JAM opcode or a 65C02 STP: execution went astray (wrong base, bad jump) or the model is wrong (a 65C02 opcode run on `nmos`) | the pc in Ghidra; re-check the base and `--model` |
@@ -172,6 +179,10 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 ./run.sh --watch 0x80301234+4 ...              # log every data access to those bytes (value, pc)
 ./run.sh --guard 0x80301234+4:w ...            # stop BEFORE the first write there (exit 129)
 ./run.sh --mmio-rule 0x18040010=fixed:0x1 -v ...  # does the guest get past if this reads 1?
+./run.sh -n 50000000 --trace polls ...         # a stall: which register, and what value ends it
+./run.sh --trace mmio --trace-mmio-range 0x18040000:0x18041000 ...  # one device's protocol
+./run.sh --trace irq,sysreg ...                # interrupt inputs; system registers used
+./run.sh --trace console --log-stamp ...       # console lines and log lines with their icount
 ./run.sh --snapshot-at 0x8023f00c --save-snapshot build/here.snap ...  # bookmark a state
 ```
 

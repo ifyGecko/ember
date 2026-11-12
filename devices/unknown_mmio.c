@@ -1,6 +1,7 @@
 /*
  * unknown_mmio.c - Logged fallback for unmapped accesses (uam/dev/unknown_mmio.h).
  */
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "uam/dev/unknown_mmio.h"
@@ -23,7 +24,7 @@ typedef struct unknown_mmio {
 static unknown_mmio *to_um(uam_device *d) { return UAM_CONTAINER_OF(d, unknown_mmio, dev); }
 
 /* Find or create the entry for addr; logs the first access. NULL if full. */
-static entry *lookup(unknown_mmio *u, uint64_t addr, bool is_write, unsigned size)
+static entry *lookup(unknown_mmio *u, uint64_t addr, bool is_write, unsigned size, uint64_t v)
 {
     uint32_t h = (uint32_t)((addr * UINT64_C(0x9E3779B97F4A7C15)) >> 52) & (TABLE_SIZE - 1);
     for (uint32_t probe = 0; probe < TABLE_SIZE; probe++) {
@@ -35,8 +36,12 @@ static entry *lookup(unknown_mmio *u, uint64_t addr, bool is_write, unsigned siz
             e->addr = addr;
             e->value = 0;
             u->count++;
-            uam_log(UAM_LOG_WARN, "unknown-mmio", "first %s of %u bytes at 0x%llx",
-                    is_write ? "write" : "read", size, (unsigned long long)addr);
+            char at[80], val[32] = "";
+            uam_origin_format(at, sizeof(at));   /* the accessing instruction */
+            if (is_write)
+                snprintf(val, sizeof(val), ": 0x%llx", (unsigned long long)v);
+            uam_log(UAM_LOG_WARN, "unknown-mmio", "first %s of %u bytes at 0x%llx%s%s",
+                    is_write ? "write" : "read", size, (unsigned long long)addr, val, at);
             return e;
         }
     }
@@ -46,7 +51,7 @@ static entry *lookup(unknown_mmio *u, uint64_t addr, bool is_write, unsigned siz
 static uam_status um_read(uam_device *d, uint64_t addr, unsigned size, uint64_t *val)
 {
     unknown_mmio *u = to_um(d);
-    entry *e = lookup(u, addr, false, size);
+    entry *e = lookup(u, addr, false, size, 0);
     *val = (u->policy == UAM_UNKNOWN_POLICY_ECHO && e) ? e->value & uam_mask(size * 8) : 0;
     return UAM_OK;
 }
@@ -54,7 +59,7 @@ static uam_status um_read(uam_device *d, uint64_t addr, unsigned size, uint64_t 
 static uam_status um_write(uam_device *d, uint64_t addr, unsigned size, uint64_t v)
 {
     unknown_mmio *u = to_um(d);
-    entry *e = lookup(u, addr, true, size);
+    entry *e = lookup(u, addr, true, size, v);
     if (e)
         e->value = v;
     return UAM_OK;

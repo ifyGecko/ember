@@ -174,7 +174,7 @@ FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
                $(if $(HAVE_SUZZER),$(SUZZER_SRC))
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/blockdev_file.c \
                src/host/hostloop.c \
-               src/debug/gdbstub.c src/runner/runner.c
+               src/debug/gdbstub.c src/runner/runner.c src/runner/trace.c
 
 CORE_ALL := $(IR_SRC) $(CORE_SRC) $(EXEC_SRC) $(ANALYSIS_SRC) $(LOADER_SRC) $(MACHINE_SRC)
 LIB_SRC  := $(CORE_ALL) $(RISCV_SRC) $(MIPS_SRC) $(ARM_SRC) $(X86_SRC) $(PPC_SRC) $(AVR_SRC) $(AVR32_SRC) $(PIC_SRC) $(MCS51_SRC) $(M6502_SRC) $(Z80_SRC) $(XTENSA_SRC) $(DEV_SRC) $(BOARD_SRC) $(FUZZ_SRC) $(HOST_SRC)
@@ -1003,9 +1003,11 @@ bench-test: $(RUN)
 xbench: $(RUN)
 	AVR32_CROSS=$(AVR32_CROSS) sh tools/xbench.sh --run $(RUN) --out $(abspath $(BUILD))/firmware-bench $(XBENCH_ARGS)
 
-# uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit)
-runner-test: $(TRUN) firmware-x86
+# uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit) and
+# its bring-up traces (--trace mmio/sysreg/irq/polls/console, --log-stamp)
+runner-test: $(TRUN) $(RUN) firmware-x86 firmware
 	sh tests/runner/runner-check.sh $(TRUN) $(FW_X86)
+	sh tests/runner/trace-check.sh $(RUN) $(BUILD)/firmware/selftest.elf
 
 net-check: $(TRUN) firmware
 	sh tests/net/net-check.sh $(TRUN) $(BUILD)/firmware/nettest.elf both

@@ -41,14 +41,16 @@ static slot *track(unimp *u, uint64_t off, bool is_write, unsigned size, uint64_
             s->used = true;
             s->off = off;
             u->n_used++;
+            char at[80];
+            uam_origin_format(at, sizeof(at));   /* the accessing instruction */
             if (is_write)
-                uam_log(UAM_LOG_WARN, "unimp", "%s+0x%llx (0x%llx): first write of %u bytes: 0x%llx",
+                uam_log(UAM_LOG_WARN, "unimp", "%s+0x%llx (0x%llx): first write of %u bytes: 0x%llx%s",
                         u->dev.name, (unsigned long long)off, (unsigned long long)(u->base + off),
-                        size, (unsigned long long)v);
+                        size, (unsigned long long)v, at);
             else
-                uam_log(UAM_LOG_WARN, "unimp", "%s+0x%llx (0x%llx): first read of %u bytes",
+                uam_log(UAM_LOG_WARN, "unimp", "%s+0x%llx (0x%llx): first read of %u bytes%s",
                         u->dev.name, (unsigned long long)off, (unsigned long long)(u->base + off),
-                        size);
+                        size, at);
             return s;
         }
     }

@@ -75,9 +75,12 @@ static uam_status mal_read(uam_device *d, uint64_t off, unsigned size, uint64_t 
     *val = size >= 8 ? ~0ull : (1ull << (8 * size)) - 1;
     if (s->log) {
         account(s, off, false);
-        if (first_access(s, off))
-            uam_log(UAM_LOG_WARN, "master-abort", "first read of %u bytes at 0x%llx (nothing decodes it: all ones)",
-                    size, (unsigned long long)off);
+        if (first_access(s, off)) {
+            char at[80];
+            uam_origin_format(at, sizeof(at));   /* " pc=0x... icount=N": the accessing instruction */
+            uam_log(UAM_LOG_WARN, "master-abort", "first read of %u bytes at 0x%llx (nothing decodes it: all ones)%s",
+                    size, (unsigned long long)off, at);
+        }
     }
     return UAM_OK;
 }
@@ -87,9 +90,12 @@ static uam_status mal_write(uam_device *d, uint64_t off, unsigned size, uint64_t
     master_abort_log *s = to_mal(d);
     if (s->log) {
         account(s, off, true);
-        if (first_access(s, off))
-            uam_log(UAM_LOG_WARN, "master-abort", "first write of %u bytes at 0x%llx: 0x%llx (dropped)",
-                    size, (unsigned long long)off, (unsigned long long)v);
+        if (first_access(s, off)) {
+            char at[80];
+            uam_origin_format(at, sizeof(at));
+            uam_log(UAM_LOG_WARN, "master-abort", "first write of %u bytes at 0x%llx: 0x%llx (dropped)%s",
+                    size, (unsigned long long)off, (unsigned long long)v, at);
+        }
     }
     return UAM_OK;
 }

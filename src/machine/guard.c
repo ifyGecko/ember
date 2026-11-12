@@ -110,7 +110,7 @@ static void on_access(void *ctx, uint64_t pa, unsigned size, bool is_write, uint
     const bool refused = g->spec.action != UAM_GUARD_LOG;
     s->last = (uam_guard_hit){
         .id = g->id, .name = g->name, .action = g->spec.action, .cpu = hart,
-        .pc = uam_machine_cpu(m, hart)->pc,
+        .pc = uam_machine_cpu(m, hart)->insn_pc,   /* the accessing instruction */
         .addr = g->spec.addr + p->off + (pa - p->pa),   /* wraps when it starts earlier */
         .start = g->spec.addr, .len = g->spec.len, .paddr = pa, .size = size,
         .is_write = is_write, .val = refused && !is_write ? 0 : val,

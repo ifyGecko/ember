@@ -51,7 +51,7 @@ static inline int64_t uam_sext(uint64_t v, unsigned width)
  * changes. Entry points check it together with the struct sizes the caller
  * was compiled with (uam_abi_layout in uam/machine.h).
  */
-#define UAM_ABI_VERSION 18u
+#define UAM_ABI_VERSION 19u
 
 /* The UAM_ABI_VERSION the library itself was built with. */
 unsigned uam_abi_version(void);
@@ -62,10 +62,37 @@ unsigned uam_abi_version(void);
 #define UAM_CONTAINER_OF(ptr, type, member) \
     ((type *)(void *)((char *)(ptr) - offsetof(type, member)))
 
-/* Minimal logging used by all modules; writes to stderr. */
+/* Minimal logging used by all modules; writes to stderr. With uam_log_stamp set
+ * (the runner's --log-stamp), each line made while a processor runs starts with where
+ * the guest stands: "@ICOUNT" ("@ICOUNT:cpuN" for processors other than 0). */
 typedef enum { UAM_LOG_ERROR, UAM_LOG_WARN, UAM_LOG_INFO, UAM_LOG_DEBUG } uam_log_level;
 extern uam_log_level uam_log_threshold;
+extern bool uam_log_stamp;
 void uam_log(uam_log_level lvl, const char *module, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
+
+/*
+ * The origin of what is happening now, for diagnostics: the guest instruction a
+ * processor is executing (exact while it makes a bus access, a system register access
+ * or a helper call; between blocks - timers, interrupts, hooks - the next one to run) and the processor's
+ * instruction count. A device's log line can then say which code touched it without the
+ * device knowing anything about processors. The executor publishes its processors while
+ * it runs (uam_exec_run); with nothing running (the loader, a debugger, the board being
+ * built) uam_origin_get returns false.
+ */
+typedef struct uam_origin {
+    unsigned cpu;      /* processor number (hartid) */
+    uint64_t pc;       /* the instruction */
+    uint64_t icount;   /* that processor's instruction count */
+} uam_origin;
+
+typedef bool (*uam_origin_fn)(void *ctx, uam_origin *out);
+bool   uam_origin_get(uam_origin *out);
+/* Install the provider; returns the previous one in *prev_fn / *prev_ctx (may be NULL)
+ * so that a nested run can put it back. */
+void   uam_origin_set_provider(uam_origin_fn fn, void *ctx, uam_origin_fn *prev_fn, void **prev_ctx);
+/* " pc=0x... icount=N" (and " cpu=N" for processors other than 0) into buf, or "" when
+ * nothing runs. Returns buf. */
+char  *uam_origin_format(char *buf, size_t len);
 
 #endif /* UAM_COMMON_H */

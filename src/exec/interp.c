@@ -95,6 +95,7 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
             pos.parent_pc = cont ? pos.parent_pc : pc;
             pos.pc = pc;
             pos.cont = cont;
+            cpu->insn_pc = pc;
             cpu->icount++;
             break;
         }
@@ -155,13 +156,18 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
         case UAM_OP_SYSRD: {
             uint64_t v = 0;
             uam_status st = cpu->isa->sysreg_read(cpu, in->aux, &v);
+            if (cpu->obs && cpu->obs->sysreg)
+                cpu->obs->sysreg(cpu->obs->ctx, cpu, in->aux, false, v & uam_mask(W), st);
             if (st != UAM_OK)
                 return fault(UAM_EXC_SYSREG, &pos, in->aux, 0);
             t[in->dst] = v & uam_mask(W);
             break;
         }
         case UAM_OP_SYSWR: {
-            uam_status st = cpu->isa->sysreg_write(cpu, in->aux, opnd(blk, t, in->a, W));
+            const uint64_t v = opnd(blk, t, in->a, W);
+            uam_status st = cpu->isa->sysreg_write(cpu, in->aux, v);
+            if (cpu->obs && cpu->obs->sysreg)
+                cpu->obs->sysreg(cpu->obs->ctx, cpu, in->aux, true, v, st);
             if (st != UAM_OK)
                 return fault(UAM_EXC_SYSREG, &pos, in->aux, 0);
             break;

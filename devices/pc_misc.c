@@ -277,12 +277,14 @@ static void abort_note(master_abort *a, uint64_t addr, unsigned size, bool is_wr
             a->n_used++;
             char where[80];
             abort_where(a, addr, where, sizeof(where));
+            char at[80];
+            uam_origin_format(at, sizeof(at));   /* the accessing instruction */
             if (is_write)
                 uam_log(UAM_LOG_WARN, "master-abort", "first write of %u bytes to %s: 0x%llx, nothing "
-                        "claims it (dropped)", size, where, (unsigned long long)v);
+                        "claims it (dropped)%s", size, where, (unsigned long long)v, at);
             else
                 uam_log(UAM_LOG_WARN, "master-abort", "first read of %u bytes at %s: nothing claims it, "
-                        "reads all ones", size, where);
+                        "reads all ones%s", size, where, at);
         }
         if (p->key == key) {
             if (is_write) p->writes++; else p->reads++;

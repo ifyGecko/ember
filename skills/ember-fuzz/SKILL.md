@@ -57,7 +57,9 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
 2. **Pick the route** (`references/harness.md`, "Routes"): the device the input arrives
    through, published by the board as a named input (`uart0`, `eth0.rx`; ember's PC board
    names its serial port `com1`), is the most faithful; `mem:ADDR` to a buffer the handler
-   reads is the quickest; `mmio` feeds `--mmio-rule ...=input` registers. If the firmware
+   reads is the quickest; `mmio` feeds `--mmio-rule ...=input` registers (`--trace mmio
+   --trace-mmio-range` on a normal run shows which registers the handler reads its input
+   from, with their pcs). If the firmware
    reaches the handler only after console interaction (a login, a menu choice), script it
    for the boot (`--console file:OUT,script=FILE`, or `string:TEXT,after=PATTERN`), all of
    it consumed before the begin pc (`references/harness.md`, "Reaching the handler").

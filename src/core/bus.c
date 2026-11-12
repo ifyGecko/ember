@@ -590,6 +590,25 @@ static uam_status read_bytewise(uam_bus *bus, uint64_t addr, unsigned size, unsi
     return UAM_OK;
 }
 
+/* After a guest read a device served: remember it (polls) and tell the observer. */
+static void dev_read_done(uam_bus *bus, const uam_region *r, uint64_t addr, unsigned size,
+                          uam_status st, const uint64_t *val)
+{
+    if (st == UAM_OK) {
+        bus->last_dev_read_addr = addr;
+        bus->last_dev_read_val = *val;
+        bus->last_dev_read_valid = true;
+    }
+    if (bus->dev_obs)
+        bus->dev_obs(bus->dev_obs_ctx, r, addr, size, false, st == UAM_OK ? *val : 0, st);
+}
+
+void uam_bus_set_dev_observer(uam_bus *bus, uam_dev_access_fn fn, void *ctx)
+{
+    bus->dev_obs = fn;
+    bus->dev_obs_ctx = fn ? ctx : NULL;
+}
+
 uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned attrs, uint64_t *val)
 {
     if (!valid_size(size))
@@ -611,6 +630,7 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
         if (!bus->unmapped || side_effect_free)
             return UAM_ERR_FAULT;
         st = dev_read(NULL, bus->unmapped, addr, size, be, val);
+        dev_read_done(bus, NULL, addr, size, st, val);
         break;
     case RES_ONE:
     default:
@@ -620,6 +640,7 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
                 if (attrs & UAM_ACC_FETCH)
                     return UAM_ERR_FAULT;  /* no execution from device mode */
                 st = dev_read(h.r, h.r->dev, h.off, size, be, val);
+                dev_read_done(bus, h.r, addr, size, st, val);
                 break;
             }
             /* ROM mode reads the backing store */
@@ -634,9 +655,12 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
              * can serve without side effects (its peek handler). */
             if ((attrs & UAM_ACC_FETCH) || (side_effect_free && !h.r->dev->ops->peek))
                 return UAM_ERR_FAULT;
-            st = side_effect_free
-                ? dev_read_with(h.r, h.r->dev, h.r->dev->ops->peek, h.off, size, be, val)
-                : dev_read(h.r, h.r->dev, h.off, size, be, val);
+            if (side_effect_free) {
+                st = dev_read_with(h.r, h.r->dev, h.r->dev->ops->peek, h.off, size, be, val);
+            } else {
+                st = dev_read(h.r, h.r->dev, h.off, size, be, val);
+                dev_read_done(bus, h.r, addr, size, st, val);
+            }
             break;
         default:
             return UAM_ERR_FAULT;
@@ -683,6 +707,8 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
         if (!bus->unmapped || debug)
             return UAM_ERR_FAULT;
         st = dev_write(NULL, bus->unmapped, addr, size, be, val);
+        if (bus->dev_obs)
+            bus->dev_obs(bus->dev_obs_ctx, NULL, addr, size, true, val, st);
         break;
     case RES_ONE:
     default:
@@ -692,6 +718,8 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
         case UAM_REGION_ROMD:
             if (!debug) {
                 st = dev_write(h.r, h.r->dev, h.off, size, be, val);
+                if (bus->dev_obs)
+                    bus->dev_obs(bus->dev_obs_ctx, h.r, addr, size, true, val, st);
                 break;
             }
             /* a debugger pokes the backing store */
@@ -707,6 +735,8 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
             if (debug)
                 return UAM_ERR_FAULT;
             st = dev_write(h.r, h.r->dev, h.off, size, be, val);
+            if (bus->dev_obs)
+                bus->dev_obs(bus->dev_obs_ctx, h.r, addr, size, true, val, st);
             break;
         default:
             return UAM_ERR_FAULT;

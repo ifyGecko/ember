@@ -304,8 +304,10 @@ static reg *reg_get(mmio_stub *s, uint64_t off, bool is_write, unsigned size)
     s->n_regs++;
     char how[96];
     uam_mmio_rule_describe(&s->rule, how, sizeof(how));
-    uam_log(UAM_LOG_INFO, "mmio-stub", "%s (%s): first %s of %u bytes at 0x%llx", s->dev.name,
-            how, is_write ? "write" : "read", size, (unsigned long long)(s->rule.addr + off));
+    char at[80];
+    uam_origin_format(at, sizeof(at));   /* the accessing instruction */
+    uam_log(UAM_LOG_INFO, "mmio-stub", "%s (%s): first %s of %u bytes at 0x%llx%s", s->dev.name,
+            how, is_write ? "write" : "read", size, (unsigned long long)(s->rule.addr + off), at);
     return r;
 }
 

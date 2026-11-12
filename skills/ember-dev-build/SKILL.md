@@ -132,7 +132,15 @@ and, when the pin moved, the skills' end-to-end test against it:
    `decompile`/`disasm`). Use ember's probes (`--log-pc`, `--break -d`, `-n N -d`,
    `--dump-mem`, `--trace blocks --trace-range`, `--watch`/`--guard` on the memory a wrong
    value lives in) or gdb (`--gdb`, `scripts/gdb_trace_calls.py`) to find which call fails or
-   what a hang loops on. Test a register hypothesis with
+   what a hang loops on. The bring-up traces, each off until asked for, say what the firmware
+   expects of the hardware: `--trace polls` (a stalled run: the register a loop waits on and
+   the bit or value that ends it), `--trace mmio [--trace-mmio-range LO:HI]` (one device's
+   register protocol: order, values, pcs), `--trace irq` (did the line rise, does the CPU see
+   it, is it masked), `--trace sysreg` (core and implementation registers the code relies
+   on), `--trace console` (console lines with their icount, to aim `--trace-after`,
+   `--snapshot-at`, `-n N -d`). Turn on one or two for the question at hand, not `all` on a
+   long boot. First-access lines of the catch-alls carry the instruction (`pc=... icount=N`):
+   decompile that pc. Test a register hypothesis with
    `--mmio-rule ADDR=fixed:V` before writing C (an x86 I/O port is
    `0x10000000000 + port`). Once the boot is long, start runs from a snapshot
    (`--snapshot-at PC --save-snapshot`, then `--load-snapshot`).

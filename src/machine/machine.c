@@ -353,6 +353,12 @@ void uam_machine_set_irq_hook(uam_machine *m, uam_irq_hook_fn fn, void *ctx)
         uam_exec_set_irq_hook(uam_machine_exec(m, i), fn, ctx);
 }
 
+void uam_machine_set_cpu_observer(uam_machine *m, const uam_cpu_observer *obs)
+{
+    for (uint32_t i = 0; i <= m->n_aps; i++)
+        uam_exec_set_cpu_observer(uam_machine_exec(m, i), obs);
+}
+
 uam_status uam_machine_add_pass(uam_machine *m, const uam_pass *p)
 {
     for (uint32_t i = 0; i <= m->n_aps; i++) {

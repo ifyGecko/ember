@@ -156,7 +156,29 @@ typedef struct uam_cpu {
     /* JIT data-TLB (see above). tag = guest vpage, base = host_page - vpage*4096. */
     uint64_t              dtlb_rt[UAM_DTLB_SIZE], dtlb_rb[UAM_DTLB_SIZE];
     uint64_t              dtlb_wt[UAM_DTLB_SIZE], dtlb_wb[UAM_DTLB_SIZE];
+    /* Diagnostics. insn_pc: the guest instruction executing now, exact while it makes a
+     * bus access, a system register access or a helper call (the executors set it; between
+     * blocks it is the next instruction to run). It is what uam_origin_get reports. obs:
+     * optional observers of system register accesses and interrupt input lines
+     * (uam_exec_set_cpu_observer); NULL when nothing watches. */
+    uint64_t              insn_pc;
+    const struct uam_cpu_observer *obs;
 } uam_cpu;
+
+/*
+ * Observers of one processor, for tracing and bring-up diagnostics (all optional).
+ * sysreg: after each SYSRD / SYSWR (isa->sysreg_read / sysreg_write), with the ISA's
+ *   register id, the value read or written and the handler's status (not UAM_OK: the
+ *   access raises UAM_EXC_SYSREG). cpu->insn_pc is the instruction.
+ * irq_input: an interrupt input line of the processor changed level (uam_cpu_irq_sink),
+ *   before the ISA sees it.
+ */
+typedef struct uam_cpu_observer {
+    void  (*sysreg)(void *ctx, struct uam_cpu *cpu, uint32_t id, bool write, uint64_t val,
+                    uam_status st);
+    void  (*irq_input)(void *ctx, struct uam_cpu *cpu, unsigned line, int level);
+    void   *ctx;
+} uam_cpu_observer;
 
 static inline void uam_cpu_dtlb_flush(uam_cpu *cpu)
 {

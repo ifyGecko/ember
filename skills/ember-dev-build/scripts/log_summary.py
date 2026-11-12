@@ -22,6 +22,12 @@ Prints, in order:
      --guard/--watch hits, scripted console input never sent, x86 MSRs no device answered
      (board option -o msr-trace=1), POST codes (-v -v), and the processors involved on a
      multiprocessor run (cpu=N)
+  7. what the bring-up traces add, when the run had them (all off by default):
+     --trace polls (a loop still waiting at the stop is called out in section 1, with the
+     register and the bit or value it waits for), --trace mmio (accesses per device),
+     --trace irq (interrupt input lines, a pending interrupt at the stop), --trace sysreg
+     (system register accesses that fault). First-access lines carry the instruction that
+     made them (pc=..., icount): shown with each event. --log-stamp prefixes are ignored.
 
 usage: log_summary.py [build/emu.log] [--isa mips|riscv|arm|x86|other] [--first 20] [--top 15]
 (default: from the project's run.sh ISA=; ppc, avr, avr32, pic, mcs51, m6502, z80 and xtensa
@@ -105,6 +111,17 @@ RE_JAM = re.compile(r"\] m6502: pc=(0x[0-9a-f]+): JAM")
 RE_MSR = re.compile(r"^x86: (rdmsr|wrmsr) (0x[0-9a-f]+) (?:->|<-) (0x[0-9a-f]+)")
 RE_POST = re.compile(r"\] post: code (0x[0-9a-f]+)")
 RE_GUARD = re.compile(r"^(?:\S+: )?guard (\S+) \((stop|fault|log)\): cpu (\d+) pc (0x[0-9a-f]+) (read|write) (\d+) at (0x[0-9a-f]+)")
+RE_AT = re.compile(r" pc=0x([0-9a-f]+) icount=(\d+)(?: cpu=(\d+))?")
+RE_STAMP = re.compile(r"^@\d+(?::cpu\d+)? ")      # --log-stamp
+RE_POLL_STILL = re.compile(r"^poll: STILL POLLING at the stop: (.*); (\d+) passes in (\d+) arrivals")
+RE_POLL_WAIT = re.compile(r"^poll: waiting: (.*) \((\d+) passes\) icount=(\d+)")
+RE_POLL_DONE = re.compile(r"^poll: done: (.*) \((\d+) passes\) icount=(\d+)")
+RE_POLL_SUM = re.compile(r"^poll: (pc 0x.*); (\d+) passes in (\d+) arrivals, longest (\d+)")
+RE_MMIO = re.compile(r"^mmio: ([rw]) (\d) 0x([0-9a-f]+) (\S+?)(?:\+0x([0-9a-f]+))? = (0x[0-9a-f]+)")
+RE_IRQ_SUM = re.compile(r"^irq-in: cpu(\d+) line (\d+): (\d+) rises, (\d+) falls, level (-?\d+) at the stop")
+RE_IRQ_NONE = re.compile(r"^irq-in: no interrupt input line")
+RE_IRQ_PEND = re.compile(r"^irq: at the stop (cpu\d+) has an interrupt pending and enabled(.*)")
+RE_SYSREG_FAULT = re.compile(r"^sysreg: (?:first )?(read|write) (0x[0-9a-f]+) .*system register exception.*?(?: pc=0x([0-9a-f]+))?")
 RE_CONSOLE_LEFT = re.compile(r"\] chardev: console input: (\d+) byte\(s\) never sent, waiting for '(.*)' \(step")
 PIO_BASE = 0x10000000000
 
@@ -193,20 +210,30 @@ def main(argv=None):
     posts = []
     guards = Counter()               # (guard, action, access) -> hits
     console_left = None
+    polls_still, polls_done, polls_sum = [], [], []
+    mmio_dev = Counter()             # (device, r/w) -> accesses (--trace mmio)
+    irq_lines, irq_pending, irq_none = [], [], False
 
     def note(i, text):
         if len(first) < a.first:
             first.append((i + 1, text))
 
+    def by(ln):
+        m = RE_AT.search(ln)
+        if not m:
+            return ""
+        return "  by pc 0x%s @%s%s" % (m.group(1), m.group(2), " cpu " + m.group(3) if m.group(3) else "")
+
     for i, ln in enumerate(lines):
+        ln = RE_STAMP.sub("", ln)
         m = RE_UNIMP_FIRST.search(ln)
         if m:
             w, off, addr, rw, sz, val = m.groups()
             w_ = where(int(addr, 16), w, isa)
             if rw == "write" and int(addr, 16) == PIO_BASE + 0xB2 and smi_lost is None:
                 smi_lost = (i + 1, val)
-            note(i, "unimp %-6s %s+0x%s (phys 0x%s) %sB%s%s" % (rw, w, off, addr, sz, " = " + val if val else "",
-                                                             "  " + w_ if w_ else ""))
+            note(i, "unimp %-6s %s+0x%s (phys 0x%s) %sB%s%s%s" % (rw, w, off, addr, sz, " = " + val if val else "",
+                                                               "  " + w_ if w_ else "", by(ln)))
             continue
         m = RE_UNIMP_HOT.search(ln)
         if m:
@@ -220,7 +247,7 @@ def main(argv=None):
         m = RE_STUB_FIRST.search(ln)
         if m:
             name, how, rw, sz, addr = m.groups()
-            note(i, "rule   %-6s 0x%s %sB (%s, %s)" % (rw, addr, sz, name, how))
+            note(i, "rule   %-6s 0x%s %sB (%s, %s)%s" % (rw, addr, sz, name, how, by(ln)))
             continue
         m = RE_STUB_SUM.search(ln)
         if m:
@@ -230,8 +257,8 @@ def main(argv=None):
         if m:
             src, rw, sz, addr = m.groups()
             unk_pages[int(addr, 16) & ~0xFFFF].add(int(addr, 16))
-            note(i, "unmapped %-5s 0x%s %sB (no window covers it%s)" % (
-                rw, addr, sz, "; master abort: reads all ones" if src == "master-abort" else ""))
+            note(i, "unmapped %-5s 0x%s %sB (no window covers it%s)%s" % (
+                rw, addr, sz, "; master abort: reads all ones" if src == "master-abort" else "", by(ln)))
             continue
         m = RE_EXC.match(ln)
         if m:
@@ -297,6 +324,42 @@ def main(argv=None):
             if guards[(name, act, rw)] == 1:
                 note(i, "guard %s (%s): %s %sB at %s, pc %s%s" % (
                     name, act, rw, sz, addr, pc, " cpu " + cpu if cpu != "0" else ""))
+            continue
+        m = RE_MMIO.match(ln)
+        if m:
+            mmio_dev[(m.group(4), m.group(1))] += 1
+            continue
+        m = RE_POLL_STILL.match(ln)
+        if m:
+            polls_still.append((m.group(1), int(m.group(2))))
+            continue
+        m = RE_POLL_WAIT.match(ln)
+        if m:
+            note(i, "poll waiting (%s passes so far): %s" % (m.group(2), m.group(1)))
+            continue
+        m = RE_POLL_DONE.match(ln)
+        if m:
+            polls_done.append((m.group(1), int(m.group(2)), int(m.group(3))))
+            continue
+        m = RE_POLL_SUM.match(ln)
+        if m:
+            polls_sum.append((m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))))
+            continue
+        m = RE_IRQ_SUM.match(ln)
+        if m:
+            irq_lines.append(tuple(int(x) for x in m.groups()))
+            continue
+        if RE_IRQ_NONE.match(ln):
+            irq_none = True
+            continue
+        m = RE_IRQ_PEND.match(ln)
+        if m:
+            irq_pending.append(m.group(1) + m.group(2))
+            continue
+        m = RE_SYSREG_FAULT.match(ln)
+        if m:
+            note(i, "system register %s %s faulted (the guest takes an exception)%s" % (
+                m.group(1), m.group(2), " at pc 0x" + m.group(3) if m.group(3) else ""))
             continue
         m = RE_CONSOLE_LEFT.search(ln)
         if m:
@@ -371,6 +434,10 @@ def main(argv=None):
         elif "differs" in msg or "is of board" in msg or "holds state for" in msg:
             print("   -> load with the same board build, options, images, --ram, rules and ports")
 
+    for desc, passes in polls_still:
+        print("   -> stopped while polling a device (--trace polls, %d passes): %s\n"
+              "      make that register produce the value (try --mmio-rule ADDR=fixed:V first), or\n"
+              "      model the device behaviour that sets it" % (passes, desc))
     print("\n== first distinct events (log line: event)")
     for n, t in first:
         print("%7d: %s" % (n, t))
@@ -424,6 +491,25 @@ def main(argv=None):
               "   output only, not output from before a --load-snapshot)" % console_left)
     if posts:
         print("\n== POST codes in order (last is where the firmware got to): %s" % " ".join(posts[-24:]))
+    if polls_sum or polls_done:
+        print("\n== device polls that waited and finished (--trace polls; desc, passes, arrivals, longest)")
+        for desc, passes, arr, longest in sorted(polls_sum, key=lambda x: -x[1])[:a.top]:
+            print("   %8d passes, %d arrivals, longest %d: %s" % (passes, arr, longest, desc))
+        for desc, passes, ic in polls_done[:a.top]:
+            print("   done at icount %d after %d passes: %s" % (ic, passes, desc))
+    if mmio_dev:
+        print("\n== --trace mmio: accesses per device (device: reads / writes)")
+        names = sorted({d for d, _ in mmio_dev}, key=lambda d: -(mmio_dev[(d, 'r')] + mmio_dev[(d, 'w')]))
+        for d in names[:a.top]:
+            print("   %-24s %d R / %d W" % (d, mmio_dev[(d, 'r')], mmio_dev[(d, 'w')]))
+    if irq_lines or irq_none or irq_pending:
+        print("\n== --trace irq: processor interrupt inputs")
+        if irq_none:
+            print("   no input line ever changed: nothing reached a CPU (unwired, or the controller never asserts)")
+        for cpu, line, r, f, lvl in irq_lines:
+            print("   cpu%d line %d: %d rises, %d falls, level %d at the stop" % (cpu, line, r, f, lvl))
+        for p_ in irq_pending:
+            print("   %s: an interrupt pending and enabled at the stop%s" % (p_.split()[0], p_[len(p_.split()[0]):]))
     print("\n%d lines total" % len(lines))
     return 0
 
