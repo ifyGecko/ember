@@ -57,8 +57,8 @@ boot that now stops at an unmodelled register has found a hole in the board: giv
 device or a `board_windows[]` catch-all rather than going back to `zero`, and remember that
 a catch-all answers wild accesses inside its window too.
 
-The runner refuses (exit 2) `--fuzz-*` options without `--fuzz-begin` (or suzzer's
-`--cov-boundary`), fuzzing without a frontend (`--fuzz-replay`, or `--fuzz-szr`), and
+The runner refuses (exit 2) `--fuzz-*` options without `--fuzz-begin` (or a boundary
+file's `--cov-boundary`), fuzzing without a frontend (`--fuzz-replay`, or `--fuzz-net`), and
 `--fuzz-begin` together with `--gdb` or `--save-snapshot`.
 
 ### Reaching the handler
@@ -102,7 +102,7 @@ taken is host state, not snapshot state: never leave a step pending into the ite
   first, and each input goes wherever the firmware takes it.
 - Recursion: with `--fuzz-end` the first end reached ends the iteration, so a recursive
   handler stops at its innermost return. Keeping it in one input takes nested boundaries:
-  depth-zero markers in suzzer's boundary file (`references/suzzer.md`), or
+  depth-zero markers in a boundary file (`references/lists-and-brain.md`), or
   `uam_fuzz_config.nested` in a program.
 - Code between an end and the next begin (the RTOS loop that waits for the next request)
   runs once, at boot, never per input.
@@ -414,8 +414,8 @@ and its range. A route's redzones are named `mem-before`, `mem-after` and `mem-a
 `--cov-map-size`). Interpreter and JIT give byte-identical maps and the guest runs exactly
 as without coverage, so maps from two runs compare directly. Blocks are not basic blocks;
 the edges are approximate but stable. Site-accurate coverage comes from a site table:
-suzzer's lists (`references/suzzer.md`) or `uam_fuzz_set_sites` in a program. A site in a
-MIPS branch delay slot cannot be instrumented (the run stops, naming it). Block coverage
+a site list (`references/lists-and-brain.md`) or `uam_fuzz_set_sites` in a program. A site in a
+MIPS branch delay slot or a Thumb IT block cannot be instrumented (the run stops, naming it). Block coverage
 works on every ISA; ember's fuzz-check compares the maps of interpreter, JIT and unchained
 JIT on every stock board but `x86_64-ref` and `xtensaeb-ref` (several only when their
 toolchain is installed). With several processors all
@@ -448,7 +448,7 @@ count into one map, each in its own history; edges between processors are not co
 
 ## In a program
 
-When neither replay nor suzzer fits (a custom mutator, a differential check), link the
+When neither replay nor the brain fits (a custom mutator, a differential check), link the
 project against the same libuam and drive `uam/fuzz.h` directly:
 
 ```c

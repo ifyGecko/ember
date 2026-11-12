@@ -4,8 +4,8 @@ Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A w
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
 and AVR32B, 8-bit PIC in four core families, the 8051 in three core models, the 6502 in
 three core models, the Z80, Xtensa in three core models and both byte orders), the
-phase 3 except the cmp-log pass (snapshots, coverage, the fuzz harness, guards, suzzer
-interoperation) and the JIT from phase 4. IR, interpreter and optimizer, a
+phase 3 except the cmp-log pass (snapshots, coverage, the fuzz harness, guards, site
+lists, boundary files and the fuzz brain) and the JIT from phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
 (`mips-ref` / `mipsel-ref` boards), ARMv7-A, ARM and Thumb-2, little-endian and BE8
@@ -103,10 +103,6 @@ devices/*     → device.h, signal.h, sched.h, chardev.h, netdev.h, blockdev.h, 
 boards/*      → everything public except host.h; the only place concrete modules meet
 host/, debug/ → public interfaces (chardev, netdev, blockdev, exec, machine, guard); never a concrete device
 runner, fuzz/, tools/ → boards + public headers
-fuzz/suzzer/  → as fuzz/, plus suzzer's format header (src/lcv_formats.h of the suzzer
-                checkout the build is given; docs/suzzer.md); the only code that knows suzzer's
-                formats, built only when a checkout is configured (fuzz/stock_exts.c
-                adds its runner extension then)
 ```
 
 The consequences are deliberate:
@@ -183,12 +179,17 @@ boards/           rv32_ref.c mips_ref.c arm_ref.c x86_64_ref.c ppc_ref.c avr_ref
                   pic_ref.c pic32_ref.c mcs51_ref.c m6502_ref.c z80_ref.c xtensa_ref.c stock.c mmio_rules.c (uam_board_add_mmio_rules,
                   any board)
 fuzz/             harness.c frontend_replay.c (the harness and the replay frontend),
-                  stock_exts.c (the runner extensions uam_run_main uses)
-fuzz/suzzer/      scheme.c (the bucket formula) import.c (LCV3/LCVB1 readers, site check)
-                  frontend_szr1.c (the SZR1 executor, --fuzz-szr) lcvs.c (the LCVS export,
-                  --cov-shm) cli.c (the runner extension for all of them) suzzer.h
-tools/            uam-run.c fetch-suzzer.sh (`make suzzer`: clone suzzer into ./suzzer, ignored
-                  by git) xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
+                  stock_exts.c (the runner extensions uam_run_main uses), formats.h (the site
+                  list, boundary file, coverage region and fuzz protocol; docs/fuzz-formats.md),
+                  cov_scheme.c (the bucket formula) site_list.c (site-list and boundary readers,
+                  site check) frontend_net.c (the fuzz protocol, --fuzz-net) cov_region.c (the
+                  coverage region, --cov-shm) cov_cli.c (the runner extension for all of them)
+                  cov_formats.h
+fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files
+                  from rizin's analysis) ghidra/ (the same two from headless Ghidra, Jython)
+                  fuzz_brain.py mutate.py (the coverage-guided brain and its mutator)
+                  status_tui.py (its status screen) cov_region.py (reads a coverage region)
+tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
                   docs/jit-perf.md)
 examples/         external-board/ (an out-of-tree board built against `make lib`)
 skills/           ember-dev-recon/ ember-dev-build/ ember-fuzz/ (agent skills: SKILL.md, scripts,
@@ -197,17 +198,17 @@ skills/           ember-dev-recon/ ember-dev-build/ ember-fuzz/ (agent skills: S
 tests/boards/     test_boards.c test_boards.h uam-test-run.c  (x86_64-test and rv32-test: reference boards plus
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
-                  test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_suzzer.c
+                  test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_cov_formats.c
                   test_smp.c test_f80.c test_xtensa_fpu.c, and one per ISA: test_riscv.c
                   test_mips.c test_arm.c test_x86.c test_ppc.c test_avr.c test_avr32.c
                   test_pic.c test_mcs51.c test_m6502.c test_z80.c test_xtensa.c
 tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
-tests/suzzer/     suzzer-check.sh mk_lists.py lcvs_check.py  (suzzer's formats through the
-                  runner) gen-check.sh  (lists from suzzer's own rizin generators; its Ghidra
-                  ports write the same files and are not run here)
-tests/szr/        szr-check.sh fake_brain.py  (the SZR1 executor against a scripted brain)
-                  brain-check.sh  (a session with suzzer's own brain)
+                  formats-check.sh mk_lists.py cov_region_check.py  (site lists, boundary files
+                  and the coverage region through the runner) gen-check.sh  (lists from
+                  fuzz/tools' generators; rizin and, when present, headless Ghidra)
+                  fuzz-net-check.sh fake_brain.py  (the fuzz protocol against a scripted brain)
+                  brain-check.sh  (a session with fuzz_brain.py)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
 tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dump-mem,
                   --trace-after, traces with --jit, --guard/--watch)
@@ -357,8 +358,8 @@ devices.
   convention for code addresses, so the translation cache, interrupted blocks and ELF entry
   points need nothing ARM-specific, and interworking branches stay plain IR (`BX` compiles and
   chains like any computed exit). PC hooks, coverage sites and fuzz boundaries in Thumb code
-  name the pc with bit 0 set; the gdb stub and the suzzer importer (suzzer marks Thumb sites
-  by their 2-byte length) translate. IT blocks are continuations (`UAM_IMARK_CONT`) so no
+  name the pc with bit 0 set; the gdb stub and the site-list importer (a list flags Thumb sites
+  as ALT_STATE) translate. IT blocks are continuations (`UAM_IMARK_CONT`) so no
   interrupt splits one; only an exception return into the middle of one leaves IT state for
   the next block, which `cpu->priv` then carries (`uam-isa.md` section 10b). Byte order is
   BE8: code is always little-endian, data follows CPSR.E (also part of `cpu->priv`, so code
@@ -662,11 +663,12 @@ devices.
   counted by the boundary hooks, in the map they close. Frontends sit behind
   `uam_fuzz_frontend`; the replay frontend runs saved inputs. Observers
   (`uam_fuzz_set_observer`) see every published map, for side channels.
-- **suzzer interoperation** (`fuzz/suzzer/`, built only with a suzzer checkout,
-  [`suzzer.md`](suzzer.md)): LCV3 site lists and LCVB1 boundary files in, the SZR1 executor
-  (`--fuzz-szr`) and LCVS export (`--cov-shm`, an observer) out. It reaches the runner
-  through the generic runner-extension interface (`runner.h`), so outside `fuzz/suzzer/` only
-  `fuzz/stock_exts.c` adds its extension, and only when a checkout is configured.
+- **Site lists, boundary files and the fuzz brain** (`fuzz/`, formats in
+  [`fuzz-formats.md`](fuzz-formats.md)): site lists and boundary files in (made by
+  `fuzz/tools/gen_sites.py` and `gen_boundaries.py`), the fuzz protocol (`--fuzz-net`, driven
+  by `fuzz/tools/fuzz_brain.py`) and the coverage region (`--cov-shm`, an observer) out. It
+  reaches the runner through the generic runner-extension interface (`runner.h`): only
+  `fuzz/stock_exts.c` adds its extension.
 - **Planned** (phase 3, on top of snapshots):
   - More passes: cmp-logging, memory hooks, taint (`HELPER` calls, which such passes would
     insert, compile in the JIT like every other IR op).
@@ -859,18 +861,19 @@ Implemented (`make test`):
   covers the rest but `x86_64-ref` and `xtensaeb-ref`: the cores without exceptions (8-bit AVR
   and PIC, 8051, 6502, Z80) skip the exception-policy step (`FUZZ_CHECK_NO_TRAPS`), and AVR32A
   needs an AVR32 toolchain.
-- suzzer formats: `test_suzzer` reproduces every conformance vector of the configured suzzer (N=1..4 and 8,
-  rotation off and on) byte for byte through `UAM_OP_COV` on every backend, checks the map-size rule against suzzer's table, and
-  covers the LCV3/LCVB1 readers (every rejection of suzzer's reader checklist), base
-  resolution, boundaries, site naming, the site-byte check and the LCVS region's ownership
-  rules. `tests/suzzer/suzzer-check.sh` runs `--cov-sites`/`--cov-boundary` end to end on
-  RV32, MIPS32 BE/LE, ARM (Thumb-2, LE and BE8) and PowerPC, including N=3 and N=8 with rotation, and the LCVS export read back by suzzer's
-  reader; `gen-check.sh` does it with suzzer's own generators; `tests/szr/` checks the SZR1
-  executor frame by frame and in a session with suzzer's brain, whose saved crash directory
-  replays without its `.info` notes.
-- With a suzzer checkout configured: its format header compiles on its own with ember's
-  strict flags, and `test_suzzer` reads the checkout's own conformance vectors. Without one,
-  the suzzer tests are skipped.
+- Fuzz formats: `test_cov_formats` runs fixed emit sequences through every coverage scheme
+  (site and pc, N=1..4 and 8, rotation off and on, two map sizes) on every backend, which must
+  agree byte for byte and match the golden map hashes in `tests/unit/cov_golden.txt`; it
+  checks the map-size rule and covers the site-list and boundary readers (every rejection of
+  their checklists), base resolution, the alternate-state flag, boundaries, site naming, the
+  site-byte check and the coverage region's ownership rules. `fuzz/formats.h` compiles on its
+  own with ember's strict flags, and `mutate.py --selftest` runs. `tests/fuzz/formats-check.sh`
+  runs `--cov-sites`/`--cov-boundary` end to end on RV32, MIPS32 BE/LE, ARM (Thumb-2, LE and
+  BE8) and PowerPC, including N=3 and N=8 with rotation, and the coverage region read back by
+  `cov_region.py` and an independent reader; `gen-check.sh` does it with `fuzz/tools`'
+  generators (rizin, and the Ghidra route when headless Ghidra is installed);
+  `fuzz-net-check.sh` checks the fuzz protocol frame by frame, and `brain-check.sh` a session
+  with `fuzz_brain.py`, whose saved crash directory replays without its `.info` notes.
 - The external-board example is built and run against the library.
 - Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
   board but `pic-ref` (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, AVR32A

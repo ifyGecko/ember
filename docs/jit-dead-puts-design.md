@@ -208,9 +208,9 @@ I read src/core, src/exec, src/ir, src/machine, src/runner, src/loader, src/host
 1. **Thumb bit masked for every ISA.** `src/exec/run.c:46` and `:398` clear pc bit 0 unconditionally. For x86 (odd pcs) `mark_block_code` then misses the last byte of a block. If that byte starts a new 64-byte line, a guest write there does not invalidate the translation.
    - Fix: use the ISA's `pc_state_bits` (already declared in isa.h and used by the gdb stub).
    - **Fixed (2be1aca):** `uam_isa_pc_state_bits()`; x86 self-test 97 patches such a byte.
-2. **ARM-specific code in the suzzer fuzz frontend.** `fuzz/suzzer/cli.c:23,240,274` calls `uam_arm_is`; `fuzz/suzzer/import.c:346-374` guesses Thumb from site lengths. This creates a link dependency on the ARM module.
+2. **ARM-specific code in the site-list frontend.** The runner extension for site lists called `uam_arm_is`, and its importer guessed Thumb from site lengths. This creates a link dependency on the ARM module.
    - Fix: also go through `pc_state_bits`.
-   - **Fixed (1af0c59):** `sz_state_sites`/`sz_state_bounds`; `sz_check_sites` also read the wrong bytes for a 2-byte x86 site at an odd address.
+   - **Fixed (1af0c59):** the state bits came from `pc_state_bits`, and the site check also read the wrong bytes for a 2-byte x86 site at an odd address. Site lists now mark alternate-state sites with a flag of their own (`docs/fuzz-formats.md`).
 3. **PC chipset behaviour in the generic PCI device.** `devices/pci.c:680-684` treats a byte write to CF9 as reset control.
    - Fix: make it a board option or callback.
    - **Fixed (44d822b):** the CAM now implements the generic PCI rule (only a dword access to CONFIG_ADDRESS is a configuration access) and passes the rest to `uam_pci_cam_passthrough`. The `uam_pci_set_cf9_hook` compatibility wrapper kept at first was removed in bc4e678: a board wires its own reset-control device through the pass-through.

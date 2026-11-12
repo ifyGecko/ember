@@ -86,7 +86,7 @@ make                 # build/uam-run and the libraries (build/uam-test-run: make
 make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, external-board example,
                      # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
                      # the runner's debugging options, the cross-ISA benchmark's checksums
-                     # (and suzzer interop, with a suzzer checkout)
+                     # (and site lists, boundary files and the fuzz brain)
 make runner-test     # one group on its own (also unit-test, fuzz-test, gdb-test, bench-test, ...)
 make jitdiff-soak    # the JIT-against-interpreter differential test, at length
 make xbench          # time the cross-ISA benchmark (docs/jit-perf.md)
@@ -262,13 +262,13 @@ in front of its buffer and past the input in it (`before=N`, `after`). `--fuzz-r
 FILE|DIR` runs saved inputs once each and exits with the most severe verdict of any input
 (20/21/25 crash, else 22 hang, else 23 timeout, else 24 rejected, else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
 
-With a [suzzer](docs/suzzer.md) checkout (`make SUZZER_DIR=path`, or `make suzzer` to clone one
-into `./suzzer`), suzzer's site lists and boundary files plug in directly: `--cov-sites fw.lcv3` gives bitmaps
-with the same meaning as libcov's (site-id or hashed-PC model, N=1..8, rotation, leapfrog's
-emit stream), `--cov-boundary fw.lcvb` replaces `--fuzz-begin`/`--fuzz-end`, and
-`--cov-strict` checks every site's bytes in memory against the list. `--fuzz-szr HOST:PORT`
-lets suzzer's brain drive ember in place of `suzzer-relay`, and `--cov-shm PATH` publishes
-the maps in an LCVS region for suzzer's readers.
+Site lists and boundary files made by static analysis (`fuzz/tools/gen_sites.py` and
+`gen_boundaries.py`, on rizin or headless Ghidra) plug in directly: `--cov-sites fw.uams`
+gives site-id or hashed-pc N-gram coverage (N=1..8, optionally order-sensitive),
+`--cov-boundary fw.uamb` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-strict` checks every
+site's bytes in memory against the list. `--fuzz-net HOST:PORT` lets ember's coverage-guided
+brain (`fuzz/tools/fuzz_brain.py`) drive the campaign, and `--cov-shm PATH` publishes the maps
+in a shared-memory coverage region. The formats are in [`docs/fuzz-formats.md`](docs/fuzz-formats.md).
 
 A run is as bounded as you make it: with neither option, a guest that spins forever runs
 until it is stopped. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual
@@ -502,7 +502,7 @@ ember board and then fuzz it: `ember-dev-recon` (triage: architecture, load addr
 map, MMIO, whether ember can run it), `ember-dev-build` (an out-of-tree board brought up one
 device at a time, against a local ember clone pinned to the latest commit, with any change
 to ember kept as `git am`-ready patch files) and `ember-fuzz` (the snapshot
-fuzz harness and suzzer). They are plain `SKILL.md` folders; `skills/install.sh` links them
+fuzz harness, site lists and the brain). They are plain `SKILL.md` folders; `skills/install.sh` links them
 into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agents/skills`).
 `skills/tests/run-tests.sh ~/ember` checks their tooling end to end. See `skills/README.md`.
 
@@ -527,7 +527,8 @@ src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
 analysis/          IR passes (cov.c: the edge-coverage pass)
 fuzz/              the persistent-mode fuzz harness, the replay frontend, the runner's fuzz
-                   options; fuzz/suzzer/: suzzer's formats (built only with a suzzer checkout)
+                   options, site lists, boundary files, the coverage region and the fuzz
+                   protocol; fuzz/tools/: the list generators, the brain and its tools
 isa/riscv/         RISC-V lifter (rv_lift.c) and privileged architecture (rv_system.c)
 isa/mips32/        MIPS32 lifter (mips_lift.c) and privileged architecture (mips_system.c);
                    mips16.c (MIPS16e), mips_umips.c (microMIPS), mips_fpu.c (the FPU),
@@ -593,14 +594,14 @@ boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
-tools/             also fetch-suzzer.sh (make suzzer), xbench.sh / jitbench.sh (timing),
+tools/             also xbench.sh / jitbench.sh (timing),
                    jitprof.py (native-code profiles; docs/jit-perf.md)
 examples/          external-board: an out-of-tree board using the library
 skills/            agent skills (recon, board bring-up, fuzzing), their installer and tests
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
                    loops, stores next to code, MMIO rules, coverage, the fuzz harness,
-                   multiprocessor observers, suzzer's formats, the x87's software 80-bit
+                   multiprocessor observers, the fuzz formats and golden coverage maps, the x87's software 80-bit
                    format (against the host's x87 on x86-64), the Xtensa FPU against exact
                    arithmetic (test_xtensa_fpu); and one test_<arch>.c per ISA for what its
                    self-test cannot reach (such as the CPU models and reset state, exception
@@ -651,7 +652,8 @@ tests/firmware-x86/ x86-64 self-test, multiprocessor, legacy (tasks, V86, MMX), 
 tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and PowerPC
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/cov/ tests/fuzz/  block-coverage maps across backends; the fuzz harness on planted bugs
-tests/suzzer/ tests/szr/  suzzer's formats and the SZR1 executor (with a suzzer checkout)
+tests/fuzz/        also site lists, boundary files, the coverage region, the fuzz protocol and
+                   a session with the brain (make fuzz-lists-test)
 tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
 tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch;
                    trace-check.sh: --trace mmio/sysreg/irq/polls/console, --log-stamp

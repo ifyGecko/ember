@@ -1,6 +1,6 @@
 ---
 name: ember-fuzz
-description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage, replay or triage crashing inputs, or connect ember to suzzer (site lists, boundary files, its brain, LCVS). Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (suzzer's brain over --fuzz-szr, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'suzzer with ember', '--fuzz-szr', '--cov-sites'."
+description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage, replay or triage crashing inputs, or use generated site lists, boundary files and ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites'."
 ---
 
 # ember-fuzz: fuzzing firmware on a working ember board
@@ -15,16 +15,15 @@ snapshot through a named **route**, classifying each run as ok, crash (fault, or
 guard), hang, timeout or rejected. Runs are deterministic: the same input from the same
 snapshot gives the same verdict and the same coverage map, on the interpreter and the JIT.
 It works the same on every ISA ember has; what differs per core is which crash oracles
-exist. Ember has **no mutator of its own**: it replays inputs (`--fuzz-replay`) and executes
-inputs a frontend sends (suzzer's brain over `--fuzz-szr`, or your own program on
-`uam/fuzz.h`).
+exist. Inputs come from a frontend: saved inputs (`--fuzz-replay`), ember's coverage-guided
+brain (`fuzz/tools/fuzz_brain.py` over `--fuzz-net`), or your own program on `uam/fuzz.h`.
 
 Read `references/harness.md` before configuring a target (routes, boundaries, oracles,
-per-ISA notes, verdicts, coverage, triage), and `references/suzzer.md` when suzzer is
-involved (its site and boundary lists come from suzzer's rizin generators or, without
-rizin, from their Ghidra ports run by headless Ghidra on the recon project). This skill ships in ember's repository (`skills/ember-fuzz/`, beside
+per-ISA notes, verdicts, coverage, triage), and `references/lists-and-brain.md` for site lists, boundary files and
+the brain (the lists come from ember's rizin generators or, without rizin, from their Ghidra
+ports run by headless Ghidra on the recon project). This skill ships in ember's repository (`skills/ember-fuzz/`, beside
 `skills/ember-dev-recon/` and `skills/ember-dev-build/`), but the project links the ember
-it pins: that checkout's `docs/fuzzing.md`, `docs/suzzer.md` and `build/<board>-run --help`
+it pins: that checkout's `docs/fuzzing.md`, `docs/fuzz-formats.md` and `build/<board>-run --help`
 are the authority on option details, and a pin older than this skill may lack options used
 here. Script paths are relative to this skill's directory; python3 is all
 `scripts/replay_summary.py` needs.
@@ -92,12 +91,12 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
 6. **Check coverage moves**: `--cov-blocks --cov-out` for two different inputs must give
    different maps; identical maps mean the input never reaches the handler (begin pc after
    the read, wrong route, input dropped by a full FIFO).
-7. **Run the campaign**: suzzer's brain (`references/suzzer.md`) or a program on
+7. **Run the campaign**: the brain (`references/lists-and-brain.md`) or a program on
    `uam/fuzz.h`. Keep inputs, crashes and hangs in `fuzz/` of the project.
 8. **Triage**: replay the crash directory, group with `scripts/replay_summary.py`, reproduce
    each group's smallest input alone, then debug it with ember-dev-build's tools from the
    snapshot (`--load-snapshot`, `--break`, `-d`, gdb). A `crash-guard` (replay exit 25;
-   over SZR1 it arrives as GUEST_FAULT with the pc) is an out-of-bounds access stopped
+   to the brain it arrives as `GUARD` with the pc) is an out-of-bounds access stopped
    before it happened: its replay line names the guard and the access's offset into it
    (`read 1 at 0x80000470: +0 into guard mem-after [...]`), which says whether it is an
    off-by-one, a trusted length or an underflow (`references/harness.md`, "Reading a

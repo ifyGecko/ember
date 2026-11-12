@@ -9,19 +9,15 @@
 #
 # Usage:
 #   build-ember.sh [--proj DIR] [--ember-src DIR] [--jobs N] [--cflags "-O2 -g"] [--fresh] [--force]
-#                  [--suzzer DIR|off]
 #
 #   --force   discard ember edits or commits in the clone that patches/ does not hold, or
 #             move a working copy's HEAD to the pinned commit. Without it the script refuses.
 #   --fresh   delete the project-local clone (<proj>/ember-src) and the library build, re-clone.
-#   --suzzer  build ember's suzzer integration (--cov-sites, --cov-boundary, --fuzz-szr,
-#             --cov-shm) against this suzzer checkout; "off" turns it off. Remembered in
-#             <proj>/suzzer.dir. Only for the ember-fuzz skill; bring-up needs no suzzer.
 # Env: PROJ_DIR, EMBER_SRC, EMBER_UPSTREAM (clone source; else <proj>/ember.upstream), CFLAGS.
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-P=""; S=""; JOBS="$(nproc 2>/dev/null || echo 4)"; FRESH=0; FORCE=0; CF="${CFLAGS:--O2 -g}"; SZ=""
+P=""; S=""; JOBS="$(nproc 2>/dev/null || echo 4)"; FRESH=0; FORCE=0; CF="${CFLAGS:--O2 -g}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --proj) P="$2"; shift 2;;
@@ -30,7 +26,6 @@ while [[ $# -gt 0 ]]; do
         --cflags) CF="$2"; shift 2;;
         --fresh) FRESH=1; shift;;
         --force) FORCE=1; shift;;
-        --suzzer) SZ="$2"; shift 2;;
         -h|--help) sed -n '2,20p' "$0"; exit 0;;
         *) _die "unknown argument: $1";;
     esac
@@ -40,12 +35,6 @@ SRC="$(resolve_src "$S" "$PROJ")"
 COMMIT="$(head -1 "$PROJ/ember.commit")"; [[ -n "$COMMIT" ]] || _die "empty ember.commit"
 BOARD="$(board_name_of "$PROJ")"
 LIBBUILD="$PROJ/.ember-build"
-if [[ -n "$SZ" ]]; then
-    [[ "$SZ" == off || -f "$SZ/src/lcv_formats.h" ]] || _die "not a suzzer checkout (no src/lcv_formats.h): $SZ"
-    [[ "$SZ" == off ]] && echo off > "$PROJ/suzzer.dir" || (cd "$SZ" && pwd) > "$PROJ/suzzer.dir"
-fi
-SZ="$(head -1 "$PROJ/suzzer.dir" 2>/dev/null || true)"
-SZARG=(); [[ -n "$SZ" ]] && SZARG=("SUZZER_DIR=${SZ/#off/}")
 
 if [[ "$FRESH" -eq 1 ]]; then
     project_owned_src "$SRC" "$PROJ" && rm -rf "$SRC"
@@ -97,7 +86,7 @@ while read -r p; do
 done < <(patch_files "$PROJ")
 
 echo "--- ember libraries -> $LIBBUILD ---"
-make -C "$SRC" BUILD="$LIBBUILD" CFLAGS="$CF" "${SZARG[@]}" -j"$JOBS" lib > "$PROJ/build-lib.log" 2>&1 \
+make -C "$SRC" BUILD="$LIBBUILD" CFLAGS="$CF" -j"$JOBS" lib > "$PROJ/build-lib.log" 2>&1 \
     || { tail -30 "$PROJ/build-lib.log"; _die "ember library build failed (full log: build-lib.log)"; }
 rm -f "$PROJ/build-lib.log"
 cat > "$LIBBUILD/paths.mk" <<EOF

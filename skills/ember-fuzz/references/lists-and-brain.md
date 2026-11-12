@@ -1,66 +1,50 @@
-# suzzer with ember
+# Site lists, boundary files and the brain
 
-[suzzer](https://github.com/ifyGecko/suzzer) is a separate project: coverage and remote
-fuzzing for embedded Linux userland (libcov, site and boundary generators,
-`suzzer_brain.py`).
-Ember reads its published formats and plays the executor for its brain, so a firmware fuzzed
-under ember produces maps that mean the same as libcov's on a device, and corpora carry
-over. Ember's `docs/suzzer.md` and `docs/fuzzing.md` (section "suzzer") in the pinned
-checkout are the authority; this page is what matters on a custom board.
+Ember can take its coverage sites and iteration boundaries from files made by static
+analysis (`fuzz/tools/gen_sites.py`, `gen_boundaries.py`) and its inputs from its
+coverage-guided brain (`fuzz/tools/fuzz_brain.py`, over `--fuzz-net`). Everything ships in
+ember's tree; the project's pinned ember checkout has the tools at `$EMBER/fuzz/tools/`
+(`$EMBER` = the project's `ember-src`, or the clone `ember.src` names). That checkout's
+`docs/fuzzing.md` (section "Site lists, boundary files and the brain") and
+`docs/fuzz-formats.md` are the authority; this page is what matters on a custom board.
 
-## Build the project's ember with suzzer
+## A `fuzz-lists.sh` next to `fuzz.sh`
 
-The suzzer options exist only in a libuam built against a suzzer checkout (ember reads
-suzzer's `src/lcv_formats.h` and nothing else). ember-dev-build's `build-ember.sh` does it:
-
-```bash
-scripts/build-ember.sh --suzzer ~/src/suzzer    # remembered in suzzer.dir; --suzzer off removes it
-build/<board>-run --help | grep -- --cov-sites  # present now
-```
-
-A suzzer whose format versions differ from ember's (LCV3 3, LCVB1 1, LCVS 1, SZR1 1) stops
-the library build, naming the format: pin a matching suzzer or move the ember pin.
-
-## A `fuzz-suzzer.sh` next to `fuzz.sh`
-
-suzzer's files replace two of `fuzz.sh`'s options, and the runner refuses both at once
+The two files replace two of `fuzz.sh`'s options, and the runner refuses both at once
 (exit 2): `--cov-boundary` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-sites` replaces
 `--cov-blocks`. Keep the rest (oracles, route, budget) the same in a second script:
 
 ```bash
 #!/usr/bin/env bash
-# fuzz-suzzer.sh - fuzz.sh with suzzer's sites and boundaries (fuzz-XX.md)
+# fuzz-lists.sh - fuzz.sh with generated sites and boundaries (fuzz-XX.md)
 set -euo pipefail
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TRACE="${TRACE-}"
 export UNKNOWN_MMIO="${UNKNOWN_MMIO-fault}"
 exec "$PROJ/run.sh" -n 2000000000 \
     --console "file:$PROJ/build/fuzz-console.txt" \
-    --cov-sites "$PROJ/fuzz/fw.lcv3" --cov-boundary "$PROJ/fuzz/fw.lcvb" --cov-strict \
+    --cov-sites "$PROJ/fuzz/fw.uams" --cov-boundary "$PROJ/fuzz/fw.uamb" --cov-strict \
     --fuzz-crash-pc 0x80001234 \
     --fuzz-input uart0 \
     --fuzz-iter-insns 5000000 \
     "$@"
 ```
 
-## Site lists and boundaries
+## Making the lists
 
-suzzer has two sets of generators that write the same LCV3 and LCVB1 files: the rizin ones
-(`tools/gen_patchlist.py`, `tools/gen_boundary.py`; they need rizin and python3's `rzpipe`)
-and their Ghidra Jython ports (`tools/ghidra/gen_patchlist_ghidra.py`,
-`gen_boundary_ghidra.py`; headless Ghidra, no rizin). Use either, but make both files of one
-target with the same one: the two analyses cut basic blocks differently (Ghidra ends one at a
-call), so their site sets differ.
+Two routes write the same files, byte for byte: the rizin tools (need rizin and python3's
+`rzpipe`) and their Ghidra Jython ports (`fuzz/tools/ghidra/`; headless Ghidra, no rizin).
+Use whichever is installed. Ghidra also covers what rizin cannot decode: ARM BE8 images,
+AVR32 and 8-bit PIC ELFs, MIPS16e/microMIPS functions.
 
 With rizin:
 
 ```bash
-# suzzer side: sites and boundaries for the exact bytes the board runs
-python3 suzzer/tools/gen_patchlist.py --strategy entry fw.elf fuzz/fw.lcv3
-python3 suzzer/tools/gen_boundary.py --strategy entry --patchlist fuzz/fw.lcv3 fw.elf \
-    fuzz/fw.lcvb handle_request:begin
-# ember side
-IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
+T=$EMBER/fuzz/tools
+python3 $T/gen_sites.py --strategy entry fw.elf fuzz/fw.uams
+python3 $T/gen_boundaries.py --strategy entry --sites fuzz/fw.uams fw.elf fuzz/fw.uamb \
+    handle_request:begin
+IMAGE=fw.bin ./fuzz-lists.sh --fuzz-replay corpus/
 ```
 
 With headless Ghidra, on the project ember-dev-recon's `recon.sh` already made (the stage
@@ -70,105 +54,99 @@ analysed twice and RECON's function names are the ones the markers use:
 ```bash
 H="$GHIDRA_HOME/support/analyzeHeadless"; P="${GHIDRA_PROJECTS:-$HOME/GhidraProjects}"
 # -process takes the program's name in the project: the stage file as recon imported it
-"$H" "$P" fw.bin_recon -process fw.bin -noanalysis -scriptPath suzzer/tools/ghidra \
-    -postScript gen_patchlist_ghidra.py "$PWD/fuzz/fw.lcv3" --strategy entry
-"$H" "$P" fw.bin_recon -process fw.bin -noanalysis -scriptPath suzzer/tools/ghidra \
-    -postScript gen_boundary_ghidra.py "$PWD/fuzz/fw.lcvb" handle_request:begin \
-    --strategy entry --patchlist "$PWD/fuzz/fw.lcv3"
-IMAGE=fw.bin ./fuzz-suzzer.sh --fuzz-replay corpus/
+"$H" "$P" fw.bin_recon -process fw.bin -noanalysis -scriptPath "$EMBER/fuzz/tools/ghidra" \
+    -postScript gen_sites.py "$PWD/fuzz/fw.uams" --strategy entry \
+    -postScript gen_boundaries.py "$PWD/fuzz/fw.uamb" handle_request:begin \
+    --strategy entry --sites "$PWD/fuzz/fw.uams"
+IMAGE=fw.bin ./fuzz-lists.sh --fuzz-replay corpus/
 ```
 
   (Without a recon project: `"$H" <dir> <name> -import fw.elf -scriptPath ... -postScript
-  gen_patchlist_ghidra.py ...` imports and analyses first; later calls use `-process`.)
+  gen_sites.py ...` imports and analyses first; later calls use `-process`.)
 
-- **The Ghidra ports differ from the rizin tools in their command line** (suzzer's
-  `tools/ghidra/README.md` is the authority): the first argument is the output file, since
-  the program is the one Ghidra has open; there is no `--raw/--base/--arch/--bits/--endian`,
-  since the processor, base and byte order are those of the import (recon's, here);
-  function names are Ghidra's bare ones (no `sym.` prefix), and default-named `FUN_xxxx`
-  functions are skipped unless `--include-fcn` (stripped firmware is mostly those: pass it,
-  or name the functions first, in the project or with `--symbols`). Output paths must be absolute: the script
-  runs in Ghidra's directory, not yours.
+- **The Ghidra ports' command line** (`fuzz/tools/ghidra/README.md` is the authority): the
+  first argument is the output file, since the program is the one Ghidra has open; there is
+  no `--raw/--base/--arch/--bits/--endian/--cpu`, since the processor, base and byte order
+  are those of the import (recon's, here); names are Ghidra's bare ones. Output paths must be
+  absolute: the script runs in Ghidra's directory, not yours.
 - **They are Jython 2.7 scripts.** Ghidra 11.4 and later no longer bundle Jython: install
   the Jython extension (`Extensions/Ghidra/ghidra_*_Jython.zip`, unzipped into
   `Ghidra/Extensions/`) first.
+- **Which functions get sites**: those an ELF's symbol table names (`STT_FUNC`), its entry
+  point, and `--symbols FILE` addresses. Stripped firmware has few of those: pass
+  `--symbols` (RECON's names: `nm` output, `ADDR NAME` lines or a Ghidra symbol-table CSV),
+  name the functions in the Ghidra project, or use `--all-functions` to take every function
+  the analyser found.
 - **Generate against the bytes the board places**: the stage being fuzzed, at the RECON base.
-  For a raw image with the rizin tools, suzzer's `--raw --base <RECON base> --arch ARCH
-  --bits N --endian E --symbols FILE` (all but `--symbols` are required; `FILE` is `nm`
-  output, `ADDR NAME` lines or a Ghidra symbol-table CSV, so RECON's names work). With the
-  Ghidra ports the import already has the base; `--symbols FILE` still names functions.
+  For a raw image with the rizin tools: `--raw --base <RECON base> --arch ARCH --bits N
+  --endian E --symbols FILE` (`--cpu` for rizin's CPU variant). With Ghidra the import
+  already has the base.
 - **Where the sites are.** The board places the image itself (`--image os=`), so the runner
-  has no image of its own to take a link base from. A list generated from an ELF carries
-  its base and needs nothing more; for a list generated from a raw image, add
-  `--cov-module <module>=<base>` (the module name the list records) or
-  `--raw-base <BOARD_IMAGE_BASE>` to `fuzz-suzzer.sh`. `--cov-strict` compares every
-  site's bytes in memory with the list at the first begin (`cov: site check: N of N sites
-  match the patch list, 0 do not`) and catches a wrong base or byte order; always use it.
+  has no image of its own to take a link base from. A list carries its module base table;
+  `--cov-module <module>=<base>` or `--raw-base <BOARD_IMAGE_BASE>` overrides it.
+  `--cov-strict` compares every site's bytes in memory with the list at the first begin
+  (`cov: site check: N of N sites match the site list, 0 do not`) and catches a wrong base
+  or byte order; always use it.
 - **The BEGIN marker must precede the input read**: `--strategy entry` (the MIPS default
-  anyway; RV32's default puts a function's site after its first read).
+  anyway; elsewhere the default puts a block's site on its last instruction, after the read).
 - **Recursion**: a marker spec is `SYM[:kind[:depth_filter]]`. `handle_request:begin:zero` and
   a matching `:end:zero` keep nested arrivals inside one input; "any depth" markers end the
   iteration at the first END.
-- **Thumb** (`arm-ref`): suzzer gives every site its even address and marks Thumb sites by
-  their 2-byte length; the importer sets bit 0 on those, and on each boundary marker whose
-  closest site at or below it is one, so a Thumb marker needs `--cov-sites` next to
-  `--cov-boundary`. Pcs you pass yourself (`--fuzz-crash-pc`) take bit 0 as in
-  `harness.md`. The importer applies the same rule (bit 0 on 2-byte sites only) to
-  MIPS16e/microMIPS code on PIC32, where no list is tested end to end: prefer
-  `--cov-blocks` there.
-- A site in a MIPS branch delay slot cannot be instrumented; the run stops naming the
-  record. suzzer's generators never place one, so it means a wrong base or a hand-made list.
-- Match the device's libcov build when maps must compare with a device:
-  `--cov-scheme site|pc`, `--cov-ngram N`, `--cov-rotate`, `--cov-mode leapfrog`. The defaults
-  are libcov's (site, N=2, no rotation, leapfrog). For fuzzing with nothing to compare
-  against, the brain asks for N=3 with rotation (`--cov-ngram 3 --cov-rotate`).
+- **Thumb, MIPS16e, microMIPS**: the files hold even addresses and flag such sites and
+  markers `ALT_STATE`; ember sets bit 0 for them. Pcs you pass yourself (`--fuzz-crash-pc`)
+  take bit 0 as in `harness.md`.
+- The generators never place a site on an instruction ember runs as part of the one before
+  it (a MIPS delay slot, an instruction inside a Thumb IT block); one there stops the run
+  naming the record, so it means a wrong base or a hand-made list.
+- For fuzzing, the brain suggests `--cov-ngram 3 --cov-rotate`; the defaults are site ids,
+  N=2, no rotation, `--cov-mode leapfrog`.
 
-**Which ISAs.** ember's site-list path is tested end to end (`suzzer-check.sh`) on RV32,
-MIPS32 BE/LE, ARM (Thumb-2, LE and BE8) and 32-bit PowerPC; suzzer's generators describe
-x86-64, AArch64, ARM/Thumb, PowerPC, RISC-V and MIPS. On the other ember ISAs (8-bit AVR and
-PIC, AVR32, 8051, 6502, Z80, Xtensa) keep `--cov-blocks` and `--fuzz-begin`; the brain
-still drives them.
+**Which ISAs.** The site-list path is tested end to end on RV32, MIPS32 BE/LE, ARM (Thumb-2,
+LE and BE8) and 32-bit PowerPC. The generators also write correct lists (every site's bytes
+check out) for 8-bit AVR, Xtensa, 6502, Z80, 8051 (raw, with `--symbols`) and PIC32, though
+ember does not test those end to end; rizin and Ghidra disagree on AVR, so make both files
+with one route there. Where a list is not worth it, keep `--cov-blocks` and `--fuzz-begin`;
+the brain drives those too.
 
-## Driving ember from suzzer's brain
+## Driving ember from the brain
 
 ```bash
-python3 suzzer/tools/suzzer_brain.py --listen 127.0.0.1:7000 --seeds fuzz/seeds/ --out fuzz/run/
-IMAGE=fw.bin ./fuzz-suzzer.sh --jit --fuzz-szr 127.0.0.1:7000 \
-    > build/szr.txt 2> build/szr.log < /dev/null
+python3 $EMBER/fuzz/tools/fuzz_brain.py --listen 127.0.0.1:7000 --seeds fuzz/seeds/ \
+    --out fuzz/run/ --status-file fuzz/run/status.jsonl
+IMAGE=fw.bin ./fuzz-lists.sh --jit --fuzz-net 127.0.0.1:7000 \
+    > build/net.txt 2> build/net.log < /dev/null
+python3 $EMBER/fuzz/tools/status_tui.py fuzz/run/status.jsonl   # live status (--once: one frame)
 ```
 
 - Ember connects, boots to the begin pc, and only then sends HELLO and the INIT map, so a
-  long boot is fine; an older brain without `--hello-timeout` needs a larger `--io-timeout`.
-  `-n` still bounds the boot. Any coverage source works: with `--cov-sites` HELLO
-  describes the scheme, with `--cov-blocks` none. HELLO's arch is the ISA's (`rv32`,
-  `mips32be`, `mips32le`, `armv7`, `armv7be`, `ppc32`, `x86-64`, `avr`, `avr32`, `pic`,
-  `mcs51`, `m6502`, `z80`, `xtensa`, `xtensaeb`).
+  long boot is fine (the brain's `--hello-timeout`, 600 s by default; 0 waits forever). `-n`
+  still bounds the boot. Any coverage source works: with `--cov-sites` HELLO describes the
+  scheme, with `--cov-blocks` none. HELLO's arch is the ISA's name.
 - The brain keeps a resumable corpus in `--out`/`corpus` (a restart continues the campaign);
   `--iters N` bounds a run, 0 (the default) runs until stopped. Set `--max-size` (default
   65536) to what the route can deliver: `mem:`'s `max` (default 4096) or the UART's buffer. A
-  plain route tests only a longer input's prefix, and a `reject` route answers CRASH
-  `DELIVERY`, which the brain files under `crashes/` as if it were a finding.
-- Verdicts become CRASH frames (fault 5, oracle 6, hang 7, timeout 8, rejected 3; a crash
-  (guard), from a redzone or a `--guard`, is sent as GUEST_FAULT 5 with the pc of the
-  access, so only a replay tells it from a fault and names the guard); the brain
-  saves and minimizes them under `--out`. Its `crashes/` and `hangs/` directories replay
-  directly (`--fuzz-replay fuzz/run/crashes/`, the `.info` notes are skipped), so triage
-  follows `harness.md`. A malformed INPUT gets CRASH `MALFORMED` (4) and runs nothing.
+  plain route tests only a longer input's prefix; a `reject` route answers CRASH
+  `REJECTED`, which the brain counts (`rejected` in its status) and does not save.
+- Verdicts become CRASH frames: `FAULT` 1, `GUARD` 2 (a redzone or `--guard`, with the pc of
+  the access), `ORACLE` 3, `HANG` 4, `TIMEOUT` 5. The brain saves each distinct
+  `(reason, status)` under `--out/crashes/` (hangs and timeouts under `hangs/`) as the input
+  plus an `.info` sidecar (`reason_name=`, `status=`, `len=`, `hex=`), minimized. Both
+  directories replay directly (`--fuzz-replay fuzz/run/crashes/`, the `.info` notes are
+  skipped), so triage follows `harness.md`. A malformed INPUT gets CRASH `MALFORMED` (7).
 - The run ends with exit 0 on the brain's BYE, 2 when the brain closes without one or ember
-  hits an internal error, 130 on SIGINT (BYE sent). `--fuzz-szr-timeout SEC` ends it (with
+  hits an internal error, 130 on SIGINT (BYE sent). `--fuzz-net-timeout SEC` ends it (with
   an error) when the brain goes silent for SEC seconds; without it ember waits, and only
   TCP keepalive notices a vanished brain host.
 - `--cov-shm PATH` (`--cov-shm-ring N`, default 8 slots) publishes INIT and every ok
-  iteration's map in an LCVS region for suzzer's readers (`suzzer/test/shm_bitmap.py stats
+  iteration's map in a coverage region (`python3 $EMBER/fuzz/tools/cov_region.py stats
   PATH`). A PATH with a `/` after its first character is a file, any other a shared-memory
   name (`/dev/shm`); a region another live process owns is refused. It works next to
   `--fuzz-replay` too.
 
-## Differences from libcov on a device
+## How boundaries behave
 
-Every input starts from one snapshot at the first BEGIN the boot reached; there are no GAP
-maps (code between an END and the next BEGIN counts in INIT); with "any depth" markers the
-first END ends the iteration; markers need not be sites (keep both lists from one generator
-run); crashed iterations are not published to LCVS; no counterpart to libcov's MT variant
-(several processors share one map, each in its own history).
-See ember's `docs/suzzer.md` for the full list before comparing ember's maps with a device's.
+Every input starts from one snapshot at the first BEGIN the boot reached; the code between
+an END and the next BEGIN runs once, at boot, and counts in INIT; with "any depth" markers
+the first END ends the iteration; markers need not be sites (keep both files from one
+generator run); crashed iterations are not published to the coverage region; several
+processors (`-o cpus=N`) share one map, each in its own history.
