@@ -1208,7 +1208,7 @@ static void test_nested(void)
 
 /*
  * Coverage sites at the boundaries are counted by the hooks, in the map they close
- * (suzzer's FORMATS.md 5.7): the begin's hit goes to INIT (and, in begin-only mode,
+ * (docs/fuzz-formats.md "Which executions count"): the begin's hit goes to INIT (and, in begin-only mode,
  * to the iteration that ends back at begin), an end's to the iteration it ends, and an
  * iteration's first count is the site after the begin with an empty history. B values
  * are non-zero so that a begin counted inside the iteration would move the next bucket.

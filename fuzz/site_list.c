@@ -1,6 +1,6 @@
 /*
- * import.c - LCV3 patch lists and LCVB1 boundary files into ember's site tables and
- * harness boundaries; the site-byte check (suzzer.h).
+ * site_list.c - Site lists and boundary files into ember's site tables and harness
+ * boundaries; the site-byte check (cov_formats.h, docs/fuzz-formats.md).
  *
  * Every field is decoded explicitly as little-endian, so the readers work on any host.
  */
@@ -9,13 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "lcv_formats.h"
-#include "suzzer.h"
+#include "formats.h"
+#include "cov_formats.h"
 
-#define LCV3_HDR sizeof(struct patchlist_header_v3)
-#define LCV3_REC sizeof(struct patchlist_record)
-#define LCVB_HDR sizeof(struct lcvb_header)
-#define LCVB_REC sizeof(struct lcvb_record)
+#define SITES_HDR  sizeof(struct uam_sites_header)
+#define SITES_REC  sizeof(struct uam_sites_record)
+#define BOUNDS_HDR sizeof(struct uam_bounds_header)
+#define BOUNDS_REC sizeof(struct uam_bounds_record)
 
 static bool fail(char *err, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static bool fail(char *err, size_t n, const char *fmt, ...)
@@ -72,9 +72,9 @@ static bool read_all(const char *path, uint8_t **d, size_t *len, char *err, size
     return true;
 }
 
-/* ---- LCV3 --------------------------------------------------------------- */
+/* ---- site list ------------------------------------------------------------ */
 
-void sz_patchlist_free(sz_patchlist *p)
+void cf_sites_free(cf_sites *p)
 {
     if (p->module)
         for (unsigned i = 0; i < p->n_modules; i++)
@@ -85,80 +85,96 @@ void sz_patchlist_free(sz_patchlist *p)
     memset(p, 0, sizeof(*p));
 }
 
-bool sz_lcv3_parse(const uint8_t *d, size_t len, sz_patchlist *out, char *err, size_t errlen)
+static bool zero(const uint8_t *p, size_t n)
+{
+    while (n--)
+        if (*p++)
+            return false;
+    return true;
+}
+
+bool cf_sites_parse(const uint8_t *d, size_t len, cf_sites *out, char *err, size_t errlen)
 {
     memset(out, 0, sizeof(*out));
-    if (len < LCV3_HDR)
-        return fail(err, errlen, "too short for an LCV3 header (%zu bytes)", len);
-    if (memcmp(d, LIBCOV_MAGIC, 4))
-        return fail(err, errlen, "not an LCV3 patch list (magic %.4s)", (const char *)d);
+    if (len < 4 || memcmp(d, UAM_SITES_MAGIC, 4))
+        return fail(err, errlen, "not a site list (no %s magic): make one with "
+                    "fuzz/tools/gen_sites.py", UAM_SITES_MAGIC);
+    if (len < SITES_HDR)
+        return fail(err, errlen, "too short for a site list header (%zu bytes)", len);
     uint32_t version = (uint32_t)le(d + 4, 4);
-    if (version != LIBCOV_VERSION)
-        return fail(err, errlen, "LCV3 version %u is not supported (only %u)", version, LIBCOV_VERSION);
+    if (version != UAM_SITES_VERSION)
+        return fail(err, errlen, "site list version %u is not supported (only %u): make "
+                    "one with fuzz/tools/gen_sites.py", version, UAM_SITES_VERSION);
     uint32_t count = (uint32_t)le(d + 8, 4);
-    uint8_t threading = d[12], flags = d[13], n_mod = d[14];
+    uint8_t flags = d[12], n_mod = d[13];
     uint64_t mod_off = le(d + 16, 4), mod_size = le(d + 20, 4);
-    if ((uint64_t)count * LCV3_REC > len - LCV3_HDR)
+    if (flags & ~UAM_SITES_FLAG_BASES)
+        return fail(err, errlen, "unknown header flags 0x%x", flags);
+    if (!zero(d + 14, 2))
+        return fail(err, errlen, "reserved header bytes are not 0");
+    if ((uint64_t)count * SITES_REC > len - SITES_HDR)
         return fail(err, errlen, "%u records do not fit the file (%zu bytes)", count, len);
     if (!n_mod)
         return fail(err, errlen, "no modules");
-    if (!mod_size || mod_size > LIBCOV_MAX_MODULES_BYTES)
+    if (!mod_size || mod_size > UAM_SITES_NAMES_MAX)
         return fail(err, errlen, "bad module name table size %llu", (unsigned long long)mod_size);
     if (mod_off > len || mod_size > len - mod_off)
         return fail(err, errlen, "the module name table runs past the end of the file");
     if (d[mod_off + mod_size - 1] != 0)
         return fail(err, errlen, "the module name table does not end in NUL");
+    uint64_t bo = UAM_SITES_BASES_OFFSET(mod_off, mod_size);
+    if ((flags & UAM_SITES_FLAG_BASES) && (bo > len || (uint64_t)n_mod * 8 > len - bo))
+        return fail(err, errlen, "the module base table runs past the end of the file");
 
     out->count = count;
-    out->threading = threading;
-    out->flags = flags;
     out->n_modules = n_mod;
     out->rec = calloc(count ? count : 1, sizeof(*out->rec));
     out->module = calloc(n_mod, sizeof(*out->module));
     if (!out->rec || !out->module) {
-        sz_patchlist_free(out);
+        cf_sites_free(out);
         return fail(err, errlen, "out of memory");
     }
     const char *names = (const char *)d + mod_off;
     size_t pos = 0;
     for (unsigned i = 0; i < n_mod; i++) {
         if (pos >= mod_size) {
-            sz_patchlist_free(out);
+            cf_sites_free(out);
             return fail(err, errlen, "the name table holds fewer than %u names", n_mod);
         }
         size_t n = strnlen(names + pos, mod_size - pos);
         if (!n) {
-            sz_patchlist_free(out);
+            cf_sites_free(out);
             return fail(err, errlen, "module %u has an empty name", i);
         }
         if (!(out->module[i] = strndup(names + pos, n))) {
-            sz_patchlist_free(out);
+            cf_sites_free(out);
             return fail(err, errlen, "out of memory");
         }
         pos += n + 1;
     }
     for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *r = d + LCV3_HDR + (size_t)i * LCV3_REC;
-        sz_record *x = &out->rec[i];
+        const uint8_t *r = d + SITES_HDR + (size_t)i * SITES_REC;
+        cf_site *x = &out->rec[i];
         x->offset = le(r, 8);
-        x->len = r[8];
-        x->module = r[9];
-        memcpy(x->orig, r + 10, 4);
-        if (x->module >= n_mod) {
-            sz_patchlist_free(out);
-            return fail(err, errlen, "record %u names module %u of %u", i, x->module, n_mod);
-        }
-        if (x->len == 0 || x->len > LIBCOV_PATCH_ORIG_MAX) {
-            sz_patchlist_free(out);
-            return fail(err, errlen, "record %u has length %u", i, x->len);
+        x->module = r[8];
+        x->len = r[9];
+        x->flags = r[10];
+        memcpy(x->orig, r + 12, 4);
+        const char *bad = x->module >= n_mod                 ? "names a module the list does not have"
+                        : x->len > UAM_SITES_ORIG_MAX         ? "checks more than 4 bytes"
+                        : x->flags & ~UAM_SITE_ALT_STATE      ? "has unknown flags"
+                        : r[11] || !zero(x->orig + x->len, UAM_SITES_ORIG_MAX - x->len)
+                                                              ? "has non-zero reserved bytes"
+                                                              : NULL;
+        if (bad) {
+            cf_sites_free(out);
+            return fail(err, errlen, "record %u %s", i, bad);
         }
     }
-    /* S2 base table; ignored if it runs past the end (FORMATS.md 1.5). */
-    uint64_t bo = LCV_MODULE_BASES_OFFSET(mod_off, mod_size);
-    if ((flags & LCV_FLAG_MODULE_BASES) && bo <= len && (uint64_t)n_mod * 8 <= len - bo) {
+    if (flags & UAM_SITES_FLAG_BASES) {
         out->bases = malloc(sizeof(uint64_t) * n_mod);
         if (!out->bases) {
-            sz_patchlist_free(out);
+            cf_sites_free(out);
             return fail(err, errlen, "out of memory");
         }
         for (unsigned i = 0; i < n_mod; i++)
@@ -168,74 +184,78 @@ bool sz_lcv3_parse(const uint8_t *d, size_t len, sz_patchlist *out, char *err, s
     return true;
 }
 
-bool sz_lcv3_load(const char *path, sz_patchlist *out, char *err, size_t errlen)
+bool cf_sites_load(const char *path, cf_sites *out, char *err, size_t errlen)
 {
     uint8_t *d;
     size_t len;
     memset(out, 0, sizeof(*out));
     if (!read_all(path, &d, &len, err, errlen))
         return false;
-    bool ok = sz_lcv3_parse(d, len, out, err, errlen);
+    bool ok = cf_sites_parse(d, len, out, err, errlen);
     free(d);
     return ok;
 }
 
-/* ---- LCVB1 -------------------------------------------------------------- */
+/* ---- boundary file -------------------------------------------------------- */
 
-void sz_boundaries_free(sz_boundaries *b)
+void cf_markers_free(cf_markers *b)
 {
     free(b->rec);
     memset(b, 0, sizeof(*b));
 }
 
-bool sz_lcvb_parse(const uint8_t *d, size_t len, sz_boundaries *out, char *err, size_t errlen)
+bool cf_bounds_parse(const uint8_t *d, size_t len, cf_markers *out, char *err, size_t errlen)
 {
     memset(out, 0, sizeof(*out));
-    if (len < LCVB_HDR)
-        return fail(err, errlen, "too short for an LCVB1 header (%zu bytes)", len);
-    if (memcmp(d, LIBCOV_BOUNDARY_MAGIC, 4))
-        return fail(err, errlen, "not an LCVB1 boundary file (magic %.4s)", (const char *)d);
+    if (len < 4 || memcmp(d, UAM_BOUNDS_MAGIC, 4))
+        return fail(err, errlen, "not a boundary file (no %s magic): make one with "
+                    "fuzz/tools/gen_boundaries.py", UAM_BOUNDS_MAGIC);
+    if (len < BOUNDS_HDR)
+        return fail(err, errlen, "too short for a boundary file header (%zu bytes)", len);
     uint32_t version = (uint32_t)le(d + 4, 4);
-    if (version != LIBCOV_BOUNDARY_VERSION)
-        return fail(err, errlen, "LCVB version %u is not supported (only %u)", version,
-                    LIBCOV_BOUNDARY_VERSION);
+    if (version != UAM_BOUNDS_VERSION)
+        return fail(err, errlen, "boundary file version %u is not supported (only %u): "
+                    "make one with fuzz/tools/gen_boundaries.py", version, UAM_BOUNDS_VERSION);
     uint32_t count = (uint32_t)le(d + 8, 4);
-    if ((uint64_t)count * LCVB_REC > len - LCVB_HDR)
-        return fail(err, errlen, "%u records do not fit the file", count);
+    if (!zero(d + 12, 4))
+        return fail(err, errlen, "reserved header bytes are not 0");
+    if ((uint64_t)count * BOUNDS_REC > len - BOUNDS_HDR)
+        return fail(err, errlen, "%u markers do not fit the file", count);
     out->rec = calloc(count ? count : 1, sizeof(*out->rec));
     if (!out->rec)
         return fail(err, errlen, "out of memory");
     out->count = count;
     for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *r = d + LCVB_HDR + (size_t)i * LCVB_REC;
-        out->rec[i] = (sz_marker){ .offset = le(r, 8), .kind = r[8], .depth_filter = r[9] };
-        if (r[8] != LIBCOV_BOUNDARY_KIND_BEGIN && r[8] != LIBCOV_BOUNDARY_KIND_END) {
-            sz_boundaries_free(out);
-            return fail(err, errlen, "marker %u has unknown kind %u", i, r[8]);
-        }
-        if (r[9] > LIBCOV_BOUNDARY_DEPTH_ZERO) {
-            sz_boundaries_free(out);
-            return fail(err, errlen, "marker %u has unknown depth filter %u", i, r[9]);
+        const uint8_t *r = d + BOUNDS_HDR + (size_t)i * BOUNDS_REC;
+        out->rec[i] = (cf_marker){ .offset = le(r, 8), .kind = r[8], .depth = r[9], .flags = r[10] };
+        const char *bad = r[8] > UAM_BOUNDS_END              ? "has an unknown kind"
+                        : r[9] > UAM_BOUNDS_DEPTH_ZERO       ? "has an unknown depth filter"
+                        : r[10] & ~UAM_SITE_ALT_STATE        ? "has unknown flags"
+                        : !zero(r + 11, 5)                   ? "has non-zero reserved bytes"
+                                                             : NULL;
+        if (bad) {
+            cf_markers_free(out);
+            return fail(err, errlen, "marker %u %s", i, bad);
         }
     }
     return true;
 }
 
-bool sz_lcvb_load(const char *path, sz_boundaries *out, char *err, size_t errlen)
+bool cf_bounds_load(const char *path, cf_markers *out, char *err, size_t errlen)
 {
     uint8_t *d;
     size_t len;
     memset(out, 0, sizeof(*out));
     if (!read_all(path, &d, &len, err, errlen))
         return false;
-    bool ok = sz_lcvb_parse(d, len, out, err, errlen);
+    bool ok = cf_bounds_parse(d, len, out, err, errlen);
     free(d);
     return ok;
 }
 
 /* ---- into ember --------------------------------------------------------- */
 
-bool sz_resolve_bases(const sz_patchlist *p, const sz_module_base *cli, size_t n_cli,
+bool cf_resolve_bases(const cf_sites *p, const cf_module_base *cli, size_t n_cli,
                       bool have_image_base, uint64_t image_base, uint64_t *bases,
                       char *err, size_t errlen)
 {
@@ -248,7 +268,7 @@ bool sz_resolve_bases(const sz_patchlist *p, const sz_module_base *cli, size_t n
             i++;
         if (i == p->n_modules) {
             free(known);
-            return fail(err, errlen, "--cov-module %s: the patch list has no such module", cli[k].name);
+            return fail(err, errlen, "--cov-module %s: the site list has no such module", cli[k].name);
         }
         bases[i] = cli[k].base;
         known[i] = true;
@@ -269,17 +289,18 @@ bool sz_resolve_bases(const sz_patchlist *p, const sz_module_base *cli, size_t n
     return ok;
 }
 
-bool sz_build_sites(const sz_patchlist *p, const uint64_t *bases, const sz_scheme *s,
-                    unsigned addr_width, uam_cov_site **out, char *err, size_t errlen)
+bool cf_build_sites(const cf_sites *p, const uint64_t *bases, const cf_scheme *s,
+                    unsigned addr_width, uint64_t state, uam_cov_site **out,
+                    char *err, size_t errlen)
 {
     const uint64_t amask = uam_mask(addr_width);
     uam_cov_site *t = malloc(sizeof(*t) * (p->count ? p->count : 1));
     if (!t)
         return fail(err, errlen, "out of memory");
     for (uint32_t i = 0; i < p->count; i++) {
-        const sz_record *r = &p->rec[i];
-        t[i].pc = (bases[r->module] + r->offset) & amask;
-        sz_site_ab(s, i, r->offset & amask, r->module, &t[i].a, &t[i].b);
+        const cf_site *r = &p->rec[i];
+        t[i].pc = ((bases[r->module] + r->offset) & amask) | (r->flags & UAM_SITE_ALT_STATE ? state : 0);
+        cf_site_ab(s, i, r->offset & amask, r->module, &t[i].a, &t[i].b);
     }
     *out = t;
     return true;
@@ -292,7 +313,7 @@ static int pair_cmp(const void *x, const void *y)
     return a[0] < b[0] ? -1 : a[0] > b[0];
 }
 
-bool sz_namer_init(sz_namer *n, const sz_patchlist *p, const uam_cov_site *sites)
+bool cf_namer_init(cf_namer *n, const cf_sites *p, const uam_cov_site *sites)
 {
     memset(n, 0, sizeof(*n));
     n->p = p;
@@ -301,7 +322,7 @@ bool sz_namer_init(sz_namer *n, const sz_patchlist *p, const uam_cov_site *sites
     n->idx = malloc(sizeof(uint32_t) * (p->count ? p->count : 1));
     if (!pairs || !n->pc || !n->idx) {
         free(pairs);
-        sz_namer_fini(n);
+        cf_namer_fini(n);
         return false;
     }
     for (uint32_t i = 0; i < p->count; i++) {
@@ -317,7 +338,7 @@ bool sz_namer_init(sz_namer *n, const sz_patchlist *p, const uam_cov_site *sites
     return true;
 }
 
-void sz_namer_fini(sz_namer *n)
+void cf_namer_fini(cf_namer *n)
 {
     free(n->pc);
     free(n->idx);
@@ -325,9 +346,9 @@ void sz_namer_fini(sz_namer *n)
     n->idx = NULL;
 }
 
-void sz_namer_describe(void *ctx, uint64_t pc, char *buf, size_t len)
+void cf_namer_describe(void *ctx, uint64_t pc, char *buf, size_t len)
 {
-    const sz_namer *n = ctx;
+    const cf_namer *n = ctx;
     size_t lo = 0, hi = n->p->count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
@@ -337,58 +358,26 @@ void sz_namer_describe(void *ctx, uint64_t pc, char *buf, size_t len)
             hi = mid;
     }
     if (lo < n->p->count && n->pc[lo] == pc) {
-        const sz_record *r = &n->p->rec[n->idx[lo]];
-        snprintf(buf, len, "patch-list record %u, module %u %s, offset 0x%llx", n->idx[lo],
+        const cf_site *r = &n->p->rec[n->idx[lo]];
+        snprintf(buf, len, "site-list record %u, module %u %s, offset 0x%llx", n->idx[lo],
                  r->module, n->p->module[r->module], (unsigned long long)r->offset);
     }
 }
 
-void sz_state_sites(const sz_patchlist *p, uam_cov_site *sites, uint64_t state)
+static uint64_t marker_pc(const cf_marker *m, uint64_t base0, uint64_t amask, uint64_t state)
 {
-    if (!state)
-        return;
-    for (uint32_t i = 0; i < p->count; i++)
-        if (p->rec[i].len == 2)
-            sites[i].pc |= state;
+    return ((base0 + m->offset) & amask) | (m->flags & UAM_SITE_ALT_STATE ? state : 0);
 }
 
-static uint64_t state_pc(const sz_patchlist *p, const uam_cov_site *sites, uint64_t state,
-                         uint64_t pc)
-{
-    uint64_t best = 0, bits = 0;
-    bool found = false;
-    for (uint32_t i = 0; i < p->count; i++) {
-        uint64_t at = sites[i].pc & ~state;
-        if (at <= pc && (!found || at >= best)) {
-            best = at;
-            found = true;
-            bits = sites[i].pc & state;
-        }
-    }
-    return pc | bits;
-}
-
-void sz_state_bounds(const sz_patchlist *p, const uam_cov_site *sites, uint64_t state,
-                     sz_bounds *bd)
-{
-    if (!p || !sites || !state)
-        return;
-    bd->begin_pc = state_pc(p, sites, state, bd->begin_pc);
-    for (size_t i = 0; i < bd->n_more_begin_pcs; i++)
-        bd->more_begin_pcs[i] = state_pc(p, sites, state, bd->more_begin_pcs[i]);
-    for (size_t i = 0; i < bd->n_end_pcs; i++)
-        bd->end_pcs[i] = state_pc(p, sites, state, bd->end_pcs[i]);
-}
-
-bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_width,
-                         sz_bounds *out, char *err, size_t errlen)
+bool cf_bounds_apply(const cf_markers *b, uint64_t base0, unsigned addr_width, uint64_t state,
+                     cf_bounds *out, char *err, size_t errlen)
 {
     const uint64_t amask = uam_mask(addr_width);
     memset(out, 0, sizeof(*out));
     int begin = -1;
     size_t n_end = 0, n_begin = 0;
     for (uint32_t i = 0; i < b->count; i++) {
-        if (b->rec[i].kind == LIBCOV_BOUNDARY_KIND_END) {
+        if (b->rec[i].kind == UAM_BOUNDS_END) {
             n_end++;
             continue;
         }
@@ -398,24 +387,23 @@ bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_w
     }
     if (begin < 0)
         return fail(err, errlen, "the boundary file has no BEGIN marker");
-    /* Depth-zero-only markers: nested BEGIN/END arrivals (recursion) stay inside one
-     * iteration. With "any depth" libcov publishes each nested segment, which a
-     * snapshot-per-input harness does not; it ends the iteration at the first END. */
-    const uint8_t depth = b->rec[begin].depth_filter;
+    /* Depth-zero markers: nested BEGIN/END arrivals (recursion) stay inside one
+     * iteration. With "any depth" the iteration ends at the first END. */
+    const uint8_t depth = b->rec[begin].depth;
     for (uint32_t i = 0; i < b->count; i++)
-        if (b->rec[i].depth_filter != depth)
+        if (b->rec[i].depth != depth)
             return fail(err, errlen, "boundary markers %d and %u have different depth filters",
                         begin, i);
-    out->begin_pc = (base0 + b->rec[begin].offset) & amask;
-    out->nested = n_end && depth == LIBCOV_BOUNDARY_DEPTH_ZERO;
+    out->begin_pc = marker_pc(&b->rec[begin], base0, amask, state);
+    out->nested = n_end && depth == UAM_BOUNDS_DEPTH_ZERO;
     if ((n_end && !(out->end_pcs = malloc(sizeof(uint64_t) * n_end)))
         || (n_begin > 1 && !(out->more_begin_pcs = malloc(sizeof(uint64_t) * (n_begin - 1))))) {
-        sz_bounds_free(out);
+        cf_bounds_free(out);
         return fail(err, errlen, "out of memory");
     }
     for (uint32_t i = 0; i < b->count; i++) {
-        uint64_t pc = (base0 + b->rec[i].offset) & amask;
-        if (b->rec[i].kind == LIBCOV_BOUNDARY_KIND_END)
+        uint64_t pc = marker_pc(&b->rec[i], base0, amask, state);
+        if (b->rec[i].kind == UAM_BOUNDS_END)
             out->end_pcs[out->n_end_pcs++] = pc;
         else if ((int)i != begin)
             out->more_begin_pcs[out->n_more_begin_pcs++] = pc;
@@ -423,23 +411,23 @@ bool sz_boundaries_apply(const sz_boundaries *b, uint64_t base0, unsigned addr_w
     return true;
 }
 
-void sz_bounds_free(sz_bounds *bd)
+void cf_bounds_free(cf_bounds *bd)
 {
     free(bd->end_pcs);
     free(bd->more_begin_pcs);
     memset(bd, 0, sizeof(*bd));
 }
 
-size_t sz_check_sites(uam_machine *m, const sz_patchlist *p, const uam_cov_site *sites,
+size_t cf_check_sites(uam_machine *m, const cf_sites *p, const uam_cov_site *sites,
                       FILE *log, unsigned max_report)
 {
     uam_cpu *cpu = &m->cpu;
     size_t match = 0, bad = 0;
     for (uint32_t i = 0; i < p->count; i++) {
-        const sz_record *r = &p->rec[i];
-        uint8_t got[LIBCOV_PATCH_ORIG_MAX] = { 0 };
+        const cf_site *r = &p->rec[i];
+        uint8_t got[UAM_SITES_ORIG_MAX] = { 0 };
         bool ok = true;
-        /* a pc may carry state bits (sz_state_sites); the bytes start without them */
+        /* a pc may carry state bits (UAM_SITE_ALT_STATE); the bytes start without them */
         const uint64_t at = sites[i].pc & ~uam_isa_pc_state_bits(cpu->isa);
         for (unsigned k = 0; k < r->len && ok; k++) {
             uint64_t va = at + k, pa = va, v = 0;
@@ -466,12 +454,12 @@ size_t sz_check_sites(uam_machine *m, const sz_patchlist *p, const uam_cov_site 
                 fprintf(log, " in memory, ");
                 for (unsigned k = 0; k < r->len; k++)
                     fprintf(log, "%02x", r->orig[k]);
-                fprintf(log, " in the patch list\n");
+                fprintf(log, " in the site list\n");
             }
         }
     }
     if (log)
-        fprintf(log, "cov: site check: %zu of %u sites match the patch list, %zu do not\n", match,
+        fprintf(log, "cov: site check: %zu of %u sites match the site list, %zu do not\n", match,
                 p->count, bad);
     return bad;
 }

@@ -11,7 +11,7 @@ pipeline every ember build goes through; the third is for later, once the emulat
 |---|---|
 | **`ember-dev-recon`** | Triage an unknown image: container members and flash layout, architecture/endianness and **whether ember can run it**, load address of each stage (with evidence), entry state, memory map, RTOS identity, an MMIO table with per-register offsets and owning functions; on PC firmware the flash descriptor, firmware volumes, I/O ports, PCI config and MSRs. Emits `RECON.md`. |
 | **`ember-dev-build`** | Write an ember board for it and bring the firmware up **iteratively**, one blocker and one device at a time, with an `iter-XX.md` journal per iteration. The project is a separate tree that links against its own local ember clone, pinned to the latest ember commit; no emulation code ever lives in the ember tree, and any change ember itself needs is a `git format-patch` file in the project, applied to the clone as a commit and ready to `git am` upstream. Every device saves its own state, so the finished board snapshots and resumes bit-identically. |
-| **`ember-fuzz`** | *Later, when the emulation is functional.* Fuzz the firmware with ember's snapshot-based harness: pick a target handler and begin pc, publish the input route from the board, set crash oracles and guards, smoke-test with replay, check coverage, run a campaign (suzzer's brain), and triage crashes into firmware bugs or emulation gaps, journaled in `fuzz-XX.md`. |
+| **`ember-fuzz`** | *Later, when the emulation is functional.* Fuzz the firmware with ember's snapshot-based harness: pick a target handler and begin pc, publish the input route from the board, set crash oracles and guards, smoke-test with replay, check coverage, run a campaign (ember's fuzz brain, with generated site lists), and triage crashes into firmware bugs or emulation gaps, journaled in `fuzz-XX.md`. |
 
 They cover every ISA ember has: RV32IMAC, MIPS32r2 (big and little endian, and the PIC32
 cores: MIPS16e, microMIPS, FPU, DSP), ARMv7-A (ARM and Thumb-2, LE and BE8), x86-64 PCs from
@@ -24,7 +24,7 @@ Everything about building, running, diagnosing and modelling follows ember's own
 out-of-tree boards on `libuam`, `uam_device` models behind ember's layering rules,
 deterministic virtual time, instruction and virtual-time budgets, per-register MMIO rules,
 guarded memory, scripted console input, machine snapshots, ember's diagnostics and its gdb
-stub; and, for ember-fuzz, its coverage and fuzz harness and its suzzer interop. The ember
+stub; and, for ember-fuzz, its coverage and fuzz harness, site lists and fuzz brain. The ember
 checkout a project pins is the authority on options and APIs; the skills say where to look.
 
 ## Requirements
@@ -33,7 +33,7 @@ checkout a project pins is the authority on options and APIs; the skills say whe
 |---|---|
 | recon | python3 (stdlib only); optional `binwalk`; Ghidra for the analysis pass (headless `analyzeHeadless`, or a Ghidra MCP server for interactive work) |
 | build | git, a C11 compiler, make, python3, an ember git checkout or URL; `gdb-multiarch` for debugging (see ember-dev-build for which ISAs it can drive) |
-| fuzz | a working ember-dev-build project; optionally a suzzer checkout, plus one of the two tools its list generators run on: rizin with python3's `rzpipe`, or headless Ghidra with the Jython extension (the Ghidra recon already uses) |
+| fuzz | a working ember-dev-build project; for site lists, one of the two tools ember's list generators run on: rizin with python3's `rzpipe`, or headless Ghidra with the Jython extension (the Ghidra recon already uses) |
 | tests | the build requirements; `mips-linux-gnu-gcc` (fixture firmware) and gcc with `-m32` (the PC fixture); ember's own firmware builds (`make firmware firmware-mips ...` in the ember checkout) for the bare-board runs. Optional: gdb-multiarch, OVMF, Ghidra. Parts whose tools are missing are skipped |
 
 ## Install
@@ -104,7 +104,7 @@ skills/
                                  examples/pc/ a Q35-class chipset)
   ember-fuzz/       SKILL.md
                     scripts/  replay_summary.py
-                    references/  harness, suzzer
+                    references/  harness, lists-and-brain
   tests/
     run-tests.sh    end-to-end regression against an ember checkout
     fixture/        the wired test boards, an HLE example, and the fixture firmware

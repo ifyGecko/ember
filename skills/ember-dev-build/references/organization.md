@@ -30,7 +30,6 @@ holds `RECON.md` (`new-emulation.sh <board> --dir .`).
   patches/                       # every change to ember ITSELF: git format-patch files - normally empty
   ember.commit                   # the pinned ember commit: the latest one (repin.sh moves it)
   ember.upstream | ember.src     # clone source for <project>/ember-src | another dedicated clone
-  suzzer.dir                     # (optional, ember-fuzz) suzzer checkout libuam is built with
   scripts/                       # project-local copies of the build helpers
   tools/                         # data generators (flash images, NVRAM, calibration, ...)
   run.sh                         # the runner invocation under construction
@@ -148,7 +147,7 @@ journal.
 
 | script | does |
 |---|---|
-| `build-ember.sh` | full build: clone if needed → guard → clone reset to the pin → patches as commits (`git am`) → ember libraries (out of tree; `--suzzer DIR` adds suzzer support for ember-fuzz) → `build/<board>-run` → confirm the board is registered |
+| `build-ember.sh` | full build: clone if needed → guard → clone reset to the pin → patches as commits (`git am`) → ember libraries (out of tree) → `build/<board>-run` → confirm the board is registered |
 | `rebuild.sh` | fast build: clone still pin + patches, nothing uncaptured → library make (no-op) → layering check → project make |
 | `regen-patches.sh` | export the clone's commits since the pin as `patches/` (`-m MSG` first commits pending edits, `--add PATH` new files) |
 | `repin.sh` | move to the latest ember commit (`--to REF` for another): fetch → rebase the patch commits → `ember.commit` → `patches/` → full build |

@@ -1,17 +1,18 @@
 /*
- * cli.c - The runner extension for suzzer's formats (uam/runner.h).
+ * cov_cli.c - The runner extension for site lists, boundary files, the coverage region
+ * and the fuzz network frontend (uam/runner.h; formats in docs/fuzz-formats.md).
  *
- *   --cov-sites LCV3        coverage sites from a suzzer patch list
- *   --cov-module NAME=BASE  a module's load base (repeatable; before the file's S2 table)
- *   --cov-scheme site|pc    coverage model (default site, like libcov)
- *   --cov-ngram N           N-gram length 1..8 (default 2, like libcov)
- *   --cov-rotate            N-gram rotation (libcov's LIBCOV_NGRAM_ROTATE=1)
- *   --cov-mode leapfrog|every  which executions count (default leapfrog, like libcov)
- *   --cov-strict            a site whose bytes differ from the patch list is fatal
- *   --cov-boundary LCVB1    iteration boundaries from a suzzer boundary file (fuzzing)
- *   --fuzz-szr HOST:PORT    take inputs from a suzzer brain over SZR1 (fuzzing)
- *   --fuzz-szr-timeout SEC  give up when the brain sends nothing for SEC seconds
- *   --cov-shm PATH          publish the maps in an LCVS region (fuzzing)
+ *   --cov-sites FILE        coverage sites from a site list (fuzz/tools/gen_sites.py)
+ *   --cov-module NAME=BASE  a module's load base (repeatable; before the list's base table)
+ *   --cov-scheme site|pc    coverage model (default site)
+ *   --cov-ngram N           N-gram length 1..8 (default 2)
+ *   --cov-rotate            N-gram rotation
+ *   --cov-mode leapfrog|every  which executions count (default leapfrog)
+ *   --cov-strict            a site whose bytes differ from the site list is fatal
+ *   --cov-boundary FILE     iteration boundaries from a boundary file (fuzzing)
+ *   --fuzz-net HOST:PORT    take inputs from a fuzz brain over TCP (fuzzing)
+ *   --fuzz-net-timeout SEC  give up when the brain sends nothing for SEC seconds
+ *   --cov-shm PATH          publish the maps in a coverage region (fuzzing)
  *   --cov-shm-ring N        its ring size (default 8)
  *
  * Site bytes are checked at the first begin when fuzzing, else when the run ends.
@@ -19,45 +20,45 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "suzzer.h"
+#include "cov_formats.h"
 #include "uam/runner.h"
 
 #define MAX_MODULE_OPTS 32
 
 typedef struct cli {
-    const char     *sites_path, *boundary_path, *szr_addr, *shm_path;
+    const char     *sites_path, *boundary_path, *net_addr, *shm_path;
     unsigned        shm_ring;
-    unsigned        szr_timeout;
-    sz_module_base  mod[MAX_MODULE_OPTS];
+    unsigned        net_timeout;
+    cf_module_base  mod[MAX_MODULE_OPTS];
     char           *mod_names[MAX_MODULE_OPTS];
     size_t          n_mod;
-    sz_scheme       scheme;
+    cf_scheme       scheme;
     bool            every;      /* --cov-mode every: count every execution */
     bool            strict;
     /* after setup */
-    sz_patchlist    pl;
+    cf_sites        pl;
     uam_cov_site   *sites;
-    sz_namer        namer;
+    cf_namer        namer;
     bool            loaded;
-    sz_bounds       bounds;
-    sz_szr         *szr;
-    sz_lcvs        *shm;
+    cf_bounds       bounds;
+    cf_net         *net;
+    cf_region      *shm;
 } cli;
 
 static const uam_runner_opt opts[] = {
     { "cov-sites", true }, { "cov-module", true }, { "cov-scheme", true },
     { "cov-ngram", true }, { "cov-strict", false }, { "cov-boundary", true },
-    { "cov-rotate", false }, { "fuzz-szr", true }, { "cov-mode", true },
-    { "cov-shm", true }, { "cov-shm-ring", true }, { "fuzz-szr-timeout", true },
+    { "cov-rotate", false }, { "fuzz-net", true }, { "cov-mode", true },
+    { "cov-shm", true }, { "cov-shm-ring", true }, { "fuzz-net-timeout", true },
 };
-enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_SZR, O_MODE,
-       O_SHM, O_SHM_RING, O_SZR_TIMEOUT };
+enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_NET, O_MODE,
+       O_SHM, O_SHM_RING, O_NET_TIMEOUT };
 
 static void *cli_create(void)
 {
     cli *c = calloc(1, sizeof(*c));
     if (c) {
-        c->scheme = (sz_scheme){ .model = SZ_MODEL_SITE, .ngram = 2 };
+        c->scheme = (cf_scheme){ .model = CF_MODEL_SITE, .ngram = 2 };
         c->shm_ring = 8;
     }
     return c;
@@ -68,12 +69,12 @@ static void cli_destroy(void *st)
     cli *c = st;
     if (!c)
         return;
-    sz_szr_close(c->szr);
-    sz_lcvs_close(c->shm);
-    sz_namer_fini(&c->namer);
-    sz_bounds_free(&c->bounds);
+    cf_net_close(c->net);
+    cf_region_close(c->shm);
+    cf_namer_fini(&c->namer);
+    cf_bounds_free(&c->bounds);
     free(c->sites);
-    sz_patchlist_free(&c->pl);
+    cf_sites_free(&c->pl);
     for (size_t i = 0; i < c->n_mod; i++)
         free(c->mod_names[i]);
     free(c);
@@ -85,7 +86,7 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
     switch (i) {
     case O_SITES:    c->sites_path = arg; return true;
     case O_BOUNDARY: c->boundary_path = arg; return true;
-    case O_SZR:      c->szr_addr = arg; return true;
+    case O_NET:      c->net_addr = arg; return true;
     case O_SHM:      c->shm_path = arg; return true;
     case O_SHM_RING: {
         char *end;
@@ -97,22 +98,21 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
         c->shm_ring = (unsigned)n;
         return true;
     }
-    case O_SZR_TIMEOUT: {
+    case O_NET_TIMEOUT: {
         char *end;
         unsigned long n = strtoul(arg, &end, 10);
         if (*end || !*arg || n > 86400) {
             snprintf(err, errlen, "expected seconds from 0 (no limit) to 86400");
             return false;
         }
-        c->szr_timeout = (unsigned)n;
+        c->net_timeout = (unsigned)n;
         return true;
     }
     case O_STRICT:   c->strict = true; return true;
     case O_ROTATE:   c->scheme.rotate = true; return true;
     case O_MODE:
-        /* libcov's LIBCOV_MODE: leapfrog re-arms the previous site when one fires, so
-         * a site counts again only after another one did (FORMATS.md 5.7). oneshot is
-         * not offered: it is a sanity-check mode, not a fuzzing one. */
+        /* leapfrog: a site counts again only after another one did, so a tight loop
+         * counts once per entry (docs/fuzz-formats.md "Which executions count"). */
         if (!strcmp(arg, "leapfrog"))
             c->every = false;
         else if (!strcmp(arg, "every"))
@@ -124,9 +124,9 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
         return true;
     case O_SCHEME:
         if (!strcmp(arg, "site"))
-            c->scheme.model = SZ_MODEL_SITE;
+            c->scheme.model = CF_MODEL_SITE;
         else if (!strcmp(arg, "pc"))
-            c->scheme.model = SZ_MODEL_PC;
+            c->scheme.model = CF_MODEL_PC;
         else {
             snprintf(err, errlen, "expected site or pc");
             return false;
@@ -135,8 +135,8 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
     case O_NGRAM: {
         char *end;
         unsigned long n = strtoul(arg, &end, 10);
-        if (*end || n < 1 || n > SZ_NGRAM_MAX) {
-            snprintf(err, errlen, "expected an N-gram length from 1 to %u", SZ_NGRAM_MAX);
+        if (*end || n < 1 || n > CF_NGRAM_MAX) {
+            snprintf(err, errlen, "expected an N-gram length from 1 to %u", CF_NGRAM_MAX);
             return false;
         }
         c->scheme.ngram = (unsigned)n;
@@ -158,7 +158,7 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
         if (!name)
             return false;
         c->mod_names[c->n_mod] = name;
-        c->mod[c->n_mod++] = (sz_module_base){ .name = name, .base = base };
+        c->mod[c->n_mod++] = (cf_module_base){ .name = name, .base = base };
         return true;
     }
     }
@@ -169,28 +169,28 @@ static unsigned cli_provides(void *st)
 {
     const cli *c = st;
     return (c->sites_path ? UAM_RUNNER_EXT_SITES : 0) | (c->boundary_path ? UAM_RUNNER_EXT_BEGIN : 0)
-         | (c->szr_addr ? UAM_RUNNER_EXT_FRONTEND : 0) | (c->shm_path ? UAM_RUNNER_EXT_OBSERVER : 0);
+         | (c->net_addr ? UAM_RUNNER_EXT_FRONTEND : 0) | (c->shm_path ? UAM_RUNNER_EXT_OBSERVER : 0);
 }
 
 /* Last in setup: the brain hears HELLO with the scheme the sites were built for. */
 static uam_status connect_brain(cli *c, uam_runner_setup *s, char *err, size_t errlen)
 {
-    if (!c->szr_addr)
+    if (!c->net_addr)
         return UAM_OK;
     char e[256];
-    c->szr = sz_szr_connect(c->szr_addr, c->loaded ? sz_hello_scheme_flags(&c->scheme) : 0,
-                            c->szr_timeout, e, sizeof(e));
-    if (!c->szr) {
-        snprintf(err, errlen, "--fuzz-szr: %s", e);
+    c->net = cf_net_connect(c->net_addr, c->loaded ? (uint16_t)cf_scheme_flags(&c->scheme) : 0,
+                            c->net_timeout, e, sizeof(e));
+    if (!c->net) {
+        snprintf(err, errlen, "--fuzz-net: %s", e);
         return UAM_ERR_INVALID;
     }
-    s->frontend = &sz_szr_frontend;
-    s->frontend_ctx = c->szr;
+    s->frontend = &cf_net_frontend;
+    s->frontend_ctx = c->net;
     return UAM_OK;
 }
 
-/* suzzer's brain saves each crash or hang X with its notes in X.info (FORMATS.md 4.5):
- * replaying its crashes/ or hangs/ directory runs the inputs, not the notes. */
+/* The brain saves each crash or hang X with its notes in X.info: replaying its crashes/
+ * or hangs/ directory runs the inputs, not the notes. */
 static const char *const brain_sidecars[] = { ".info" };
 
 static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t errlen)
@@ -198,8 +198,8 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
     cli *c = st;
     s->replay_sidecars = brain_sidecars;
     s->n_replay_sidecars = UAM_ARRAY_LEN(brain_sidecars);
-    if (c->szr_timeout && !c->szr_addr) {
-        snprintf(err, errlen, "--fuzz-szr-timeout needs --fuzz-szr");
+    if (c->net_timeout && !c->net_addr) {
+        snprintf(err, errlen, "--fuzz-net-timeout needs --fuzz-net");
         return UAM_ERR_INVALID;
     }
     if (!c->sites_path && !c->boundary_path) {
@@ -216,7 +216,7 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
 
     if (c->sites_path) {
         char e[256];
-        if (!sz_lcv3_load(c->sites_path, &c->pl, e, sizeof(e))) {
+        if (!cf_sites_load(c->sites_path, &c->pl, e, sizeof(e))) {
             snprintf(err, errlen, "%s: %s", c->sites_path, e);
             return UAM_ERR_INVALID;
         }
@@ -224,31 +224,30 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
         uint64_t *bases = calloc(c->pl.n_modules, sizeof(*bases));
         if (!bases)
             return UAM_ERR_NOMEM;
-        if (!sz_resolve_bases(&c->pl, c->mod, c->n_mod, have_base0, image_base, bases, err, errlen)) {
+        if (!cf_resolve_bases(&c->pl, c->mod, c->n_mod, have_base0, image_base, bases, err, errlen)) {
             free(bases);
             return UAM_ERR_INVALID;
         }
         base0 = bases[0];
         c->scheme.map_size = s->map_size_option ? s->map_size_option
-                           : c->scheme.model == SZ_MODEL_SITE ? sz_map_size_for(c->pl.count, c->scheme.ngram)
-                                                              : SZ_PC_MAP_SIZE;
-        if (c->scheme.model == SZ_MODEL_SITE && c->pl.count > c->scheme.map_size)
-            uam_log(UAM_LOG_WARN, "cov", "%u sites in a %u-byte map: site ids collide, and the map "
-                    "differs from libcov's", c->pl.count, c->scheme.map_size);
-        bool ok = sz_build_sites(&c->pl, bases, &c->scheme, aw, &c->sites, err, errlen);
-        if (ok)
-            sz_state_sites(&c->pl, c->sites, uam_isa_pc_state_bits(s->m->cpu.isa));
-        ok = ok && sz_namer_init(&c->namer, &c->pl, c->sites);
+                           : c->scheme.model == CF_MODEL_SITE ? cf_map_size_for(c->pl.count, c->scheme.ngram)
+                                                              : CF_PC_MAP_SIZE;
+        if (c->scheme.model == CF_MODEL_SITE && c->pl.count > c->scheme.map_size)
+            uam_log(UAM_LOG_WARN, "cov", "%u sites in a %u-byte map: site ids collide",
+                    c->pl.count, c->scheme.map_size);
+        bool ok = cf_build_sites(&c->pl, bases, &c->scheme, aw, uam_isa_pc_state_bits(s->m->cpu.isa),
+                                 &c->sites, err, errlen);
+        ok = ok && cf_namer_init(&c->namer, &c->pl, c->sites);
         free(bases);
         if (!ok)
             return UAM_ERR_INVALID;
         s->sites = c->sites;
         s->n_sites = c->pl.count;
-        s->scheme = sz_scheme_name(&c->scheme);
+        s->scheme = cf_scheme_name(&c->scheme);
         s->map_size = c->scheme.map_size;
-        sz_cov_history(&c->scheme, &s->history);
+        cf_cov_history(&c->scheme, &s->history);
         s->skip_repeats = !c->every;
-        s->namer = sz_namer_describe;
+        s->namer = cf_namer_describe;
         s->namer_ctx = &c->namer;
         uam_log(UAM_LOG_INFO, "cov", "%s: %u sites in %u modules, scheme %s, map %u bytes",
                 c->sites_path, c->pl.count, c->pl.n_modules, s->scheme, s->map_size);
@@ -258,20 +257,19 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
             snprintf(err, errlen, "--cov-boundary needs module 0's base: an image or --cov-sites");
             return UAM_ERR_INVALID;
         }
-        sz_boundaries b;
+        cf_markers b;
         char e[256];
-        if (!sz_lcvb_load(c->boundary_path, &b, e, sizeof(e))) {
+        if (!cf_bounds_load(c->boundary_path, &b, e, sizeof(e))) {
             snprintf(err, errlen, "%s: %s", c->boundary_path, e);
             return UAM_ERR_INVALID;
         }
-        bool ok = sz_boundaries_apply(&b, base0, aw, &c->bounds, e, sizeof(e));
-        sz_boundaries_free(&b);
+        bool ok = cf_bounds_apply(&b, base0, aw, uam_isa_pc_state_bits(s->m->cpu.isa), &c->bounds,
+                                  e, sizeof(e));
+        cf_markers_free(&b);
         if (!ok) {
             snprintf(err, errlen, "%s: %s", c->boundary_path, e);
             return UAM_ERR_INVALID;
         }
-        sz_state_bounds(c->sites_path ? &c->pl : NULL, c->sites,
-                        uam_isa_pc_state_bits(s->m->cpu.isa), &c->bounds);
         s->have_begin = true;
         s->begin_pc = c->bounds.begin_pc;
         s->more_begin_pcs = c->bounds.more_begin_pcs;
@@ -285,9 +283,9 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
 
 static uam_status check(cli *c, uam_machine *m)
 {
-    size_t bad = sz_check_sites(m, &c->pl, c->sites, stderr, 5);
+    size_t bad = cf_check_sites(m, &c->pl, c->sites, stderr, 5);
     if (bad && c->strict) {
-        uam_log(UAM_LOG_ERROR, "cov", "--cov-strict: %zu sites do not match the patch list (wrong "
+        uam_log(UAM_LOG_ERROR, "cov", "--cov-strict: %zu sites do not match the site list (wrong "
                 "base or byte order?)", bad);
         return UAM_ERR_INVALID;
     }
@@ -310,14 +308,14 @@ static uam_status cli_attach(void *st, uam_machine *m, uam_fuzz *f)
         size_t map_size;
         uam_fuzz_map(f, &map_size);
         char e[300];
-        c->shm = sz_lcvs_create(c->shm_path, (uint32_t)map_size, c->shm_ring,
-                                c->loaded ? sz_lcvs_scheme_flags(&c->scheme) : 0, e, sizeof(e));
+        c->shm = cf_region_create(c->shm_path, (uint32_t)map_size, c->shm_ring,
+                                  c->loaded ? cf_scheme_flags(&c->scheme) : 0, e, sizeof(e));
         if (!c->shm) {
-            uam_log(UAM_LOG_ERROR, "lcvs", "--cov-shm: %s", e);
+            uam_log(UAM_LOG_ERROR, "cov-region", "--cov-shm: %s", e);
             return UAM_ERR_INVALID;
         }
-        uam_fuzz_set_observer(f, sz_lcvs_observe, c->shm);
-        uam_log(UAM_LOG_INFO, "lcvs", "%s: %zu-byte maps, %u ring slots", c->shm_path, map_size,
+        uam_fuzz_set_observer(f, cf_region_observe, c->shm);
+        uam_log(UAM_LOG_INFO, "cov-region", "%s: %zu-byte maps, %u ring slots", c->shm_path, map_size,
                 c->shm_ring);
     }
     return UAM_OK;
@@ -331,28 +329,29 @@ static int cli_finish(void *st, uam_machine *m, bool fuzzed, int rc)
     return rc;
 }
 
-const uam_runner_ext uam_suzzer_runner_ext = {
-    .name = "suzzer",
+const uam_runner_ext uam_fuzz_lists_runner_ext = {
+    .name = "fuzz-lists",
     .opts = opts,
     .n_opts = UAM_ARRAY_LEN(opts),
     .help =
-        "  suzzer formats:\n"
-        "      --cov-sites LCV3    coverage sites from a suzzer patch list (site ids, orig bytes)\n"
-        "      --cov-module NAME=BASE  load base of the patch-list module NAME (repeatable; default:\n"
+        "  site lists, boundary files, the coverage region and the fuzz brain:\n"
+        "      --cov-sites FILE    coverage sites from a site list (gen_sites.py: site ids,\n"
+        "                          instruction bytes)\n"
+        "      --cov-module NAME=BASE  load base of the site-list module NAME (repeatable; default:\n"
         "                          the list's base table, then the image's link base for module 0)\n"
-        "      --cov-scheme M      site (default) or pc: libcov's coverage model\n"
-        "      --cov-ngram N       N-gram length 1..8 (default 2, like libcov)\n"
-        "      --cov-rotate        N-gram rotation, as libcov's LIBCOV_NGRAM_ROTATE=1\n"
-        "      --cov-mode M        leapfrog (default, like libcov: a site counts again only\n"
-        "                          after another one) or every (each execution counts)\n"
+        "      --cov-scheme M      site (default: buckets from site ids) or pc (hashed pcs)\n"
+        "      --cov-ngram N       N-gram length 1..8 (default 2)\n"
+        "      --cov-rotate        rotate each history slot, so the order of sites counts\n"
+        "      --cov-mode M        leapfrog (default: a site counts again only after another\n"
+        "                          one) or every (each execution counts)\n"
         "      --cov-strict        fail if a site's bytes in memory differ from the list\n"
-        "      --cov-boundary LCVB1  iteration begin/end from a suzzer boundary file (any\n"
-        "                          number of BEGIN and END markers)\n"
-        "      --fuzz-szr HOST:PORT  fuzz with inputs from a suzzer brain (SZR1 over TCP;\n"
+        "      --cov-boundary FILE iteration begin/end from a boundary file (gen_boundaries.py;\n"
+        "                          any number of BEGIN and END markers)\n"
+        "      --fuzz-net HOST:PORT  fuzz with inputs from a fuzz brain over TCP (fuzz_brain.py;\n"
         "                          TCP keepalive notices a vanished brain host)\n"
-        "      --fuzz-szr-timeout S  give up when the brain sends nothing for S seconds\n"
+        "      --fuzz-net-timeout S  give up when the brain sends nothing for S seconds\n"
         "                          (default 0: wait as long as it takes)\n"
-        "      --cov-shm PATH      publish INIT and each ok iteration's map in an LCVS region\n"
+        "      --cov-shm PATH      publish INIT and each ok iteration's map in a coverage region\n"
         "                          (a file if PATH has a '/' after its start, else /dev/shm)\n"
         "      --cov-shm-ring N    ring slots in that region (default 8)\n",
     .create = cli_create,
