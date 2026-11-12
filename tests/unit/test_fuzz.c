@@ -397,6 +397,47 @@ static void test_verdicts(const target *t)
     }
 }
 
+/* uam_fuzz_map_hits: the set buckets, ascending, exactly the non-zero ones; NULL when
+ * there are more than asked for. Asking for them lets the next iteration clear only those
+ * buckets: maps must stay exactly what a whole-map clear gives, whatever the order of
+ * inputs and whether or not the list was taken (or refused) in between. */
+static void test_hits(const target *t)
+{
+    static outcome ref;
+    run_inputs(t, BK_INTERP, &ref);
+    uam_machine m;
+    machine_for(&m, t, BK_INTERP);
+    uam_fuzz *f = harness_for(&m, t, NULL, 0, UAM_FUZZ_EXC_DEFAULT | UAM_FUZZ_EXC_TRAP);
+    uam_fuzz_result r;
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "%s: hits: boot", t->name);
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < N_INPUTS; i++) {
+            const uint8_t *map;
+            size_t n = 0;
+            if (round == 1 && (i & 1)) {
+                /* too few allowed: refused, and the next clear is a whole-map one */
+                CHECK(uam_fuzz_map_hits(f, 1, &n) == NULL || nonzero(uam_fuzz_map(f, NULL)) <= 1,
+                      "%s: hits: a list longer than max is refused", t->name);
+            } else if (round != 2 || (i & 1)) {
+                const uint32_t *h = uam_fuzz_map_hits(f, MAP_SIZE, &n);
+                map = uam_fuzz_map(f, NULL);
+                bool ok = h && n == nonzero(map);
+                for (size_t k = 0; ok && k < n; k++)
+                    ok = map[h[k]] && (k == 0 || h[k] > h[k - 1]);
+                CHECK(ok, "%s: hits: round %d before '%s': the set buckets, ascending", t->name,
+                      round, inputs[i]);
+            }
+            CHECK(uam_fuzz_run_one(f, (const uint8_t *)inputs[i], strlen(inputs[i]), &r) == UAM_OK,
+                  "run");
+            map = uam_fuzz_map(f, NULL);
+            CHECK(!memcmp(map, ref.map[i], MAP_SIZE), "%s: hits: round %d: '%s' gives the map a "
+                  "whole-map clear gives", t->name, round, inputs[i]);
+        }
+    }
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+}
+
 static void test_modes(const target *t)
 {
     /* Paired: the iteration ends at END, before the jump back. */
@@ -1295,6 +1336,7 @@ int main(void)
                           arm_target(true), ppc_target() };
     for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {
         test_verdicts(&ts[i]);
+        test_hits(&ts[i]);
         test_modes(&ts[i]);
         test_routes(&ts[i]);
         test_frontend(&ts[i]);

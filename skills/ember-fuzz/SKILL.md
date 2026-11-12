@@ -94,7 +94,12 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    different maps; identical maps mean the input never reaches the handler (begin pc after
    the read, wrong route, input dropped by a full FIFO).
 7. **Run the campaign**: the brain (`references/lists-and-brain.md`) or a program on
-   `uam/fuzz.h`. Keep inputs, crashes and hangs in `fuzz/` of the project.
+   `uam/fuzz.h`. Give the brain a dictionary of the handler's magic values and command
+   words (`--dict`, ember's format: integers follow the target's byte order). Use every
+   core: `fuzz_launch.py -n N` runs N brain + ember workers that share their queues, each
+   on a different power schedule. An `UNSTABLE` line from the brain means the harness leaks
+   state between iterations: back to the readiness gate. Keep inputs, crashes and hangs in
+   `fuzz/` of the project.
 8. **Triage**: replay the crash directory, group with `scripts/replay_summary.py`, reproduce
    each group's smallest input alone, then debug it with ember-dev-build's tools from the
    snapshot (`--load-snapshot`, `--break`, `-d`, gdb). A `crash-guard` (replay exit 25;

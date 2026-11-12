@@ -13,6 +13,8 @@ the latest events.
   python3 fuzz/tools/status_tui.py fuzz_out/status.jsonl --refresh 2
   python3 fuzz/tools/status_tui.py --once fuzz_out/status.jsonl   # one frame, no curses
   python3 fuzz/tools/status_tui.py --input - --once < status.jsonl
+  python3 fuzz/tools/status_tui.py --sync-dir camp                # every worker of a
+                                                                  # parallel campaign
   python3 fuzz/tools/status_tui.py --demo                         # synthetic data
   python3 fuzz/tools/status_tui.py --selftest                     # render checks
 
@@ -41,7 +43,11 @@ unknown keys are ignored, missing ones render as "?"):
   hangs_saved    hang inputs kept (the brain keeps each distinct hang input,
                  so this can exceed hangs_unique)
   rejected       inputs the input route refused (REJECTED; not bugs)
-  stage          current stage, e.g. "havoc + splice"
+  stage          current stage, e.g. "havoc id:000003,... (fast, cycle 2)"
+  favored        favored queue entries   pending_favored  favored, never chosen yet
+  unstable       entries that ran differently twice (a harness that leaks state)
+  imported       entries imported from other workers
+  worker, role, schedule   the worker's name, main/secondary, its power schedule
   config         object of label:value pairs for the "run config" box
   finished       true when the run is over
   event          {"kind":"find"|"crash"|"hang"|"info", "msg":"...",
@@ -162,6 +168,9 @@ class Status:
         "crashes_unique": "crashes_unique", "hangs": "hangs",
         "hangs_unique": "hangs_unique", "hangs_saved": "hangs_saved",
         "init_edges": "init_edges", "rejected": "rejected", "stage": "stage",
+        "favored": "favored", "pending_favored": "pending_favored",
+        "unstable": "unstable", "imported": "imported", "worker": "worker",
+        "role": "role", "schedule": "schedule",
     }
 
     def __init__(self):
@@ -181,6 +190,13 @@ class Status:
         self.init_edges = None
         self.rejected = None
         self.stage = "—"
+        self.favored = None
+        self.pending_favored = None
+        self.unstable = None
+        self.imported = None
+        self.worker = None
+        self.role = None
+        self.schedule = None
         self.config = {}
         self.finished = False
         self.last_find_t = None
@@ -448,12 +464,19 @@ def render(st, w, h, title="ember fuzz status", source=None,
     except (TypeError, ValueError):
         dups = "?"
     none = "none seen yet"
+    def opt(v):
+        return "?" if v is None else fmt_n(v)
+
     rows += [(ln, "") for ln in _pair("findings in depth", [
         _field("corpus paths", fmt_n(st.corpus), 14),
+        _field("favored", f"{opt(st.favored)}  ({opt(st.pending_favored)} pending)", 14),
         _field("new-cov finds", fmt_n(st.finds), 14),
         _field("total crashes", f"{fmt_n(st.crashes)}  ({uc} unique)", 14),
         _field("dup crashes", dups, 14),
         _field("total hangs", st.hangs_label(), 14),
+        _field("unstable", opt(st.unstable) + ("  (harness leaks state!)"
+                                               if st.unstable else ""), 14),
+        _field("imported", opt(st.imported), 14),
     ], "latest findings", [
         _field("find", st.last_msg.get("find", none), 5),
         _field("crash", st.last_msg.get("crash", none), 5),
@@ -470,6 +493,91 @@ def render(st, w, h, title="ember fuzz status", source=None,
     return _clamp(rows, tw, h)
 
 
+# ---- several workers (fuzz_launch.py, fuzz_brain.py --sync-dir) ----------------
+
+class MultiFeed:
+    """Follows SYNC_DIR/*/status.jsonl: one Status per worker, new workers picked up."""
+
+    def __init__(self, sync_dir):
+        self.dir = sync_dir
+        self.feeds = {}                  # worker -> JsonFeed
+
+    def read_new(self):
+        try:
+            names = sorted(os.listdir(self.dir))
+        except OSError:
+            names = []
+        for n in names:
+            p = os.path.join(self.dir, n, "status.jsonl")
+            if n not in self.feeds and os.path.isfile(p):
+                f = JsonFeed(p, Status())
+                f.initial_scan()
+                self.feeds[n] = f
+        got = 0
+        for f in self.feeds.values():
+            got += f.read_new()
+        return got
+
+    def states(self):
+        return [(n, f.st) for n, f in sorted(self.feeds.items(),
+                                             key=lambda kv: (kv[0] != "main", kv[0]))]
+
+
+def render_multi(states, w, h, title="ember fuzz workers", source=None, stall_after=None,
+                 now=None):
+    """One row per worker and a total (afl-whatsup style), as (text, attr) rows."""
+    now = time.time() if now is None else now
+    tw = min(max(w - 1, 60), 132)
+    rows = [(title.center(tw), "head")]
+    if source:
+        rows.append((f"  sync dir : {source}", "dim"))
+    if not states:
+        rows.append(("  waiting for workers (no status.jsonl yet)", "warn"))
+        return _clamp(rows, tw, h)
+    hdr = (f"{'worker':<10} {'role':<9} {'sched':<7} {'state':<8} {'execs':>9} "
+           f"{'exec/s':>8} {'cyc':>5} {'queue':>6} {'fav':>5} {'pend':>5} {'edges':>7} "
+           f"{'crash':>5} {'hang':>5} {'imp':>5} {'unst':>4}")
+    rows.append((hdr[:tw], "head"))
+    tot = {"execs": 0, "rate": 0.0, "crash": 0, "hang": 0, "imp": 0, "unst": 0}
+    alive = 0
+    for name, st in states:
+        age = None if st.last_update_wall is None else max(0.0, now - st.last_update_wall)
+        if st.finished:
+            state, attr = "done", "dim"
+        elif stall_after is not None and age is not None and age > stall_after:
+            state, attr = "STALLED", "err"
+        else:
+            state, attr = "running", "ok"
+            alive += 1
+        cur = st.current_rate()
+        rate = cur if cur is not None else st.execs_per_sec or 0.0
+        if st.unstable:
+            attr = "warn"
+
+        def n(v):
+            return "?" if v is None else fmt_n(v)
+        line = (f"{name[:10]:<10} {str(st.role or '?')[:9]:<9} {str(st.schedule or '?')[:7]:<7} "
+                f"{state:<8} {fmt_n(st.execs):>9} {rate:>8.1f} {n(st.cycles_done()):>5} "
+                f"{fmt_n(st.corpus):>6} {n(st.favored):>5} {n(st.pending_favored):>5} "
+                f"{fmt_n(st.edges):>7} {st.uniq_crashes():>5} {st.hangs_unique or 0:>5} "
+                f"{n(st.imported):>5} {n(st.unstable):>4}")
+        rows.append((line[:tw], attr))
+        tot["execs"] += st.execs or 0
+        if state == "running":
+            tot["rate"] += rate
+        tot["crash"] += st.uniq_crashes()
+        tot["hang"] += st.hangs_unique or 0
+        tot["imp"] += st.imported or 0
+        tot["unst"] += st.unstable or 0
+    rows.append((f"total: {len(states)} workers ({alive} running), {fmt_n(tot['execs'])} execs, "
+                 f"{tot['rate']:.1f} execs/s now, {tot['crash']} unique crashes (summed over "
+                 f"workers), {tot['hang']} unique hangs, {tot['imp']} imports"[:tw], "head"))
+    if tot["unst"]:
+        rows.append(("  unstable entries: the harness leaks state between iterations; "
+                     "see the workers' brain logs"[:tw], "err"))
+    return _clamp(rows, tw, h)
+
+
 # ---- curses UI -----------------------------------------------------------------
 
 ATTR_MAP = {
@@ -478,7 +586,7 @@ ATTR_MAP = {
 }
 
 
-def run_curses(feed, st, refresh, title, source, stall_after):
+def run_curses(feed, st, refresh, title, source, stall_after, draw=None):
     """Static board: redraw every `refresh` seconds until Ctrl-C. No hotkeys."""
     import curses
 
@@ -516,8 +624,8 @@ def run_curses(feed, st, refresh, title, source, stall_after):
                 feed.read_new()
             h, w = scr.getmaxyx()
             scr.erase()
-            rows = render(st, w, h, title=title, source=source,
-                          stall_after=stall_after)
+            rows = (draw(w, h) if draw else
+                    render(st, w, h, title=title, source=source, stall_after=stall_after))
             for r, (txt, a) in enumerate(rows[:h]):
                 try:
                     scr.addnstr(r, 0, txt, max(0, w - 1), attr(a))
@@ -606,8 +714,22 @@ def selftest():
     s4.apply({"execs": 10, "edges": 5, "map_size": 100,
               "event": {"kind": "find", "edges": 5}})
     assert s4.execs == 10 and s4.finds == 1 and s4.last_find_t is not None
+    # several workers
+    a, b = Status(), Status()
+    a.apply({"t": 5, "execs": 500, "corpus": 9, "edges": 30, "worker": "main", "role": "main",
+             "schedule": "fast", "favored": 4, "pending_favored": 1, "imported": 2,
+             "unstable": 0, "crashes_unique": 1})
+    b.apply({"t": 5, "execs": 300, "corpus": 7, "edges": 25, "worker": "w1",
+             "role": "secondary", "schedule": "rare", "unstable": 1, "finished": True})
+    a.last_update_wall = b.last_update_wall = time.time()
+    blob = text(render_multi([("main", a), ("w1", b)], 132, 40, stall_after=10))
+    assert "main" in blob and "w1" in blob and "rare" in blob and "done" in blob, blob
+    assert "2 workers (1 running), 800 execs" in blob, blob
+    assert "unstable entries" in blob, blob
+    blob = text(render(a, 100, 60))
+    assert "favored" in blob and "imported" in blob, "queue fields on the single board"
     print("[selftest] ok: static board renders at 60/80/100/132 cols, "
-          "full config, run state, apply() works")
+          "full config, run state, apply() works, the workers view")
     return 0
 
 
@@ -629,6 +751,9 @@ def main():
                     help="render synthetic data (no feed needed)")
     ap.add_argument("--selftest", action="store_true",
                     help="render checks on synthetic data; exit 0 on success")
+    ap.add_argument("--sync-dir", default=None,
+                    help="show every worker of a parallel campaign (fuzz_launch.py --out, "
+                         "fuzz_brain.py --sync-dir): one row each and a total")
     ap.add_argument("--title", default="ember fuzz status")
     args = ap.parse_args()
     if args.feed and args.input:
@@ -639,6 +764,23 @@ def main():
         return selftest()
     if args.refresh <= 0:
         ap.error("--refresh must be > 0")
+    if args.sync_dir:
+        mf = MultiFeed(args.sync_dir)
+        mf.read_new()
+        stall = max(10.0, 5 * args.refresh)
+
+        def draw(w, h):
+            mf.read_new()
+            return render_multi(mf.states(), w, h, source=args.sync_dir, stall_after=stall)
+        if args.once or not sys.stdout.isatty():
+            import shutil
+            w, h = shutil.get_terminal_size((132, 44))
+            tags = {"err": "!!", "warn": "**", "head": ">>", "ok": "++"}
+            for txt, attr in draw(w, max(24, h)):
+                print(f"{tags.get(attr, '  ')} {txt}")
+            return 0
+        run_curses(None, None, args.refresh, args.title, args.sync_dir, stall, draw=draw)
+        return 0
 
     st = Status()
     feed = None

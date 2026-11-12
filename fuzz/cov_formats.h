@@ -167,6 +167,10 @@ typedef struct cf_net cf_net;
 cf_net *cf_net_connect(const char *hostport, uint16_t flags, unsigned timeout_s, char *err,
                        size_t errlen);
 void    cf_net_close(cf_net *z);
+/* Once the harness exists (a runner extension's attach): the target's byte order goes into
+ * HELLO, and SPARSE replies carry each iteration's instruction count and use the harness's
+ * hit list. */
+void    cf_net_attach(cf_net *z, uam_fuzz *f, bool big_endian);
 extern const uam_fuzz_frontend cf_net_frontend;
 
 /* ---- the coverage region (cov_region.c) ---------------------------------------- */

@@ -12,7 +12,7 @@ explains how to use them.
 | site list | `UAMS` | 1 | little-endian | `gen_sites.py` | `--cov-sites` |
 | boundary file | `UAMB` | 1 | little-endian | `gen_boundaries.py` | `--cov-boundary` |
 | coverage region | `UAMC` | 1 | the writer's | `--cov-shm` | `cov_region.py`, outside readers |
-| fuzz protocol | `UAMF` | 1 | big-endian | ember and `fuzz_brain.py` | each other |
+| fuzz protocol | `UAMF` | 1 (OPTIONS and SPARSE are optional, negotiated) | big-endian | ember and `fuzz_brain.py` | each other |
 
 Readers check the magic and the version, and refuse a file of any other version. For a
 site list or a boundary file the error names the tool that makes a current one.
@@ -166,15 +166,27 @@ Every integer is big-endian, and maps are raw u8 counters.
 
 | Type | Direction | Payload |
 |---|---|---|
-| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
+| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits, and bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
 | 2 INPUT | brain → ember | u64 id (non-zero), u32 len, data |
 | 3 COVERAGE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u32 map_size, map |
 | 4 CRASH | ember → brain | u64 id, u8 reason, u32 status |
 | 5 BYE | either way | none |
+| 6 OPTIONS | brain → ember, optional, once after HELLO and before the first INPUT | u32 flags: bit 0 SPARSE (reply with SPARSE instead of COVERAGE); later fields, if any, are ignored |
+| 7 SPARSE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u64 insns (instructions the iteration ran; 0 for INIT), u32 map_size, u32 n, then n × (u32 index, u8 count), indices ascending |
 
 **Lockstep.** After HELLO, ember sends the boot's map once, unsolicited, as COVERAGE id 0,
-kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE kind ITER if the
-input ended normally, CRASH otherwise. Unknown frame types are ignored.
+kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE (or SPARSE) kind
+ITER if the input ended normally, CRASH otherwise. Unknown frame types are ignored.
+
+**SPARSE.** A brain that sends OPTIONS with bit 0 gets every later map as the list of its
+set buckets instead of the whole map: a typical iteration sets a few hundred to a few
+thousand buckets of a map of 4 KiB to 16 MiB, so the frame, and the brain's work on it,
+follow what the iteration touched rather than the map size. A map with more than
+map_size / 5 set buckets, for which the list would be larger, still goes as COVERAGE, so a
+brain that asks for SPARSE handles both. The INIT map, sent before OPTIONS can arrive, is
+always COVERAGE. An ember that predates OPTIONS ignores it and keeps sending COVERAGE; a
+brain that sends no OPTIONS gets COVERAGE as before. `insns` is the iteration's cost, which
+the brain's schedules use.
 
 The session ends with BYE from either side. EOF before a BYE is an error. ember notices a
 vanished brain host through TCP keepalive, and a brain that stops answering through

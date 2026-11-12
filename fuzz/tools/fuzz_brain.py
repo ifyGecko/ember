@@ -4,35 +4,37 @@
 ember runs the inputs; this chooses them. Start the brain, then start ember
 with `uam-run --fuzz-net HOST:PORT ...` (within --accept-timeout seconds):
 ember dials in, boots its firmware, says HELLO, and from then on runs each
-INPUT the brain sends and answers it with one COVERAGE map or CRASH verdict.
-The protocol (UAMF) is specified in docs/fuzz-formats.md; its constants are
-in fuzz/formats.h.
+INPUT the brain sends and answers it with one COVERAGE (or SPARSE) map or CRASH
+verdict. The protocol (UAMF) is specified in docs/fuzz-formats.md; its constants
+are in fuzz/formats.h. The design of the campaign is docs/fuzz-ideas.md; its
+logic lives in fuzz/tools/fuzz_queue.py.
 
 The brain
-  - mutates inputs with fuzz/tools/mutate.py (Engine: havoc + splice);
-  - folds each returned map into a cumulative one, keeps inputs that reached
-    new coverage, and saves + triages the inputs that crashed or hung.
-
-What makes this a campaign rather than a coverage dump:
-
-  * It runs **until you stop it** (Ctrl-C / SIGTERM) or ember says BYE.
-    `--iters N` caps the run only if you ask; the default (0) is open-ended.
-  * It keeps a **disk-backed corpus** under <out>/corpus and **reloads it on
-    start**, so a restart resumes the campaign instead of throwing it away.
-  * It saves each crash as the **full input plus a .info sidecar** (reason
-    name, status, size, hex) so it can be replayed (`uam-run --fuzz-replay`),
-    and **deduplicates** by (reason, status) so one bug does not fill the
-    directory with copies. HANG and TIMEOUT verdicts go to <out>/hangs,
-    counted apart from crashes; every distinct hang input is kept (up to
-    --max-hangs), since (reason, status) says little about one. REJECTED
-    (the input route refused the input) is not a bug: it is only counted.
-    A finding is written before it is minimized, so it survives a lost
-    connection.
-  * It **minimizes** a newly found crash (bounded block dropping) before
-    saving it. Not hangs: every probe of one costs ember a full per-input
-    budget (--minimize-timeouts opts in).
-  * The default `--max-size` is 64 KiB, a real input budget (it is unrelated
-    to the coverage map size).
+  - asks ember for SPARSE replies (OPTIONS): each iteration's set buckets and its
+    instruction count, folded in O(buckets hit) with AFL-style hit-count classes;
+  - keeps a disk-backed **queue** under <out>/queue (id:NNNNNN,... names that
+    record lineage) and **resumes** it on start;
+  - walks the queue in cycles: a **favored** set (the cheapest entry per bucket),
+    **calibration** (a new entry runs twice; ember is deterministic, so a
+    difference is a harness bug, reported as UNSTABLE), **trimming**, and an
+    **energy** per entry from a performance score times its **power schedule**
+    (--schedule fast, explore, exploit, coe, rare);
+  - mutates with fuzz/tools/mutate.py (havoc + splice), an optional ember
+    **dictionary** (--dict; integer tokens in the target's byte order, from
+    HELLO), and operator weights it **adapts** to what finds coverage;
+  - saves each crash as the **full input plus a .info sidecar** (reason name,
+    status, size, hex) so it can be replayed (`uam-run --fuzz-replay`), and
+    **deduplicates** by (reason, status). HANG and TIMEOUT verdicts go to
+    <out>/hangs: every distinct hang input is kept (up to --max-hangs). REJECTED
+    (the input route refused the input) is not a bug: it is only counted. A
+    finding is written before it is minimized, so it survives a lost connection;
+  - **minimizes** a newly found crash (bounded block dropping). Not hangs: every
+    probe of one costs ember a full per-input budget (--minimize-timeouts opts in);
+  - with --sync-dir and --name, **shares work** with other workers: it imports
+    their new queue entries that are new to it (fuzz/tools/fuzz_launch.py runs a
+    whole parallel campaign).
+  * It runs **until you stop it** (Ctrl-C / SIGTERM) or ember says BYE; --iters N
+    caps the mutated executions.
 
 Usage:
   python3 fuzz/tools/fuzz_brain.py --listen 127.0.0.1:7000 --seeds seeds/ \\
@@ -41,13 +43,16 @@ Usage:
   python3 fuzz/tools/status_tui.py fuzz_out/status.jsonl
 
   fuzz_brain.py --listen HOST:PORT [--seeds DIR] [--out DIR] [--iters N]
+                [--schedule S] [--dict FILE]... [--no-trim] [--trim-probes N]
+                [--no-calibrate] [--reweight-every N]
+                [--name NAME --sync-dir DIR [--sync-interval S] [--main|--secondary]]
                 [--max-size N] [--no-minimize] [--minimize-timeouts]
                 [--max-hangs N] [--seed-rng N] [--accept-timeout S]
                 [--hello-timeout S] [--io-timeout S]
                 [--status-file FILE] [--status-interval S] [--quiet]
 
 A missing or empty --seeds directory falls back to built-in seeds (plus any
-resumed corpus). --listen with port 0 picks a free port; the log line
+resumed queue). --listen with port 0 picks a free port; the log line
 "listening on HOST:PORT" names it.
 
 Exit status: 0 after a clean session (--iters reached, a signal, or ember's
@@ -58,6 +63,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import signal
 import socket
 import struct
@@ -66,15 +72,20 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mutate import Engine  # noqa: E402
+from mutate import DEFAULT_OP_WEIGHTS, Dictionary, Engine, parse_dict  # noqa: E402
+from fuzz_queue import (SCHEDULES, Coverage, Entry, OpStats, Queue, entry_name,  # noqa: E402
+                        hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
+                        save_state, set_synced, synced_upto)
 
 # ---- the fuzz protocol (fuzz/formats.h, docs/fuzz-formats.md) ----------
 NET_MAGIC = b"UAMF"
 NET_VERSION = 1
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
-HELLO, INPUT, COVERAGE, CRASH, BYE = 1, 2, 3, 4, 5
+HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE = 1, 2, 3, 4, 5, 6, 7
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
-COVERAGE_HDR_LEN, CRASH_LEN = 13, 13
+COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 13, 25
+HELLO_BIG_ENDIAN = 1 << 15               # HELLO flags: the target is big-endian
+OPT_SPARSE = 1 << 0                      # OPTIONS: reply with SPARSE, not COVERAGE
 KIND_INIT, KIND_ITER = 1, 2
 
 # HELLO flags: the coverage scheme (the coverage region's flags, same bits).
@@ -154,12 +165,39 @@ def main():
                          "built-in seeds)")
     ap.add_argument("--out", default=None,
                     help="output dir (holds crashes/, hangs/ and the resumable "
-                         "corpus/; default ./fuzz_out)")
+                         "queue/; default ./fuzz_out; with --sync-dir: SYNC_DIR/NAME)")
     ap.add_argument("--iters", type=int, default=0,
                     help="stop after N mutated execs (0 = run until stopped)")
     ap.add_argument("--max-size", type=int, default=65536,
                     help="max mutated input bytes (default 65536; an input "
                          "budget, not a protocol limit)")
+    ap.add_argument("--schedule", default="fast", choices=SCHEDULES,
+                    help="power schedule: how much energy each queue entry gets "
+                         "(default fast; docs/fuzz-ideas.md)")
+    ap.add_argument("--dict", action="append", default=[],
+                    help="ember dictionary file (fuzz/tools/mutate.py's format; "
+                         "integer tokens follow the target's byte order); repeatable")
+    ap.add_argument("--no-trim", dest="trim", action="store_false",
+                    help="do not trim new queue entries")
+    ap.add_argument("--trim-probes", type=int, default=64,
+                    help="most runs spent trimming one entry (default 64)")
+    ap.add_argument("--no-calibrate", dest="calibrate", action="store_false",
+                    help="do not run new entries twice to check that ember is deterministic")
+    ap.add_argument("--reweight-every", type=int, default=5000,
+                    help="adapt the mutation operators' weights every N execs "
+                         "(0 = keep the defaults; default 5000)")
+    ap.add_argument("--name", default=None,
+                    help="this worker's name (parallel campaigns; default main)")
+    ap.add_argument("--sync-dir", default=None,
+                    help="share work with the other workers whose output directories "
+                         "are in SYNC_DIR (this one's is SYNC_DIR/NAME)")
+    ap.add_argument("--sync-interval", type=float, default=60.0,
+                    help="seconds between imports from the other workers (default 60)")
+    role = ap.add_mutually_exclusive_group()
+    role.add_argument("--main", dest="role", action="store_const", const="main",
+                      help="this worker is the main one of a parallel campaign")
+    role.add_argument("--secondary", dest="role", action="store_const", const="secondary",
+                      help="this worker is a secondary one")
     ap.add_argument("--no-minimize", dest="minimize", action="store_false",
                     help="skip crash minimization (on by default)")
     ap.add_argument("--minimize-timeouts", action="store_true",
@@ -169,7 +207,7 @@ def main():
                     help="save at most N distinct HANG/TIMEOUT inputs "
                          "(default 64)")
     ap.add_argument("--seed-rng", type=int, default=0xC0FFEE,
-                    help="RNG seed (default 0xC0FFEE)")
+                    help="RNG seed (default 0xC0FFEE; parallel workers need distinct ones)")
     ap.add_argument("--accept-timeout", type=float, default=15.0,
                     help="seconds to wait for ember to connect (default 15)")
     ap.add_argument("--hello-timeout", type=float, default=600.0,
@@ -181,7 +219,7 @@ def main():
                          "default 60)")
     ap.add_argument("--status-file",
                     help="write a JSON-lines status feed here, anew each session (watch it with "
-                         "fuzz/tools/status_tui.py)")
+                         "fuzz/tools/status_tui.py; default with --sync-dir: OUT/status.jsonl)")
     ap.add_argument("--status-interval", type=float, default=1.0,
                     help="seconds between status snapshots (default 1.0)")
     ap.add_argument("--quiet", action="store_true",
@@ -192,56 +230,45 @@ def main():
     if not port.isdigit():
         sys.exit("brain: --listen must be HOST:PORT (e.g. 127.0.0.1:7000), got %r"
                  % args.listen)
-    out = args.out or os.path.join(os.getcwd(), "fuzz_out")
+    name = args.name or "main"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
+        sys.exit("brain: --name must be 1-32 of [A-Za-z0-9_-], got %r" % name)
+    if args.sync_dir:
+        out = os.path.join(args.sync_dir, name)
+        if args.out and os.path.abspath(args.out) != os.path.abspath(out):
+            sys.exit("brain: with --sync-dir the output directory is SYNC_DIR/NAME (%s)" % out)
+    else:
+        out = args.out or os.path.join(os.getcwd(), "fuzz_out")
+    role_name = args.role or ("main" if not args.sync_dir else "secondary")
     crash_dir = os.path.join(out, "crashes")
     hang_dir = os.path.join(out, "hangs")
-    corpus_dir = os.path.join(out, "corpus")
-    for d in (crash_dir, hang_dir, corpus_dir):
+    queue_dir = os.path.join(out, "queue")
+    for d in (crash_dir, hang_dir, queue_dir):
         os.makedirs(d, exist_ok=True)
+    if args.sync_dir and not args.status_file:
+        args.status_file = os.path.join(out, "status.jsonl")
 
     def log(*a):
         if not args.quiet:
-            print("brain:", *a, flush=True)
+            print("brain:%s" % ("" if not args.sync_dir else " [%s]" % name), *a, flush=True)
 
-    # ---- load seeds, and RESUME any previously saved corpus --------------
+    # ---- seeds, and RESUME any previously saved queue ---------------------------
     def load_dir(d):
         found = []
-        for name in (sorted(os.listdir(d)) if d and os.path.isdir(d) else []):
-            p = os.path.join(d, name)
-            if os.path.isfile(p) and not name.endswith(".info"):
+        for fname in (sorted(os.listdir(d)) if d and os.path.isdir(d) else []):
+            p = os.path.join(d, fname)
+            if os.path.isfile(p) and not fname.endswith(".info"):
                 with open(p, "rb") as f:
-                    found.append(f.read())
+                    found.append((fname, f.read()))
         return found
 
     if args.seeds and not os.path.isdir(args.seeds):
         print("brain: WARNING: seed directory %r does not exist; using built-in seeds"
               % args.seeds, file=sys.stderr)
     seeds = load_dir(args.seeds)
-    resumed = load_dir(corpus_dir)
+    resumed = load_queue(queue_dir)
     if resumed:
-        log("resumed %d inputs from %s" % (len(resumed), corpus_dir))
-    seen_inputs = set()                  # de-dup by content: reload is idempotent
-    corpus = []
-    for data in seeds + resumed:
-        h = hashlib.sha1(data).digest()
-        if h not in seen_inputs:
-            seen_inputs.add(h)
-            corpus.append(data)
-    if not corpus:
-        corpus = [b"A", b"B", b"C"]
-    saved_corpus = set(hashlib.sha1(d).hexdigest() for d in resumed)
-
-    def save_corpus_input(data):
-        """Persist a new-coverage input so the campaign is resumable."""
-        h = hashlib.sha1(data).hexdigest()
-        if h in saved_corpus:
-            return
-        saved_corpus.add(h)
-        with open(os.path.join(corpus_dir, "cov_%s" % h[:16]), "wb") as f:
-            f.write(data)
-
-    for data in seeds:                   # so a later session resumes without --seeds
-        save_corpus_input(data)
+        log("resumed %d queue entries from %s" % (len(resumed), queue_dir))
 
     # ---- stop cleanly on Ctrl-C / SIGTERM (campaign state is on disk) ----
     stop = {"flag": False}
@@ -296,55 +323,83 @@ def main():
     if map_size == 0:
         sys.exit("brain: HELLO map_size is 0")
     arch = payload[HELLO_FIXED_LEN:HELLO_FIXED_LEN + arch_len].decode("ascii", "replace")
+    order = "big" if flags & HELLO_BIG_ENDIAN else "little"
     scheme = scheme_str(flags)
     if flags & SCHEME and (flags & NGRAM_MASK) >> NGRAM_SHIFT < 3:
         log("NOTE: coverage scheme is %s; an N>=3 scheme with rotation is more "
             "path-sensitive for fuzzing (uam-run --cov-ngram 3 --cov-rotate)" % scheme)
-    log("HELLO version=%d arch=%s map_size=%d flags=0x%x scheme=%s"
-        % (ver, arch, map_size, flags, scheme))
+    log("HELLO version=%d arch=%s (%s-endian) map_size=%d flags=0x%x scheme=%s"
+        % (ver, arch, order, map_size, flags, scheme))
+    # Ask for SPARSE replies: the hit buckets instead of the whole map. An ember that
+    # does not know OPTIONS ignores it and keeps sending COVERAGE; both are handled.
+    send_frame(conn, OPTIONS, struct.pack(">I", OPT_SPARSE))
 
-    cumulative = bytearray(map_size)
+    dictionary = None
+    if args.dict:
+        dictionary = Dictionary()
+        for p in args.dict:
+            try:
+                dictionary.merge(parse_dict(p, order))
+            except (OSError, ValueError) as e:
+                sys.exit("brain: --dict: %s" % e)
+        log("dictionary: %d tokens (%d integers, %s-endian unless marked) from %d file(s)"
+            % (len(dictionary), len(dictionary.ints), order, len(args.dict)))
+
     rng = random.Random(args.seed_rng)
+    cov = Coverage(map_size)
+    queue = Queue(args.schedule)
+    opstats = OpStats()
+    default_weights = {int(op): w for op, w in DEFAULT_OP_WEIGHTS.items()}
 
     def splice_donor():
-        return rng.choice(corpus) if corpus else b""
+        return rng.choice(queue.entries).data if queue.entries else b""
 
-    engine = Engine(rng, corpus=splice_donor, max_size=args.max_size)
+    engine = Engine(rng, dictionary=dictionary, corpus=splice_donor, max_size=args.max_size)
 
-    execs = new_cov = crashes = hangs = rejected = 0
+    execs = mutated = new_cov = crashes = hangs = rejected = 0
+    unstable = imported = trimmed_bytes = 0
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
     hang_sigs = {}         # same, for HANG / TIMEOUT
     hang_inputs = set()    # sha1 of every hang input already saved
-    next_id = [1]
+    next_id = [1]          # protocol input ids
+    next_eid = [max([e.id for e in resumed], default=-1) + 1]   # queue entry ids
+    sparse_seen = [False]
 
     # ---- optional JSON-lines status feed (for fuzz/tools/status_tui.py) --
     start = time.monotonic()
     status_fp = open(args.status_file, "w", buffering=1) if args.status_file else None
     last_status = [0.0]
-    stage = ["baseline 0/%d" % len(corpus)]
+    stage = ["baseline"]
     baseline_edges = [None]   # edges after the corpus replay; new_edges counts past it
     run_config = {"arch": arch, "scheme": scheme, "map_size": map_size,
                   "proto": ver, "ember": "%s:%d" % peer, "listen": listen_addr,
                   "out": out, "seeds": len(seeds), "resumed": len(resumed),
-                  "max_size": args.max_size, "minimize": str(bool(args.minimize))}
+                  "max_size": args.max_size, "minimize": str(bool(args.minimize)),
+                  "schedule": args.schedule, "worker": name, "role": role_name}
     if args.iters:
         run_config["iters_limit"] = args.iters
+    if args.dict:
+        run_config["dict"] = len(dictionary)
 
     def emit_status(finished=False):
         if not status_fp:
             return
         el = time.monotonic() - start
-        edges = sum(1 for b in cumulative if b)
+        edges = cov.edges
         status_fp.write(json.dumps({
             "t": round(el, 1), "execs": execs,
             "execs_per_sec": round(execs / el, 1) if el > 0 else 0.0,
-            "corpus": len(corpus), "edges": edges, "map_size": map_size,
+            "corpus": len(queue.entries), "edges": edges, "map_size": map_size,
             "new_edges": edges - baseline_edges[0] if baseline_edges[0] is not None else 0,
             "init_edges": init_edges[0],
             "crashes": crashes, "crashes_unique": len(crash_sigs),
             "hangs": hangs, "hangs_unique": len(hang_sigs),
             "hangs_saved": len(hang_inputs), "rejected": rejected,
+            "cycles": queue.cycle, "favored": queue.favored_count(),
+            "pending_favored": queue.pending_favored, "unstable": unstable,
+            "imported": imported, "sparse": sparse_seen[0],
+            "worker": name, "role": role_name, "schedule": args.schedule,
             "stage": stage[0], "finished": finished, "config": run_config,
         }) + "\n")
 
@@ -362,18 +417,10 @@ def main():
             emit_status()
             last_status[0] = now
 
-    def fold(bitmap):
-        """Merge bitmap into cumulative; return the count of newly set bytes."""
-        newly = 0
-        for i, b in enumerate(bitmap):
-            if b and not cumulative[i]:
-                cumulative[i] = b
-                newly += 1
-        return newly
-
     def probe(data):
         """Send one input and return ember's verdict, with no accounting:
-        ('crash', reason, status) | ('iter', map, None) | ('other', None, None)."""
+        ('crash', reason, status) | ('iter', hits, insns) | ('other', None, None).
+        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map."""
         ident = next_id[0]
         next_id[0] += 1
         send_frame(conn, INPUT, struct.pack(">QI", ident, len(data)) + data)
@@ -381,6 +428,7 @@ def main():
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
                 raise EmberBye()
+            insns = 0
             if ftype == CRASH:
                 if len(payload) < CRASH_LEN:
                     raise ProtocolError("CRASH payload is %d bytes (needs %d)"
@@ -390,6 +438,16 @@ def main():
                     # ember could not parse our INPUT frame: a bug on this side.
                     raise ProtocolError("ember reports input id=%d as MALFORMED "
                                         "(its reply id %d)" % (ident, cid))
+            elif ftype == SPARSE:
+                if len(payload) < SPARSE_HDR_LEN:
+                    raise ProtocolError("SPARSE payload is %d bytes (needs %d)"
+                                        % (len(payload), SPARSE_HDR_LEN))
+                cid, kind, insns, msz, n = struct.unpack(">QBQII", payload[:SPARSE_HDR_LEN])
+                if msz != map_size or len(payload) != SPARSE_HDR_LEN + 5 * n:
+                    raise ProtocolError("SPARSE map_size %d with %d entries in %d bytes "
+                                        "(HELLO said %d)" % (msz, n, len(payload), map_size))
+                hits = list(struct.iter_unpack(">IB", payload[SPARSE_HDR_LEN:]))
+                sparse_seen[0] = True
             elif ftype == COVERAGE:
                 if len(payload) < COVERAGE_HDR_LEN:
                     raise ProtocolError("COVERAGE payload is %d bytes (needs %d)"
@@ -400,15 +458,16 @@ def main():
                     raise ProtocolError("COVERAGE map_size %d with %d map bytes "
                                         "(HELLO said %d)"
                                         % (msz, len(payload) - COVERAGE_HDR_LEN, map_size))
-                if cid == 0 and kind == KIND_INIT:
-                    # The unsolicited INIT map (boot up to the first begin):
-                    # not a reply to this input, which is still to come.
-                    init_edges[0] = sum(1 for b in bitmap if b)
-                    log("ember sent its INIT map (%d edges); not scored" % init_edges[0])
-                    continue
+                hits = hits_from_map(bitmap)
             else:
                 log("ignoring unexpected frame type %d (%d bytes)"
                     % (ftype, len(payload)))
+                continue
+            if ftype != CRASH and cid == 0 and kind == KIND_INIT:
+                # The unsolicited INIT map (boot up to the first begin): not a reply
+                # to this input, which is still to come.
+                init_edges[0] = len(hits)
+                log("ember sent its INIT map (%d edges); not scored" % init_edges[0])
                 continue
             if cid != ident:
                 raise ProtocolError("input id=%d answered with id=%d (lockstep "
@@ -418,7 +477,7 @@ def main():
                 return ("crash", reason, status)
             if kind != KIND_ITER:      # only per-input (ITER) coverage is scored
                 return ("other", None, None)
-            return ("iter", bitmap, None)
+            return ("iter", hits, insns)
 
     def minimize(data, reason, status):
         """Bounded block dropping: shrink `data` while it still fails with the
@@ -445,28 +504,31 @@ def main():
 
     def write_finding(where, prefix, data, reason, status):
         """Write one finding plus its .info sidecar; return the file name."""
-        name = "%s_r%d_s%d_%s" % (prefix, reason, status,
-                                  hashlib.sha1(data).hexdigest()[:12])
-        with open(os.path.join(where, name), "wb") as f:
+        fname = "%s_r%d_s%d_%s" % (prefix, reason, status,
+                                   hashlib.sha1(data).hexdigest()[:12])
+        with open(os.path.join(where, fname), "wb") as f:
             f.write(data)
-        with open(os.path.join(where, name + ".info"), "w") as f:
+        with open(os.path.join(where, fname + ".info"), "w") as f:
             f.write("reason=%d\nreason_name=%s\nstatus=%d\n"
                     % (reason, reason_name(reason), status))
             if reason in HEX_STATUS:
                 f.write("status_hex=%s\n" % fmt_status(reason, status))
             f.write("len=%d\nsig=r%d/s%d\nhex=%s\n"
                     % (len(data), reason, status, data.hex()))
-        return name
+        return fname
 
-    def drop_finding(where, name):
-        for n in (name, name + ".info"):
+    def drop_finding(where, fname):
+        for n in (fname, fname + ".info"):
             try:
                 os.unlink(os.path.join(where, n))
             except OSError:
                 pass
 
     def save_crash(data, reason, status):
-        nonlocal crashes, hangs
+        nonlocal crashes, hangs, rejected
+        if reason == REJECTED:            # the input route refused it: no bug
+            rejected += 1
+            return
         is_hang = reason in HANG_REASONS
         if is_hang:
             hangs += 1
@@ -496,59 +558,244 @@ def main():
         prefix = "hang" if is_hang else "crash"
         # Save the input as found first: minimizing re-sends it, and a BYE, a
         # timeout or a dropped connection there must not lose the finding.
-        name = write_finding(where, prefix, data, reason, status)
+        fname = write_finding(where, prefix, data, reason, status)
         small = minimize(data, reason, status)
         if small != data:
-            drop_finding(where, name)
-            name = write_finding(where, prefix, small, reason, status)
+            drop_finding(where, fname)
+            fname = write_finding(where, prefix, small, reason, status)
             data = small
         log("%s #%d %s status=%s NEW len=%d (saved %s)"
-            % (label, nth, rname, st, len(data), name))
-        emit_event(ev, "%s status=%s %s" % (rname, st, name))
+            % (label, nth, rname, st, len(data), fname))
+        emit_event(ev, "%s status=%s %s" % (rname, st, fname))
 
-    def run_one(data):
-        nonlocal execs, new_cov, rejected
-        kind, a, b = probe(data)
+    def run(data):
+        """Run one input and account for it: ('crash', ...) after saving it, or
+        ('iter', hits, insns, path, new_buckets, new_classes) | ('other', ...)."""
+        nonlocal execs
+        r = probe(data)
         execs += 1
-        if kind == "crash":
-            if a == REJECTED:             # the input route refused it: no bug
-                rejected += 1
-                return
-            save_crash(data, a, b)
+        if r[0] == "crash":
+            save_crash(data, r[1], r[2])
+            return r
+        if r[0] != "iter":
+            return r
+        hits, insns = r[1], r[2]
+        pid = queue.note_execution(hits)
+        nb, nc = cov.fold(hits)
+        return ("iter", hits, insns, pid, nb, nc)
+
+    def calibrate(e, hits):
+        """Run a new entry again: ember is deterministic, so the hits must match. A
+        difference is a harness problem (state leaking between iterations), not noise."""
+        nonlocal unstable
+        e.calibrated = True
+        if not args.calibrate:
             return
-        if kind == "iter":
-            newly = fold(a)
-            if newly:
-                new_cov += 1
-                corpus.append(data)
-                save_corpus_input(data)
-                log("new coverage +%d (corpus=%d) from %r"
-                    % (newly, len(corpus), data[:24]))
-                emit_event("find", "corpus=%d" % len(corpus), edges=newly)
+        r = probe(e.data)
+        nonlocal_execs(1)
+        if r[0] == "iter" and r[1] == hits:
+            return
+        unstable += 1
+        if r[0] != "iter":
+            diff = "the second run ended as %s" % (
+                "%s status=%s" % (reason_name(r[1]), fmt_status(r[1], r[2])) if r[0] == "crash"
+                else r[0])
+        else:
+            a, b = dict(hits), dict(r[1])
+            keys = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+            diff = "%d buckets differ (%s%s)" % (
+                len(keys), ", ".join("%d: %d->%d" % (k, a.get(k, 0), b.get(k, 0)) for k in keys[:8]),
+                ", ..." if len(keys) > 8 else "")
+        msg = ("UNSTABLE: queue entry %s ran differently twice: %s. ember is deterministic, so "
+               "the harness leaks state between iterations (a device the snapshot misses, "
+               "an uninitialised buffer); fix that before trusting coverage" % (e.name, diff))
+        print("brain: " + msg, file=sys.stderr, flush=True)
+        emit_event("info", msg)
+
+    def nonlocal_execs(n):
+        nonlocal execs
+        execs += n
+
+    def add_entry(data, hits, insns, pid, nb, parent=None, op=None, sync=None, src=None,
+                  orig=None, keep_name=None):
+        e = Entry(id=next_eid[0], data=data, parent=parent.id if parent else src,
+                  depth=parent.depth + 1 if parent else 0, insns=insns,
+                  buckets=[i for i, _ in hits], path=pid, found_at=queue.cycle,
+                  new_cov=nb > 0)
+        next_eid[0] += 1
+        e.name = keep_name or entry_name(e.id, src=parent.id if parent else src, op=op,
+                                          new_cov=nb > 0, sync=sync, orig=orig)
+        if not keep_name:
+            save_entry(queue_dir, e)
+        queue.add(e)
+        calibrate(e, hits)
+        return e
+
+    def trim(e):
+        """Remove chunks while the path stays the same (AFL's trim stage): smaller
+        entries mutate faster and splice better. One run per probe: ember is exact."""
+        nonlocal trimmed_bytes
+        e.trimmed = True
+        data = e.data
+        if len(data) < 5 or args.trim_probes <= 0:
+            save_state(queue_dir, e)
+            return
+        stage[0] = "trim %s" % e.name
+        lp2 = 1
+        while lp2 < len(data):
+            lp2 <<= 1
+        remove = max(lp2 // 16, 4)
+        floor = max(lp2 // 1024, 4)
+        probes = 0
+        best_insns = e.insns
+        while remove >= floor and probes < args.trim_probes and not stop["flag"]:
+            pos = remove
+            while pos < len(data) and probes < args.trim_probes:
+                cand = data[:pos] + data[pos + remove:]
+                probes += 1
+                r = run(cand)
+                if r[0] == "iter" and r[3] == e.path:
+                    data = cand
+                    best_insns = r[2]
+                else:
+                    pos += remove
+            remove //= 2
+        if len(data) < len(e.data):
+            trimmed_bytes += len(e.data) - len(data)
+            e.data = data
+            e.insns = best_insns
+            save_entry(queue_dir, e)
+            queue.rescore(e)
+        else:
+            save_state(queue_dir, e)
+
+    last_sync = [0.0]
+
+    def sync(force=False):
+        """Import the other workers' new queue entries that are new here."""
+        nonlocal imported
+        if not args.sync_dir:
+            return
+        now = time.monotonic()
+        if not force and now - last_sync[0] < args.sync_interval:
+            return
+        last_sync[0] = now
+        for p_name in peers(args.sync_dir, name):
+            after = synced_upto(out, p_name)
+            todo, top = new_peer_inputs(args.sync_dir, p_name, after)
+            got = 0
+            for eid, path in todo:
+                if stop["flag"]:
+                    return                # .synced stays put: the rest next time
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                r = run(data)
+                if r[0] == "iter" and r[5]:
+                    add_entry(data, r[1], r[2], r[3], r[4], op=None, sync=p_name, src=eid)
+                    got += 1
+            if top > after:
+                set_synced(out, p_name, top)
+            if got:
+                imported += got
+                log("sync: imported %d of %d new entries from %s" % (got, len(todo), p_name))
+                emit_event("info", "imported %d from %s" % (got, p_name))
+
+    def maybe_reweight():
+        if args.reweight_every and mutated and mutated % args.reweight_every == 0:
+            engine.set_op_weights(opstats.weights(default_weights))
 
     status = 0
     ember_bye = False
     try:
-        # ---- baseline: run the (resumed) corpus once ----
+        # ---- baseline: the resumed queue (as saved) and the seeds ----
         emit_status()
-        replay = list(corpus)
-        for i, s in enumerate(replay, 1):
+        seen = set()
+        todo = [(e.data, e) for e in resumed] + [(d, fname) for fname, d in seeds]
+        if not todo:
+            todo = [(b, "builtin%d" % k) for k, b in enumerate((b"A", b"B", b"C"))]
+        for k, (data, src) in enumerate(todo, 1):
             if stop["flag"]:
                 break
-            stage[0] = "baseline %d/%d" % (i, len(replay))
-            run_one(s)
+            h = hashlib.sha1(data).digest()
+            if h in seen:
+                continue
+            seen.add(h)
+            stage[0] = "baseline %d/%d" % (k, len(todo))
+            r = run(data)
+            if r[0] != "iter":
+                continue
+            if isinstance(src, Entry):       # a resumed entry: kept, with its name and state
+                e = add_entry(data, r[1], r[2], r[3], r[4], keep_name=src.name)
+                e.id, e.parent, e.depth = src.id, src.parent, src.depth
+                e.found_at, e.times_chosen, e.trimmed = src.found_at, src.times_chosen, src.trimmed
+                e.new_cov = src.new_cov
+                next_eid[0] -= 1             # add_entry took an id it did not use
+            elif r[5] or not queue.entries:
+                add_entry(data, r[1], r[2], r[3], r[4], orig=src)
             maybe_status()
-        baseline_edges[0] = sum(1 for b in cumulative if b)
-        stage[0] = "havoc + splice"
-        # ---- fuzz: mutate corpus entries until stopped (or --iters) ----
-        mutated = 0
-        while not stop["flag"]:
-            if args.iters and mutated >= args.iters:
-                break
-            base = rng.choice(corpus) if corpus else b"\n"
-            run_one(engine.mutate(base))
-            mutated += 1
-            maybe_status()
+        next_eid[0] = max([e.id for e in queue.entries], default=-1) + 1
+        baseline_edges[0] = cov.edges
+        slow = max((e.insns for e in queue.entries), default=0)
+        if slow:
+            log("calibration: the slowest queue entry ran %d instructions; a per-input "
+                "budget of about 5x that (uam-run --fuzz-iter-insns %d) catches hangs early"
+                % (slow, 5 * slow))
+        sync(force=True)
+        if not queue.entries:
+            log("no queue entry ran normally (every seed crashed, hung or was rejected); "
+                "fuzzing from an empty input")
+            r = run(b"")
+            if r[0] == "iter":
+                add_entry(b"", r[1], r[2], r[3], r[4], orig="empty")
+        log("baseline: %d queue entries, %d edges; schedule %s"
+            % (len(queue.entries), cov.edges, args.schedule))
+
+        # ---- the campaign: cycles over the queue, energy from the schedule ----
+        def limit():
+            return stop["flag"] or (args.iters and mutated >= args.iters)
+
+        while not limit() and queue.entries:
+            queue.cull()
+            for e in list(queue.entries):
+                if limit():
+                    break
+                queue.cull()
+                if queue.skip(e, rng.random()):
+                    continue
+                if args.trim and not e.trimmed:
+                    trim(e)
+                n = queue.energy(e)
+                if n <= 0:
+                    continue
+                stage[0] = "havoc %s (%s, cycle %d)" % (e.name, args.schedule, queue.cycle)
+                pending = e.favored and not e.times_chosen
+                for _ in range(n):
+                    if limit():
+                        break
+                    child = engine.mutate(e.data)
+                    r = run(child)
+                    mutated += 1
+                    interesting = r[0] == "iter" and r[5] > 0
+                    opstats.note(engine.last_ops, interesting)
+                    if interesting:
+                        c = add_entry(child, r[1], r[2], r[3], r[4], parent=e, op="havoc")
+                        if r[4]:
+                            new_cov += 1
+                        log("new coverage +%d buckets, +%d classes (queue=%d) %s"
+                            % (r[4], r[5], len(queue.entries), c.name))
+                        emit_event("find", "queue=%d %s" % (len(queue.entries), c.name),
+                                   edges=r[4])
+                    maybe_status()
+                    maybe_reweight()
+                    sync()
+                e.times_chosen += 1
+                save_state(queue_dir, e)
+                if pending and queue.pending_favored:
+                    queue.pending_favored -= 1
+            queue.cycle += 1
     except socket.timeout:
         print("brain: ember sent no reply within %gs (--io-timeout)"
               % args.io_timeout, file=sys.stderr)
@@ -568,13 +815,14 @@ def main():
             send_frame(conn, BYE)
         except OSError:
             pass
-    total = sum(1 for b in cumulative if b)
     # Hangs are deduplicated by input, not by (reason, status): unique counts
     # the keys, saved the distinct inputs kept under hangs/.
     log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d, "
-        "saved=%d) rejected=%d corpus=%d edges=%d"
+        "saved=%d) rejected=%d queue=%d favored=%d cycles=%d edges=%d unstable=%d "
+        "imported=%d trimmed_bytes=%d"
         % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
-           len(hang_inputs), rejected, len(corpus), total))
+           len(hang_inputs), rejected, len(queue.entries), queue.favored_count(),
+           queue.cycle, cov.edges, unstable, imported, trimmed_bytes))
     emit_status(finished=True)
     if status_fp:
         status_fp.close()

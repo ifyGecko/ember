@@ -61,6 +61,9 @@ struct uam_fuzz {
     uint64_t      *begin_pcs;      /* cfg.begin_pc, then the distinct more_begin_pcs */
     size_t         n_begin_pcs;
     uint8_t       *map;
+    uint32_t      *hits;           /* uam_fuzz_map_hits: the set buckets of the published map */
+    size_t         n_hits, cap_hits;
+    bool           hits_valid;     /* hits lists every set bucket: the next clear uses it */
     uam_cov_state  cov;
     uam_cov_site  *marker;         /* sites at the begin and end pcs, counted by the hooks */
     size_t         n_marker;
@@ -102,6 +105,8 @@ struct uam_fuzz {
     uam_fuzz_result last;
     uam_fuzz_stats  stats;
 };
+
+static void clear_map(uam_fuzz *f);
 
 static void mem_disarm(mem_route *r, uam_machine *m);
 
@@ -437,6 +442,7 @@ void uam_fuzz_destroy(uam_fuzz *f)
     free(f->end_pcs);
     free(f->begin_pcs);
     free(f->marker);
+    free(f->hits);
     free(f->map);
     free(f);
 }
@@ -972,7 +978,7 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
         uam_log(UAM_LOG_ERROR, "fuzz", "restoring the begin snapshot failed");
         return st;
     }
-    memset(f->map, 0, f->cfg.map_size);
+    clear_map(f);
     uam_cov_reset_prev(&f->cov);
     f->cov.last_pc = f->snap_last_pc[0];
     for (unsigned i = 1; i < f->ncpus; i++) {
@@ -1067,6 +1073,55 @@ uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx)
     if (fe->bye)
         fe->bye(ctx);
     return f->aborted ? UAM_OK : st;
+}
+
+/* Zero the map for the next iteration: only the buckets the last uam_fuzz_map_hits listed
+ * when that list is complete (a sparse map), else all of it. */
+static void clear_map(uam_fuzz *f)
+{
+    if (f->hits_valid) {
+        for (size_t i = 0; i < f->n_hits; i++)
+            f->map[f->hits[i]] = 0;
+    } else {
+        memset(f->map, 0, f->cfg.map_size);
+    }
+    f->hits_valid = false;
+}
+
+const uint32_t *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n)
+{
+    f->hits_valid = false;
+    if (max > f->cfg.map_size)
+        max = f->cfg.map_size;
+    if (f->cap_hits < max) {
+        uint32_t *nh = realloc(f->hits, sizeof(*nh) * (max ? max : 1));
+        if (!nh)
+            return NULL;
+        f->hits = nh;
+        f->cap_hits = max;
+    }
+    size_t k = 0;
+    const size_t size = f->cfg.map_size;   /* a power of two */
+    for (size_t w = 0; w < size; w += 8) {
+        const size_t span = size - w < 8 ? size - w : 8;
+        if (span == 8) {
+            uint64_t word;
+            memcpy(&word, f->map + w, 8);
+            if (!word)
+                continue;               /* most of a map is zero: skip 8 buckets at once */
+        }
+        for (size_t b = 0; b < span; b++) {
+            if (!f->map[w + b])
+                continue;
+            if (k == max)
+                return NULL;           /* denser than the caller wants */
+            f->hits[k++] = (uint32_t)(w + b);
+        }
+    }
+    f->n_hits = k;
+    f->hits_valid = true;
+    *n = k;
+    return f->hits;
 }
 
 const uint8_t *uam_fuzz_map(const uam_fuzz *f, size_t *size)

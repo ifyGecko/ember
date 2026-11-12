@@ -16,6 +16,11 @@
  *   UAM_FUZZ_TIMEOUT       CRASH TIMEOUT,  status 0
  *   UAM_FUZZ_REJECTED      CRASH REJECTED, status 0: the route refused the input
  *
+ * A brain that sends OPTIONS with UAM_NET_OPT_SPARSE gets SPARSE replies in place of
+ * COVERAGE from then on: the map's set buckets as (index, count) pairs, plus the
+ * iteration's instruction count; a map too dense for that to be smaller still goes as
+ * COVERAGE. HELLO's flags carry UAM_NET_HELLO_BIG_ENDIAN for a big-endian target.
+ *
  * The boot map goes out once, unsolicited, as COVERAGE id 0 kind INIT. A malformed INPUT
  * is answered with CRASH MALFORMED and nothing runs. A BYE from the brain ends the run;
  * ember sends BYE when it stops first (an error, an interrupt). EOF before a BYE is an
@@ -50,6 +55,9 @@ struct cf_net {
     bool      broken;      /* a frame was cut short: the stream is out of sync */
     bool      peer_bye;    /* the brain said BYE */
     uint16_t  flags;       /* HELLO scheme flags */
+    bool      big_endian;  /* the target's data byte order (HELLO) */
+    bool      sparse;      /* OPTIONS asked for SPARSE replies */
+    uam_fuzz *fuzz;        /* cf_net_attach: the harness (results, hit lists) */
     unsigned  timeout_s;   /* per-frame wait for the brain; 0: none */
     uint8_t  *in;          /* the last frame's payload */
     size_t    in_cap;
@@ -268,12 +276,16 @@ static uam_status net_hello(void *ctx, const uam_fuzz_info *info)
         return UAM_ERR_INVALID;
     }
     const size_t hello = (size_t)5 + UAM_NET_HELLO_FIXED_LEN + UAM_NET_ARCH_MAX;
-    if (!reserve(&z->out, &z->out_cap, cov > hello ? cov : hello))
+    const size_t sparse = (size_t)5 + UAM_NET_SPARSE_HDR_LEN + info->map_size;  /* the list's bound */
+    size_t need = cov > hello ? cov : hello;
+    if (sparse > need)
+        need = sparse;
+    if (!reserve(&z->out, &z->out_cap, need))
         return UAM_ERR_NOMEM;
     if (!write_all(z, (const uint8_t *)UAM_FUZZ_NET_MAGIC, 4))
         return UAM_ERR_INVALID;
     uint8_t *p = put16(z->out + 5, UAM_FUZZ_NET_VERSION);
-    p = put16(p, z->flags);
+    p = put16(p, (uint16_t)(z->flags | (z->big_endian ? UAM_NET_HELLO_BIG_ENDIAN : 0)));
     p = put32(p, info->map_size);
     p = put16(p, (uint16_t)alen);
     memcpy(p, info->arch, alen);
@@ -311,6 +323,10 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
         case UAM_NET_BYE:
             z->peer_bye = true;
             return 0;
+        case UAM_NET_OPTIONS:
+            if (plen >= UAM_NET_OPTIONS_MIN_LEN)
+                z->sparse = (get32(z->in) & UAM_NET_OPT_SPARSE) && z->fuzz;
+            continue;
         case UAM_NET_INPUT: {
             uint32_t dlen = plen >= UAM_NET_INPUT_HDR_LEN ? get32(z->in + 8) : 0;
             if (plen < UAM_NET_INPUT_HDR_LEN || dlen > plen - UAM_NET_INPUT_HDR_LEN) {
@@ -332,12 +348,39 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     }
 }
 
+/* One map as SPARSE: false (nothing sent) when the list would not be smaller than the map,
+ * so that the caller sends COVERAGE. *ok: the frame went out. */
+static bool send_sparse(cf_net *z, uint64_t id, int kind, size_t map_size, bool *ok)
+{
+    const size_t max = map_size / UAM_NET_SPARSE_ENTRY_LEN;   /* past this, COVERAGE is smaller */
+    size_t n;
+    const uint32_t *hits = uam_fuzz_map_hits(z->fuzz, max, &n);
+    if (!hits)
+        return false;
+    const uint8_t *map = uam_fuzz_map(z->fuzz, NULL);
+    const uam_fuzz_result *r = uam_fuzz_last_result(z->fuzz);
+    uint8_t *p = put64(z->out + 5, id);
+    *p++ = kind == UAM_FUZZ_KIND_INIT ? UAM_COV_KIND_INIT : UAM_COV_KIND_ITER;
+    p = put64(p, kind == UAM_FUZZ_KIND_INIT || !r ? 0 : r->insns);
+    p = put32(p, (uint32_t)map_size);
+    p = put32(p, (uint32_t)n);
+    for (size_t i = 0; i < n; i++) {
+        p = put32(p, hits[i]);
+        *p++ = map[hits[i]];
+    }
+    *ok = send_frame(z, UAM_NET_SPARSE, UAM_NET_SPARSE_HDR_LEN + n * UAM_NET_SPARSE_ENTRY_LEN);
+    return true;
+}
+
 static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
                              const uint8_t *map, size_t map_size, int kind)
 {
     cf_net *z = ctx;
     bool ok;
-    if (kind == UAM_FUZZ_KIND_INIT || v == UAM_FUZZ_OK) {
+    if ((kind == UAM_FUZZ_KIND_INIT || v == UAM_FUZZ_OK) && z->sparse
+        && send_sparse(z, kind == UAM_FUZZ_KIND_INIT ? 0 : id, kind, map_size, &ok)) {
+        /* sent (or failed) as SPARSE */
+    } else if (kind == UAM_FUZZ_KIND_INIT || v == UAM_FUZZ_OK) {
         uint8_t *p = put64(z->out + 5, kind == UAM_FUZZ_KIND_INIT ? 0 : id);
         *p++ = kind == UAM_FUZZ_KIND_INIT ? UAM_COV_KIND_INIT : UAM_COV_KIND_ITER;
         p = put32(p, (uint32_t)map_size);
@@ -365,6 +408,12 @@ static void net_bye(void *ctx)
     if (!z->peer_bye && !z->broken && z->out)
         send_frame(z, UAM_NET_BYE, 0);
     shutdown(z->fd, SHUT_WR);
+}
+
+void cf_net_attach(cf_net *z, uam_fuzz *f, bool big_endian)
+{
+    z->fuzz = f;
+    z->big_endian = big_endian;
 }
 
 const uam_fuzz_frontend cf_net_frontend = {

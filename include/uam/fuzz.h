@@ -222,6 +222,12 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
 uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx);
 
 const uint8_t         *uam_fuzz_map(const uam_fuzz *f, size_t *size);
+/* The buckets the map just published set (non-zero), as ascending indices; NULL when more
+ * than max are set (send the whole map then) or on an allocation failure. The list is the
+ * harness's, valid until the next iteration starts. Asking for it also lets that iteration
+ * clear only those buckets instead of the whole map: for a big, sparse map, the cost of an
+ * iteration then follows what it touched, not the map size. */
+const uint32_t        *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n);
 const uam_fuzz_result *uam_fuzz_last_result(const uam_fuzz *f);
 void                   uam_fuzz_get_info(const uam_fuzz *f, uam_fuzz_info *info);
 

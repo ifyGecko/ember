@@ -11,6 +11,10 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
     planted bugs;
   - CRASH MALFORMED for a short payload (id 0) and for a len overrun (its id);
   - an unknown frame type being ignored;
+  - HELLO's big-endian flag on big-endian boards;
+  - OPTIONS asking for SPARSE: the same input's SPARSE list equals its COVERAGE map, with
+    indices ascending and the iteration's instruction count; maps stay right across inputs
+    (the harness then clears only the buckets it listed); crashes are still CRASH;
   - BYE ending the run with exit 0, and EOF before BYE being an error;
   - CRASH REJECTED (status 0) for an input the route refuses (mem:...,reject), the
     session going on after it;
@@ -25,7 +29,9 @@ import subprocess
 import sys
 import time
 
-HELLO, INPUT, COVERAGE, CRASH, BYE = 1, 2, 3, 4, 5
+HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE = 1, 2, 3, 4, 5, 6, 7
+FLAG_BIG_ENDIAN = 1 << 15
+BIG_ENDIAN_BOARDS = ("mips-ref", "armeb-ref", "ppc-ref")
 FAULT, GUARD, ORACLE, HANG, TIMEOUT, REJECTED, MALFORMED = 1, 2, 3, 4, 5, 6, 7
 # RAM the fuzz target does not use: rv32-ref and the MIPS boards (kseg0) reach it at
 # 0x81f00000; the ARM and PowerPC boards' RAM starts at 0.
@@ -78,6 +84,18 @@ def send_input(c, iid, data):
 def coverage(p):
     iid, kind, size = struct.unpack(">QBI", p[:13])
     return iid, kind, p[13:13 + size], size
+
+
+def sparse(p):
+    """A SPARSE payload as (id, kind, insns, map rebuilt from the list, map_size, indices)."""
+    iid, kind, insns, size, n = struct.unpack(">QBQII", p[:25])
+    m = bytearray(size)
+    idx = []
+    for k in range(n):
+        i, cnt = struct.unpack(">IB", p[25 + 5 * k:30 + 5 * k])
+        m[i] = cnt
+        idx.append(i)
+    return iid, kind, insns, bytes(m), size, idx, len(p) == 25 + 5 * n
 
 
 def session(run, board, fw, extra, script):
@@ -136,7 +154,8 @@ def main():
             ver, flags, msize, alen = struct.unpack(">HHIH", p[:10])
             check(ver == 1 and len(p) == 10 + alen, f"{tag}: HELLO version {ver}, {len(p)} bytes")
             check(p[10:10 + alen].decode() == arch, f"{tag}: HELLO arch {p[10:10 + alen]!r}")
-            check(flags == want_flags, f"{tag}: HELLO flags {flags:#x}, expected {want_flags:#x}")
+            want = want_flags | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
+            check(flags == want, f"{tag}: HELLO flags {flags:#x}, expected {want:#x}")
             t, p = recv_frame(c)
             iid, kind, bitmap, size = coverage(p) if t == COVERAGE else (None,) * 4
             check(t == COVERAGE and iid == 0 and kind == 1 and size == msize == len(bitmap),
@@ -183,6 +202,23 @@ def main():
             send_input(c, 8, b"ok")                                # still in lockstep
             t, p = recv_frame(c)
             check(t == COVERAGE and coverage(p)[0] == 8, f"{tag}: input after MALFORMED")
+            ok_map = coverage(p)[2] if t == COVERAGE else None
+
+            # SPARSE: asked for once, then every map comes as its list of set buckets.
+            send_frame(c, OPTIONS, struct.pack(">I", 1))
+            for iid, data, want_map in ((9, b"hello", maps[0] if maps else None),
+                                        (10, b"ok", ok_map), (11, b"hello", maps[0] if maps else None)):
+                send_input(c, iid, data)
+                t, p = recv_frame(c)
+                if not check(t == SPARSE, f"{tag}: input {iid}: SPARSE reply (type {t})"):
+                    break
+                rid, kind, insns, m, size, idx, exact = sparse(p)
+                check(exact and rid == iid and kind == 2 and size == msize,
+                      f"{tag}: input {iid}: SPARSE layout (id {rid}, kind {kind}, size {size})")
+                check(idx == sorted(idx) and len(set(idx)) == len(idx), f"{tag}: input {iid}: indices ascending")
+                check(insns > 0, f"{tag}: input {iid}: SPARSE carries the instruction count")
+                check(m == want_map, f"{tag}: input {iid}: SPARSE list equals the COVERAGE map")
+            check(crash(12, b"FUZ?", ORACLE, panic & 0xffffffff) is not None, f"{tag}: CRASH while SPARSE")
 
             if st.get("eof"):
                 return                                            # close without BYE

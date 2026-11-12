@@ -271,8 +271,11 @@ Site lists and boundary files made by static analysis (`fuzz/tools/gen_sites.py`
 gives site-id or hashed-pc N-gram coverage (N=1..8, optionally order-sensitive),
 `--cov-boundary fw.uamb` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-strict` checks every
 site's bytes in memory against the list. `--fuzz-net HOST:PORT` lets ember's coverage-guided
-brain (`fuzz/tools/fuzz_brain.py`) drive the campaign, and `--cov-shm PATH` publishes the maps
-in a shared-memory coverage region. The formats are in [`docs/fuzz-formats.md`](docs/fuzz-formats.md).
+brain (`fuzz/tools/fuzz_brain.py`) drive the campaign: a queue with a favored set,
+calibration, trimming and five power schedules, ember dictionaries, adaptive mutation
+operators, and sparse coverage replies; `fuzz/tools/fuzz_launch.py` runs several brain +
+ember workers that share their queues. `--cov-shm PATH` publishes the maps in a
+shared-memory coverage region. The formats are in [`docs/fuzz-formats.md`](docs/fuzz-formats.md).
 
 A run is as bounded as you make it: with neither option, a guest that spins forever runs
 until it is stopped. `-n N` bounds guest instructions and `--max-ticks N` bounds virtual

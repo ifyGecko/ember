@@ -300,8 +300,9 @@ static uam_status boot_check(void *ctx, uam_fuzz *f, uam_machine *m)
 
 static uam_status cli_attach(void *st, uam_machine *m, uam_fuzz *f)
 {
-    (void)m;
     cli *c = st;
+    if (c->net)
+        cf_net_attach(c->net, f, m->cpu.isa->default_endian == UAM_ACC_BE);
     if (c->loaded)
         uam_fuzz_set_boot_hook(f, boot_check, c);
     if (c->shm_path) {

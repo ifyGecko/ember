@@ -123,13 +123,40 @@ IMAGE=fw.bin ./fuzz-lists.sh --jit --fuzz-net 127.0.0.1:7000 \
 python3 $EMBER/fuzz/tools/status_tui.py fuzz/run/status.jsonl   # live status (--once: one frame)
 ```
 
+**Parallel workers.** One brain drives one ember, and ember is single-threaded: use the
+cores with `fuzz_launch.py`, which runs N brain + ember pairs that share their queues through
+one directory, each with its own seed and the next of `--schedules` (round robin), and
+restarts a worker that dies:
+
+```bash
+IMAGE=fw.bin python3 $EMBER/fuzz/tools/fuzz_launch.py -n 8 --out fuzz/camp \
+    --seeds fuzz/seeds/ --dict fuzz/fw.dict -- ./fuzz-lists.sh --jit   # ember's command after --
+python3 $EMBER/fuzz/tools/status_tui.py --sync-dir fuzz/camp   # one row per worker
+```
+
+Each worker's files are under `fuzz/camp/NAME/` (`main`, `w1`, ...: queue, crashes, hangs,
+`brain.log`, `ember.log`); entries imported from another worker are named `sync:PEER`.
+Crashes are deduplicated per worker: replay every `crashes/` directory, or group them with
+`scripts/replay_summary.py`.
+
 - Ember connects, boots to the begin pc, and only then sends HELLO and the INIT map, so a
   long boot is fine (the brain's `--hello-timeout`, 600 s by default; 0 waits forever). `-n`
   still bounds the boot. Any coverage source works: with `--cov-sites` HELLO describes the
   scheme, with `--cov-blocks` none. HELLO's arch is the ISA's name.
 - Start the brain first and ember within 15 s of it (`--accept-timeout`). The brain keeps a
-  resumable corpus in `--out`/`corpus`, seeds included (a restart continues the campaign);
-  `--iters N` bounds a run, 0 (the default) runs until stopped. Set `--max-size` (default
+  resumable queue in `--out`/`queue` (`id:NNNNNN,...` names recording each entry's origin;
+  a restart continues the campaign); `--iters N` bounds a run, 0 (the default) runs until
+  stopped. It asks ember for sparse replies (the hit buckets and the instruction count), so
+  a big site-list map costs nothing extra.
+- The campaign (`docs/fuzzing.md`, "The campaign"): a favored set, calibration (each new
+  entry runs twice; an `UNSTABLE` line means the harness leaks state between iterations:
+  fix that first, the readiness gate in `SKILL.md`), trimming, and energy from a power
+  schedule: `--schedule fast` (default), `explore`, `exploit`, `coe`, `rare`. After the
+  baseline it suggests a `--fuzz-iter-insns` (5x the slowest entry).
+- A dictionary (`--dict FILE`, repeatable) in ember's format: `"text"`, `hex:BYTES`,
+  `u8:`/`u16:`/`u32:`/`u64:` integers in the target's byte order (from HELLO), `u32be:`
+  and the like for a fixed order. Take the tokens from the handler's compares in Ghidra:
+  magic numbers, command words, header bytes; integer tokens are also tried ±1. Set `--max-size` (default
   65536) to what the route can deliver: `mem:`'s `max` (default 4096) or the UART's buffer. A
   plain route tests only a longer input's prefix; a `reject` route answers CRASH
   `REJECTED`, which the brain counts (`rejected` in its status) and does not save.

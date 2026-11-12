@@ -188,6 +188,8 @@ fuzz/             harness.c frontend_replay.c (the harness and the replay fronte
 fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files
                   from rizin's analysis) ghidra/ (the same two from headless Ghidra, Jython)
                   fuzz_brain.py mutate.py (the coverage-guided brain and its mutator)
+                  fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)
+                  fuzz_launch.py (a parallel campaign of brain + ember workers)
                   status_tui.py (its status screen) cov_region.py (reads a coverage region)
 tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
                   docs/jit-perf.md)
@@ -209,7 +211,9 @@ tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmwa
                   and the coverage region through the runner) gen-check.sh  (lists from
                   fuzz/tools' generators; rizin and, when found, headless Ghidra)
                   fuzz-net-check.sh fake_brain.py  (the fuzz protocol against a scripted brain)
-                  brain-check.sh  (a session with fuzz_brain.py)
+                  brain-check.sh  (sessions with fuzz_brain.py: every schedule, a dictionary)
+                  parallel-check.sh  (a parallel campaign through fuzz_launch.py)
+                  brain_unit.py  (the brain's campaign logic on synthetic data)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
 tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dump-mem,
                   --trace-after, traces with --jit, --guard/--watch)
@@ -899,8 +903,15 @@ Implemented (`make test`):
   `cov_region.py` and an independent reader; `gen-check.sh` does it with `fuzz/tools`'
   generators (rizin, and the Ghidra route when it finds headless Ghidra: `GHIDRA_HEADLESS`,
   `GHIDRA_HOME`, `PATH`, `~/ghidra*`, `/opt/ghidra*`);
-  `fuzz-net-check.sh` checks the fuzz protocol frame by frame, and `brain-check.sh` a session
-  with `fuzz_brain.py`, whose saved crash directory replays without its `.info` notes.
+  `fuzz-net-check.sh` checks the fuzz protocol frame by frame (SPARSE replies against the
+  whole maps, the big-endian HELLO flag), `brain-check.sh` sessions with `fuzz_brain.py`
+  (whose saved crash directory replays without its `.info` notes; one per power schedule; the
+  planted crash found from a dictionary alone), and `parallel-check.sh` a two-worker campaign
+  through `fuzz_launch.py` (imports, both planted crashes, a killed ember restarted).
+  `tests/fuzz/brain_unit.py` checks the brain's campaign logic on synthetic data (hit-count
+  classes, path ids, the favored set and skip rule, every schedule, operator weights, queue
+  files, sync bookkeeping), and `test_fuzz` the harness's hit lists (`uam_fuzz_map_hits`) and
+  the selective map clear they enable, against whole-map clears.
 - The external-board example is built and run against the library.
 - Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
   board but `pic-ref` (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, AVR32A

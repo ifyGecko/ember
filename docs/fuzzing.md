@@ -408,12 +408,17 @@ formats end to end with lists written by `tests/fuzz/mk_lists.py`.
 ### The brain (`--fuzz-net HOST:PORT`)
 
 `fuzz/tools/fuzz_brain.py` is a coverage-guided fuzzer that drives ember over TCP. It
-mutates inputs (`fuzz/tools/mutate.py`), keeps the ones that reach new coverage in a
-disk-backed corpus that a restart resumes, saves crashes and hangs, and runs until stopped
-(`--iters N` caps it). Under `--out DIR`:
+mutates inputs (`fuzz/tools/mutate.py`), keeps the interesting ones in a disk-backed queue
+that a restart resumes, saves crashes and hangs, and runs until stopped (`--iters N` caps
+the mutated executions). Its campaign logic is in `fuzz/tools/fuzz_queue.py`; the design and
+its reasons are in [`fuzz-ideas.md`](fuzz-ideas.md). Under `--out DIR`:
 
-- `corpus/cov_<sha1, 16 digits>`: the seeds and every input that reached new coverage. A
-  later session with the same `--out` starts from them, with or without `--seeds`.
+- `queue/id:NNNNNN,...`: the queue. Names record each entry's origin:
+  `id:000000,orig:SEEDNAME` (a seed), `id:000012,src:000003,op:havoc,+cov` (mutated from
+  entry 3; `+cov` when it reached a new bucket, not only a new hit-count class),
+  `id:000020,sync:w2,src:000310` (imported from worker w2's entry 310). `queue/.state/`
+  keeps each entry's lineage, depth and how often it was chosen. A later session with the
+  same `--out` starts from the queue, with or without `--seeds`.
 - `crashes/crash_r<reason>_s<status>_<sha1, 12 digits>`: one input per distinct
   `(reason, status)` of a session, minimized (`--no-minimize` keeps it as found), with a
   `.info` note beside it: `reason=`, `reason_name=`, `status=`, `status_hex=` (the pc, for
@@ -427,8 +432,70 @@ mutator's random sequence, `--status-file FILE` writes the feed for the status s
 each session, every `--status-interval` seconds) and `--quiet` drops the log lines. The
 brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 
+**The campaign.** The brain asks ember for SPARSE replies (`fuzz-formats.md`): each
+iteration's set buckets and its instruction count, folded in time proportional to the
+buckets hit. An input is interesting when it sets a bucket never hit or reaches a hit-count
+class (1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+) that bucket never had. The queue is walked
+in cycles:
+
+- **Favored entries:** for every bucket, the entry that hits it with the smallest
+  instructions × size; the favored set covers every bucket seen. While favored entries
+  wait, 99% of the others are skipped (95% once fuzzed, 75% when new, otherwise).
+- **Calibration:** each new entry runs twice. ember is deterministic, so the runs must
+  match; a difference is reported as `UNSTABLE` with the buckets that differed (the harness
+  leaks state between iterations) and counted in the status. `--no-calibrate` skips it.
+  After the baseline the brain also suggests a per-input budget (5× the slowest entry).
+- **Trimming:** a new entry, when first chosen, loses chunks for as long as its path (its
+  buckets and hit-count classes) stays the same, up to `--trim-probes` runs (64);
+  `--no-trim` keeps entries as found.
+- **Energy:** each chosen entry gets a number of mutations from a performance score
+  (cheaper, wider, later-found and deeper entries score higher; the cost is the exact
+  instruction count) times its power schedule's factor (`--schedule`):
+
+| `--schedule` | gives energy to | use |
+|---|---|---|
+| `fast` (default) | entries on rarely exercised paths; grows each time an entry is chosen, capped | the general choice |
+| `explore` | everyone alike (the score alone) | breadth; a parallel set's variety |
+| `exploit` | the score at full strength: small, cheap, new entries | depth |
+| `coe` | like `fast`, but nothing to entries whose path runs more often than the mean | aggressive rarity, next to `fast` |
+| `rare` | entries that hit the rarest buckets | narrow checks: parsers, protocols |
+
+- **Adaptive operators:** every `--reweight-every` (5000) mutated executions, the
+  mutator's operators that produced interesting children get more weight (up to 4× their
+  default, at least 1); 0 keeps the defaults.
+
+**Dictionaries** (`--dict FILE`, repeatable) are ember's own format, one token per line:
+`"text"` (escapes `\\ \" \t \n \r \xHH`), `hex:BYTES`, and integers `u8:`, `u16:`,
+`u32:`, `u64:` laid out in the target's byte order (HELLO says which), or `u16le:` /
+`u32be:` ... for a fixed one; a line starting with `#` is a comment. Integer tokens are also written ±1 (the
+off-by-one neighbour of a boundary check). `python3 fuzz/tools/mutate.py --selftest` checks
+the parser.
+
+```
+# a bootloader's command protocol
+"BOOT"
+hex:a55a
+# a magic the firmware compares as a word, and a network-order field
+u32:0xdeadbeef
+u16be:0x0800
+```
+
+**Parallel workers.** `fuzz/tools/fuzz_launch.py -n N --out DIR -- <uam-run arguments>`
+runs N brain + ember pairs, each on its own port with its own output directory `DIR/NAME`
+(`main`, `w1`, `w2`, ...): its queue, crashes, hangs, `status.jsonl`, `brain.log` and
+`ember.log`. The workers share through `DIR` (`fuzz_brain.py --sync-dir DIR --name NAME`):
+every `--sync-interval` seconds (60), each one runs the other workers' new queue entries
+once and keeps those that are new to it (`sync:` names; `.synced/PEER` records how far it
+read). Each worker gets a distinct RNG seed, derived from `--seed-rng` and its name
+(identical workers would only repeat each other), and the next schedule of `--schedules`
+(default all five, round robin); `--dict` and `--seeds` go to every worker, `--brain-arg`
+passes anything else. A worker whose brain or ember exits unexpectedly is restarted from
+its queue (`--max-restarts`, 5); Ctrl-C stops them all with BYE.
+`python3 fuzz/tools/status_tui.py --sync-dir DIR` shows one row per worker and a total.
+
 ember dials the brain (retrying for a few seconds while it starts), runs each INPUT through
-the harness and answers it, in lockstep, with one COVERAGE or CRASH frame. It needs fuzzing
+the harness and answers it, in lockstep, with one COVERAGE (SPARSE, when asked) or CRASH
+frame. It needs fuzzing
 boundaries (`--fuzz-begin` or `--cov-boundary`) and replaces `--fuzz-replay`. ember connects
 first, boots to the begin pc, and only then sends HELLO and the INIT map, so a long firmware
 boot is not spent between HELLO and the first reply; the brain waits for HELLO up to its
@@ -438,7 +505,7 @@ is the ISA's name (`rv32imac`, `mips32be`, `armv7`, ...).
 
 | Verdict | Reply | `status` |
 |---|---|---|
-| ok | COVERAGE, kind ITER | |
+| ok | COVERAGE (or SPARSE), kind ITER | |
 | crash (fault) | CRASH `FAULT` (1) | the faulting pc, low 32 bits |
 | crash (guard) | CRASH `GUARD` (2) | the pc of the guarded access, low 32 bits |
 | crash (oracle) | CRASH `ORACLE` (3) | the detail, low 32 bits: the crash pc, a halt status, the interrupt lines |
@@ -460,13 +527,22 @@ python3 fuzz/tools/fuzz_brain.py --listen 127.0.0.1:7000 --seeds seeds/ --out ru
 build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
     --fuzz-input uart0 --fuzz-iter-insns 200000 --fuzz-net 127.0.0.1:7000 build/firmware/fuzztarget.elf
 python3 fuzz/tools/status_tui.py run/status.jsonl     # a live status screen (--once: one frame)
+
+python3 fuzz/tools/fuzz_launch.py -n 4 --out camp --seeds seeds/ --dict fw.dict -- \
+    build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
+    --fuzz-input uart0 --fuzz-iter-insns 200000 build/firmware/fuzztarget.elf
+python3 fuzz/tools/status_tui.py --sync-dir camp      # every worker
 ```
 
 Replaying the brain's `crashes/` or `hangs/` directory (`--fuzz-replay run/crashes`) runs
 the inputs and skips their `.info` notes. `make fuzz-lists-test` checks the protocol frame
-by frame against a scripted brain (`tests/fuzz/fake_brain.py`) and runs a session with the
-brain (`tests/fuzz/brain-check.sh`: the planted crash is reported, saved with its reason,
-minimized, and the session ends with BYE).
+by frame against a scripted brain (`tests/fuzz/fake_brain.py`, SPARSE included), runs
+sessions with the brain (`tests/fuzz/brain-check.sh`: the planted crash is reported, saved
+with its reason, minimized, and the session ends with BYE; a session per schedule; the
+planted crash found from a dictionary alone) and a parallel campaign
+(`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
+crashes, and survive a killed ember). `make unit-test` runs `tests/fuzz/brain_unit.py` (the
+campaign logic on synthetic data) and `test_fuzz`'s check of the harness's hit lists.
 
 ### The coverage region (`--cov-shm PATH`)
 

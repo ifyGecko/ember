@@ -37,7 +37,7 @@ The stack count is log-uniform, `1 << (1 + randint(0, 7))`, which
 yields {2,4,8,16,32,64,128,256}. The engine samples log-uniformly
 between `stack_min` and `stack_max`.
 
-The op menu (21 entries):
+The op menu (22 entries):
 
   bit/byte:        BIT_FLIP, BYTE_FLIP, BYTE_ARITH, RANDOM_BYTE
   multi-byte arith:
@@ -49,7 +49,7 @@ The op menu (21 entries):
                    SET_INTERESTING_U32_LE, SET_INTERESTING_U32_BE
   chunk:           DELETE_CHUNK, CLONE_CHUNK, OVERWRITE_CHUNK,
                    SWAP_CHUNKS
-  dictionary:      DICT_INSERT, DICT_OVERWRITE
+  dictionary:      DICT_INSERT, DICT_OVERWRITE, DICT_INT_ADJ
   structured:      STRUCTURED_INSERT, STRUCTURED_OVERWRITE
 
 Splice is *not* in the havoc op menu; it's a separate strategy. When
@@ -60,16 +60,30 @@ the corpus *before* the havoc stack runs.
 Dictionary
 ----------
 
-A `Dictionary` is a list of byte fragments with optional weights. The
-expected use is well-known protocol tokens / magic constants / API
-keywords that pure byte havoc is statistically unlikely to synthesize
-(e.g. `IAC SB <opt> <body> IAC SE` for telnet, HTTP method strings,
-DNS label sequences, X.509 OIDs). When no dictionary is supplied the
-two dict ops have weight 0 and are never picked.
+A `Dictionary` is a list of byte fragments with optional weights, plus
+integer tokens. The expected use is protocol tokens, magic constants and
+command words that pure byte havoc is statistically unlikely to
+synthesize. When no dictionary is supplied the dict ops have weight 0
+and are never picked.
 
-`parse_dict()` reads the common `name="hex-escaped string"` text
-dictionary format, so existing dictionaries (oss-fuzz's, for one)
-work unchanged.
+`parse_dict(path, target_order)` reads ember's dictionary format, one
+token per line (docs/fuzz-ideas.md, "Dictionaries"):
+
+    # comment; blank lines are ignored
+    "GET /"              bytes; escapes \\\\ \\" \\t \\n \\r \\xHH
+    hex:7f454c46         raw bytes
+    u8:0x5a              an integer of 1, 2, 4 or 8 bytes, laid out in
+    u16:0x8100           the target's byte order (`target_order`: the
+    u32:0xdeadbeef       brain takes it from ember's HELLO)
+    u64:0x0123456789abcdef
+    u32le:0xdeadbeef     an explicit byte order, whatever the target
+    u32be:0xdeadbeef     (network fields are big-endian everywhere)
+
+Integer values may be written in any base Python's int(x, 0) reads, and
+negative ones within the width's signed range. Integer tokens are also
+fragments (DICT_INSERT, DICT_OVERWRITE), and DICT_INT_ADJ writes one of
+them plus or minus 1: the off-by-one neighbour of a boundary check,
+which a byte string cannot express.
 
 Structured inserts
 ------------------
@@ -200,6 +214,7 @@ class OP(IntEnum):
     DICT_OVERWRITE           = 19
     STRUCTURED_INSERT        = 20
     STRUCTURED_OVERWRITE     = 21
+    DICT_INT_ADJ             = 22
 
 
 # Default relative weights. Tunable via `Engine(op_weights={...})`.
@@ -226,6 +241,7 @@ DEFAULT_OP_WEIGHTS = {
     OP.DICT_OVERWRITE:           6,    # auto-zeroed when no dict
     OP.STRUCTURED_INSERT:        8,    # auto-zeroed when no inserts
     OP.STRUCTURED_OVERWRITE:     4,    # auto-zeroed when no inserts
+    OP.DICT_INT_ADJ:             4,    # auto-zeroed when the dict has no integers
 }
 
 
@@ -249,6 +265,7 @@ class Dictionary:
     """
     fragments: List[bytes] = field(default_factory=list)
     weights: List[int] = field(default_factory=list)
+    ints: List["IntToken"] = field(default_factory=list)   # also in fragments, encoded
 
     def __post_init__(self):
         if not self.weights:
@@ -274,6 +291,16 @@ class Dictionary:
         for f in fragments:
             self.add(f)
 
+    def add_int(self, tok: "IntToken"):
+        """An integer token: its encoding as a fragment, and the token for DICT_INT_ADJ."""
+        self.ints.append(tok)
+        self.add(tok.encode(tok.value))
+
+    def merge(self, other: "Dictionary"):
+        for frag, w in zip(other.fragments, other.weights):
+            self.add(frag, w)
+        self.ints.extend(other.ints)
+
     def pick(self, rng: random.Random) -> bytes:
         return self.fragments[rng.choice(self._alias)]
 
@@ -284,82 +311,104 @@ class Dictionary:
         return bool(self.fragments)
 
 
-def parse_dict(path) -> Dictionary:
-    """Parse a name="value" text dictionary file.
+@dataclass
+class IntToken:
+    """An integer dictionary token: `width` bytes, in `order` ("little" or "big")."""
+    value: int
+    width: int
+    order: str
 
-    Format (one entry per line):
-        # comment
-        name="hex-or-printable-escaped string"
-        name@level="..."
+    def encode(self, value: int) -> bytes:
+        return (value % (1 << (8 * self.width))).to_bytes(self.width, self.order)
 
-    Recognized escapes inside the quoted body:
-        \\\\  ->  0x5c
-        \\"  ->  0x22
-        \\t   ->  0x09
-        \\n   ->  0x0a
-        \\r   ->  0x0d
-        \\xHH ->  the byte with hex value HH
 
-    Empty/whitespace lines and `#` comments are ignored. Each entry's
-    `name` and `@level` qualifier are discarded; only the byte payload
-    is kept (with weight=1). Decode errors on a single line raise
-    `ValueError` with line number.
+_ESCAPES = {"\\": 0x5c, '"': 0x22, "t": 0x09, "n": 0x0a, "r": 0x0d}
+
+
+def _unquote(body: str, where: str) -> bytes:
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c != "\\":
+            out += c.encode("utf-8")
+            i += 1
+            continue
+        if i + 1 >= len(body):
+            raise ValueError(f"{where}: trailing backslash")
+        nxt = body[i + 1]
+        if nxt in _ESCAPES:
+            out.append(_ESCAPES[nxt])
+            i += 2
+        elif nxt == "x":
+            try:
+                out.append(int(body[i + 2:i + 4], 16))
+            except ValueError:
+                raise ValueError(f"{where}: bad \\x escape") from None
+            if len(body[i + 2:i + 4]) != 2:
+                raise ValueError(f"{where}: truncated \\x escape")
+            i += 4
+        else:
+            raise ValueError(f"{where}: unknown escape \\{nxt}")
+    return bytes(out)
+
+
+def parse_dict(path, target_order: str = "little") -> Dictionary:
+    """Read an ember dictionary file (the format is in this module's docstring).
+
+    `target_order` ("little" or "big") lays out the integer tokens that do not name a
+    byte order. Errors raise ValueError naming the file and line.
     """
+    if target_order not in ("little", "big"):
+        raise ValueError(f"target_order must be 'little' or 'big', not {target_order!r}")
     d = Dictionary()
     p = Path(path)
     with p.open("rb") as fh:
         for lineno, raw in enumerate(fh, 1):
+            where = f"{p}:{lineno}"
             try:
                 line = raw.decode("utf-8", "strict").strip()
             except UnicodeDecodeError as e:
-                raise ValueError(f"{p}:{lineno}: invalid utf-8: {e}")
+                raise ValueError(f"{where}: invalid utf-8: {e}") from None
             if not line or line.startswith("#"):
                 continue
+            if line.startswith('"'):
+                if len(line) < 2 or not line.endswith('"'):
+                    raise ValueError(f"{where}: unterminated string")
+                frag = _unquote(line[1:-1], where)
+                if not frag:
+                    raise ValueError(f"{where}: empty token")
+                d.add(frag)
+                continue
+            kind, sep, val = line.partition(":")
+            if not sep or not val.strip():
+                raise ValueError(f"{where}: expected \"text\", hex:BYTES or uN[le|be]:VALUE")
+            kind, val = kind.strip(), val.strip()
+            if kind == "hex":
+                try:
+                    frag = bytes.fromhex(val)
+                except ValueError:
+                    raise ValueError(f"{where}: bad hex bytes") from None
+                if not frag:
+                    raise ValueError(f"{where}: empty token")
+                d.add(frag)
+                continue
+            order = target_order
+            base = kind
+            for suffix, o in (("le", "little"), ("be", "big")):
+                if kind.endswith(suffix):
+                    base, order = kind[:-2], o
+            widths = {"u8": 1, "u16": 2, "u32": 4, "u64": 8}
+            if base not in widths:
+                raise ValueError(f"{where}: unknown token kind {kind!r}")
+            width = widths[base]
             try:
-                qstart = line.index('"')
-                qend = line.rindex('"')
+                v = int(val, 0)
             except ValueError:
-                raise ValueError(f"{p}:{lineno}: missing quoted body")
-            if qstart == qend:
-                raise ValueError(f"{p}:{lineno}: unterminated string")
-            body = line[qstart + 1:qend]
-            payload = bytearray()
-            i = 0
-            while i < len(body):
-                c = body[i]
-                if c == "\\":
-                    if i + 1 >= len(body):
-                        raise ValueError(
-                            f"{p}:{lineno}: trailing backslash")
-                    nxt = body[i + 1]
-                    if nxt == "\\":
-                        payload.append(0x5c); i += 2
-                    elif nxt == '"':
-                        payload.append(0x22); i += 2
-                    elif nxt == "t":
-                        payload.append(0x09); i += 2
-                    elif nxt == "n":
-                        payload.append(0x0a); i += 2
-                    elif nxt == "r":
-                        payload.append(0x0d); i += 2
-                    elif nxt == "x":
-                        if i + 3 >= len(body):
-                            raise ValueError(
-                                f"{p}:{lineno}: truncated \\x escape")
-                        try:
-                            payload.append(int(body[i + 2:i + 4], 16))
-                        except ValueError:
-                            raise ValueError(
-                                f"{p}:{lineno}: bad \\x escape")
-                        i += 4
-                    else:
-                        raise ValueError(
-                            f"{p}:{lineno}: unknown escape \\{nxt}")
-                else:
-                    payload.append(ord(c))
-                    i += 1
-            if payload:
-                d.add(bytes(payload))
+                raise ValueError(f"{where}: bad integer {val!r}") from None
+            if not -(1 << (8 * width - 1)) <= v < (1 << (8 * width)):
+                raise ValueError(f"{where}: {val} does not fit {width * 8} bits")
+            d.add_int(IntToken(v % (1 << (8 * width)), width, order))
     return d
 
 
@@ -556,28 +605,7 @@ class Engine:
             for _ in range(max(1, s.weight))
         ]
 
-        # Resolve op weights: defaults -> user overrides -> backing
-        # availability (last word).
-        weights = dict(DEFAULT_OP_WEIGHTS)
-        if op_weights:
-            for k, v in op_weights.items():
-                weights[OP(k)] = int(v)
-        if not (dictionary and len(dictionary)):
-            weights[OP.DICT_INSERT] = 0
-            weights[OP.DICT_OVERWRITE] = 0
-        if not self.structured_inserts:
-            weights[OP.STRUCTURED_INSERT] = 0
-            weights[OP.STRUCTURED_OVERWRITE] = 0
-        self.op_weights = weights
-
-        self._op_alias = [
-            op for op, w in weights.items() if w > 0
-            for _ in range(w)
-        ]
-        if not self._op_alias:
-            raise ValueError(
-                "no enabled ops -- check op_weights or supply a "
-                "dictionary / structured inserts")
+        self.set_op_weights(op_weights)
 
         # Stack-count alias: log-uniform 1 << (1 + r), bounded.
         self.stack_min = max(1, int(stack_min))
@@ -608,10 +636,36 @@ class Engine:
             OP.DICT_OVERWRITE:          self._op_dict_overwrite,
             OP.STRUCTURED_INSERT:       self._op_structured_insert,
             OP.STRUCTURED_OVERWRITE:    self._op_structured_overwrite,
+            OP.DICT_INT_ADJ:            self._op_dict_int_adj,
         }
 
+        self.last_ops: List[OP] = []     # the ops the last mutate()/havoc() applied
         self.last_trace: List[OpRecord] = []
         self.last_trace_hash: str = ""
+
+    def set_op_weights(self, op_weights: Optional[dict] = None):
+        """Resolve and install op weights: the defaults, then `op_weights`, then what
+        the backings allow (no dictionary, no integers, no structured inserts: those
+        ops get 0). The brain calls it again as it learns which ops pay off."""
+        weights = dict(DEFAULT_OP_WEIGHTS)
+        if op_weights:
+            for k, v in op_weights.items():
+                weights[OP(k)] = max(0, int(v))
+        if not (self.dictionary and len(self.dictionary)):
+            weights[OP.DICT_INSERT] = 0
+            weights[OP.DICT_OVERWRITE] = 0
+        if not (self.dictionary and self.dictionary.ints):
+            weights[OP.DICT_INT_ADJ] = 0
+        if not self.structured_inserts:
+            weights[OP.STRUCTURED_INSERT] = 0
+            weights[OP.STRUCTURED_OVERWRITE] = 0
+        alias = [op for op, w in weights.items() if w > 0 for _ in range(w)]
+        if not alias:
+            raise ValueError(
+                "no enabled ops -- check op_weights or supply a "
+                "dictionary / structured inserts")
+        self.op_weights = weights
+        self._op_alias = alias
 
     @staticmethod
     def _log_stack_choices(lo: int, hi: int) -> List[int]:
@@ -651,6 +705,7 @@ class Engine:
                 src = self.splice(src, donor)
 
         buf = bytearray(src)
+        self.last_ops = []
         if self.trace_enabled:
             self.last_trace = []
 
@@ -681,6 +736,7 @@ class Engine:
         caller wants explicit control over splice scheduling.
         """
         buf = bytearray(src)
+        self.last_ops = []
         if self.trace_enabled:
             self.last_trace = []
         n_ops = self.rng.choice(self._stack_choices)
@@ -725,7 +781,7 @@ class Engine:
         # Empty buffer: only ops that grow the buffer make sense.
         # Fall back to whichever growth-op is available.
         if not buf and op not in (
-                OP.DICT_INSERT, OP.STRUCTURED_INSERT,
+                OP.DICT_INSERT, OP.DICT_INT_ADJ, OP.STRUCTURED_INSERT,
                 OP.CLONE_CHUNK, OP.RANDOM_BYTE):
             if self.dictionary:
                 op = OP.DICT_INSERT
@@ -733,6 +789,7 @@ class Engine:
                 op = OP.STRUCTURED_INSERT
             else:
                 op = OP.RANDOM_BYTE
+        self.last_ops.append(op)
         try:
             self._dispatch[op](buf)
         except (IndexError, struct.error):
@@ -941,6 +998,21 @@ class Engine:
         buf[pos:pos + len(frag)] = frag
         self._record(OP.DICT_OVERWRITE, pos, frag)
 
+    def _op_dict_int_adj(self, buf: bytearray):
+        # An integer token plus or minus 1, in its own width and byte order: the
+        # neighbour of a boundary the firmware checks. Overwrites in place when it
+        # fits, else inserts.
+        if not self.dictionary or not self.dictionary.ints: return
+        tok = self.rng.choice(self.dictionary.ints)
+        frag = tok.encode(tok.value + self.rng.choice((-1, 1)))
+        if len(buf) >= len(frag) and self.rng.random() < 0.5:
+            pos = self.rng.randint(0, len(buf) - len(frag))
+            buf[pos:pos + len(frag)] = frag
+        else:
+            pos = self.rng.randint(0, len(buf)) if buf else 0
+            buf[pos:pos] = frag
+        self._record(OP.DICT_INT_ADJ, pos, frag)
+
     # ---- structured ops ---------------------------------------------------
 
     def _pick_structured(self) -> StructuredInsert:
@@ -1035,21 +1107,68 @@ def _selftest() -> int:
 
     print("[selftest] dict parse ...", end=" ", flush=True)
     import tempfile
-    with tempfile.NamedTemporaryFile("w", suffix=".dict",
-                                     delete=False) as fh:
-        fh.write('# comment\n')
-        fh.write('greet="hello"\n')
-        fh.write('iac_do_ttype="\\xff\\xfd\\x18"\n')
-        fh.write('crlf="\\r\\n"\n')
-        path = fh.name
+
+    def dict_file(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".dict", delete=False) as fh:
+            fh.write(text)
+            return fh.name
+
+    path = dict_file('# comment\n\n"hello"\n"\\xff\\xfd\\x18"\n"a\\"b\\\\c\\r\\n"\n'
+                     'hex:7f454c46\nu8:0x5a\nu16:0x8100\nu32:0xdeadbeef\n'
+                     'u32be:0x01020304\nu16le:-2\nu64:1\n')
     try:
-        d = parse_dict(path)
-        assert len(d) == 3
-        assert b"hello" in d.fragments
-        assert b"\xff\xfd\x18" in d.fragments
-        assert b"\r\n" in d.fragments
+        for order in ("little", "big"):
+            d = parse_dict(path, order)
+            f = d.fragments
+            assert b"hello" in f and b"\xff\xfd\x18" in f and b'a"b\\c\r\n' in f, f
+            assert b"\x7fELF" in f and b"\x5a" in f
+            assert (0x8100).to_bytes(2, order) in f and (0xdeadbeef).to_bytes(4, order) in f
+            assert b"\x01\x02\x03\x04" in f, "u32be ignores the target order"
+            assert b"\xfe\xff" in f, "u16le:-2 is two's complement, little-endian"
+            assert (1).to_bytes(8, order) in f
+            assert len(f) == 10 and len(d.ints) == 6, (len(f), len(d.ints))
     finally:
         os.unlink(path)
+    for bad, why in (('name="x"\n', "expected"), ('"open\n', "unterminated"),
+                     ('u24:1\n', "unknown token kind"), ('u8:256\n', "does not fit"),
+                     ('hex:abc\n', "bad hex"), ('"\\q"\n', "unknown escape"),
+                     ('""\n', "empty token")):
+        path = dict_file("# ok\n" + bad)
+        try:
+            parse_dict(path)
+        except ValueError as e:
+            assert ":2:" in str(e) and why in str(e), (bad, str(e))
+        else:
+            raise AssertionError(f"accepted {bad!r}")
+        finally:
+            os.unlink(path)
+    print("ok")
+
+    print("[selftest] integer token +-1 ...", end=" ", flush=True)
+    d = Dictionary()
+    d.add_int(IntToken(0x1000, 2, "big"))
+    w = {op: 0 for op in OP}
+    w[OP.DICT_INT_ADJ] = 1
+    eng = Engine(random.Random(9), dictionary=d, op_weights=w, stack_min=1, stack_max=1)
+    seen = set()
+    for _ in range(64):
+        out = eng.mutate(b"")
+        assert out in (b"\x0f\xff", b"\x10\x01"), out
+        assert eng.last_ops == [OP.DICT_INT_ADJ]
+        seen.add(out)
+    assert len(seen) == 2, "both neighbours"
+    print("ok")
+
+    print("[selftest] op records and re-weighting ...", end=" ", flush=True)
+    eng = Engine(random.Random(10), stack_min=4, stack_max=4)
+    eng.mutate(b"hello world")
+    assert len(eng.last_ops) == 4 and all(isinstance(o, OP) for o in eng.last_ops)
+    w = {op: 0 for op in OP}
+    w[OP.BYTE_FLIP] = 1
+    eng.set_op_weights(w)
+    eng.mutate(b"hello world")
+    assert set(eng.last_ops) == {OP.BYTE_FLIP}
+    assert eng.op_weights[OP.DICT_INT_ADJ] == 0, "no integers: DICT_INT_ADJ stays off"
     print("ok")
 
     print("[selftest] trace + hash ...", end=" ", flush=True)
@@ -1094,7 +1213,9 @@ def _cli() -> int:
     ap.add_argument("--count", type=int, default=100,
                     help="number of mutants to emit (default 100)")
     ap.add_argument("--dict", type=Path, action="append", default=[],
-                    help="name=\"value\" text dictionary; repeat for multiple")
+                    help="ember dictionary file (see the module docstring); repeatable")
+    ap.add_argument("--endian", choices=("little", "big"), default="little",
+                    help="byte order of integer tokens that name none (default little)")
     ap.add_argument("--max-size", type=int, default=DEFAULT_MAX_SIZE,
                     help="hard cap on mutant length")
     ap.add_argument("--seed-rng", type=int, default=0xC0FFEE,
@@ -1122,9 +1243,7 @@ def _cli() -> int:
     if args.dict:
         dictionary = Dictionary()
         for p in args.dict:
-            d = parse_dict(p)
-            for frag, w in zip(d.fragments, d.weights):
-                dictionary.add(frag, w)
+            dictionary.merge(parse_dict(p, args.endian))
 
     corpus_cb = None
     if args.splice_from:

@@ -183,8 +183,10 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  *     [u32 length][u8 type][payload...]        length counts type + payload
  *
  * big-endian throughout, maps as raw u8 counters. Lockstep: each INPUT gets exactly one
- * COVERAGE or CRASH reply carrying its id; ember sends one unsolicited COVERAGE (id 0,
- * kind INIT) first. */
+ * COVERAGE (or SPARSE) or CRASH reply carrying its id; ember sends one unsolicited COVERAGE
+ * (id 0, kind INIT) first. A brain that sends OPTIONS with UAM_NET_OPT_SPARSE (after HELLO,
+ * before its first INPUT) gets SPARSE replies in place of COVERAGE from then on; an ember
+ * that predates OPTIONS ignores it, as every peer ignores unknown frame types. */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
 #define UAM_FUZZ_NET_VERSION   1u
@@ -196,18 +198,33 @@ enum uam_fuzz_net_frame {
     UAM_NET_COVERAGE = 3,   /* ember -> brain: one map */
     UAM_NET_CRASH    = 4,   /* ember -> brain: the input did not end normally */
     UAM_NET_BYE      = 5,   /* either way: clean shutdown */
+    UAM_NET_OPTIONS  = 6,   /* brain -> ember, optional, once after HELLO: what it wants */
+    UAM_NET_SPARSE   = 7,   /* ember -> brain: one map as its set buckets (OPTIONS asked) */
 };
+
+/* HELLO flags beyond the UAM_COV_SCHEME* bits */
+#define UAM_NET_HELLO_BIG_ENDIAN  (1u << 15)  /* the target's data byte order is big-endian */
+
+/* OPTIONS flags */
+#define UAM_NET_OPT_SPARSE        (1u << 0)   /* reply with SPARSE instead of COVERAGE */
 
 /* HELLO:    u16 version, u16 flags (UAM_COV_SCHEME* bits), u32 map_size,
  *           u16 arch_len (<= UAM_NET_ARCH_MAX), u8 arch[arch_len] (the ISA's name)
  * INPUT:    u64 id (non-zero), u32 len, u8 data[len]
  * COVERAGE: u64 id (0: the INIT map), u8 kind (UAM_COV_KIND_*), u32 map_size, u8 map[]
- * CRASH:    u64 id, u8 reason (enum uam_fuzz_net_reason), u32 status */
+ * CRASH:    u64 id, u8 reason (enum uam_fuzz_net_reason), u32 status
+ * OPTIONS:  u32 flags (UAM_NET_OPT_*); more fields may follow, to be ignored
+ * SPARSE:   u64 id (0: the INIT map), u8 kind, u64 insns (instructions the iteration ran),
+ *           u32 map_size, u32 n, then n x (u32 index, u8 count), indices ascending. A map
+ *           with too many set buckets for the list to be smaller goes as COVERAGE instead. */
 #define UAM_NET_HELLO_FIXED_LEN    10u
 #define UAM_NET_ARCH_MAX           64u
 #define UAM_NET_INPUT_HDR_LEN      12u
 #define UAM_NET_COVERAGE_HDR_LEN   13u
 #define UAM_NET_CRASH_LEN          13u
+#define UAM_NET_OPTIONS_MIN_LEN    4u
+#define UAM_NET_SPARSE_HDR_LEN     25u
+#define UAM_NET_SPARSE_ENTRY_LEN   5u
 
 /* (reason, status) is a crash's identity for deduplication. */
 enum uam_fuzz_net_reason {

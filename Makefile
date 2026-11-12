@@ -495,6 +495,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_COV_FORMATS) tests/unit/cov_golden.txt
 	python3 fuzz/tools/mutate.py --selftest
 	python3 fuzz/tools/status_tui.py --selftest
+	python3 tests/fuzz/brain_unit.py
 
 # The JIT differential test at length: JITDIFF_BLOCKS random blocks per seed, several seeds.
 JITDIFF_BLOCKS ?= 200000
@@ -891,8 +892,9 @@ endif
 # runner: lists written by tests/fuzz/mk_lists.py, and by fuzz/tools' rizin generators when
 # rizin is installed (gen-check; with headless Ghidra on PATH, the Ghidra route must write
 # the same files); the region read back by fuzz/tools/cov_region.py and an independent
-# reader; a session with fuzz/tools/fuzz_brain.py; and the protocol frame by frame against
-# a scripted brain (tests/fuzz/fake_brain.py).
+# reader; sessions with fuzz/tools/fuzz_brain.py (every power schedule, a dictionary find);
+# the protocol frame by frame against a scripted brain (tests/fuzz/fake_brain.py), SPARSE
+# replies included; and a parallel campaign through fuzz/tools/fuzz_launch.py.
 fuzz-lists-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
 	sh tests/fuzz/formats-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/formats-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
@@ -916,6 +918,7 @@ fuzz-lists-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
 	sh tests/fuzz/fuzz-net-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
 	sh tests/fuzz/fuzz-net-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf
 	sh tests/fuzz/fuzz-net-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf
+	sh tests/fuzz/parallel-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 
 test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test z80-test xtensa-test \
       example-test snapshot-test cov-test fuzz-test \
