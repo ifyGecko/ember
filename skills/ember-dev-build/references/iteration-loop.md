@@ -107,14 +107,14 @@ reports it: the prompt never came). Patterns only match output of the current ru
 | `[info] mmio-stub: rule@0xADDR (fixed:0x1): first read ...` | `-v`: first access to each register an `--mmio-rule` answers; a per-rule summary at exit |
 | `[error] snapshot: device X ... has no save/restore` | a device that does not take part in snapshots (`device-anatomy.md`) |
 | `[error] abi: ...` (exit 2) | board and libuam built from different ember headers: `scripts/build-ember.sh` |
-| `exc: kind=K pc=.. cause=.. tval=..` | `--trace exc`: every synchronous exception (kind 0 = guest trap; cause is ISA-defined: the MIPS ExcCode, RISC-V mcause, x86 vector, ...; `uam/isa/*.h`) |
-| `guard NAME (stop\|fault\|log): cpu N pc .. read\|write S at ..` | a `--guard` / `--watch` hit |
+| `exc: kind=K (NAME) pc=.. cause=.. tval=.. icount=N` | `--trace exc`: every synchronous exception (kind 0 = `trap`, a guest trap; 2/3 = `load-fault`/`store-fault`; cause is ISA-defined: the MIPS ExcCode, RISC-V mcause, x86 vector, ...; `uam/isa/*.h`) |
+| `guard NAME (stop\|fault\|log): cpu N pc .. read\|write S at ..` | a `--guard` / `--watch` hit (a `--watch` line ends with `icount=N`) |
 | `[error] z80: pc=..: load from nothing at 0x..: core halted` | an AVR, 8-bit PIC, 8051, 6502 or Z80 stopped: it has no bus-error exception to take |
 | `[warn] m6502: pc=..: JAM: the core stops until reset` | an NMOS 6502 executed a JAM opcode |
 | `[warn] chardev: console input: N byte(s) never sent, waiting for '...'` | scripted console input whose prompt never came |
-| `irq: entered handler at ..`, `reset: system` | `--trace exc`: interrupt entries, device-requested resets |
+| `irq: entered handler at .. from pc=.. lines=0x.. icount=N`, `reset: system icount=N` | `--trace exc`: interrupt entries (the lines pending), device-requested resets |
 | `mmio: r\|w SIZE 0xADDR dev+0xOFF = 0xVAL pc=.. icount=N` | `--trace mmio`: every access a device served (x86 ports at `0x10000000000 + port`) |
-| `irq-in: cpuN line L = 0\|1 icount=..`; `irq-in: cpuN line L: R rises, F falls, level V at the stop`; `irq: at the stop cpuN has an interrupt pending and enabled ...` | `--trace irq`: a processor's interrupt inputs |
+| `irq-in: cpuN line L = 0\|1 icount=..`; `irq-in: cpuN line L: R rises, F falls, level V at the stop`; `irq-in: at the stop cpuN has an interrupt pending and enabled ...` | `--trace irq`: a processor's interrupt inputs |
 | `sysreg: first read\|write 0xID = 0xVAL pc=..`, `sysreg:   0xID: R reads, W writes` | `--trace sysreg`: system registers (ids as `uam/isa/<arch>.h` numbers them); a faulting access says so |
 | `console: icount=N pc=.. "text"` | `--trace console`: each console line and where in the run it was printed |
 | `@ICOUNT [warn] ...` | `--log-stamp`: the icount at which a log line was made |

@@ -317,7 +317,7 @@ ones a bring-up step needs, all on stderr:
 
 | kind | what it shows | for |
 |---|---|---|
-| `exc` | exceptions, interrupts taken, resets | where control went |
+| `exc` | exceptions (`exc: kind=2 (load-fault) pc=.. cause=.. tval=.. icount=N`), interrupts taken (handler, the pc they came from, the pending lines), resets | where control went |
 | `blocks`, `ir` | every block executed; the IR of each translated block | control flow, the lifter |
 | `mmio` | every access a device serves (MMIO, a ROM device in device mode, an unmapped address, x86 ports): `mmio: r 1 0x10000005 uart0+0x5 = 0x60 pc=0x8000025e icount=141` | the register protocol a driver speaks: what to model, in which order, with which values |
 | `sysreg` | the first read and the first write of each system register (CSR, CP0, CP15, SPR, MSR, ...) with value and pc, every access that faults, and a per-register summary at the stop; `sysreg-all`: every access | which core and implementation registers the firmware relies on |
@@ -338,8 +338,12 @@ build/uam-run -t sysreg,irq,console fw.elf    # system registers, interrupt line
 ```
 
 `--trace ir` prints every translated block in the IR's text form; `--trace blocks`
-can be narrowed with `--trace-range LO:HI` and `--trace-after N` (which also holds back
-the `mmio`, `sysreg`, `irq` and `console` traces). A block trace lists every
+can be narrowed with `--trace-range LO:HI` and `--trace-after N` (which holds back every
+trace but `ir`; the `sysreg` and `irq` summaries, and what counts as a register's first
+access, start from there too). Every trace line carries the `icount` (and `cpu=N` on a
+processor other than 0), and so do `--watch` lines, so the traces can be merged by icount.
+An unknown trace name is an error (exit 2). With `--fuzz-replay` (or a fuzz campaign) each
+input gets its own section: `trace: input ID`, its lines, then its summaries. A block trace lists every
 block also with `--jit`: blocks are not chained while it is on. `--trace-after N` is an
 absolute instruction count, like the `icount` the runner prints, and a snapshot keeps that
 count; `--trace-after +N` counts from where the run starts. `-n` and `--max-ticks` always

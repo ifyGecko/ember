@@ -228,8 +228,8 @@ and a guard stops at the first:
 
 ```
 build/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --watch p:0x3000+4:w build/firmware-x86/selftest.bin
-guard p:0x3000+4:w (log): cpu 0 pc 0xbf write 2 at 0x3000 (+0) value 0xa55a
-guard p:0x3000+4:w (log): cpu 0 pc 0xc8 write 2 at 0x3002 (+2) value 0xa55a
+guard p:0x3000+4:w (log): cpu 0 pc 0xc8 write 2 at 0x3000 (+0) value 0xa55a icount=144
+guard p:0x3000+4:w (log): cpu 0 pc 0xc8 write 2 at 0x3002 (+2) value 0xa55a icount=145
 
 build/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --guard 0x3000-16+16:w,name=lo build/firmware-x86/selftest.bin
 uam-run: guard lo (stop): cpu 0 pc 0xc8 write 2 at 0x3000 (+16) value 0xa55a

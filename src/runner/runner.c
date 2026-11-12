@@ -271,8 +271,9 @@ static void usage(FILE *out)
         "                          all     exc, mmio, sysreg, irq, console\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
         "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI)\n"
-        "      --trace-after N     trace blocks, mmio, sysreg, irq and console only once the\n"
-        "                          instruction count reaches N. N is absolute, like every\n"
+        "      --trace-after N     trace only once the instruction count reaches N (every\n"
+        "                          trace but ir; the sysreg and irq summaries and sysreg's\n"
+        "                          first accesses count from there). N is absolute, like every\n"
         "                          icount the runner prints (a snapshot keeps the count); +N:\n"
         "                          N instructions after the run starts\n"
         "      --log-stamp         start each log line made while the guest runs with\n"
@@ -363,25 +364,33 @@ static uint64_t parse_size(const char *s)
     return v;
 }
 
-/* The executor's trace flags; the runner's own (trace.h, RT_*) go to *rt. */
-static unsigned parse_trace(const char *s, unsigned *rt)
+/* The executor's trace flags go to *t, the runner's own (trace.h, RT_*) to *rt. False
+ * (after saying which) for a token that names no trace: a run that would trace nothing
+ * of what was asked for is not worth starting. */
+static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
 {
-    unsigned t = 0;
+    bool ok = true;
     char *copy = strdup(s);
+    if (!copy)
+        return false;
     for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
-        if (!strcmp(tok, "blocks"))     t |= UAM_TRACE_BLOCKS;
-        else if (!strcmp(tok, "ir"))    t |= UAM_TRACE_IR;
-        else if (!strcmp(tok, "exc"))   t |= UAM_TRACE_EXC;
+        if (!strcmp(tok, "blocks"))     *t |= UAM_TRACE_BLOCKS;
+        else if (!strcmp(tok, "ir"))    *t |= UAM_TRACE_IR;
+        else if (!strcmp(tok, "exc"))   *t |= UAM_TRACE_EXC;
         /* TODO: a trace that detects device polling loops of any shape ("polls" was
          * removed: it only found single-block loops; see the TODO at the end of
          * src/exec/spin.c). */
-        else if (!strcmp(tok, "all"))   { t |= UAM_TRACE_EXC;
+        else if (!strcmp(tok, "all"))   { *t |= UAM_TRACE_EXC;
                                           *rt |= RT_MMIO | RT_SYSREG | RT_IRQ | RT_CONSOLE; }
         else if (rtrace_flag(tok))      *rt |= rtrace_flag(tok);
-        else fprintf(stderr, "uam-run: unknown trace flag '%s'\n", tok);
+        else {
+            fprintf(stderr, "uam-run: unknown trace '%s' (traces: blocks, ir, exc, mmio, sysreg, "
+                    "sysreg-all, irq, console, all)\n", tok);
+            ok = false;
+        }
     }
     free(copy);
-    return t;
+    return ok;
 }
 
 /* Split "KEY=VALUE" in place. */
@@ -469,6 +478,54 @@ static uam_hook_action break_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
     return UAM_HOOK_STOP;
 }
 
+/* With --trace while fuzzing or replaying: a frontend around the real one that gives each
+ * input its own trace section. The boot's traces end with its summaries (at the INIT
+ * report); each input's begin with a "trace: input ID" line and end with its own. */
+typedef struct trace_fe {
+    const uam_fuzz_frontend *fe;
+    void                    *ctx;
+    rtrace                  *rt;
+} trace_fe;
+
+static uam_status trace_fe_hello(void *ctx, const uam_fuzz_info *info)
+{
+    trace_fe *t = ctx;
+    return t->fe->hello ? t->fe->hello(t->ctx, info) : UAM_OK;
+}
+
+static int trace_fe_next(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
+{
+    trace_fe *t = ctx;
+    int rc = t->fe->next_input(t->ctx, data, len, id);
+    if (rc > 0) {
+        rtrace_restart(t->rt);
+        fprintf(t->rt->out, "trace: input %llu\n", (unsigned long long)*id);
+    }
+    return rc;
+}
+
+static uam_status trace_fe_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
+                                  const uint8_t *map, size_t map_size, int kind)
+{
+    trace_fe *t = ctx;
+    if (kind == UAM_FUZZ_KIND_INIT)
+        fprintf(t->rt->out, "trace: the boot to the begin pc ends\n");
+    rtrace_finish(t->rt);
+    return t->fe->report(t->ctx, id, v, detail, map, map_size, kind);
+}
+
+static void trace_fe_bye(void *ctx)
+{
+    trace_fe *t = ctx;
+    if (t->fe->bye)
+        t->fe->bye(t->ctx);
+}
+
+static const uam_fuzz_frontend trace_frontend = {
+    .hello = trace_fe_hello, .next_input = trace_fe_next, .report = trace_fe_report,
+    .bye = trace_fe_bye,
+};
+
 /* --fuzz-begin: the harness with the replay frontend. Returns the exit status. */
 /* The extensions of a run and their states. */
 typedef struct ext_set {
@@ -479,7 +536,8 @@ typedef struct ext_set {
 
 static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, const char *route,
                     uam_mmio_input *mmio_input, const char *replay, const char *cov_out,
-                    uint64_t map_size, bool stats, const uam_runner_setup *xs, const ext_set *es)
+                    uint64_t map_size, bool stats, const uam_runner_setup *xs, const ext_set *es,
+                    rtrace *rt)
 {
     char err[512];
     uam_fuzz_config cfg = *fz;
@@ -516,8 +574,13 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
                                                          xs->n_replay_sidecars)))
         goto out;
     g_fuzz = f;
-    uam_status st = xs->frontend ? uam_fuzz_run(f, xs->frontend, xs->frontend_ctx)
-                                 : uam_fuzz_run(f, &uam_fuzz_replay_frontend, r);
+    trace_fe tfe = {
+        .fe = xs->frontend ? xs->frontend : &uam_fuzz_replay_frontend,
+        .ctx = xs->frontend ? xs->frontend_ctx : r,
+        .rt = rt,
+    };
+    uam_status st = rt->flags || m->exec.trace ? uam_fuzz_run(f, &trace_frontend, &tfe)
+                              : uam_fuzz_run(f, tfe.fe, tfe.ctx);
     g_fuzz = NULL;
     fflush(stdout);
     const uam_fuzz_stats *fs = uam_fuzz_get_stats(f);
@@ -718,7 +781,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         switch (c) {
         case 'b': board_name = optarg; break;
         case 'n': max_insns = strtoull(optarg, NULL, 0); break;
-        case 't': trace |= parse_trace(optarg, &rt.flags); break;
+        case 't': if (!parse_trace(optarg, &trace, &rt.flags)) return 2; break;
         case OPT_TRACE_MMIO_RANGE: {
             char *end;
             rt.mmio_lo = strtoull(optarg, &end, 0);
@@ -1113,9 +1176,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint64_t start_icount = uam_machine_cpu(&m, 0)->icount;
     if (trace_after_rel)
         trace_after += start_icount;
-    else if (load_snap && (trace & UAM_TRACE_BLOCKS) && trace_after && trace_after <= start_icount)
-        fprintf(stderr, "uam-run: --trace-after %llu is before the snapshot (icount %llu): blocks are "
-                "traced from the start; --trace-after +N counts from the snapshot\n",
+    else if (load_snap && (trace || rt.flags) && trace_after && trace_after <= start_icount)
+        fprintf(stderr, "uam-run: --trace-after %llu is before the snapshot (icount %llu): tracing "
+                "starts at once; --trace-after +N counts from the snapshot\n",
                 (unsigned long long)trace_after, (unsigned long long)start_icount);
     m.exec.trace_after = trace_after;
     rt.after = (trace_after || trace_after_rel) ? trace_after : 0;
@@ -1256,7 +1319,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     clock_gettime(CLOCK_MONOTONIC, &run_t0);
     if (fuzzing) {
         rc = run_fuzz(&m, &fz, cov_blocks, fuzz_input, mmio_input, fuzz_replay, cov_out,
-                      cov_map_size, stats, &xs, es);
+                      cov_map_size, stats, &xs, es, &rt);
     } else if (gdb_port) {
         uam_gdb *g = uam_gdb_create(&m);
         if (!g || uam_gdb_listen(g, gdb_port) != UAM_OK) {

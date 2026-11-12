@@ -18,6 +18,7 @@ typedef struct unknown_mmio {
     uam_device         dev;
     uam_unknown_policy policy;
     size_t             count;
+    uint64_t           untracked;   /* accesses to addresses the table had no room for */
     entry              table[TABLE_SIZE];
 } unknown_mmio;
 
@@ -45,6 +46,9 @@ static entry *lookup(unknown_mmio *u, uint64_t addr, bool is_write, unsigned siz
             return e;
         }
     }
+    if (!u->untracked++)
+        uam_log(UAM_LOG_WARN, "unknown-mmio", "more than %u distinct unmapped addresses: the "
+                "others are not reported, and read 0 even with echo", TABLE_SIZE);
     return NULL;
 }
 
@@ -69,8 +73,8 @@ static void um_destroy(uam_device *d)
 {
     unknown_mmio *u = to_um(d);
     if (u->count)
-        uam_log(UAM_LOG_WARN, "unknown-mmio", "%zu distinct unmapped addresses were accessed",
-                u->count);
+        uam_log(UAM_LOG_WARN, "unknown-mmio", "%zu distinct unmapped addresses were accessed%s",
+                u->count, u->untracked ? " (and more that were not tracked)" : "");
     free(u);
 }
 

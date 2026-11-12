@@ -39,6 +39,24 @@ const char *uam_stop_reason_str(uam_stop_reason r)
     return "?";
 }
 
+const char *uam_exc_kind_str(uam_exc_kind k)
+{
+    switch (k) {
+    case UAM_EXC_TRAP:             return "trap";
+    case UAM_EXC_FETCH_FAULT:      return "fetch-fault";
+    case UAM_EXC_LOAD_FAULT:       return "load-fault";
+    case UAM_EXC_STORE_FAULT:      return "store-fault";
+    case UAM_EXC_LOAD_MISALIGNED:  return "load-misaligned";
+    case UAM_EXC_STORE_MISALIGNED: return "store-misaligned";
+    case UAM_EXC_SYSREG:           return "sysreg";
+    case UAM_EXC_HELPER:           return "helper";
+    case UAM_EXC_FETCH_XLATE:      return "fetch-xlate";
+    case UAM_EXC_LOAD_XLATE:       return "load-xlate";
+    case UAM_EXC_STORE_XLATE:      return "store-xlate";
+    }
+    return "?";
+}
+
 /* Bus hook: the running block may just have overwritten its own code, and blocks
  * on that page are stale (so are JIT links into them). */
 /* uam_tcache_remap_fn: do the block's virtual pages still map where its code
@@ -560,15 +578,31 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
 
 /* ---- run loop ---------------------------------------------------------- */
 
+/* --trace exc (exceptions, interrupt entries, resets): from trace_after on. */
+static bool trace_event(const uam_exec *x)
+{
+    return (x->trace & UAM_TRACE_EXC) && x->cpu->icount >= x->trace_after;
+}
+
+/* End a trace line: the processor, when it is not processor 0, as every trace marks it. */
+static void trace_cpu_end(FILE *out, const uam_cpu *cpu)
+{
+    if (cpu->hartid)
+        fprintf(out, " cpu=%u", cpu->hartid);
+    fputc('\n', out);
+}
+
 /* Take a synchronous exception. Returns false if the observer stopped the run
  * instead (the exception is not delivered; cpu->pc is where it would restart). */
 static bool deliver(uam_exec *x, const uam_exception *exc)
 {
-    if (x->trace & UAM_TRACE_EXC)
-        fprintf(x->trace_out, x->cpu->hartid ? "exc: kind=%d pc=0x%llx cause=0x%llx tval=0x%llx cpu=%u\n"
-                                             : "exc: kind=%d pc=0x%llx cause=0x%llx tval=0x%llx\n",
-                exc->kind, (unsigned long long)exc->pc, (unsigned long long)exc->cause,
-                (unsigned long long)exc->tval, x->cpu->hartid);
+    if (trace_event(x)) {
+        fprintf(x->trace_out, "exc: kind=%d (%s) pc=0x%llx cause=0x%llx tval=0x%llx icount=%llu",
+                exc->kind, uam_exc_kind_str(exc->kind), (unsigned long long)exc->pc,
+                (unsigned long long)exc->cause, (unsigned long long)exc->tval,
+                (unsigned long long)x->cpu->icount);
+        trace_cpu_end(x->trace_out, x->cpu);
+    }
     if (x->exc_hook) {
         x->cpu->pc = (exc->flags & UAM_EXC_F_CONT) ? exc->parent_pc : exc->pc;
         if (x->exc_hook(x->exc_hook_ctx, x->cpu, exc) == UAM_HOOK_STOP)
@@ -702,9 +736,12 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
             if (!c->reset_fn)
                 return UAM_STOP_RESET;
             c->stats.resets++;
-            if (c->trace & UAM_TRACE_EXC)
-                fprintf(c->trace_out, "reset: %s\n",
-                        c->reset_kind == UAM_RESET_SYSTEM ? "system" : "cpu");
+            if (trace_event(c)) {
+                fprintf(c->trace_out, "reset: %s icount=%llu",
+                        c->reset_kind == UAM_RESET_SYSTEM ? "system" : "cpu",
+                        (unsigned long long)c->cpu->icount);
+                trace_cpu_end(c->trace_out, c->cpu);
+            }
             c->reset_fn(c->reset_ctx, c->reset_kind);
             for (uint32_t i = 0; i < (c->n_smp ? c->n_smp : 1); i++) {
                 uam_exec *e = c->n_smp ? c->smp[i] : c;
@@ -750,10 +787,14 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         if (isa->irq_take(cpu)) {
             x->stats.interrupts++;
             cpu->waiting = false;
-            if (x->trace & UAM_TRACE_EXC)
-                fprintf(x->trace_out, cpu->hartid ? "irq: entered handler at 0x%llx cpu=%u\n"
-                                                  : "irq: entered handler at 0x%llx\n",
-                        (unsigned long long)cpu->pc, cpu->hartid);
+            if (trace_event(x)) {
+                fprintf(x->trace_out, "irq: entered handler at 0x%llx from pc=0x%llx",
+                        (unsigned long long)cpu->pc, (unsigned long long)from_pc);
+                if (isa->irq_lines)
+                    fprintf(x->trace_out, " lines=0x%llx", (unsigned long long)isa->irq_lines(cpu));
+                fprintf(x->trace_out, " icount=%llu", (unsigned long long)cpu->icount);
+                trace_cpu_end(x->trace_out, cpu);
+            }
             if (x->irq_hook) {
                 const uam_interrupt irq = { .from_pc = from_pc, .handler_pc = cpu->pc,
                                             .lines = isa->irq_lines ? isa->irq_lines(cpu) : 0 };
@@ -863,9 +904,11 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         }
 
 
-        if (x->trace && trace_block(x, blk->guest_pc))
-            fprintf(x->trace_out, "blk 0x%llx icount=%llu\n", (unsigned long long)blk->guest_pc,
+        if (x->trace && trace_block(x, blk->guest_pc)) {
+            fprintf(x->trace_out, "blk 0x%llx icount=%llu", (unsigned long long)blk->guest_pc,
                     (unsigned long long)cpu->icount);
+            trace_cpu_end(x->trace_out, cpu);
+        }
 
         /* 7. Execute (native if compiled, else interpreted) and act on the result.
          * Native code may run on into further blocks without coming back here

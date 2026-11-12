@@ -157,24 +157,6 @@ const uint8_t *uam_fuzz_replay_last_map(const uam_fuzz_replay *r, size_t *size)
     return r->last_map;
 }
 
-static const char *exc_name(uam_exc_kind k)
-{
-    switch (k) {
-    case UAM_EXC_TRAP:             return "trap";
-    case UAM_EXC_FETCH_FAULT:      return "fetch-fault";
-    case UAM_EXC_LOAD_FAULT:       return "load-fault";
-    case UAM_EXC_STORE_FAULT:      return "store-fault";
-    case UAM_EXC_LOAD_MISALIGNED:  return "load-misaligned";
-    case UAM_EXC_STORE_MISALIGNED: return "store-misaligned";
-    case UAM_EXC_SYSREG:           return "sysreg";
-    case UAM_EXC_HELPER:           return "helper";
-    case UAM_EXC_FETCH_XLATE:      return "fetch-xlate";
-    case UAM_EXC_LOAD_XLATE:       return "load-xlate";
-    case UAM_EXC_STORE_XLATE:      return "store-xlate";
-    }
-    return "?";
-}
-
 /* The exit status is the most severe verdict of any input: a crash (the first one
  * seen), else a hang, else a timeout, else a rejected input, else ok. So replaying a
  * directory fails when any input in it does, whatever else (or whatever order) the
@@ -274,7 +256,7 @@ static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint
     case UAM_FUZZ_CRASH_FAULT:
         fprintf(r->out, " pc=0x%llx", (unsigned long long)detail);
         if (res->exc_valid)
-            fprintf(r->out, " (%s cause 0x%llx tval 0x%llx)", exc_name(res->exc.kind),
+            fprintf(r->out, " (%s cause 0x%llx tval 0x%llx)", uam_exc_kind_str(res->exc.kind),
                     (unsigned long long)res->exc.cause, (unsigned long long)res->exc.tval);
         else
             fprintf(r->out, " (%s)", uam_stop_reason_str(res->stop));

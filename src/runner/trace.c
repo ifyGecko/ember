@@ -28,6 +28,13 @@ static void put_origin(FILE *out, bool ok, const uam_origin *o)
         fprintf(out, " cpu=%u", o->cpu);
 }
 
+/* Is an event made now inside the --trace-after window? */
+static bool in_window(const rtrace *t, bool *ok, uam_origin *o)
+{
+    *ok = uam_origin_get(o);
+    return *ok ? o->icount >= t->after : t->after == 0;
+}
+
 /* ---- device accesses --------------------------------------------------------- */
 
 static void on_dev(void *ctx, const uam_region *r, uint64_t addr, unsigned size, bool is_write,
@@ -37,8 +44,8 @@ static void on_dev(void *ctx, const uam_region *r, uint64_t addr, unsigned size,
     if (t->mmio_hi && (addr < t->mmio_lo || addr >= t->mmio_hi))
         return;
     uam_origin o;
-    bool ok = uam_origin_get(&o);
-    if (ok ? o.icount < t->after : t->after != 0)
+    bool ok;
+    if (!in_window(t, &ok, &o))
         return;
     if (r)
         fprintf(t->out, "mmio: %c %u 0x%llx %s+0x%llx = 0x%0*llx", is_write ? 'w' : 'r', size,
@@ -76,7 +83,11 @@ static rt_sysreg *sr_get(rtrace *t, uint32_t id)
 static void on_sysreg(void *ctx, uam_cpu *cpu, uint32_t id, bool write, uint64_t val, uam_status st)
 {
     rtrace *t = ctx;
-    (void)cpu;
+    uam_origin o;
+    bool ok;
+    /* Only accesses in the window count: "first" is the first one from --trace-after on. */
+    if (!in_window(t, &ok, &o))
+        return;
     rt_sysreg *e = sr_get(t, id);
     bool first = false;
     if (e) {
@@ -85,12 +96,11 @@ static void on_sysreg(void *ctx, uam_cpu *cpu, uint32_t id, bool write, uint64_t
             e->first_pc = cpu->insn_pc;
         if (write) e->writes++; else e->reads++;
         if (st != UAM_OK) e->fails++;
+    } else if (!t->sr_dropped++) {
+        fprintf(t->out, "sysreg: more than %u system registers accessed: the first accesses of "
+                "the others are not reported (only those that fault)\n", t->n_sr);
     }
     if (!(t->flags & RT_SYSREG_ALL) && !first && st == UAM_OK)
-        return;
-    uam_origin o;
-    bool ok = uam_origin_get(&o);
-    if (ok ? o.icount < t->after : t->after != 0)
         return;
     fprintf(t->out, "sysreg: %s%s 0x%x %s 0x%llx", (t->flags & RT_SYSREG_ALL) || !first ? "" : "first ",
             write ? "write" : "read", id, write ? "<-" : "=", (unsigned long long)val);
@@ -105,6 +115,10 @@ static void on_sysreg(void *ctx, uam_cpu *cpu, uint32_t id, bool write, uint64_t
 static void on_irq_input(void *ctx, uam_cpu *cpu, unsigned line, int level)
 {
     rtrace *t = ctx;
+    uam_origin o;
+    bool ok;
+    if (!in_window(t, &ok, &o))
+        return;
     rt_irq_line *l = NULL;
     for (uint32_t i = 0; i < t->n_irq; i++)
         if (t->irq[i].cpu == cpu->hartid && t->irq[i].line == line)
@@ -116,11 +130,9 @@ static void on_irq_input(void *ctx, uam_cpu *cpu, unsigned line, int level)
     if (l) {
         if (level) l->rises++; else l->falls++;
         l->level = level;
+    } else {
+        t->irq_dropped++;
     }
-    uam_origin o;
-    bool ok = uam_origin_get(&o);
-    if (ok ? o.icount < t->after : t->after != 0)
-        return;
     fprintf(t->out, "irq-in: cpu%u line %u = %d", cpu->hartid, line, level);
     if (ok)
         fprintf(t->out, " icount=%llu (cpu%u at pc=0x%llx)", (unsigned long long)o.icount, o.cpu,
@@ -215,7 +227,8 @@ void rtrace_finish(rtrace *t)
                 list[n++] = t->sr[i];
         if (list) {
             qsort(list, n, sizeof(*list), sr_cmp);
-            fprintf(t->out, "sysreg: %u system registers accessed (ids as uam/isa/<arch>.h numbers them):\n", n);
+            fprintf(t->out, "sysreg: %u system registers accessed%s (ids as uam/isa/<arch>.h numbers them):\n",
+                    n, t->sr_dropped ? " and more not tracked" : "");
             for (uint32_t i = 0; i < n; i++)
                 fprintf(t->out, "sysreg:   0x%x: %llu reads, %llu writes%s, first at pc=0x%llx\n",
                         list[i].id, (unsigned long long)list[i].reads,
@@ -229,17 +242,33 @@ void rtrace_finish(rtrace *t)
             fprintf(t->out, "irq-in: cpu%u line %u: %llu rises, %llu falls, level %d at the stop\n",
                     t->irq[i].cpu, t->irq[i].line, (unsigned long long)t->irq[i].rises,
                     (unsigned long long)t->irq[i].falls, t->irq[i].level);
+        if (t->irq_dropped)
+            fprintf(t->out, "irq-in: %llu changes on lines beyond the first %u not counted\n",
+                    (unsigned long long)t->irq_dropped, (unsigned)UAM_ARRAY_LEN(t->irq));
         if (!t->n_irq)
             fprintf(t->out, "irq-in: no interrupt input line of a processor changed level\n");
         for (unsigned c = 0; c < uam_machine_ncpus(m); c++) {
             uam_cpu *cpu = uam_machine_cpu(m, c);
             if (cpu->isa->irq_wakeup && cpu->isa->irq_wakeup(cpu))
-                fprintf(t->out, "irq: at the stop cpu%u has an interrupt pending and enabled%s\n", c,
+                fprintf(t->out, "irq-in: at the stop cpu%u has an interrupt pending and enabled%s\n", c,
                         cpu->waiting ? " (waiting: it wakes)" : " (it is taken at the next instruction "
                         "boundary unless interrupts are globally off)");
         }
     }
     fflush(t->out);
+}
+
+void rtrace_restart(rtrace *t)
+{
+    if (!t->m)
+        return;
+    if (t->flags & RT_CONSOLE)
+        console_flush(t);
+    memset(t->sr, 0, sizeof(t->sr));
+    t->n_sr = 0;
+    t->sr_dropped = 0;
+    t->n_irq = 0;
+    t->irq_dropped = 0;
 }
 
 void rtrace_detach(rtrace *t)

@@ -96,8 +96,11 @@ RE_UNIMP_FIRST = re.compile(r"\] unimp: (\S+)\+0x([0-9a-f]+) \(0x([0-9a-f]+)\): 
 RE_UNIMP_SUM = re.compile(r"\] unimp: (\S+): (\d+) accesses to (\d+) unimplemented offsets")
 RE_UNIMP_HOT = re.compile(r"\] unimp:\s+(\S+)\+0x([0-9a-f]+): (\d+) reads, (\d+) writes \(last (0x[0-9a-f]+)\)")
 RE_UNK = re.compile(r"\] (unknown-mmio|master-abort): first (read|write) of (\d) bytes at 0x([0-9a-f]+)")
-RE_EXC = re.compile(r"^exc: kind=(\d+) pc=0x([0-9a-f]+) cause=0x([0-9a-f]+) tval=0x([0-9a-f]+)" + CPU)
-RE_IRQ = re.compile(r"^irq: entered handler at 0x([0-9a-f]+)" + CPU)
+ICOUNT = r"(?: icount=\d+)?"
+RE_EXC = re.compile(r"^exc: kind=(\d+)(?: \([\w-]+\))? pc=0x([0-9a-f]+) cause=0x([0-9a-f]+) tval=0x([0-9a-f]+)"
+                    + ICOUNT + CPU)
+RE_IRQ = re.compile(r"^irq: entered handler at 0x([0-9a-f]+)(?: from pc=0x[0-9a-f]+)?(?: lines=0x[0-9a-f]+)?"
+                    + ICOUNT + CPU)
 RE_RESET = re.compile(r"^reset: (\w+)")
 RE_STOP = re.compile(r"^\S+: (.+?) \(status (-?\d+)\) at pc=0x([0-9a-f]+) after (\d+) instructions")
 RE_STUB_FIRST = re.compile(r"\] mmio-stub: (\S+) \(([^)]*)\): first (read|write) of (\d) bytes at 0x([0-9a-f]+)")
@@ -115,7 +118,7 @@ RE_STAMP = re.compile(r"^@\d+(?::cpu\d+)? ")      # --log-stamp
 RE_MMIO = re.compile(r"^mmio: ([rw]) (\d) 0x([0-9a-f]+) (\S+?)(?:\+0x([0-9a-f]+))? = (0x[0-9a-f]+)")
 RE_IRQ_SUM = re.compile(r"^irq-in: cpu(\d+) line (\d+): (\d+) rises, (\d+) falls, level (-?\d+) at the stop")
 RE_IRQ_NONE = re.compile(r"^irq-in: no interrupt input line")
-RE_IRQ_PEND = re.compile(r"^irq: at the stop (cpu\d+) has an interrupt pending and enabled(.*)")
+RE_IRQ_PEND = re.compile(r"^irq-in: at the stop (cpu\d+) has an interrupt pending and enabled(.*)")
 RE_SYSREG_FAULT = re.compile(r"^sysreg: (?:first )?(read|write) (0x[0-9a-f]+) .*system register exception.*?(?: pc=0x([0-9a-f]+))?")
 RE_CONSOLE_LEFT = re.compile(r"\] chardev: console input: (\d+) byte\(s\) never sent, waiting for '(.*)' \(step")
 PIO_BASE = 0x10000000000

@@ -120,9 +120,14 @@ static void on_access(void *ctx, uint64_t pa, unsigned size, bool is_write, uint
     if (g->spec.action == UAM_GUARD_STOP)
         uam_exec_request_fault_stop(uam_machine_exec(m, hart), &s->last.pc);
     if (g->spec.action == UAM_GUARD_LOG && s->log) {
+        /* The icount, as every trace line has it, so the line can be placed among them. */
         char line[256];
+        uam_origin o;
         uam_guard_hit_format(&s->last, line, sizeof(line));
-        fprintf(s->log, "%s\n", line);
+        if (uam_origin_get(&o))
+            fprintf(s->log, "%s icount=%llu\n", line, (unsigned long long)o.icount);
+        else
+            fprintf(s->log, "%s\n", line);
     }
     if (s->observer)
         s->observer(s->observer_ctx, m, &s->last);

@@ -1,5 +1,6 @@
 #!/bin/sh
-# trace-check.sh RUNNER RV32_SELFTEST_ELF - checks of uam-run's bring-up traces on rv32-ref:
+# trace-check.sh RUNNER RV32_SELFTEST_ELF RV32_SMPTEST_ELF RV32_FUZZTARGET_ELF - checks of
+# uam-run's traces on rv32-ref:
 #   default      a run without --trace prints none of the new trace lines
 #   mmio, sysreg, irq, console
 #                on the RISC-V self-test: the lines are there (the UART's LSR read and THR
@@ -8,9 +9,17 @@
 #   --trace-mmio-range, --trace-after  narrow the mmio trace
 #   catch-alls   the unknown-mmio first-access line names the instruction (pc, icount);
 #                --log-stamp prefixes log lines with the icount
+#   exc          exceptions and interrupt entries name the kind and carry the icount, and
+#                --trace-after holds them back too
+#   sysreg       with --trace-after, first accesses and the summary count from there
+#   names        an unknown trace name is an error (exit 2), not a run that traces nothing
+#   smp          block lines of processors other than 0 say which processor
+#   replay       --fuzz-replay with traces: the boot's section, then one per input
 set -eu
 RUN=$1
 FW=$2
+SMP=$3
+FUZZ=$4
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 fail() { echo "trace-check: FAIL: $*" >&2; exit 1; }
@@ -19,7 +28,7 @@ R="$RUN --raw-base 0x80000000"
 # ---- default: quiet --------------------------------------------------------------
 $RUN "$FW" </dev/null >"$T/out" 2>"$T/err" || fail "self-test failed without traces"
 grep -q 'SELFTEST PASS' "$T/out" || fail "self-test did not pass"
-if grep -Eq '^(mmio|sysreg|irq-in|console):' "$T/err"; then
+if grep -Eq '^(mmio|sysreg|irq-in|irq|exc|reset|console|trace):|^blk ' "$T/err"; then
     fail "trace lines printed without --trace"
 fi
 
@@ -64,5 +73,45 @@ grep -q '^\[warn\] unknown-mmio: first read of 4 bytes at 0x20000014 pc=0x800000
     fail "unknown-mmio first access without its instruction"
 $R --log-stamp --unknown-mmio zero -n 50 "$T/bit.bin" </dev/null >/dev/null 2>"$T/u" || true
 grep -q '^@2 \[warn\] unknown-mmio: first read' "$T/u" || fail "--log-stamp: no icount prefix"
+
+# ---- exc: names, icount, --trace-after ----------------------------------------------
+$RUN -t exc "$FW" </dev/null >/dev/null 2>"$T/exc" || fail "self-test failed with -t exc"
+grep -Eq '^exc: kind=0 \(trap\) pc=0x[0-9a-f]+ cause=0x[0-9a-f]+ tval=0x[0-9a-f]+ icount=[0-9]+$' "$T/exc" ||
+    fail "exc line without its kind name or icount"
+grep -Eq '^exc: kind=6 \(sysreg\) .* icount=[0-9]+$' "$T/exc" || fail "no faulting CSR access in the exc trace"
+grep -Eq '^irq: entered handler at 0x[0-9a-f]+ from pc=0x[0-9a-f]+ lines=0x80 icount=[0-9]+$' "$T/exc" ||
+    fail "interrupt entry without its origin, lines or icount"
+last=$(sed -n 's/^exc: .* icount=\([0-9]*\)$/\1/p' "$T/exc" | tail -1)
+$RUN -t exc --trace-after "$last" "$FW" </dev/null >/dev/null 2>"$T/exc2" || true
+lo=$(sed -n 's/^\(exc\|irq\): .* icount=\([0-9]*\)$/\2/p' "$T/exc2" | sort -n | head -1)
+[ -n "$lo" ] && [ "$lo" -ge "$last" ] || fail "--trace-after $last: an exc/irq line at icount $lo"
+
+# ---- sysreg: the window decides what is first ---------------------------------------
+$RUN -t sysreg --trace-after 3000 "$FW" </dev/null >/dev/null 2>"$T/sr" || true
+if sed -n 's/^sysreg: first .* icount=\([0-9]*\)$/\1/p' "$T/sr" | awk '$1 < 3000 { bad = 1 } END { exit !bad }'; then
+    fail "--trace-after 3000: a sysreg line from before the window"
+fi
+grep -Eq '^sysreg: first (read|write) ' "$T/sr" || fail "no first accesses in the --trace-after window"
+
+# ---- an unknown trace name stops the run before it starts ----------------------------
+rc=0; $RUN -t mmio,nosuch "$FW" </dev/null >/dev/null 2>"$T/bad" || rc=$?
+[ "$rc" = 2 ] || fail "-t nosuch: exit $rc, not 2"
+grep -q "unknown trace 'nosuch'" "$T/bad" || fail "-t nosuch: not named"
+
+# ---- smp: which processor ran a block ------------------------------------------------
+$RUN -o cpus=2 -t blocks -n 20000 "$SMP" </dev/null >/dev/null 2>"$T/smp" || true
+grep -Eq '^blk 0x[0-9a-f]+ icount=[0-9]+ cpu=1$' "$T/smp" || fail "no block line marked cpu=1"
+grep -Eq '^blk 0x[0-9a-f]+ icount=[0-9]+$' "$T/smp" || fail "no block line of processor 0"
+
+# ---- replay: one section per input ---------------------------------------------------
+mkdir "$T/in"
+printf 'hello' >"$T/in/1"
+printf 'again' >"$T/in/2"
+begin=$(readelf -sW "$FUZZ" | awk '$NF == "fuzz_iteration" { print "0x" $2; exit }')
+$RUN --fuzz-begin "$begin" --fuzz-input uart0 -t sysreg --fuzz-replay "$T/in" "$FUZZ" </dev/null \
+    >/dev/null 2>"$T/rp" || fail "replay with traces failed"
+grep '^trace: ' "$T/rp" >"$T/rp.s"
+printf 'trace: the boot to the begin pc ends\ntrace: input 1\ntrace: input 2\n' >"$T/rp.want"
+cmp -s "$T/rp.s" "$T/rp.want" || { cat "$T/rp.s" >&2; fail "replay: trace sections are not boot, input 1, input 2"; }
 
 echo "trace-check: ok"

@@ -125,6 +125,8 @@ typedef enum uam_stop_reason {
 } uam_stop_reason;
 
 const char *uam_stop_reason_str(uam_stop_reason r);
+/* "load-fault", "trap", ...: the name the traces and the replay verdicts give a kind. */
+const char *uam_exc_kind_str(uam_exc_kind k);
 
 enum uam_trace_flag {
     UAM_TRACE_BLOCKS = 1u << 0,  /* each executed block's pc (see trace_lo/hi/after) */

@@ -46,8 +46,10 @@ typedef struct rtrace {
     uam_cpu_observer  obs;
     rt_sysreg         sr[RT_SYSREG_SLOTS];
     uint32_t          n_sr;
+    uint64_t          sr_dropped;         /* accesses to registers the table had no room for */
     rt_irq_line       irq[64];
     uint32_t          n_irq;
+    uint64_t          irq_dropped;        /* changes on lines the table had no room for */
     char              line[200];          /* RT_CONSOLE: the line being printed */
     size_t            len;
     bool              line_origin_ok;
@@ -62,6 +64,10 @@ void     rtrace_attach(rtrace *t, uam_machine *m, uam_chardev *console, FILE *ou
  * lines). TODO: a summary of the device polling loops a run waited in, once a trace
  * can detect polling loops of any shape (the removed --trace polls could not). */
 void     rtrace_finish(rtrace *t);
+/* Start over: a fuzz input begins (the machine is back at the snapshot). Flushes a
+ * partial console line and forgets the first accesses and the counts, so that what
+ * follows, and the next rtrace_finish, is this input's alone. */
+void     rtrace_restart(rtrace *t);
 /* Remove the observers (before the machine goes). */
 void     rtrace_detach(rtrace *t);
 

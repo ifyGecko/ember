@@ -68,7 +68,7 @@ if $X --dump-mem 0x1000 "$FW" </dev/null >/dev/null 2>&1; then fail "--dump-mem 
 
 # --watch / --guard: the self-test's first writes into its scratch area at 0x3000
 $X --watch p:0x3000+4:w -n 20000 "$FW" </dev/null 2>"$T/log" >/dev/null || true
-grep -q '^guard p:0x3000+4:w (log): cpu 0 pc 0x[0-9a-f]* write 2 at 0x3000 (+0) value 0xa55a$' "$T/log" ||
+grep -q '^guard p:0x3000+4:w (log): cpu 0 pc 0x[0-9a-f]* write 2 at 0x3000 (+0) value 0xa55a icount=[0-9]*$' "$T/log" ||
     fail "--watch: the first write is not logged"
 [ "$(grep -c '^guard p:0x3000+4:w' "$T/log")" -ge 2 ] || fail "--watch: the second write is not logged"
 grc=0
