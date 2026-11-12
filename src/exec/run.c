@@ -35,6 +35,7 @@ const char *uam_stop_reason_str(uam_stop_reason r)
     case UAM_STOP_EXC_HOOK:   return "stopped by the exception observer";
     case UAM_STOP_IRQ_HOOK:   return "stopped by the interrupt observer";
     case UAM_STOP_GUARD:      return "guarded memory access";
+    case UAM_STOP_UNMAPPED:   return "access to an unmapped address";
     }
     return "?";
 }
@@ -115,6 +116,9 @@ void uam_exec_fini(uam_exec *x)
     uam_builder_free(&x->b);
     free(x->temps);
     x->temps = NULL;
+    free(x->hist);
+    x->hist = NULL;
+    x->hist_cap = x->hist_n = x->hist_pos = 0;
     free(x->hooks);
     x->hooks = NULL;
     x->n_hooks = x->cap_hooks = 0;
@@ -147,11 +151,83 @@ void uam_exec_stop(uam_exec *x, int64_t status)
     uam_cpu_request_exit(x->cpu);
 }
 
-void uam_exec_request_fault_stop(uam_exec *x, uint64_t *pc_out)
+void uam_exec_request_stop_at_fault(uam_exec *x, uint64_t *pc_out, uam_stop_reason why)
 {
     x->fault_stop = true;
     x->fault_stop_pc = pc_out;
+    x->fault_stop_why = why;
     uam_cpu_request_exit(x->cpu);   /* an absorbed failure: stop at the next boundary */
+}
+
+void uam_exec_request_fault_stop(uam_exec *x, uint64_t *pc_out)
+{
+    uam_exec_request_stop_at_fault(x, pc_out, UAM_STOP_GUARD);
+}
+
+/* ---- execution history ------------------------------------------------- */
+
+uam_status uam_exec_set_history(uam_exec *x, uint32_t n)
+{
+    uam_hist_entry *h = NULL;
+    if (n && !(h = calloc(n, sizeof(*h))))
+        return UAM_ERR_NOMEM;
+    free(x->hist);
+    x->hist = h;
+    x->hist_cap = n;
+    x->hist_n = x->hist_pos = 0;
+    return UAM_OK;
+}
+
+void uam_exec_history_clear(uam_exec *x)
+{
+    x->hist_n = x->hist_pos = 0;
+}
+
+static void hist_add(uam_exec *x, uam_hist_kind kind, uam_exc_kind exc, uint64_t pc, uint64_t a,
+                     uint64_t b)
+{
+    x->hist[x->hist_pos] = (uam_hist_entry){ .kind = kind, .exc = exc, .pc = pc,
+                                             .icount = x->cpu->icount, .a = a, .b = b };
+    x->hist_pos = x->hist_pos + 1 == x->hist_cap ? 0 : x->hist_pos + 1;
+    if (x->hist_n < x->hist_cap)
+        x->hist_n++;
+}
+
+size_t uam_exec_history(const uam_exec *x, uam_hist_entry *out, size_t max)
+{
+    size_t n = x->hist_n < max ? x->hist_n : max;
+    /* the oldest of the newest n */
+    uint32_t start = (x->hist_pos + x->hist_cap - (uint32_t)n) % (x->hist_cap ? x->hist_cap : 1);
+    for (size_t i = 0; i < n; i++)
+        out[i] = x->hist[(start + i) % x->hist_cap];
+    return n;
+}
+
+void uam_exec_history_print(const uam_exec *x, FILE *out, const char *prefix)
+{
+    if (!x->hist)
+        return;
+    fprintf(out, "%scpu%u: the last %u events before the stop (oldest first):\n", prefix,
+            x->cpu->hartid, x->hist_n);
+    for (uint32_t i = 0; i < x->hist_n; i++) {
+        const uam_hist_entry *e = &x->hist[(x->hist_pos + x->hist_cap - x->hist_n + i) % x->hist_cap];
+        switch (e->kind) {
+        case UAM_HIST_BLOCK:
+            fprintf(out, "%s  blk 0x%llx icount=%llu\n", prefix, (unsigned long long)e->pc,
+                    (unsigned long long)e->icount);
+            break;
+        case UAM_HIST_EXC:
+            fprintf(out, "%s  exc %s pc=0x%llx cause=0x%llx tval=0x%llx icount=%llu\n", prefix,
+                    uam_exc_kind_str(e->exc), (unsigned long long)e->pc, (unsigned long long)e->a,
+                    (unsigned long long)e->b, (unsigned long long)e->icount);
+            break;
+        case UAM_HIST_IRQ:
+            fprintf(out, "%s  irq handler 0x%llx from pc=0x%llx lines=0x%llx icount=%llu\n", prefix,
+                    (unsigned long long)e->pc, (unsigned long long)e->a, (unsigned long long)e->b,
+                    (unsigned long long)e->icount);
+            break;
+        }
+    }
 }
 
 /* A requested fault stop (uam_exec_request_fault_stop): at the faulting instruction
@@ -164,7 +240,7 @@ static uam_stop_reason fault_stopped(uam_exec *x, const uam_exception *exc)
         *x->fault_stop_pc = x->cpu->pc;
     x->fault_stop = false;
     x->fault_stop_pc = NULL;
-    return UAM_STOP_GUARD;
+    return x->fault_stop_why;
 }
 
 void uam_exec_request_reset(uam_exec *x, uam_reset_kind kind)
@@ -609,6 +685,10 @@ static bool deliver(uam_exec *x, const uam_exception *exc)
             return false;
     }
     x->stats.exceptions++;
+    if (x->hist)
+        hist_add(x, UAM_HIST_EXC, exc->kind, exc->pc, exc->cause, exc->tval);
+    if (x->cpu->obs && x->cpu->obs->exception)
+        x->cpu->obs->exception(x->cpu->obs->ctx, x->cpu, exc);
     x->cpu->isa->take_exception(x->cpu, exc);
     return true;
 }
@@ -787,6 +867,13 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         if (isa->irq_take(cpu)) {
             x->stats.interrupts++;
             cpu->waiting = false;
+            if (x->hist || (cpu->obs && cpu->obs->interrupt)) {
+                const uint64_t lines = isa->irq_lines ? isa->irq_lines(cpu) : 0;
+                if (x->hist)
+                    hist_add(x, UAM_HIST_IRQ, UAM_EXC_TRAP, cpu->pc, from_pc, lines);
+                if (cpu->obs && cpu->obs->interrupt)
+                    cpu->obs->interrupt(cpu->obs->ctx, cpu, from_pc, cpu->pc, lines);
+            }
             if (trace_event(x)) {
                 fprintf(x->trace_out, "irq: entered handler at 0x%llx from pc=0x%llx",
                         (unsigned long long)cpu->pc, (unsigned long long)from_pc);
@@ -904,6 +991,8 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         }
 
 
+        if (x->hist)
+            hist_add(x, UAM_HIST_BLOCK, UAM_EXC_TRAP, blk->guest_pc, 0, 0);
         if (x->trace && trace_block(x, blk->guest_pc)) {
             fprintf(x->trace_out, "blk 0x%llx icount=%llu", (unsigned long long)blk->guest_pc,
                     (unsigned long long)cpu->icount);
@@ -917,7 +1006,7 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         uam_block_result r;
         if (blk->backend && blk->backend != UAM_JIT_INTERP) {
             uam_jit_chain ch = { .budget = 0, .link = false };
-            if (x->chain && !(x->trace & UAM_TRACE_BLOCKS)) {
+            if (x->chain && !(x->trace & UAM_TRACE_BLOCKS) && !x->hist) {
                 ch.budget = !c->host.poll ? CHAIN_MAX
                           : c->blocks_since_poll < c->host.poll_interval
                               ? c->host.poll_interval - 1 - c->blocks_since_poll : 0;

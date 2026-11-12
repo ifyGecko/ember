@@ -359,6 +359,22 @@ void uam_machine_set_cpu_observer(uam_machine *m, const uam_cpu_observer *obs)
         uam_exec_set_cpu_observer(uam_machine_exec(m, i), obs);
 }
 
+uam_status uam_machine_set_history(uam_machine *m, uint32_t n)
+{
+    for (uint32_t i = 0; i <= m->n_aps; i++) {
+        uam_status st = uam_exec_set_history(uam_machine_exec(m, i), n);
+        if (st != UAM_OK)
+            return st;
+    }
+    return UAM_OK;
+}
+
+void uam_machine_history_clear(uam_machine *m)
+{
+    for (uint32_t i = 0; i <= m->n_aps; i++)
+        uam_exec_history_clear(uam_machine_exec(m, i));
+}
+
 uam_status uam_machine_add_pass(uam_machine *m, const uam_pass *p)
 {
     for (uint32_t i = 0; i <= m->n_aps; i++) {

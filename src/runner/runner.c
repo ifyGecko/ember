@@ -235,7 +235,10 @@ static void usage(FILE *out)
         "      --quantum N         with several processors, run each N instructions at a\n"
         "                          time before the next (default 4096)\n"
         "      --ram SIZE          RAM size in bytes (suffix K/M/G allowed)\n"
-        "      --unknown-mmio P    unmapped accesses: fault (default), zero, echo\n"
+        "      --unknown-mmio P    unmapped accesses: fault (default), zero, echo, or stop: the\n"
+        "                          first one does not happen and the run stops at its\n"
+        "                          instruction (exit 131; -d, --dump-mem, --save-snapshot\n"
+        "                          apply there)\n"
         "      --mmio-rule RULE    answer unmodelled registers (repeatable; later rules win):\n"
         "                          ADDR[+SIZE]=POLICY[,width=N][,set=MASK][,clear=MASK]\n"
         "                          POLICY: zero, echo, fixed:VALUE, fault, input\n"
@@ -258,9 +261,14 @@ static void usage(FILE *out)
         "                          blocks  every block executed (also with --jit, which does\n"
         "                                  not chain blocks while tracing)\n"
         "                          ir      the IR of each translated block\n"
-        "                          exc     exceptions, interrupts taken, resets\n"
+        "                          exc     exceptions, interrupts taken, resets; at the stop,\n"
+        "                                  the exceptions by kind, cause and pc, and the\n"
+        "                                  interrupt handlers entered\n"
         "                          mmio    every access a device serves (MMIO, ROM devices,\n"
-        "                                  unmapped; x86 ports), with value, pc and icount\n"
+        "                                  unmapped; x86 ports), with value, pc and icount;\n"
+        "                                  at the stop, a summary per register (counts, the\n"
+        "                                  value reads always or last returned, the last\n"
+        "                                  write); mmio-summary: only that summary\n"
         "                          sysreg  the first read and write of each system register\n"
         "                                  (CSR, CP0, CP15, SPR, MSR, ...) and every one that\n"
         "                                  faults, with a summary at the stop; sysreg-all: all\n"
@@ -268,7 +276,10 @@ static void usage(FILE *out)
         "                                  level; at the stop, each line's counts and whether\n"
         "                                  an interrupt is pending and enabled\n"
         "                          console each line the guest prints, with its icount and pc\n"
-        "                          all     exc, mmio, sysreg, irq, console\n"
+        "                          dma     every DMA transfer a device makes (address,\n"
+        "                                  length, direction)\n"
+        "                          all     exc, mmio, sysreg, irq, console, dma\n"
+        "      --trace-file FILE   write the traces (and --watch, --history) to FILE, not stderr\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
         "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI)\n"
         "      --trace-after N     trace only once the instruction count reaches N (every\n"
@@ -278,7 +289,12 @@ static void usage(FILE *out)
         "                          N instructions after the run starts\n"
         "      --log-stamp         start each log line made while the guest runs with\n"
         "                          @ICOUNT (@ICOUNT:cpuN on other processors)\n"
-        "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
+        "      --log-pc ADDR[,REG...]  log each arrival at ADDR (repeatable), with the values\n"
+        "                          of the registers named (as gdb names them: a0, r3, eax, ...)\n"
+        "      --history N         keep each processor's last N events (blocks entered,\n"
+        "                          exceptions, interrupt entries) and print them at the stop\n"
+        "                          (fuzzing: for each input that is not ok); --jit does not\n"
+        "                          chain blocks while it is on\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
         "      --guard SPEC        guard guest memory (repeatable): a data access that\n"
         "                          touches it stops the run before it happens (exit 129).\n"
@@ -376,16 +392,17 @@ static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
     for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
         if (!strcmp(tok, "blocks"))     *t |= UAM_TRACE_BLOCKS;
         else if (!strcmp(tok, "ir"))    *t |= UAM_TRACE_IR;
-        else if (!strcmp(tok, "exc"))   *t |= UAM_TRACE_EXC;
+        else if (!strcmp(tok, "exc"))   { *t |= UAM_TRACE_EXC; *rt |= RT_EXC_SUM; }
         /* TODO: a trace that detects device polling loops of any shape ("polls" was
          * removed: it only found single-block loops; see the TODO at the end of
          * src/exec/spin.c). */
         else if (!strcmp(tok, "all"))   { *t |= UAM_TRACE_EXC;
-                                          *rt |= RT_MMIO | RT_SYSREG | RT_IRQ | RT_CONSOLE; }
+                                          *rt |= RT_EXC_SUM | RT_MMIO | RT_SYSREG | RT_IRQ
+                                               | RT_CONSOLE | RT_DMA; }
         else if (rtrace_flag(tok))      *rt |= rtrace_flag(tok);
         else {
-            fprintf(stderr, "uam-run: unknown trace '%s' (traces: blocks, ir, exc, mmio, sysreg, "
-                    "sysreg-all, irq, console, all)\n", tok);
+            fprintf(stderr, "uam-run: unknown trace '%s' (traces: blocks, ir, exc, mmio, "
+                    "mmio-summary, sysreg, sysreg-all, irq, console, dma, all)\n", tok);
             ok = false;
         }
     }
@@ -436,14 +453,127 @@ static const char *cpu_tag(const uam_cpu *cpu, char *buf, size_t n)
     return buf;
 }
 
+/* --log-pc ADDR[,REG...]: the hit count and the registers to show. */
+#define LOG_PC_REGS 16
+typedef struct log_pc_ctx {
+    uint64_t hits;
+    unsigned n_regs;
+    unsigned regno[LOG_PC_REGS];
+    char     name[LOG_PC_REGS][24];
+} log_pc_ctx;
+
 static uam_hook_action log_pc_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
 {
-    uint64_t *hits = ctx;
+    log_pc_ctx *l = ctx;
     char tag[24];
-    (*hits)++;
-    fprintf(stderr, "uam-run: pc 0x%llx reached (hit %llu, icount %llu%s)\n", (unsigned long long)pc,
-            (unsigned long long)*hits, (unsigned long long)cpu->icount, cpu_tag(cpu, tag, sizeof(tag)));
+    l->hits++;
+    fprintf(stderr, "uam-run: pc 0x%llx reached (hit %llu, icount %llu%s)", (unsigned long long)pc,
+            (unsigned long long)l->hits, (unsigned long long)cpu->icount, cpu_tag(cpu, tag, sizeof(tag)));
+    for (unsigned i = 0; i < l->n_regs; i++) {
+        uint64_t v;
+        if (cpu->isa->gdb->read_reg(cpu, l->regno[i], &v))
+            fprintf(stderr, " %s=0x%llx", l->name[i], (unsigned long long)v);
+        else
+            fprintf(stderr, " %s=?", l->name[i]);
+    }
+    fputc('\n', stderr);
     return UAM_HOOK_CONTINUE;
+}
+
+typedef struct name_list {
+    FILE    *out;
+    unsigned n;
+} name_list;
+
+static void put_reg_name(void *ctx, const char *name, unsigned regno)
+{
+    name_list *l = ctx;
+    (void)regno;
+    fprintf(l->out, "%s%s", l->n++ ? " " : "", name);
+}
+
+/* Resolve "REG,REG,..." (as the ISA's debugger view names them) into l. */
+static bool log_pc_regs(log_pc_ctx *l, const uam_isa *isa, const char *list, uint64_t pc)
+{
+    char *copy = strdup(list);
+    bool ok = copy != NULL;
+    for (char *tok = ok ? strtok(copy, ",") : NULL; ok && tok; tok = strtok(NULL, ",")) {
+        unsigned r;
+        if (l->n_regs == LOG_PC_REGS || strlen(tok) >= sizeof(l->name[0])) {
+            fprintf(stderr, "uam-run: --log-pc 0x%llx: at most %d registers\n", (unsigned long long)pc,
+                    LOG_PC_REGS);
+            ok = false;
+        } else if (!isa->gdb || !isa->gdb->read_reg || !uam_isa_reg_by_name(isa, tok, &r)) {
+            fprintf(stderr, "uam-run: --log-pc 0x%llx: no register '%s'", (unsigned long long)pc, tok);
+            if (isa->gdb) {
+                name_list nl = { .out = stderr };
+                fprintf(stderr, " (registers: ");
+                uam_isa_reg_names(isa, put_reg_name, &nl);
+                fputc(')', stderr);
+            }
+            fputc('\n', stderr);
+            ok = false;
+        } else {
+            l->regno[l->n_regs] = r;
+            strcpy(l->name[l->n_regs++], tok);
+        }
+    }
+    free(copy);
+    return ok;
+}
+
+/* ---- --unknown-mmio stop --------------------------------------------------- */
+
+/* The bus's unmapped device for the stop policy: the first access to an address nothing
+ * decodes does not happen, and the run stops at the instruction that made it. */
+typedef struct stop_unmapped {
+    uam_device   dev;
+    uam_machine *m;
+    bool         hit;
+    uint64_t     addr, val;
+    unsigned     size;
+    bool         is_write;
+    uam_origin   at;
+    bool         at_ok;
+} stop_unmapped;
+
+static uam_status su_access(uam_device *d, uint64_t addr, unsigned size, bool is_write, uint64_t val)
+{
+    stop_unmapped *s = UAM_CONTAINER_OF(d, stop_unmapped, dev);
+    if (!s->hit) {
+        s->hit = true;
+        s->addr = addr;
+        s->size = size;
+        s->is_write = is_write;
+        s->val = val;
+        s->at_ok = uam_origin_get(&s->at);
+    }
+    uam_exec_request_stop_at_fault(uam_machine_exec(s->m, uam_machine_current_cpu(s->m)), NULL,
+                                   UAM_STOP_UNMAPPED);
+    return UAM_ERR_FAULT;
+}
+
+static uam_status su_read(uam_device *d, uint64_t addr, unsigned size, uint64_t *val)
+{
+    *val = 0;
+    return su_access(d, addr, size, false, 0);
+}
+
+static uam_status su_write(uam_device *d, uint64_t addr, unsigned size, uint64_t val)
+{
+    return su_access(d, addr, size, true, val);
+}
+
+static const uam_device_ops stop_unmapped_ops = {
+    .type = "uam-run,stop-unmapped", .read = su_read, .write = su_write,
+};
+
+/* ---- --history ---------------------------------------------------------------- */
+
+static void print_history(uam_machine *m, FILE *out)
+{
+    for (unsigned i = 0, n = uam_machine_ncpus(m); i < n; i++)
+        uam_exec_history_print(uam_machine_exec(m, i), out, "history: ");
 }
 
 /* --snapshot-at: save once, on the first arrival. */
@@ -485,6 +615,8 @@ typedef struct trace_fe {
     const uam_fuzz_frontend *fe;
     void                    *ctx;
     rtrace                  *rt;
+    uam_machine             *m;
+    bool                     history;   /* --history: print it for each input that is not ok */
 } trace_fe;
 
 static uam_status trace_fe_hello(void *ctx, const uam_fuzz_info *info)
@@ -499,6 +631,8 @@ static int trace_fe_next(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     int rc = t->fe->next_input(t->ctx, data, len, id);
     if (rc > 0) {
         rtrace_restart(t->rt);
+        if (t->history)
+            uam_machine_history_clear(t->m);
         fprintf(t->rt->out, "trace: input %llu\n", (unsigned long long)*id);
     }
     return rc;
@@ -510,6 +644,8 @@ static uam_status trace_fe_report(void *ctx, uint64_t id, uam_fuzz_verdict v, ui
     trace_fe *t = ctx;
     if (kind == UAM_FUZZ_KIND_INIT)
         fprintf(t->rt->out, "trace: the boot to the begin pc ends\n");
+    else if (t->history && v != UAM_FUZZ_OK)
+        print_history(t->m, t->rt->out);
     rtrace_finish(t->rt);
     return t->fe->report(t->ctx, id, v, detail, map, map_size, kind);
 }
@@ -578,8 +714,10 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
         .fe = xs->frontend ? xs->frontend : &uam_fuzz_replay_frontend,
         .ctx = xs->frontend ? xs->frontend_ctx : r,
         .rt = rt,
+        .m = m,
+        .history = m->exec.hist != NULL,
     };
-    uam_status st = rt->flags || m->exec.trace ? uam_fuzz_run(f, &trace_frontend, &tfe)
+    uam_status st = rt->flags || m->exec.trace || tfe.history ? uam_fuzz_run(f, &trace_frontend, &tfe)
                               : uam_fuzz_run(f, tfe.fe, tfe.ctx);
     g_fuzz = NULL;
     fflush(stdout);
@@ -640,7 +778,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
-           OPT_LOG_STAMP, OPT_EXT_BASE = 1000 };
+           OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -666,6 +804,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "trace-after", required_argument, NULL, OPT_TRACE_AFTER },
         { "trace-mmio-range", required_argument, NULL, OPT_TRACE_MMIO_RANGE },
         { "log-stamp", no_argument, NULL, OPT_LOG_STAMP },
+        { "trace-file", required_argument, NULL, OPT_TRACE_FILE },
+        { "history", required_argument, NULL, OPT_HISTORY },
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
         { "guard", required_argument, NULL, OPT_GUARD },
@@ -715,8 +855,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint64_t raw_base = 0, entry = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
     uint64_t max_ticks = 0, max_stall = UAM_EXEC_DEFAULT_MAX_STALL;
     uint32_t quantum = 0;
-    uint64_t realtime_tps = 0, *log_hits = NULL;
+    uint64_t realtime_tps = 0;
+    log_pc_ctx *log_hits = NULL;
     pc_list log_pcs = { 0 }, break_pcs = { 0 };
+    char **log_pc_regs_text = NULL;   /* per --log-pc: its ",REG..." (NULL: none) */
+    const char *trace_file = NULL;
+    FILE *trace_fp = NULL;
+    uint32_t history = 0;
+    bool unknown_stop = false;
+    stop_unmapped *su = NULL;
     const char *guard_texts[MAX_LIST];
     uam_guard_action guard_dflt[MAX_LIST];
     unsigned n_guards = 0;
@@ -868,12 +1015,40 @@ static int run_main(int argc, char **argv, const ext_set *es)
             trace_after = strtoull(optarg + trace_after_rel, NULL, 0);
             break;
         case OPT_LOG_PC:
-        case OPT_BREAK:
-            if (!pc_list_add(c == OPT_LOG_PC ? &log_pcs : &break_pcs, strtoull(optarg, NULL, 0))) {
+        case OPT_BREAK: {
+            char *end;
+            uint64_t pc = strtoull(optarg, &end, 0);
+            if (end == optarg || (*end && !(c == OPT_LOG_PC && *end == ',' && end[1]))) {
+                fprintf(stderr, "uam-run: bad --%s '%s'%s\n", c == OPT_LOG_PC ? "log-pc" : "break",
+                        optarg, c == OPT_LOG_PC ? " (ADDR[,REG...])" : "");
+                return 2;
+            }
+            if (!pc_list_add(c == OPT_LOG_PC ? &log_pcs : &break_pcs, pc)) {
                 fprintf(stderr, "uam-run: out of memory\n");
                 return 2;
             }
+            if (c == OPT_LOG_PC) {
+                char **nt = realloc(log_pc_regs_text, sizeof(*nt) * log_pcs.cap);
+                if (!nt) {
+                    fprintf(stderr, "uam-run: out of memory\n");
+                    return 2;
+                }
+                log_pc_regs_text = nt;
+                log_pc_regs_text[log_pcs.n - 1] = *end ? end + 1 : NULL;
+            }
             break;
+        }
+        case OPT_TRACE_FILE: trace_file = optarg; break;
+        case OPT_HISTORY: {
+            char *end;
+            unsigned long n = strtoul(optarg, &end, 0);
+            if (*end || !n || n > 1000000) {
+                fprintf(stderr, "uam-run: bad --history '%s' (events to keep, 1..1000000)\n", optarg);
+                return 2;
+            }
+            history = (uint32_t)n;
+            break;
+        }
         case OPT_GUARD:
         case OPT_WATCH: {
             uam_guard_spec gs;
@@ -906,7 +1081,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
             if (!strcmp(optarg, "fault"))     cfg.unknown_mmio = UAM_UNKNOWN_FAULT;
             else if (!strcmp(optarg, "zero")) cfg.unknown_mmio = UAM_UNKNOWN_ZERO;
             else if (!strcmp(optarg, "echo")) cfg.unknown_mmio = UAM_UNKNOWN_ECHO;
+            else if (!strcmp(optarg, "stop")) cfg.unknown_mmio = UAM_UNKNOWN_FAULT;
             else { fprintf(stderr, "uam-run: bad --unknown-mmio '%s'\n", optarg); return 2; }
+            unknown_stop = !strcmp(optarg, "stop");
             break;
         case OPT_MMIO_RULE: {
             char err[128];
@@ -1009,6 +1186,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
         if (es->ext[e]->provides)
             provides |= es->ext[e]->provides(es->st[e]);
     const bool fuzzing = have_begin || (provides & UAM_RUNNER_EXT_BEGIN);
+    if (unknown_stop && fuzzing) {
+        fprintf(stderr, "uam-run: --unknown-mmio stop is for bring-up runs; fuzzing takes fault, "
+                "zero or echo\n");
+        return 2;
+    }
+    if (trace_file && !(trace_fp = fopen(trace_file, "w"))) {
+        fprintf(stderr, "uam-run: cannot write --trace-file %s\n", trace_file);
+        return 2;
+    }
     if ((have_begin || n_fuzz_end) && (provides & UAM_RUNNER_EXT_BEGIN)) {
         fprintf(stderr, "uam-run: --fuzz-begin/--fuzz-end and a boundary file both set the "
                 "iteration boundaries\n");
@@ -1105,6 +1291,16 @@ static int run_main(int argc, char **argv, const ext_set *es)
         if (!nics[i].nd->receive)
             fprintf(stderr, "uam-run: board '%s' has no network port '%s'; --nic %s=... is unused\n",
                     board_name, nics[i].name, nics[i].name);
+    if (unknown_stop) {
+        /* Not one of the machine's devices: no snapshot state, and the runner frees it. */
+        if (!(su = calloc(1, sizeof(*su)))) {
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        uam_device_init(&su->dev, &stop_unmapped_ops, "unmapped");
+        su->m = &m;
+        uam_bus_set_unmapped(&m.bus, &su->dev);
+    }
     if (mmio_input_path || mmio_input_rule) {
         if (mmio_input_path && !read_file(mmio_input_path, &mmio_input_data, &mmio_input_len)) {
             fprintf(stderr, "uam-run: cannot read --mmio-input %s\n", mmio_input_path);
@@ -1168,6 +1364,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
     }
 
+    if (trace_fp) {
+        m.exec.trace_out = trace_fp;
+        uam_machine_set_guard_log(&m, trace_fp);
+    }
+    if (history && uam_machine_set_history(&m, history) != UAM_OK) {
+        fprintf(stderr, "uam-run: out of memory for --history %u\n", (unsigned)history);
+        uam_machine_fini(&m);
+        goto out_host;
+    }
     m.exec.trace = trace;
     m.exec.trace_lo = trace_lo;
     m.exec.trace_hi = trace_hi;
@@ -1192,8 +1397,14 @@ static int run_main(int argc, char **argv, const ext_set *es)
         m.exec.max_block_insns = block_insns;
     log_hits = calloc(log_pcs.n ? log_pcs.n : 1, sizeof(*log_hits));
     bool hooks_ok = log_hits != NULL;
-    for (unsigned i = 0; hooks_ok && i < log_pcs.n; i++)
+    for (unsigned i = 0; hooks_ok && i < log_pcs.n; i++) {
+        if (log_pc_regs_text[i] && !log_pc_regs(&log_hits[i], m.cpu.isa, log_pc_regs_text[i], log_pcs.pc[i])) {
+            uam_machine_fini(&m);
+            rc = 2;
+            goto out_host;
+        }
         hooks_ok = uam_machine_add_pc_hook(&m, log_pcs.pc[i], log_pc_hook, &log_hits[i]) == UAM_OK;
+    }
     snap_at snap_hook = { .m = &m, .path = save_snap };
     if (hooks_ok && have_snap_at)
         hooks_ok = uam_machine_add_pc_hook(&m, snap_at_pc, snapshot_at_hook, &snap_hook) == UAM_OK;
@@ -1362,6 +1573,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     case UAM_STOP_DEBUG:
     case UAM_STOP_HOOK:       rc = 127; break;
     case UAM_STOP_GUARD:      rc = 129; break;
+    case UAM_STOP_UNMAPPED:   rc = 131; break;
     default:                  rc = 126; break;
     }
 
@@ -1371,10 +1583,22 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: %s\n", line);
     }
 
+    if (!fuzzing && why == UAM_STOP_UNMAPPED && su && su->hit) {
+        fprintf(stderr, "uam-run: unmapped %s of %u bytes at 0x%llx", su->is_write ? "write" : "read",
+                su->size, (unsigned long long)su->addr);
+        if (su->is_write)
+            fprintf(stderr, ": 0x%llx", (unsigned long long)su->val);
+        if (su->at_ok)
+            fprintf(stderr, " by cpu %u pc 0x%llx (icount %llu)", su->at.cpu,
+                    (unsigned long long)su->at.pc, (unsigned long long)su->at.icount);
+        fprintf(stderr, ": nothing decodes it; the access did not happen\n");
+    }
     if (!fuzzing)
         fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
                 uam_stop_reason_str(why), (long long)m.exec.stop_status,
                 (unsigned long long)m.cpu.pc, (unsigned long long)uam_machine_icount(&m));
+    if (!fuzzing && history)
+        print_history(&m, m.exec.trace_out);
     if (!fuzzing)
         rtrace_finish(&rt);
     if (stats) {
@@ -1475,8 +1699,14 @@ out_host:
     free(cov_map);   /* after the machine: the hart pointed at it */
     free(uart_input_spec);
     free(log_pcs.pc);
+    free(log_pc_regs_text);
     free(break_pcs.pc);
     free(log_hits);   /* after the machine: the log hooks counted into it */
+    free(su);         /* after the machine: it was the bus's unmapped device */
+    if (trace_fp && fclose(trace_fp) != 0 && rc == 0) {
+        fprintf(stderr, "uam-run: writing --trace-file %s failed\n", trace_file);
+        rc = 2;
+    }
     return rc;
 }
 

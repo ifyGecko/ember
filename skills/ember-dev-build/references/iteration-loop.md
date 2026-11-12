@@ -48,6 +48,7 @@ input give **the same run, instruction for instruction**. Consequences:
   the hart at exactly instruction N; `--trace blocks --trace-after N --trace-range LO:HI` shows
   the blocks executed after that point (N is the absolute icount the runner prints, also
   after `--load-snapshot`; `+N` counts from the run's start); rerunning gives the identical
+  trace. For only the last stretch before a stop, `--history N` is cheaper than a full block
   trace.
 - Compare before/after an edit by diffing two logs from the same `-n`.
 - Interpreter vs `--jit` must agree (the JIT chains blocks by default; `--no-chain` turns
@@ -117,6 +118,12 @@ reports it: the prompt never came). Patterns only match output of the current ru
 | `irq-in: cpuN line L = 0\|1 icount=..`; `irq-in: cpuN line L: R rises, F falls, level V at the stop`; `irq-in: at the stop cpuN has an interrupt pending and enabled ...` | `--trace irq`: a processor's interrupt inputs |
 | `sysreg: first read\|write 0xID = 0xVAL pc=..`, `sysreg:   0xID: R reads, W writes` | `--trace sysreg`: system registers (ids as `uam/isa/<arch>.h` numbers them); a faulting access says so |
 | `console: icount=N pc=.. "text"` | `--trace console`: each console line and where in the run it was printed |
+| `mmio:   0xADDR dev+0xOFF: R reads (always\|last 0xV), W writes (last 0xV), first pc=..`; `mmio: most accessed: ..` | `--trace mmio` / `mmio-summary`, at the stop: each device register the firmware used; "always" on a hot register is what a polling loop keeps getting |
+| `exc:   KIND cause=.. pc=..: N times ..`; `irq:   0xHANDLER: N times ..` | `--trace exc`, at the stop: exceptions by kind, cause and pc; interrupt handlers entered |
+| `dma: r\|w LEN 0xADDR region+0xOFF pc=.. icount=N` | `--trace dma`: a device's DMA transfer |
+| `history: cpuN: the last K events ...`, `history:   blk\|exc\|irq ...` | `--history N`: the path to the stop, oldest first |
+| `uam-run: unmapped read\|write of S bytes at 0x.. by cpu N pc 0x.. (icount N)` | `--unknown-mmio stop`: the access that stopped the run (exit 131) |
+| `uam-run: pc 0x.. reached (hit H, icount N) a0=0x.. ra=0x..` | `--log-pc ADDR,a0,ra`: the registers at each arrival |
 | `@ICOUNT [warn] ...` | `--log-stamp`: the icount at which a log line was made |
 | `<runner>: <reason> (status N) at pc=.. after N instructions` | how the run ended |
 
@@ -132,6 +139,7 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 | exit 124, no hot offset, pc in a small range | spinning on RAM or a register that is now storage, or a delay loop calibrated against a timer that never moves | `-n N -d` / gdb: find the loop (below) |
 | exit 124 "virtual time limit" (`--max-ticks`), few instructions | the hart mostly idled: a tick arrives, but too rarely or not where the guest looks | check the timer's rate (`ticks_per_count`) and which interrupt the guest enabled |
 | exit 129 (guarded memory access) | a data access touched a `--guard` range; the guard line names pc, access and address | the code at that pc (who writes there, and why) |
+| exit 131 (access to an unmapped address) | `--unknown-mmio stop`: the first access nothing decodes; the `unmapped read\|write` line names address, pc and icount | decompile that pc; add the window or device, or answer it with `--mmio-rule`; `-d` / `--history N` show the state and the path there |
 | exit 125 (deadlock) | the guest executed WAIT and nothing can wake it: the tick timer or the interrupt it waits for is not modelled or not wired | model the timer / wire its line through the interrupt controller to the right CPU input; `--trace irq` shows whether any CPU input line ever rose, and `--trace mmio` on the interrupt controller what the guest unmasked |
 | exit 128 (livelock) | WAIT while a timer keeps firing but its interrupt is never delivered (unwired line, masked in the intc, wrong Cause.IP / mip bit), or a device re-arms a timer by itself | as for exit 125: follow the timer's line to the CPU input the guest enabled |
 | `core halted` in the log, then exit 125 | an AVR, 8-bit PIC, 8051, 6502 or Z80 reached an access nothing answers (`--unknown-mmio fault`, a write to ROM, a fetch where no memory is). These cores have no bus error to raise, so the hart stops; no timer is missing | the line's address is a bus address (`board-skeleton.md`, "Address spaces"): give it a device, RAM or a catch-all window |

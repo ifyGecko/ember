@@ -16,6 +16,8 @@ unsigned rtrace_flag(const char *tok)
     if (!strcmp(tok, "sysreg-all")) return RT_SYSREG_ALL;
     if (!strcmp(tok, "irq"))        return RT_IRQ;
     if (!strcmp(tok, "console"))    return RT_CONSOLE;
+    if (!strcmp(tok, "mmio-summary")) return RT_MMIO_SUM;
+    if (!strcmp(tok, "dma"))        return RT_DMA;
     return 0;
 }
 
@@ -37,6 +39,52 @@ static bool in_window(const rtrace *t, bool *ok, uam_origin *o)
 
 /* ---- device accesses --------------------------------------------------------- */
 
+static rt_reg *reg_get(rtrace *t, uint64_t addr)
+{
+    uint32_t h = (uint32_t)((addr * UINT64_C(0x9E3779B97F4A7C15)) >> 40) & (RT_MMIO_SLOTS - 1);
+    for (uint32_t k = 0; k < RT_MMIO_SLOTS; k++) {
+        rt_reg *e = &t->reg[(h + k) & (RT_MMIO_SLOTS - 1)];
+        if (e->used && e->addr == addr)
+            return e;
+        if (!e->used) {
+            if (t->n_reg * 4 >= RT_MMIO_SLOTS * 3)
+                return NULL;
+            *e = (rt_reg){ .used = true, .addr = addr, .read_const = true };
+            t->n_reg++;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void reg_count(rtrace *t, const uam_region *r, uint64_t addr, bool is_write, uint64_t val,
+                      uam_status st, const uam_origin *o, bool ok)
+{
+    rt_reg *e = reg_get(t, addr);
+    if (!e) {
+        t->reg_dropped++;
+        return;
+    }
+    if (!e->reads && !e->writes) {
+        e->region = r ? r->name : NULL;
+        e->off = r ? addr - r->base : 0;
+        e->first_pc = ok ? o->pc : 0;
+    }
+    if (st != UAM_OK)
+        e->faulted = true;
+    if (is_write) {
+        e->writes++;
+        e->last_write = val;
+    } else {
+        if (!e->reads)
+            e->first_read = val;
+        else if (val != e->first_read)
+            e->read_const = false;
+        e->reads++;
+        e->last_read = val;
+    }
+}
+
 static void on_dev(void *ctx, const uam_region *r, uint64_t addr, unsigned size, bool is_write,
                    uint64_t val, uam_status st)
 {
@@ -46,6 +94,9 @@ static void on_dev(void *ctx, const uam_region *r, uint64_t addr, unsigned size,
     uam_origin o;
     bool ok;
     if (!in_window(t, &ok, &o))
+        return;
+    reg_count(t, r, addr, is_write, val, st, &o, ok);
+    if (!(t->flags & RT_MMIO))
         return;
     if (r)
         fprintf(t->out, "mmio: %c %u 0x%llx %s+0x%llx = 0x%0*llx", is_write ? 'w' : 'r', size,
@@ -140,6 +191,68 @@ static void on_irq_input(void *ctx, uam_cpu *cpu, unsigned line, int level)
     fputc('\n', t->out);
 }
 
+/* ---- exceptions and interrupt entries ------------------------------------------- */
+
+static void exc_count(rtrace *t, unsigned kind, unsigned cpu, uint64_t cause, uint64_t pc,
+                      uint64_t tval, uint64_t icount)
+{
+    for (uint32_t i = 0; i < t->n_exc; i++) {
+        rt_exc *e = &t->exc[i];
+        if (e->kind == kind && e->cpu == cpu && e->cause == cause && e->pc == pc) {
+            e->count++;
+            e->last_tval = tval;
+            return;
+        }
+    }
+    if (t->n_exc == RT_EXC_SLOTS) {
+        t->exc_dropped++;
+        return;
+    }
+    t->exc[t->n_exc++] = (rt_exc){ .kind = kind, .cpu = cpu, .cause = cause, .pc = pc, .count = 1,
+                                   .last_tval = tval, .first_icount = icount };
+}
+
+static void on_exception(void *ctx, uam_cpu *cpu, const struct uam_exception *exc)
+{
+    rtrace *t = ctx;
+    uam_origin o;
+    bool ok;
+    if (!in_window(t, &ok, &o))
+        return;
+    exc_count(t, exc->kind, cpu->hartid, exc->cause, exc->pc, exc->tval, cpu->icount);
+}
+
+static void on_interrupt(void *ctx, uam_cpu *cpu, uint64_t from_pc, uint64_t handler_pc,
+                         uint64_t lines)
+{
+    rtrace *t = ctx;
+    uam_origin o;
+    bool ok;
+    (void)from_pc;
+    if (!in_window(t, &ok, &o))
+        return;
+    exc_count(t, RT_EXC_IRQ, cpu->hartid, 0, handler_pc, lines, cpu->icount);
+}
+
+/* ---- DMA -------------------------------------------------------------------------- */
+
+static void on_dma(void *ctx, const uam_region *r, uint64_t addr, size_t len, bool is_write,
+                   uam_status st)
+{
+    rtrace *t = ctx;
+    uam_origin o;
+    bool ok;
+    if (!in_window(t, &ok, &o))
+        return;
+    fprintf(t->out, "dma: %c %zu 0x%llx", is_write ? 'w' : 'r', len, (unsigned long long)addr);
+    if (r)
+        fprintf(t->out, " %s+0x%llx", r->name ? r->name : "?", (unsigned long long)(addr - r->base));
+    if (st != UAM_OK)
+        fprintf(t->out, " (%s)", uam_status_str(st));
+    put_origin(t->out, ok, &o);
+    fputc('\n', t->out);
+}
+
 /* ---- console ------------------------------------------------------------------ */
 
 static void console_flush(rtrace *t)
@@ -192,12 +305,16 @@ void rtrace_attach(rtrace *t, uam_machine *m, uam_chardev *console, FILE *out)
     t->m = m;
     t->out = out ? out : stderr;
     t->console = console;
-    if (t->flags & RT_MMIO)
+    if (t->flags & (RT_MMIO | RT_MMIO_SUM))
         uam_bus_set_dev_observer(&m->bus, on_dev, t);
-    if (t->flags & (RT_SYSREG | RT_SYSREG_ALL | RT_IRQ)) {
+    if (t->flags & RT_DMA)
+        uam_bus_set_dma_observer(&m->bus, on_dma, t);
+    if (t->flags & (RT_SYSREG | RT_SYSREG_ALL | RT_IRQ | RT_EXC_SUM)) {
         t->obs = (uam_cpu_observer){
             .sysreg = (t->flags & (RT_SYSREG | RT_SYSREG_ALL)) ? on_sysreg : NULL,
             .irq_input = (t->flags & RT_IRQ) ? on_irq_input : NULL,
+            .exception = (t->flags & RT_EXC_SUM) ? on_exception : NULL,
+            .interrupt = (t->flags & RT_EXC_SUM) ? on_interrupt : NULL,
             .ctx = t,
         };
         uam_machine_set_cpu_observer(m, &t->obs);
@@ -212,6 +329,92 @@ static int sr_cmp(const void *a, const void *b)
     return x->id < y->id ? -1 : x->id > y->id;
 }
 
+static int reg_cmp(const void *a, const void *b)
+{
+    const rt_reg *x = a, *y = b;
+    return x->addr < y->addr ? -1 : x->addr > y->addr;
+}
+
+static void mmio_summary(rtrace *t)
+{
+    rt_reg *list = t->n_reg ? malloc(sizeof(*list) * t->n_reg) : NULL;
+    uint32_t n = 0;
+    for (uint32_t i = 0; list && i < RT_MMIO_SLOTS; i++)
+        if (t->reg[i].used)
+            list[n++] = t->reg[i];
+    if (!n) {
+        fprintf(t->out, "mmio: no device register was accessed\n");
+        free(list);
+        return;
+    }
+    qsort(list, n, sizeof(*list), reg_cmp);
+    fprintf(t->out, "mmio: %u device registers accessed%s (physical address, device+offset):\n", n,
+            t->reg_dropped ? " and more not tracked" : "");
+    const rt_reg *hot = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        const rt_reg *e = &list[i];
+        if (!hot || e->reads + e->writes > hot->reads + hot->writes)
+            hot = e;
+        fprintf(t->out, "mmio:   0x%llx ", (unsigned long long)e->addr);
+        if (e->region)
+            fprintf(t->out, "%s+0x%llx", e->region, (unsigned long long)e->off);
+        else
+            fputs("unmapped", t->out);
+        fprintf(t->out, ": %llu reads", (unsigned long long)e->reads);
+        if (e->reads)
+            fprintf(t->out, " (%s 0x%llx)", e->read_const ? "always" : "last",
+                    (unsigned long long)(e->read_const ? e->first_read : e->last_read));
+        fprintf(t->out, ", %llu writes", (unsigned long long)e->writes);
+        if (e->writes)
+            fprintf(t->out, " (last 0x%llx)", (unsigned long long)e->last_write);
+        fprintf(t->out, "%s, first pc=0x%llx\n", e->faulted ? ", some faulted" : "",
+                (unsigned long long)e->first_pc);
+    }
+    if (n > 1)
+        fprintf(t->out, "mmio: most accessed: 0x%llx (%llu reads, %llu writes)\n",
+                (unsigned long long)hot->addr, (unsigned long long)hot->reads,
+                (unsigned long long)hot->writes);
+    free(list);
+}
+
+static void exc_summary(rtrace *t)
+{
+    uint64_t n_exc = 0, n_irq = 0;
+    for (uint32_t i = 0; i < t->n_exc; i++) {
+        if (t->exc[i].kind == RT_EXC_IRQ) n_irq += t->exc[i].count;
+        else                              n_exc += t->exc[i].count;
+    }
+    fprintf(t->out, "exc: %llu exceptions taken", (unsigned long long)n_exc);
+    if (n_exc)
+        fputs(" (by kind, cause and pc)", t->out);
+    fputs(t->exc_dropped ? ", and more at pcs not tracked:\n" : n_exc ? ":\n" : "\n", t->out);
+    for (uint32_t i = 0; i < t->n_exc; i++) {
+        const rt_exc *e = &t->exc[i];
+        if (e->kind == RT_EXC_IRQ)
+            continue;
+        fprintf(t->out, "exc:   %s cause=0x%llx pc=0x%llx: %llu time%s, last tval=0x%llx, first icount=%llu",
+                uam_exc_kind_str((uam_exc_kind)e->kind), (unsigned long long)e->cause,
+                (unsigned long long)e->pc, (unsigned long long)e->count, e->count == 1 ? "" : "s",
+                (unsigned long long)e->last_tval, (unsigned long long)e->first_icount);
+        if (e->cpu)
+            fprintf(t->out, " cpu=%u", e->cpu);
+        fputc('\n', t->out);
+    }
+    fprintf(t->out, "irq: %llu interrupt handler entries%s\n", (unsigned long long)n_irq,
+            n_irq ? " (by handler):" : "");
+    for (uint32_t i = 0; i < t->n_exc; i++) {
+        const rt_exc *e = &t->exc[i];
+        if (e->kind != RT_EXC_IRQ)
+            continue;
+        fprintf(t->out, "irq:   0x%llx: %llu time%s, last lines=0x%llx, first icount=%llu",
+                (unsigned long long)e->pc, (unsigned long long)e->count, e->count == 1 ? "" : "s",
+                (unsigned long long)e->last_tval, (unsigned long long)e->first_icount);
+        if (e->cpu)
+            fprintf(t->out, " cpu=%u", e->cpu);
+        fputc('\n', t->out);
+    }
+}
+
 void rtrace_finish(rtrace *t)
 {
     if (!t->m)
@@ -219,6 +422,10 @@ void rtrace_finish(rtrace *t)
     uam_machine *m = t->m;
     if (t->flags & RT_CONSOLE)
         console_flush(t);
+    if (t->flags & (RT_MMIO | RT_MMIO_SUM))
+        mmio_summary(t);
+    if (t->flags & RT_EXC_SUM)
+        exc_summary(t);
     if ((t->flags & (RT_SYSREG | RT_SYSREG_ALL)) && t->n_sr) {
         rt_sysreg *list = malloc(sizeof(*list) * t->n_sr);
         uint32_t n = 0;
@@ -269,15 +476,22 @@ void rtrace_restart(rtrace *t)
     t->sr_dropped = 0;
     t->n_irq = 0;
     t->irq_dropped = 0;
+    memset(t->reg, 0, sizeof(t->reg));
+    t->n_reg = 0;
+    t->reg_dropped = 0;
+    t->n_exc = 0;
+    t->exc_dropped = 0;
 }
 
 void rtrace_detach(rtrace *t)
 {
     if (!t->m)
         return;
-    if (t->flags & RT_MMIO)
+    if (t->flags & (RT_MMIO | RT_MMIO_SUM))
         uam_bus_set_dev_observer(&t->m->bus, NULL, NULL);
-    if (t->flags & (RT_SYSREG | RT_SYSREG_ALL | RT_IRQ))
+    if (t->flags & RT_DMA)
+        uam_bus_set_dma_observer(&t->m->bus, NULL, NULL);
+    if (t->flags & (RT_SYSREG | RT_SYSREG_ALL | RT_IRQ | RT_EXC_SUM))
         uam_machine_set_cpu_observer(t->m, NULL);
     if ((t->flags & RT_CONSOLE) && t->console)
         uam_chardev_set_tap(t->console, NULL, NULL);

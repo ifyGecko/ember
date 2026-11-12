@@ -202,6 +202,9 @@ void       uam_machine_set_exc_hook(uam_machine *m, uam_exc_hook_fn fn, void *ct
 void       uam_machine_set_irq_hook(uam_machine *m, uam_irq_hook_fn fn, void *ctx);
 /* uam_exec_set_cpu_observer on every processor (system registers, interrupt inputs). */
 void       uam_machine_set_cpu_observer(uam_machine *m, const uam_cpu_observer *obs);
+/* uam_exec_set_history / uam_exec_history_clear on every processor. */
+uam_status uam_machine_set_history(uam_machine *m, uint32_t n);
+void       uam_machine_history_clear(uam_machine *m);
 uam_status uam_machine_add_pass(uam_machine *m, const uam_pass *p);
 bool       uam_machine_remove_pass(uam_machine *m, const uam_pass *p);
 /*

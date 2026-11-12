@@ -19,6 +19,9 @@ enum {
     RT_SYSREG_ALL = 1u << 2,   /* every system register access */
     RT_IRQ        = 1u << 3,   /* interrupt input lines of the processors */
     RT_CONSOLE    = 1u << 4,   /* console output lines, stamped */
+    RT_MMIO_SUM   = 1u << 5,   /* a per-register summary of device accesses at the stop */
+    RT_EXC_SUM    = 1u << 6,   /* exceptions and interrupt entries counted, summed at the stop */
+    RT_DMA        = 1u << 7,   /* every DMA transfer a device makes */
 };
 
 #define RT_SYSREG_SLOTS 1024u
@@ -29,6 +32,30 @@ typedef struct rt_sysreg {
     uint64_t reads, writes, fails;
     uint64_t first_pc;
 } rt_sysreg;
+
+#define RT_MMIO_SLOTS 8192u
+
+typedef struct rt_reg {
+    bool        used;
+    bool        read_const;   /* every read returned first_read */
+    bool        faulted;
+    uint64_t    addr;
+    const char *region;       /* NULL: unmapped */
+    uint64_t    off;
+    uint64_t    reads, writes;
+    uint64_t    first_read, last_read, last_write;
+    uint64_t    first_pc;
+} rt_reg;
+
+#define RT_EXC_SLOTS 256u
+
+typedef struct rt_exc {
+    unsigned kind;            /* uam_exc_kind; RT_EXC_IRQ: an interrupt entry */
+    unsigned cpu;
+    uint64_t cause, pc;       /* IRQ: cause = 0, pc = the handler */
+    uint64_t count, last_tval, first_icount;
+} rt_exc;
+#define RT_EXC_IRQ 0xffu
 
 typedef struct rt_irq_line {
     unsigned cpu, line;
@@ -47,6 +74,12 @@ typedef struct rtrace {
     rt_sysreg         sr[RT_SYSREG_SLOTS];
     uint32_t          n_sr;
     uint64_t          sr_dropped;         /* accesses to registers the table had no room for */
+    rt_reg            reg[RT_MMIO_SLOTS];
+    uint32_t          n_reg;
+    uint64_t          reg_dropped;        /* accesses to registers the table had no room for */
+    rt_exc            exc[RT_EXC_SLOTS];
+    uint32_t          n_exc;
+    uint64_t          exc_dropped;
     rt_irq_line       irq[64];
     uint32_t          n_irq;
     uint64_t          irq_dropped;        /* changes on lines the table had no room for */
@@ -60,8 +93,8 @@ typedef struct rtrace {
 unsigned rtrace_flag(const char *tok);
 /* Install the observers the flags ask for. */
 void     rtrace_attach(rtrace *t, uam_machine *m, uam_chardev *console, FILE *out);
-/* The run stopped: a partial console line, the summaries (system registers, interrupt
- * lines). TODO: a summary of the device polling loops a run waited in, once a trace
+/* The run stopped: a partial console line, the summaries (device registers, system
+ * registers, exceptions and interrupt entries, interrupt lines). TODO: a summary of the device polling loops a run waited in, once a trace
  * can detect polling loops of any shape (the removed --trace polls could not). */
 void     rtrace_finish(rtrace *t);
 /* Start over: a fuzz input begins (the machine is back at the snapshot). Flushes a

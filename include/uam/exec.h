@@ -122,6 +122,7 @@ typedef enum uam_stop_reason {
     UAM_STOP_EXC_HOOK,    /* the exception observer returned UAM_HOOK_STOP */
     UAM_STOP_IRQ_HOOK,    /* the interrupt observer returned UAM_HOOK_STOP */
     UAM_STOP_GUARD,       /* uam_exec_request_fault_stop: a guarded access (guard.h) */
+    UAM_STOP_UNMAPPED,    /* uam_exec_request_stop_at_fault: an access nothing decodes */
 } uam_stop_reason;
 
 const char *uam_stop_reason_str(uam_stop_reason r);
@@ -312,9 +313,14 @@ typedef struct uam_exec {
     bool             last_fetch_fault_valid;
     uint64_t         last_fetch_fault_pc, last_fetch_fault_icount;
 
-    /* uam_exec_request_fault_stop */
+    /* uam_exec_request_fault_stop, uam_exec_request_stop_at_fault */
     bool             fault_stop;
     uint64_t        *fault_stop_pc;
+    uam_stop_reason  fault_stop_why;
+
+    /* uam_exec_set_history: a ring of the last hist_cap events (hist == NULL: off) */
+    struct uam_hist_entry *hist;
+    uint32_t         hist_cap, hist_n, hist_pos;
 
     /* Multiprocessor machines (uam_machine_add_cpus). Processor 0's executor
      * runs them all: `smp` lists every processor's executor, its own first,
@@ -361,6 +367,8 @@ void            uam_exec_stop(uam_exec *x, int64_t status);
  * dropped when the next run starts.
  */
 void            uam_exec_request_fault_stop(uam_exec *x, uint64_t *pc_out);
+/* The same with another stop reason (UAM_STOP_UNMAPPED: the --unknown-mmio stop policy). */
+void            uam_exec_request_stop_at_fault(uam_exec *x, uint64_t *pc_out, uam_stop_reason why);
 
 /* Request a reset at the next instruction boundary. uam_exec_run performs it
  * through the reset handler and keeps running; without a handler it returns
@@ -400,6 +408,28 @@ void            uam_exec_set_irq_hook(uam_exec *x, uam_irq_hook_fn fn, void *ctx
 /* Observe the processor's system register accesses and interrupt input lines
  * (uam_cpu_observer in cpu.h; NULL removes it). The struct must outlive its use. */
 void            uam_exec_set_cpu_observer(uam_exec *x, const uam_cpu_observer *obs);
+
+/*
+ * Execution history, for "how did it get here": a ring of the processor's last n events
+ * (blocks it entered, exceptions it took, interrupt handlers it entered), off (n = 0) by
+ * default. While it is on, native code is not chained, so that every block is seen; spin
+ * loops whose passes the executor skips (spin.h) appear once per round of the run loop.
+ * Not snapshot state.
+ */
+typedef enum uam_hist_kind { UAM_HIST_BLOCK, UAM_HIST_EXC, UAM_HIST_IRQ } uam_hist_kind;
+typedef struct uam_hist_entry {
+    uam_hist_kind kind;
+    uam_exc_kind  exc;      /* UAM_HIST_EXC */
+    uint64_t      pc;       /* BLOCK: its first pc; EXC: the faulting instruction; IRQ: the handler */
+    uint64_t      icount;   /* the processor's when it happened */
+    uint64_t      a, b;     /* EXC: cause, tval; IRQ: the pc it came from, the pending lines */
+} uam_hist_entry;
+uam_status      uam_exec_set_history(uam_exec *x, uint32_t n);
+void            uam_exec_history_clear(uam_exec *x);
+/* Copy up to max entries, oldest first, into out; returns how many. */
+size_t          uam_exec_history(const uam_exec *x, uam_hist_entry *out, size_t max);
+/* Print the history: a heading, then one line per event, each starting with prefix. */
+void            uam_exec_history_print(const uam_exec *x, FILE *out, const char *prefix);
 
 /* Enable the native JIT backend. Returns false (and stays on the interpreter) if code
  * generation is unavailable on this host. Call after uam_exec_init, before running. */

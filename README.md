@@ -287,7 +287,7 @@ All of these are counted in virtual time, so runs stay deterministic.
 The other exit statuses: the firmware's own status when it ends the run (0-123 or 130; any other value exits 1), 2 usage or setup error
 (including a library/header ABI mismatch), 125 deadlock (waiting with nothing that could wake it),
 126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 129 a `--guard` stopped the
-run, 130 SIGINT/SIGTERM. `--fuzz-replay` has its own (20-25, above).
+run, 130 SIGINT/SIGTERM, 131 `--unknown-mmio stop` stopped it at an unmapped access. `--fuzz-replay` has its own (20-25, above).
 
 ```bash
 build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructions and idle time
@@ -317,15 +317,33 @@ ones a bring-up step needs, all on stderr:
 
 | kind | what it shows | for |
 |---|---|---|
-| `exc` | exceptions (`exc: kind=2 (load-fault) pc=.. cause=.. tval=.. icount=N`), interrupts taken (handler, the pc they came from, the pending lines), resets | where control went |
+| `exc` | exceptions (`exc: kind=2 (load-fault) pc=.. cause=.. tval=.. icount=N`), interrupts taken (handler, the pc they came from, the pending lines), resets; at the stop, the exceptions counted by kind, cause and pc, and the interrupt handlers entered | where control went; an exception storm in one line |
 | `blocks`, `ir` | every block executed; the IR of each translated block | control flow, the lifter |
-| `mmio` | every access a device serves (MMIO, a ROM device in device mode, an unmapped address, x86 ports): `mmio: r 1 0x10000005 uart0+0x5 = 0x60 pc=0x8000025e icount=141` | the register protocol a driver speaks: what to model, in which order, with which values |
+| `mmio` | every access a device serves (MMIO, a ROM device in device mode, an unmapped address, x86 ports): `mmio: r 1 0x10000005 uart0+0x5 = 0x60 pc=0x8000025e icount=141`; at the stop, one line per register: `mmio:   0x10000005 uart0+0x5: 324 reads (always 0x60), 0 writes, first pc=0x8000025e` | the register protocol a driver speaks: what to model, in which order, with which values |
+| `mmio-summary` | only that per-register summary | the register map a firmware uses, on a long boot; the register a stalled run polls (the most accessed one, reads that always return the same value) |
 | `sysreg` | the first read and the first write of each system register (CSR, CP0, CP15, SPR, MSR, ...) with value and pc, every access that faults, and a per-register summary at the stop; `sysreg-all`: every access | which core and implementation registers the firmware relies on |
 | `irq` | each change of a processor's interrupt input lines; at the stop, each line's rises and falls and whether an interrupt is pending and enabled | "was the interrupt raised, did it reach the CPU, is it masked" |
 | `console` | each line the guest prints, with the icount and pc of its first byte | lining console output up with `--trace-after`, `--snapshot-at`, `-n N -d` |
-| `all` | `exc,mmio,sysreg,irq,console` | a first look at a short run |
+| `dma` | every DMA transfer a device makes: `dma: r 16 0x80001720 dram+0x1720 pc=.. icount=N` | descriptor rings and buffers of network, storage and DMA engines |
+| `all` | `exc,mmio,sysreg,irq,console,dma` | a first look at a short run |
 
-`--trace-mmio-range LO:HI` limits the `mmio` trace to physical addresses in [LO, HI).
+`--trace-mmio-range LO:HI` limits the `mmio` trace (and its summary) to physical addresses in
+[LO, HI). `--trace-file FILE` writes the traces (and `--watch`, `--history`) to FILE instead of
+stderr, where the logs and the runner's own lines stay.
+
+Three more probes for "how did it get here" and "what does it want":
+
+- `--history N` keeps each processor's last N events (blocks entered, exceptions taken,
+  interrupt handlers entered) and prints them at the stop, oldest first; with
+  `--fuzz-replay`, for each input that is not ok. With `--jit` blocks are not chained while it
+  is on.
+- `--unknown-mmio stop`: the first access to an address nothing decodes does not happen; the
+  run stops at its instruction (exit 131) with a line naming the access, so `-d`,
+  `--dump-mem` and `--save-snapshot` capture the machine right there. It is for bring-up runs,
+  not fuzzing.
+- `--log-pc ADDR,REG,...` adds register values (as the ISA's gdb description names them:
+  `a0`, `r3`, `eax`, ...; an unknown name lists them) to each arrival: a function's
+  arguments, a return address.
 To see what a stalled run waits on, `--trace mmio` on the register it reads over and over
 shows the value it keeps getting. The catch-all logs (`unknown-mmio`, `unimp`, `mmio-stub`,
 the PC `master-abort`) name the instruction of each first access (`pc=0x... icount=N`), and

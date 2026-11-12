@@ -787,15 +787,17 @@ static uam_status dma_chunk(uam_bus *bus, uint64_t addr, size_t len, bool write,
     return UAM_OK;
 }
 
-uam_status uam_bus_dma_read(uam_bus *bus, uint64_t addr, void *buf, size_t len)
+static uam_status dma_read(uam_bus *bus, uint64_t addr, uint8_t *dst, size_t len,
+                           const uam_region **first)
 {
-    uint8_t *dst = buf;
     while (len) {
         hit h;
         size_t n;
         uam_status st = dma_chunk(bus, addr, len, false, &h, &n);
         if (st != UAM_OK)
             return st;
+        if (!*first)
+            *first = h.r;
         memcpy(dst, h.r->host + h.off, n);
         addr += n;
         dst += n;
@@ -804,15 +806,17 @@ uam_status uam_bus_dma_read(uam_bus *bus, uint64_t addr, void *buf, size_t len)
     return UAM_OK;
 }
 
-uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_t len)
+static uam_status dma_write(uam_bus *bus, uint64_t addr, const uint8_t *src, size_t len,
+                            const uam_region **first)
 {
-    const uint8_t *src = buf;
     while (len) {
         hit h;
         size_t n;
         uam_status st = dma_chunk(bus, addr, len, true, &h, &n);
         if (st != UAM_OK)
             return st;
+        if (!*first)
+            *first = h.r;
         memcpy(h.r->host + h.off, src, n);
         note_write(bus, h.r, h.off, n);
         mark_dirty(h.r, h.off, n);
@@ -821,6 +825,30 @@ uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_
         len -= n;
     }
     return UAM_OK;
+}
+
+uam_status uam_bus_dma_read(uam_bus *bus, uint64_t addr, void *buf, size_t len)
+{
+    const uam_region *first = NULL;
+    uam_status st = dma_read(bus, addr, buf, len, &first);
+    if (bus->dma_obs)
+        bus->dma_obs(bus->dma_obs_ctx, first, addr, len, false, st);
+    return st;
+}
+
+uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_t len)
+{
+    const uam_region *first = NULL;
+    uam_status st = dma_write(bus, addr, buf, len, &first);
+    if (bus->dma_obs)
+        bus->dma_obs(bus->dma_obs_ctx, first, addr, len, true, st);
+    return st;
+}
+
+void uam_bus_set_dma_observer(uam_bus *bus, uam_dma_access_fn fn, void *ctx)
+{
+    bus->dma_obs = fn;
+    bus->dma_obs_ctx = fn ? ctx : NULL;
 }
 
 /* ---- run-time decode changes ------------------------------------------ */

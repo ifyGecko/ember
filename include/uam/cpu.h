@@ -172,11 +172,19 @@ typedef struct uam_cpu {
  *   access raises UAM_EXC_SYSREG). cpu->insn_pc is the instruction.
  * irq_input: an interrupt input line of the processor changed level (uam_cpu_irq_sink),
  *   before the ISA sees it.
+ * exception: a synchronous exception is about to be taken (after the exception hook let
+ *   it through), with cpu->icount where it happened.
+ * interrupt: the processor entered an interrupt handler at handler_pc from from_pc;
+ *   lines is isa->irq_lines (0 where the ISA does not say).
  */
+struct uam_exception;
 typedef struct uam_cpu_observer {
     void  (*sysreg)(void *ctx, struct uam_cpu *cpu, uint32_t id, bool write, uint64_t val,
                     uam_status st);
     void  (*irq_input)(void *ctx, struct uam_cpu *cpu, unsigned line, int level);
+    void  (*exception)(void *ctx, struct uam_cpu *cpu, const struct uam_exception *exc);
+    void  (*interrupt)(void *ctx, struct uam_cpu *cpu, uint64_t from_pc, uint64_t handler_pc,
+                       uint64_t lines);
     void   *ctx;
 } uam_cpu_observer;
 

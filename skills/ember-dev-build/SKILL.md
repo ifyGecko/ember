@@ -1,6 +1,6 @@
 ---
 name: ember-dev-build
-description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC board, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, make a board snapshot-capable, or debug a stalled bring-up (exit 124/125/126/128/129, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (pinned out-of-tree library, one file per device, a wiring-only board); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
+description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC board, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, make a board snapshot-capable, or debug a stalled bring-up (exit 124/125/126/128/129/131, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (pinned out-of-tree library, one file per device, a wiring-only board); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
 ---
 
 # ember-dev-build: iterative firmware bring-up on ember
@@ -119,7 +119,8 @@ and, when the pin moved, the skills' end-to-end test against it:
    Exit codes help: 124 budget or `--max-ticks` used (look at hot offsets), 125 deadlock (a
    timer/interrupt not modelled or wired), 128 livelock (a timer fires but its interrupt
    never reaches the CPU), 126 fetch-fault loop, internal error, or a reset nothing handles,
-   127 breakpoint or debug trap, 129 a `--guard` hit, 130 interrupted, 2 setup error (`abi:` =
+   127 breakpoint or debug trap, 129 a `--guard` hit, 130 interrupted, 131 an unmapped access
+   under `--unknown-mmio stop`, 2 setup error (`abi:` =
    rebuild with `build-ember.sh`); any other status is the firmware's own, through a finisher.
    An AVR, 8-bit PIC, 8051, 6502 or Z80 has no bus error: a `core halted` line before a 125
    names the address nothing answered, and no timer is missing. On
@@ -138,8 +139,12 @@ and, when the pin moved, the skills' end-to-end test against it:
    and the value it keeps getting), `--trace irq` (did the line rise, does the CPU see
    it, is it masked), `--trace sysreg` (core and implementation registers the code relies
    on), `--trace console` (console lines with their icount, to aim `--trace-after`,
-   `--snapshot-at`, `-n N -d`). Turn on one or two for the question at hand, not `all` on a
-   long boot. First-access lines of the catch-alls carry the instruction (`pc=... icount=N`):
+   `--snapshot-at`, `-n N -d`), `--trace mmio-summary` (one line per device register at the
+   stop: the map the firmware uses, and the one it polls), `--trace dma` (what a device moves),
+   `--history N` (the last N blocks, exceptions and interrupt entries before the stop),
+   `--unknown-mmio stop` (stop at the first unmodelled access, with `-d`/`--save-snapshot`),
+   `--log-pc ADDR,a0,a1` (a function's arguments). Turn on one or two for the question at
+   hand, not `all` on a long boot; `--trace-file F` keeps a big trace out of the log. First-access lines of the catch-alls carry the instruction (`pc=... icount=N`):
    decompile that pc. Test a register hypothesis with
    `--mmio-rule ADDR=fixed:V` before writing C (an x86 I/O port is
    `0x10000000000 + port`). Once the boot is long, start runs from a snapshot

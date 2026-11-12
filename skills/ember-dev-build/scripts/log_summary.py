@@ -84,6 +84,9 @@ EXIT = {"instruction limit": "124: budget (-n) used up - still booting, or loopi
         "debug trap": "127: guest executed a debug trap (sdbbp/ebreak/bkpt)",
         "guarded memory access": "129: a data access touched a --guard range (the guard line "
                                  "names processor, pc, access and address) - before it happened",
+        "access to an unmapped address": "131: --unknown-mmio stop: the first access nothing "
+                                         "decodes (the 'unmapped read/write' line names it) - "
+                                         "model that register or window, or answer it with --mmio-rule",
         "stopped by a pc hook": "127: a --break address was reached",
         "stopped by the exception observer": "an exception observer (fuzz harness) stopped the run",
         "stopped by the interrupt observer": "an interrupt observer (fuzz harness) stopped the run",

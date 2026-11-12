@@ -1,6 +1,6 @@
 #!/bin/sh
-# trace-check.sh RUNNER RV32_SELFTEST_ELF RV32_SMPTEST_ELF RV32_FUZZTARGET_ELF - checks of
-# uam-run's traces on rv32-ref:
+# trace-check.sh RUNNER RV32_SELFTEST_ELF RV32_SMPTEST_ELF RV32_FUZZTARGET_ELF TEST_RUNNER
+#                RV32_NETTEST_ELF - checks of uam-run's traces on rv32-ref (rv32-test for DMA):
 #   default      a run without --trace prints none of the new trace lines
 #   mmio, sysreg, irq, console
 #                on the RISC-V self-test: the lines are there (the UART's LSR read and THR
@@ -14,12 +14,22 @@
 #   sysreg       with --trace-after, first accesses and the summary count from there
 #   names        an unknown trace name is an error (exit 2), not a run that traces nothing
 #   smp          block lines of processors other than 0 say which processor
-#   replay       --fuzz-replay with traces: the boot's section, then one per input
+#   replay       --fuzz-replay with traces: the boot's section, then one per input, and
+#                --history for the input that crashed
+#   summaries    mmio (per register), exc (by kind, cause, pc; interrupt handlers), the
+#                same on every backend
+#   --history    the last N events at the stop, every processor's; the same on every backend
+#   --trace-file the traces go to the file, the logs stay on stderr
+#   --log-pc     ADDR,REG...: register values; an unknown name is an error
+#   --unknown-mmio stop   the run stops at the instruction (exit 131), interpreter and JIT
+#   dma          virtio-net's descriptor reads on rv32-test
 set -eu
 RUN=$1
 FW=$2
 SMP=$3
 FUZZ=$4
+TRUN=$5
+NET=$6
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 fail() { echo "trace-check: FAIL: $*" >&2; exit 1; }
@@ -36,7 +46,7 @@ fi
 for mode in interp jit nochain; do
     case $mode in interp) a="";; jit) a="--jit";; nochain) a="--jit --no-chain";; esac
     # shellcheck disable=SC2086
-    $RUN $a -t mmio,sysreg,irq,console "$FW" </dev/null >/dev/null 2>"$T/$mode" ||
+    $RUN $a -t exc,mmio,sysreg,irq,console --history 16 "$FW" </dev/null >/dev/null 2>"$T/$mode" ||
         fail "$mode: traced self-test failed"
     grep -v '^uam-run:' "$T/$mode" >"$T/$mode.tr"
 done
@@ -59,9 +69,9 @@ grep -q "^mmio: w 1 0x10000000 uart0+0x0 = 0x55 pc=0x[0-9a-f]* icount=$ci\$" "$t
 # ---- narrowing --------------------------------------------------------------------
 $RUN -t mmio --trace-mmio-range 0x10000005:0x10000006 "$FW" </dev/null >/dev/null 2>"$T/rng" || true
 grep -q '^mmio: r 1 0x10000005' "$T/rng" || fail "--trace-mmio-range dropped the range"
-if grep '^mmio:' "$T/rng" | grep -vq ' 0x10000005 '; then fail "--trace-mmio-range let other addresses through"; fi
+if grep -E '^mmio: [rw] |^mmio:   0x' "$T/rng" | grep -vq ' 0x10000005 '; then fail "--trace-mmio-range let other addresses through"; fi
 $RUN -t mmio --trace-after 2000 "$FW" </dev/null >/dev/null 2>"$T/aft" || true
-first=$(sed -n 's/^mmio: .* icount=\([0-9]*\)$/\1/p' "$T/aft" | head -1)
+first=$(sed -n 's/^mmio: [rw] .* icount=\([0-9]*\)$/\1/p' "$T/aft" | head -1)
 [ -n "$first" ] && [ "$first" -ge 2000 ] || fail "--trace-after: mmio line at icount $first"
 
 # lui t0,0x20000; 1: lw t1,20(t0); andi t1,t1,0x20; beqz t1,1b; 2: j 2b
@@ -113,5 +123,71 @@ $RUN --fuzz-begin "$begin" --fuzz-input uart0 -t sysreg --fuzz-replay "$T/in" "$
 grep '^trace: ' "$T/rp" >"$T/rp.s"
 printf 'trace: the boot to the begin pc ends\ntrace: input 1\ntrace: input 2\n' >"$T/rp.want"
 cmp -s "$T/rp.s" "$T/rp.want" || { cat "$T/rp.s" >&2; fail "replay: trace sections are not boot, input 1, input 2"; }
+
+# ---- summaries (from the backend runs above) ------------------------------------------
+grep -Eq '^mmio:   0x10000005 uart0\+0x5: [1-9][0-9]* reads \(always 0x60\), 0 writes, first pc=0x[0-9a-f]+$' "$tr" ||
+    fail "no summary line for the UART's LSR"
+grep -Eq '^mmio:   0x10000000 uart0\+0x0: 0 reads, [1-9][0-9]* writes \(last 0x[0-9a-f]+\)' "$tr" ||
+    fail "no summary line for the UART's THR"
+grep -Eq '^mmio: [0-9]+ device registers accessed' "$tr" || fail "no mmio summary heading"
+grep -Eq '^exc: [1-9][0-9]* exceptions taken \(by kind, cause and pc\):$' "$tr" || fail "no exc summary"
+grep -Eq '^exc:   load-fault cause=0x0 pc=0x[0-9a-f]+: 1 time, last tval=0xf0000000, first icount=[0-9]+$' "$tr" ||
+    fail "the load fault is not in the exc summary"
+grep -Eq '^irq:   0x[0-9a-f]+: [1-9][0-9]* times?, last lines=0x[0-9a-f]+, first icount=[0-9]+$' "$tr" ||
+    fail "the timer handler is not in the interrupt summary"
+grep -Eq '^history: cpu0: the last 16 events before the stop \(oldest first\):$' "$tr" || fail "no history heading"
+[ "$(grep -c '^history:   ' "$tr")" = 16 ] || fail "history: not 16 events"
+$RUN -t mmio-summary "$FW" </dev/null >/dev/null 2>"$T/ms" || true
+grep -q '^mmio:   0x10000005 uart0+0x5' "$T/ms" || fail "mmio-summary: no summary"
+grep -Eq '^mmio: [rw] ' "$T/ms" && fail "mmio-summary printed per-access lines"
+
+# ---- --history on every processor ---------------------------------------------------
+$RUN -o cpus=2 --history 4 -n 20000 "$SMP" </dev/null >/dev/null 2>"$T/hs" || true
+grep -q '^history: cpu0: the last 4 events' "$T/hs" || fail "--history: no cpu0 history"
+grep -q '^history: cpu1: the last 4 events' "$T/hs" || fail "--history: no cpu1 history"
+
+# ---- --trace-file ---------------------------------------------------------------------
+$RUN -t exc,mmio --history 4 --trace-file "$T/tf" "$FW" </dev/null >/dev/null 2>"$T/tfe" || fail "--trace-file run failed"
+grep -q '^exc: kind=' "$T/tf" && grep -q '^mmio: r ' "$T/tf" && grep -q '^history: cpu0' "$T/tf" ||
+    fail "--trace-file: traces missing from the file"
+grep -Eq '^(exc|mmio|history):' "$T/tfe" && fail "--trace-file: traces still on stderr"
+grep -q '^uam-run: stop requested' "$T/tfe" || fail "--trace-file: the stop line left stderr"
+
+# ---- --log-pc with registers ---------------------------------------------------------
+main=$(readelf -sW "$FW" | awk '$NF == "main" { print "0x" $2; exit }')
+$RUN --log-pc "$main,a0,ra,sp" "$FW" </dev/null >/dev/null 2>"$T/lp" || true
+grep -Eq "^uam-run: pc $main reached \(hit 1, icount [0-9]+\) a0=0x[0-9a-f]+ ra=0x[0-9a-f]+ sp=0x[0-9a-f]+\$" "$T/lp" ||
+    fail "--log-pc: no register values"
+rc=0; $RUN --log-pc "$main,nosuch" "$FW" </dev/null >/dev/null 2>"$T/lp2" || rc=$?
+[ "$rc" = 2 ] && grep -q "no register 'nosuch' (registers: zero ra sp" "$T/lp2" ||
+    fail "--log-pc: an unknown register is not an error naming the registers"
+
+# ---- --unknown-mmio stop ----------------------------------------------------------------
+for a in "" "--jit"; do
+    rc=0
+    # shellcheck disable=SC2086
+    $R $a --unknown-mmio stop -d "$T/bit.bin" </dev/null >/dev/null 2>"$T/us" || rc=$?
+    [ "$rc" = 131 ] || fail "--unknown-mmio stop $a: exit $rc, not 131"
+    grep -q '^uam-run: unmapped read of 4 bytes at 0x20000014 by cpu 0 pc 0x80000004 (icount 2): nothing decodes it' "$T/us" ||
+        fail "--unknown-mmio stop $a: no report of the access"
+    grep -q '^uam-run: access to an unmapped address (status 0) at pc=0x80000004 after 2 instructions$' "$T/us" ||
+        fail "--unknown-mmio stop $a: not stopped at the instruction"
+done
+rc=0; $RUN --unknown-mmio stop --fuzz-begin 0x80000000 --fuzz-replay "$T/in" "$FUZZ" </dev/null >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || fail "--unknown-mmio stop with fuzzing: exit $rc, not 2"
+
+# ---- replay: --history for the input that crashed ---------------------------------------
+printf 'FUZ!' >"$T/in/3"
+$RUN --fuzz-begin "$begin" --fuzz-input uart0 --history 3 --fuzz-replay "$T/in" "$FUZZ" </dev/null \
+    >/dev/null 2>"$T/rh" || true
+sed -n '/^trace: input 3$/,$p' "$T/rh" | grep -q '^history: cpu0: the last 3 events' ||
+    fail "replay --history: no history for the crashing input"
+sed -n '/^trace: input 1$/,/^trace: input 3$/p' "$T/rh" | grep -q '^history:' &&
+    fail "replay --history: history printed for an ok input"
+
+# ---- dma ---------------------------------------------------------------------------------
+timeout 60 $TRUN -b rv32-test --nic net0=null -t dma -n 5000000 "$NET" </dev/null >/dev/null 2>"$T/dma" || true
+grep -Eq '^dma: r 16 0x[0-9a-f]+ dram\+0x[0-9a-f]+ pc=0x[0-9a-f]+ icount=[0-9]+$' "$T/dma" ||
+    fail "no virtio descriptor read in the dma trace"
 
 echo "trace-check: ok"

@@ -121,6 +121,15 @@ typedef struct uam_watch {
 typedef void (*uam_dev_access_fn)(void *ctx, const uam_region *r, uint64_t addr, unsigned size,
                                   bool is_write, uint64_t val, uam_status st);
 
+/*
+ * DMA observer, for tracing: called once per uam_bus_dma_read/write with the transfer's
+ * start address, length and direction, the region it starts in (NULL if none) and its
+ * status. uam_origin_get says which instruction was running when the device moved the
+ * data (none when a timer or host input drove it).
+ */
+typedef void (*uam_dma_access_fn)(void *ctx, const struct uam_region *r, uint64_t addr, size_t len,
+                                  bool is_write, uam_status st);
+
 typedef struct uam_bus {
     uam_region       **regions;            /* sorted by priority, highest first */
     uint32_t           n_regions, cap_regions;
@@ -148,6 +157,8 @@ typedef struct uam_bus {
     bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
     uam_dev_access_fn  dev_obs;            /* uam_bus_set_dev_observer */
     void              *dev_obs_ctx;
+    uam_dma_access_fn  dma_obs;            /* uam_bus_set_dma_observer */
+    void              *dma_obs_ctx;
 } uam_bus;
 
 void       uam_bus_init(uam_bus *bus);
@@ -175,6 +186,8 @@ void       uam_bus_set_unmapped(uam_bus *bus, struct uam_device *dev);
 void       uam_bus_set_code_write_hook(uam_bus *bus, uam_code_write_fn fn, void *ctx);
 /* One observer of the accesses devices serve (NULL: none); see uam_dev_access_fn. */
 void       uam_bus_set_dev_observer(uam_bus *bus, uam_dev_access_fn fn, void *ctx);
+/* One observer of DMA transfers (NULL: none); see uam_dma_access_fn. */
+void       uam_bus_set_dma_observer(uam_bus *bus, uam_dma_access_fn fn, void *ctx);
 
 /* Region handle by name (the name given when mapping), or NULL. */
 uam_region *uam_bus_region(uam_bus *bus, const char *name);

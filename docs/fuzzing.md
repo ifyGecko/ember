@@ -270,6 +270,12 @@ names `.info`, so the brain's `crashes/` or `hangs/` directory replays its input
 and not their `.info` sidecars (`uam_fuzz_replay_create_ex` in a program). `--cov-out FILE` writes the last input's map. `tests/fuzz/fuzztarget.h`
 is a small target with planted bugs used by `make fuzz-test`.
 
+For triage, the traces work in replay too (`-t mmio,exc`, `--trace-file`): the boot's traces
+come first and end with `trace: the boot to the begin pc ends` and its summaries, then each
+input's begin with `trace: input ID` and end with its own summaries. `--history N` prints, for
+each input that is not ok, the last N blocks, exceptions and interrupt entries of its run (an
+exception the harness stopped on is in the replay line, not in the history).
+
 ### In a program
 
 ```c

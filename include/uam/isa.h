@@ -201,4 +201,12 @@ static inline uint64_t uam_isa_pc_state_bits(const uam_isa *isa)
     return isa->gdb ? isa->gdb->pc_state_bits : 0;
 }
 
+/* The gdb register number of the register `name` (as the ISA's target description names
+ * it: "a0", "r3", "eax", "pc", ...). False if the ISA has no such register, or no
+ * debugger view. */
+bool uam_isa_reg_by_name(const uam_isa *isa, const char *name, unsigned *regno);
+/* Call fn with each register's name and number, in the target description's order. */
+void uam_isa_reg_names(const uam_isa *isa, void (*fn)(void *ctx, const char *name, unsigned regno),
+                       void *ctx);
+
 #endif /* UAM_ISA_H */

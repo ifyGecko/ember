@@ -87,7 +87,9 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    predict (an empty input, a valid request, an oversized one, one that reaches a known bad
    path if there is one). `--fuzz-replay` must give exactly those verdicts, twice, and with
    `--jit`. A `hang` on an ordinary input usually means a device still missing on that path:
-   back to ember-dev-build.
+   back to ember-dev-build. To see why an input crashed or hung, replay it alone with
+   `--history 64` (its last blocks, exceptions and interrupt entries) and, as needed,
+   `-t mmio,exc`: each input gets its own `trace: input ID` section and summaries.
 6. **Check coverage moves**: `--cov-blocks --cov-out` for two different inputs must give
    different maps; identical maps mean the input never reaches the handler (begin pc after
    the read, wrong route, input dropped by a full FIFO).

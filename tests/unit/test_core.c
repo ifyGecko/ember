@@ -597,6 +597,48 @@ static void test_guards(bool jit)
     uam_machine_fini(&m);
 }
 
+/* Execution history: oldest first, bounded by its size, cleared on request, and the
+ * same on the interpreter and the JIT. Register names come from the target description. */
+static void test_history(bool jit)
+{
+    const char *bk = jit ? "jit" : "interp";
+    uam_machine m;
+    uam_hist_entry h[16];
+
+    guard_program(&m, jit);
+    EQ64(uam_machine_set_history(&m, 16), UAM_OK, "history on");
+    EQ64(uam_exec_run(&m.exec, 40), UAM_STOP_INSN_LIMIT, "run");
+    size_t n = uam_exec_history(&m.exec, h, 16);
+    CHECK(n >= 2, "%s: %zu events", bk, n);
+    CHECK(h[0].kind == UAM_HIST_BLOCK && h[0].pc == 0x80000000u && h[0].icount == 0,
+          "%s: the first block first (0x%llx at %llu)", bk, (unsigned long long)h[0].pc,
+          (unsigned long long)h[0].icount);
+    for (size_t i = 1; i < n; i++)
+        CHECK(h[i].icount >= h[i - 1].icount, "%s: oldest first", bk);
+    uam_machine_fini(&m);
+
+    guard_program(&m, jit);
+    EQ64(uam_machine_set_history(&m, 2), UAM_OK, "a short history");
+    EQ64(uam_exec_run(&m.exec, 40), UAM_STOP_INSN_LIMIT, "run");
+    n = uam_exec_history(&m.exec, h, 16);
+    EQ64(n, 2, "only the last two kept");
+    CHECK(h[0].icount <= h[1].icount && h[1].pc == 0x80000010u, "%s: the newest is the loop", bk);
+    EQ64(uam_exec_history(&m.exec, h, 1), 1, "max bounds the copy");
+    CHECK(h[0].icount == m.exec.hist[(m.exec.hist_pos + 1) % 2].icount, "%s: max 1 gives the newest", bk);
+    uam_machine_history_clear(&m);
+    EQ64(uam_exec_history(&m.exec, h, 16), 0, "cleared");
+    EQ64(uam_machine_set_history(&m, 0), UAM_OK, "off");
+    CHECK(!m.exec.hist, "off frees the ring");
+    uam_machine_fini(&m);
+
+    if (!jit) {
+        unsigned r = 0;
+        CHECK(uam_isa_reg_by_name(&uam_isa_mips32be, "r29", &r) && r == 29, "r29 is 29 (%u)", r);
+        CHECK(uam_isa_reg_by_name(&uam_isa_mips32be, "pc", &r) && r == 37, "pc is 37 (%u)", r);
+        CHECK(!uam_isa_reg_by_name(&uam_isa_mips32be, "nosuch", &r), "no such register");
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* #3 CP0 timer across resets                                                */
 /* ------------------------------------------------------------------------ */
@@ -2102,6 +2144,8 @@ int main(void)
     test_watch();
     test_guard_parse();
     test_guards(false);
+    test_history(false);
+    test_history(true);
     test_guards(true);
     test_subpage_cache();
     test_timer_reset();

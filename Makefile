@@ -932,11 +932,12 @@ xbench: $(RUN)
 	AVR32_CROSS=$(AVR32_CROSS) sh tools/xbench.sh --run $(RUN) --out $(abspath $(BUILD))/firmware-bench $(XBENCH_ARGS)
 
 # uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit) and
-# its traces (--trace exc/blocks/mmio/sysreg/irq/console, --log-stamp, with --fuzz-replay)
+# its traces (--trace exc/blocks/mmio/sysreg/irq/console/dma, --history, --trace-file,
+# --log-stamp, --unknown-mmio stop, with --fuzz-replay)
 runner-test: $(TRUN) $(RUN) firmware-x86 firmware
 	sh tests/runner/runner-check.sh $(TRUN) $(FW_X86)
 	sh tests/runner/trace-check.sh $(RUN) $(BUILD)/firmware/selftest.elf $(BUILD)/firmware/smptest.elf \
-	    $(BUILD)/firmware/fuzztarget.elf
+	    $(BUILD)/firmware/fuzztarget.elf $(TRUN) $(BUILD)/firmware/nettest.elf
 
 net-check: $(TRUN) firmware
 	sh tests/net/net-check.sh $(TRUN) $(BUILD)/firmware/nettest.elf both
