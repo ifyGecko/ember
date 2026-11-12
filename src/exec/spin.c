@@ -14,11 +14,14 @@
 #define SPIN_MAX_PUTS  16u
 #define SPIN_MAX_REGFILE 8192u /* register files up to this size (bytes) */
 
-bool uam_spin_candidate(const uam_block *blk)
+bool uam_spin_skip_enabled(void)
 {
     const char *off = getenv("UAM_SPIN_SKIP");   /* UAM_SPIN_SKIP=0: never skip */
-    if (off && strcmp(off, "0") == 0)
-        return false;
+    return !(off && strcmp(off, "0") == 0);
+}
+
+bool uam_spin_candidate(const uam_block *blk)
+{
     if (blk->n_insn > SPIN_MAX_OPS || blk->n_guest == 0)
         return false;
     const uint64_t self = blk->guest_pc & uam_mask(blk->addr_width);
@@ -209,15 +212,16 @@ bool uam_spin_fixed(uam_cpu *cpu, const uam_block *blk, uint64_t *t, bool *never
 /* ---- device polls (exec.h, uam_poll) ------------------------------------------ */
 
 typedef struct poll_eval {
-    bool     seen;          /* the device read was reached */
-    uint64_t load_pc, pa;
-    unsigned size, flags;
+    unsigned n;                              /* device reads reached */
+    uint64_t pc[UAM_POLL_MAX_READS], pa[UAM_POLL_MAX_READS];
+    unsigned size[UAM_POLL_MAX_READS], flags[UAM_POLL_MAX_READS];
 } poll_eval;
 
-/* One pass from the current state, without effects, the (single) device read answering
- * `probe`. Returns 1 if the pass goes round, 0 if it leaves, -1 if it cannot be
- * evaluated (a second device read, a fault, an op with effects). */
-static int poll_pass(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t probe, poll_eval *pe)
+/* One pass from the current state, without effects, device read k answering val[k].
+ * Returns 1 if the pass goes round, 0 if it leaves, -1 if it cannot be evaluated (too
+ * many device reads, a fault, an op with effects). */
+static int poll_pass(uam_cpu *cpu, const uam_block *blk, uint64_t *t, const uint64_t *val,
+                     poll_eval *pe)
 {
     const unsigned aw = blk->addr_width;
     uint8_t rf[SPIN_MAX_REGFILE];
@@ -225,7 +229,7 @@ static int poll_pass(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t p
         return -1;
     memcpy(rf, cpu->regfile, cpu->regfile_size);
     uint64_t pc = blk->guest_pc;
-    pe->seen = false;
+    pe->n = 0;
     for (uint32_t i = 0; i < blk->n_insn; i++) {
         const uam_insn *in = &blk->insn[i];
         const unsigned W = in->width;
@@ -270,14 +274,14 @@ static int poll_pass(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t p
                                  &v) != UAM_OK)
                     return -1;
             } else {
-                if (pe->seen)
-                    return -1;   /* a second device read: not a one-register poll */
-                pe->seen = true;
-                pe->load_pc = pc;
-                pe->pa = pa;
-                pe->size = size;
-                pe->flags = in->flags;
-                v = probe & uam_mask(W);
+                if (pe->n == UAM_POLL_MAX_READS)
+                    return -1;
+                const unsigned k = pe->n++;
+                pe->pc[k] = pc;
+                pe->pa[k] = pa;
+                pe->size[k] = size;
+                pe->flags[k] = in->flags;
+                v = val[k] & uam_mask(W);
             }
             t[in->dst] = v;
             break;
@@ -305,70 +309,137 @@ static int poll_pass(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t p
     return -1;
 }
 
-bool uam_spin_poll_analyse(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uam_poll *p)
+/* The same device reads, in the same order, as `ref`. */
+static bool same_reads(const poll_eval *a, const poll_eval *ref)
+{
+    if (a->n != ref->n)
+        return false;
+    for (unsigned k = 0; k < a->n; k++)
+        if (a->pa[k] != ref->pa[k] || a->size[k] != ref->size[k] || a->pc[k] != ref->pc[k])
+            return false;
+    return true;
+}
+
+/* Whether a pass with read k answering probe (the others their last values) leaves the
+ * loop. */
+static bool leaves(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t *val, unsigned k,
+                   uint64_t probe)
 {
     poll_eval pe;
-    p->analysed = true;
-    /* Where the read goes: one pass with any value. */
-    if (poll_pass(cpu, blk, t, 0, &pe) < 0 || !pe.seen)
-        return false;
-    p->load_pc = pe.load_pc;
-    p->addr = pe.pa;
-    p->size = pe.size;
-    const uam_bus *bus = cpu->bus;
-    uint64_t v = 0;
-    if (bus->last_dev_read_valid && bus->last_dev_read_addr == pe.pa) {
-        v = bus->last_dev_read_val;
-        p->have_value = true;
-    } else if (uam_bus_read(cpu->bus, pe.pa, pe.size, (pe.flags & (UAM_ACC_LE | UAM_ACC_BE))
-                                                          | UAM_ACC_DEBUG, &v) == UAM_OK) {
-        p->have_value = true;   /* the device's peek */
-    }
-    p->value = v;
-    const unsigned W = pe.size * 8;
-    const uint64_t m = uam_mask(W);
-    p->loops = poll_pass(cpu, blk, t, v, &pe) == 1;
-    p->exit_set = p->exit_clear = 0;
+    const uint64_t keep = val[k];
+    val[k] = probe;
+    const int r = poll_pass(cpu, blk, t, val, &pe);
+    val[k] = keep;
+    return r == 0;
+}
+
+/* What ends the loop through read k: fills p's exit fields; false if nothing tried does. */
+static bool exits_by(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t *val, unsigned k,
+                     unsigned size, uam_poll *p)
+{
+    const unsigned W = size * 8;
+    const uint64_t m = uam_mask(W), v = val[k] & m;
+    p->exit_set = p->exit_clear = p->exit_all_set = p->exit_all_clear = 0;
     p->exit_other = false;
     for (unsigned b = 0; b < W; b++) {
         const uint64_t bit = UINT64_C(1) << b;
-        if (poll_pass(cpu, blk, t, v ^ bit, &pe) == 0) {
+        if (leaves(cpu, blk, t, val, k, v ^ bit)) {
             if (v & bit)
                 p->exit_clear |= bit;
             else
                 p->exit_set |= bit;
         }
     }
-    if (!p->exit_set && !p->exit_clear) {
-        /* A comparison with a whole value: try the obvious ones and the block's constants. */
-        uint64_t cand[2 + 24];
-        unsigned n = 0;
-        cand[n++] = 0;
-        cand[n++] = m;
-        for (uint32_t i = 0; i < blk->n_imm && n < UAM_ARRAY_LEN(cand); i++)
-            cand[n++] = blk->imm[i] & m;
-        for (unsigned k = 0; k < n; k++) {
-            if (cand[k] != (v & m) && poll_pass(cpu, blk, t, cand[k], &pe) == 0) {
-                p->exit_other = true;
-                p->exit_value = cand[k];
-                break;
+    if (p->exit_set || p->exit_clear)
+        return true;
+    /* Several bits at once: the block's constants as masks, all set or all clear, then
+     * only the bits of the mask that are needed (a constant may hold more: an address). */
+    for (uint32_t i = 0; i < blk->n_imm; i++) {
+        const uint64_t c = blk->imm[i] & m;
+        for (int set = 1; set >= 0; set--) {
+            uint64_t bits = set ? c & ~v : c & v;
+            if (!bits || !leaves(cpu, blk, t, val, k, set ? v | bits : v & ~bits))
+                continue;
+            for (unsigned b = 0; b < W; b++) {
+                const uint64_t bit = UINT64_C(1) << b, less = bits & ~bit;
+                if ((bits & bit) && less && leaves(cpu, blk, t, val, k, set ? v | less : v & ~less))
+                    bits = less;
             }
+            if (set)
+                p->exit_all_set = bits;
+            else
+                p->exit_all_clear = bits;
+            return true;
         }
     }
+    /* A comparison with a whole value: the block's constants, then 0 and all ones. */
+    for (uint32_t i = 0; i <= blk->n_imm + 1; i++) {
+        const uint64_t c = i < blk->n_imm ? blk->imm[i] & m : i == blk->n_imm ? 0 : m;
+        if (c != v && leaves(cpu, blk, t, val, k, c)) {
+            p->exit_other = true;
+            p->exit_value = c;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool uam_spin_poll_analyse(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t first_read,
+                           uam_poll *p)
+{
+    uam_bus *bus = cpu->bus;
+    uint64_t val[UAM_POLL_MAX_READS] = { 0 };
+    poll_eval ref, pe;
+    /* Where the reads go: one pass with any values. */
+    if (poll_pass(cpu, blk, t, val, &ref) < 0 || ref.n == 0)
+        return false;
+    /* What the pass that just went round read: the bus remembers the last reads; a
+     * device's peek for any it no longer holds. */
+    const bool held = bus->n_dev_reads - first_read == ref.n && ref.n <= UAM_BUS_DEV_READS;
+    bool have[UAM_POLL_MAX_READS] = { false };
+    for (unsigned k = 0; k < ref.n; k++) {
+        const uint64_t seq = first_read + k;
+        const uint32_t slot = (uint32_t)(seq % UAM_BUS_DEV_READS);
+        if (held && bus->dev_reads[slot].addr == ref.pa[k]) {
+            val[k] = bus->dev_reads[slot].val;
+            have[k] = true;
+        } else if (uam_bus_read(bus, ref.pa[k], ref.size[k],
+                                (ref.flags[k] & (UAM_ACC_LE | UAM_ACC_BE)) | UAM_ACC_DEBUG,
+                                &val[k]) == UAM_OK) {
+            have[k] = true;   /* the device's peek */
+        }
+    }
+    /* Those values must keep it looping, through the same reads: else this is not a
+     * pass the analysis can stand for (the addresses depend on what was read). */
+    if (poll_pass(cpu, blk, t, val, &pe) != 1 || !same_reads(&pe, &ref))
+        return false;
+    unsigned k = 0;
+    while (k < ref.n && !exits_by(cpu, blk, t, val, k, ref.size[k], p))
+        k++;
+    if (k == ref.n) {   /* nothing tried ends it: report the first read */
+        k = 0;
+        p->exit_set = p->exit_clear = p->exit_all_set = p->exit_all_clear = 0;
+        p->exit_other = false;
+    }
+    p->n_reads = ref.n;
+    p->load_pc = ref.pc[k];
+    p->addr = ref.pa[k];
+    p->size = ref.size[k];
+    p->have_value = have[k];
+    p->value = val[k] & uam_mask(ref.size[k] * 8);
     return true;
 }
 
-static int bits_str(char *buf, size_t len, uint64_t mask)
+static void bits_str(char *buf, size_t len, uint64_t mask, bool all)
 {
-    int n = 0;
     if (!(mask & (mask - 1))) {
         unsigned b = 0;
         while (!((mask >> b) & 1))
             b++;
-        return snprintf(buf, len, "bit %u (0x%llx)", b, (unsigned long long)mask);
+        snprintf(buf, len, "bit %u (0x%llx)", b, (unsigned long long)mask);
+    } else {
+        snprintf(buf, len, "%s bits 0x%llx", all ? "all of" : "any of", (unsigned long long)mask);
     }
-    n = snprintf(buf, len, "any of bits 0x%llx", (unsigned long long)mask);
-    return n;
 }
 
 void uam_poll_describe(const uam_poll *p, const uam_bus *bus, char *buf, size_t len)
@@ -380,34 +451,45 @@ void uam_poll_describe(const uam_poll *p, const uam_bus *bus, char *buf, size_t 
                  (unsigned long long)(p->addr - r->base));
     else if (bus)
         snprintf(where, sizeof(where), " (unmapped)");
-    int n = snprintf(buf, len, "pc 0x%llx: loop at 0x%llx reads %u bytes at 0x%llx%s",
-                     (unsigned long long)p->load_pc, (unsigned long long)p->pc, p->size,
-                     (unsigned long long)p->addr, where);
-    if (n < 0 || (size_t)n >= len)
-        return;
+    size_t n = 0;
+#define ADD(...) do { if (n < len) { int k_ = snprintf(buf + n, len - n, __VA_ARGS__); \
+                                     if (k_ > 0) n += (size_t)k_; } } while (0)
+    ADD("pc 0x%llx: loop at 0x%llx reads %u byte%s at 0x%llx%s", (unsigned long long)p->load_pc,
+        (unsigned long long)p->pc, p->size, p->size == 1 ? "" : "s", (unsigned long long)p->addr,
+        where);
+    if (p->n_reads > 1)
+        ADD(" (of %u device reads a pass)", p->n_reads);
     if (p->have_value)
-        n += snprintf(buf + n, len - (size_t)n, ", last 0x%llx", (unsigned long long)p->value);
-    if (n < 0 || (size_t)n >= len)
-        return;
+        ADD(", last 0x%llx", (unsigned long long)p->value);
+    const uint64_t m = uam_mask(p->size * 8);
     char b1[64], b2[64];
-    if (!p->analysed)
-        snprintf(buf + n, len - (size_t)n, "; exit not analysed yet");
-    else if (!p->loops)
-        snprintf(buf + n, len - (size_t)n, "; that value does not keep it looping (it changes)");
-    else if (p->exit_set && p->exit_clear) {
-        bits_str(b1, sizeof(b1), p->exit_set);
-        bits_str(b2, sizeof(b2), p->exit_clear);
-        snprintf(buf + n, len - (size_t)n, "; leaves the loop if %s becomes 1 or %s becomes 0", b1, b2);
+    if ((p->exit_set | p->exit_clear) == m && p->have_value) {
+        ADD("; leaves the loop when the value changes from 0x%llx", (unsigned long long)p->value);
+    } else if (p->exit_set && p->exit_clear) {
+        bits_str(b1, sizeof(b1), p->exit_set, false);
+        bits_str(b2, sizeof(b2), p->exit_clear, false);
+        ADD("; leaves the loop if %s becomes 1 or %s becomes 0", b1, b2);
     } else if (p->exit_set) {
-        bits_str(b1, sizeof(b1), p->exit_set);
-        snprintf(buf + n, len - (size_t)n, "; leaves the loop if %s becomes 1", b1);
+        bits_str(b1, sizeof(b1), p->exit_set, false);
+        ADD("; leaves the loop if %s becomes 1", b1);
     } else if (p->exit_clear) {
-        bits_str(b1, sizeof(b1), p->exit_clear);
-        snprintf(buf + n, len - (size_t)n, "; leaves the loop if %s becomes 0", b1);
-    } else if (p->exit_other)
-        snprintf(buf + n, len - (size_t)n, "; leaves the loop on a read of 0x%llx (no single bit does)",
-                 (unsigned long long)p->exit_value);
-    else
-        snprintf(buf + n, len - (size_t)n, "; no value tried leaves the loop (it may wait for "
-                 "something else: an interrupt, a timeout)");
+        bits_str(b1, sizeof(b1), p->exit_clear, false);
+        ADD("; leaves the loop if %s becomes 0", b1);
+    } else if (p->exit_all_set) {
+        bits_str(b1, sizeof(b1), p->exit_all_set, true);
+        ADD("; leaves the loop if %s become 1 (no single bit does)", b1);
+    } else if (p->exit_all_clear) {
+        bits_str(b1, sizeof(b1), p->exit_all_clear, true);
+        ADD("; leaves the loop if %s become 0 (no single bit does)", b1);
+    } else if (p->exit_other) {
+        ADD("; leaves the loop on a read of 0x%llx (no single bit does)",
+            (unsigned long long)p->exit_value);
+    } else {
+        ADD("; no value tried leaves the loop (it may wait for something else: an interrupt, "
+            "a timeout)");
+    }
+    if (p->changes)
+        ADD("; the value changed on %llu pass%s while it looped (a counter or a timer?)",
+            (unsigned long long)p->changes, p->changes == 1 ? "" : "es");
+#undef ADD
 }

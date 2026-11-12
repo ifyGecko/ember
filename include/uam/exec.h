@@ -135,43 +135,55 @@ enum uam_trace_flag {
 };
 
 /*
- * A device poll: a loop of one block that re-reads one device register (MMIO, a ROM
+ * A device poll: a loop of one block that re-reads a device register (MMIO, a ROM
  * device in device mode, or an unmapped address) and goes round until the value
  * changes - "wait until the UART can take a byte", "wait for the PLL to lock". The
  * executor finds them among the spin-loop candidates (blocks whose only effects are
  * register writes, loads and exits, one exit back to themselves, and that count
- * nothing) whose one non-memory load is a device read, counts their passes, and works
- * out what ends the loop: it re-evaluates one pass, without effects, with the value
- * read replaced by others - the last value with each bit flipped, then 0, all ones and
- * the block's constants - and records which leave the loop. That is the value the
- * firmware expects the device to produce. Polls through a called function (a readl()
- * that is not inlined) or with a timeout counter are not single-block loops and are
- * not found. Off unless UAM_TRACE_POLL is set (it costs: a poll block returns to the run
- * loop after every pass). Diagnostic only: not saved in snapshots; spin-loop skipping off
- * (UAM_SPIN_SKIP=0) or blocks traced turns it off too.
+ * nothing) that read a device, counts their passes, and works out what ends the loop:
+ * at each arrival it re-evaluates one pass, without effects, with a device read's value
+ * replaced by others - the last value with each bit flipped, then the block's constants
+ * as masks (all of them set, or all clear) and as whole values, then 0 and all ones -
+ * and records which leave the loop. That is the value the firmware expects the device
+ * to produce. With up to UAM_POLL_MAX_READS device reads in a pass, the first read
+ * whose value can end the loop is the one reported (the others keep their last value).
+ *
+ * One entry per loop, register and exit condition: a wait helper called for two
+ * registers, or two masks, gives two entries. A pass counts when it goes round,
+ * including the test in the block before the loop that sent the processor into it.
+ * Polls through a called function (a readl() that is not inlined) or with a timeout
+ * counter are not single-block loops and are not found. Off unless UAM_TRACE_POLL is
+ * set (it costs: a poll block returns to the run loop after every pass); found whether
+ * or not spin loops are skipped and blocks traced. Diagnostic only: not saved in
+ * snapshots.
  */
+#define UAM_POLL_MAX_READS 4u
+
 typedef struct uam_poll {
     uint64_t pc;            /* the loop (its block's first instruction) */
     uint64_t load_pc;       /* the instruction that reads the device */
     uint64_t addr;          /* physical address read */
     unsigned size;          /* bytes */
-    bool     analysed;      /* the exit analysis ran (after the first pass) */
-    bool     loops;         /* re-evaluated with the last value, the pass went round */
+    unsigned n_reads;       /* device reads in a pass (load_pc's is the one analysed) */
     bool     have_value;
     uint64_t value;         /* the last value the loop read */
     uint64_t exit_set;      /* bits that, set alone (they read 0), leave the loop */
     uint64_t exit_clear;    /* bits that, cleared alone (they read 1), leave the loop */
-    bool     exit_other;    /* no single bit does, but exit_value does */
+    uint64_t exit_all_set;  /* no single bit does, but these all set together do */
+    uint64_t exit_all_clear;/* ... or these all cleared together */
+    bool     exit_other;    /* none of those, but a read of exit_value does */
     uint64_t exit_value;
     bool     active;        /* the processor is going round it now */
     bool     reported;      /* the UAM_TRACE_POLL line for the current arrival is out */
     uint64_t passes;        /* passes that went round, every arrival */
     uint64_t arrivals;
     uint64_t run, max_run;  /* passes in the current (or last) arrival; the longest */
+    uint64_t changes;       /* passes that went round reading another value than the one
+                             * before (a counter or a timer, not a state it waits for) */
     uint64_t first_icount, last_icount;
 } uam_poll;
 
-#define UAM_EXEC_MAX_POLLS      32u
+#define UAM_EXEC_MAX_POLLS      4096u   /* entries per processor; further loops: polls_dropped */
 #define UAM_EXEC_DEFAULT_POLL_REPORT 10000u
 
 /* "pc 0x.. reads 4 bytes at 0x.. (uart0+0x14): last 0x60; leaves the loop if bit 5
@@ -380,11 +392,17 @@ typedef struct uam_exec {
     uint64_t         slice_base;     /* the running processor's icount when slice_left was set */
     bool             smp_resync;     /* a snapshot was restored mid-slice: resume from slice_* */
 
-    /* Device polls this processor has run (uam_poll), in the order found. poll_report:
-     * passes in a row before a UAM_TRACE_POLL line (0: UAM_EXEC_DEFAULT_POLL_REPORT). */
-    uam_poll         polls[UAM_EXEC_MAX_POLLS];
-    uint32_t         n_polls;
+    /* Device polls this processor has run (uam_poll), in the order found (with
+     * UAM_TRACE_POLL; at most UAM_EXEC_MAX_POLLS). poll_report: passes in a row before
+     * a UAM_TRACE_POLL line (0: UAM_EXEC_DEFAULT_POLL_REPORT). */
+    uam_poll        *polls;
+    uint32_t         n_polls, cap_polls;
+    uint32_t         poll_cur;        /* the entry the last poll pass went to */
+    uint64_t         polls_dropped;   /* loops not tracked: the table was full */
     uint64_t         poll_report;
+    uint64_t         poll_mark, poll_mark_prev;   /* bus n_dev_reads before this block
+                                                   * and before the one before it */
+    bool             spin_skip;       /* spin loops may be skipped (UAM_SPIN_SKIP, per run) */
 } uam_exec;
 
 uam_status      uam_exec_init(uam_exec *x, uam_cpu *cpu, uam_sched *sched);

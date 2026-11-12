@@ -328,10 +328,14 @@ ones a bring-up step needs, all on stderr:
 
 `--trace-mmio-range LO:HI` limits the `mmio` trace to physical addresses in [LO, HI);
 `--poll-report N` is how many passes in a row a loop makes before `polls` reports it
-(default 10000). Polls are found among single-block loops that read one device register
-and count nothing (a `readl()` that is not inlined, or a loop with a timeout counter, is not
-one); the value they wait for is worked out by re-running one pass, without effects, with
-other values for the register. The catch-all logs (`unknown-mmio`, `unimp`, `mmio-stub`,
+(1 or more; default 10000). Polls are found among single-block loops that read up to four
+device registers and count nothing (a `readl()` that is not inlined, or a loop with a
+timeout counter, is not one); the value they wait for is worked out at each arrival by
+re-running one pass, without effects, with other values for a register: single bits, the
+loop's constants as masks ("all of bits 0x30 become 1") and as whole values, and "when the
+value changes from 0x7". A wait helper called for two registers gives two entries; a loop
+whose register keeps changing (a timer delay) is marked "a counter or a timer?". Each
+processor tracks up to 4096 loops, and the summary says how many more it did not. The catch-all logs (`unknown-mmio`, `unimp`, `mmio-stub`,
 the PC `master-abort`) name the instruction of each first access (`pc=0x... icount=N`), and
 `--log-stamp` starts every log line made while the guest runs with `@ICOUNT`. All of it is
 the same with and without `--jit`.

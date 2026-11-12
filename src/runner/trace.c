@@ -246,7 +246,7 @@ void rtrace_finish(rtrace *t, unsigned exec_trace)
             for (size_t i = 0; i < n; i++) {
                 if (!p[i].passes)
                     continue;   /* the condition held at once: not a wait */
-                char d[320];
+                char d[400];
                 uam_poll_describe(&p[i], &m->bus, d, sizeof(d));
                 char tag[16] = "";
                 if (c)
@@ -256,6 +256,13 @@ void rtrace_finish(rtrace *t, unsigned exec_trace)
                         (unsigned long long)p[i].passes, (unsigned long long)p[i].arrivals,
                         (unsigned long long)p[i].max_run, tag);
             }
+            const uint64_t dropped = uam_machine_exec(m, c)->polls_dropped;
+            if (dropped)
+                fprintf(t->out, c ? "poll: %llu more loops not tracked: the table of %u "
+                                    "loops is full cpu=%u\n"
+                                  : "poll: %llu more loops not tracked: the table of %u "
+                                    "loops is full\n",
+                        (unsigned long long)dropped, UAM_EXEC_MAX_POLLS, c);
         }
     }
     fflush(t->out);

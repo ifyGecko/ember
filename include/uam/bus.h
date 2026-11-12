@@ -121,6 +121,8 @@ typedef struct uam_watch {
 typedef void (*uam_dev_access_fn)(void *ctx, const uam_region *r, uint64_t addr, unsigned size,
                                   bool is_write, uint64_t val, uam_status st);
 
+#define UAM_BUS_DEV_READS 8u   /* device reads uam_bus remembers (dev_reads) */
+
 typedef struct uam_bus {
     uam_region       **regions;            /* sorted by priority, highest first */
     uint32_t           n_regions, cap_regions;
@@ -148,10 +150,11 @@ typedef struct uam_bus {
     bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
     uam_dev_access_fn  dev_obs;            /* uam_bus_set_dev_observer */
     void              *dev_obs_ctx;
-    /* The last guest read a device served (address, value as read): what a polling
-     * loop saw last, for the executor's poll reports. */
-    uint64_t           last_dev_read_addr, last_dev_read_val;
-    bool               last_dev_read_valid;
+    /* The last UAM_BUS_DEV_READS guest reads a device served (address, value as read),
+     * dev_reads[(n_dev_reads - 1) % UAM_BUS_DEV_READS] the latest: what a polling loop
+     * saw, for the executor's poll reports. n_dev_reads counts every one. */
+    struct { uint64_t addr, val; } dev_reads[UAM_BUS_DEV_READS];
+    uint64_t           n_dev_reads;
 } uam_bus;
 
 void       uam_bus_init(uam_bus *bus);

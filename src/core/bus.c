@@ -595,9 +595,9 @@ static void dev_read_done(uam_bus *bus, const uam_region *r, uint64_t addr, unsi
                           uam_status st, const uint64_t *val)
 {
     if (st == UAM_OK) {
-        bus->last_dev_read_addr = addr;
-        bus->last_dev_read_val = *val;
-        bus->last_dev_read_valid = true;
+        const uint32_t i = (uint32_t)(bus->n_dev_reads++ % UAM_BUS_DEV_READS);
+        bus->dev_reads[i].addr = addr;
+        bus->dev_reads[i].val = *val;
     }
     if (bus->dev_obs)
         bus->dev_obs(bus->dev_obs_ctx, r, addr, size, false, st == UAM_OK ? *val : 0, st);

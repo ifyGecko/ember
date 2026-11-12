@@ -16,6 +16,7 @@
  */
 #include <getopt.h>
 #include <signal.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -270,7 +271,8 @@ static void usage(FILE *out)
         "                          polls   loops that wait on a device register: the value they\n"
         "                                  wait for, once one goes round --poll-report times,\n"
         "                                  and a summary at the stop (what it was still\n"
-        "                                  waiting for)\n"
+        "                                  waiting for); one-block loops only (no timeout\n"
+        "                                  counter, no call to a read function)\n"
         "                          console each line the guest prints, with its icount and pc\n"
         "                          all     exc, mmio, sysreg, irq, polls, console\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
@@ -280,7 +282,7 @@ static void usage(FILE *out)
         "                          icount the runner prints (a snapshot keeps the count); +N:\n"
         "                          N instructions after the run starts\n"
         "      --poll-report N     passes in a row before --trace polls reports a loop\n"
-        "                          (default 10000)\n"
+        "                          (1 or more; default 10000)\n"
         "      --log-stamp         start each log line made while the guest runs with\n"
         "                          @ICOUNT (@ICOUNT:cpuN on other processors)\n"
         "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
@@ -678,6 +680,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     const char *fuzz_input = NULL, *fuzz_replay = NULL;
     unsigned trace = 0, block_insns = 0;
     uint64_t poll_report = 0;
+    bool have_poll_report = false;
     static rtrace rt;   /* large (tables); static, one run per process */
     memset(&rt, 0, sizeof(rt));
     uam_board_option options[MAX_LIST];
@@ -736,7 +739,19 @@ static int run_main(int argc, char **argv, const ext_set *es)
             rt.flags |= RT_MMIO;
             break;
         }
-        case OPT_POLL_REPORT: poll_report = strtoull(optarg, NULL, 0); break;
+        case OPT_POLL_REPORT: {
+            char *end;
+            errno = 0;
+            poll_report = strtoull(optarg, &end, 0);
+            if (end == optarg || *end || errno || optarg[strspn(optarg, " \t")] == '-'
+                || poll_report == 0) {
+                fprintf(stderr, "uam-run: --poll-report wants a number of passes, 1 or more "
+                        "(got '%s')\n", optarg);
+                return 2;
+            }
+            have_poll_report = true;
+            break;
+        }
         case OPT_LOG_STAMP: uam_log_stamp = true; break;
         case 's': stats = true; break;
         case 'd': dump = true; break;
@@ -1126,6 +1141,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 (unsigned long long)trace_after, (unsigned long long)start_icount);
     m.exec.trace_after = trace_after;
     m.exec.poll_report = poll_report;
+    if (have_poll_report && !(trace & UAM_TRACE_POLL))
+        fprintf(stderr, "uam-run: --poll-report does nothing without --trace polls\n");
     rt.after = (trace_after || trace_after_rel) ? trace_after : 0;
     rtrace_attach(&rt, &m, console, m.exec.trace_out);
     m.exec.verify = verify;
