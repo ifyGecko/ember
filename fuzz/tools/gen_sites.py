@@ -26,20 +26,34 @@ Site selection per basic block (--strategy):
               instruction instead.
   auto        the arch's default.
 A block ends after every jump or return (on MIPS after its delay slot),
-also where rizin's own block runs on (PowerPC conditional returns). On
-every arch a candidate must be an instruction ember runs on its own --
-never one it runs as part of the one before it (a MIPS delay slot, an ARM
-Thumb instruction inside an IT block after the IT: a site there stops the
-run with "translation failed") -- and must be code: an instruction rizin decoded as
-data (a literal pool, a jump-table payload) is never a site, and two sites
+also where rizin's own block runs on (PowerPC returns), and what follows an
+unconditional return there belongs to no block. On every arch a candidate
+must be an instruction ember runs on its own -- never one it runs as part
+of the one before it (a MIPS delay slot, an ARM Thumb instruction inside an
+IT block after the IT: a site there stops the run with "translation
+failed") -- and must be code: it lies in an executable section of the ELF
+(an executable segment, if the ELF has no section headers), and rizin did
+not decode it as data (a literal pool, a jump-table payload). Two sites
 whose bytes overlap (a decoding disagreement) keep only the first.
 
 Which functions get sites: those that start at a function symbol of the
 ELF (STT_FUNC), at its entry point, or at a --symbols address; functions
-rizin found only by analysis need --all-functions. The rule is the
-image's, not the analyser's, so the Ghidra port (ghidra/gen_sites.py)
-picks the same functions and writes the same file. The records are in
-offset order; a site's id is its index.
+rizin found only by analysis need --all-functions. Import stubs
+(sym.imp.*) and the C runtime's start/stop stubs (_init, _fini,
+frame_dummy, register_tm_clones, deregister_tm_clones,
+__do_global_dtors_aux, __libc_csu_init, __libc_csu_fini; exact names) get
+none unless --no-default-exclude. The records are in offset order; a
+site's id is its index.
+
+The Ghidra port (ghidra/gen_sites.py) follows the same rules, and they are
+the image's where they can be, not the analyser's. So the two write the
+same file when both analysers recover the same functions and blocks. They
+can differ where one resolves a jump table and the other does not: the
+case blocks of a switch are then blocks, with sites, in one list only
+(seen with rizin on ARM `add pc, pc, rN, lsl #2`, MIPS `jr` and PowerPC
+`bctr` tables that Ghidra resolves). Module 0's name is the image's file
+name here and the program's name in the Ghidra project there, so the files
+are identical only if the image was imported under its file name.
 
 Arches: whatever rizin disassembles -- MIPS, ARM, RISC-V, PowerPC, x86
 (16/32/64), AVR, Xtensa, 8051, Z80, 6502, PIC (raw images: --arch, and --cpu
@@ -79,8 +93,8 @@ Selective coverage (--root / --cutoff / --max-depth):
 
   The call graph is built from rizin's `afij` callrefs: outgoing CALL
   edges to functions rizin found in the analysed binary. An import stub
-  (sym.imp.*) makes no CALL, so the BFS stops there, and DEFAULT_EXCLUDE
-  keeps stubs out of the list.
+  (sym.imp.*) makes no CALL, so the BFS stops there, and the default
+  exclusion keeps stubs out of the list.
 
   With --include-pat / --exclude-pat the result is the intersection: a
   function must be both reachable AND pass the regex filters.
@@ -120,13 +134,27 @@ import rzpipe
 sys.dont_write_bytecode = True  # no __pycache__ next to the tools
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image_resolve import (NotFound, Image, add_image_args,  # noqa: E402
-                           image_from_args, resolve_to_offset, symbol_entries)
+                           code_ranges, image_from_args, in_ranges,
+                           resolve_to_offset, symbol_entries)
 
 
-# Functions that get no sites by default: import stubs and CRT/init code,
-# none of which are meaningful coverage. --exclude-pat is ORed with this;
-# --no-default-exclude drops it.
-DEFAULT_EXCLUDE = r"^(sym\.imp\.|sym\._init|sym\._fini|sym\.deregister|sym\.register|sym\.frame_dummy|sym\.__libc_csu)"
+# Functions that get no sites by default: import stubs (rizin's sym.imp.*)
+# and the C runtime's start/stop stubs, none of which are meaningful
+# coverage. The stubs are matched by their whole name, whatever prefix
+# rizin gives it (sym._init, dbg._init), so a firmware function named
+# register_handler or _init_board keeps its sites. --exclude-pat adds to
+# this; --no-default-exclude drops it.
+DEFAULT_EXCLUDE_NAMES = frozenset((
+    "_init", "_fini", "frame_dummy", "register_tm_clones",
+    "deregister_tm_clones", "__do_global_dtors_aux", "__libc_csu_init",
+    "__libc_csu_fini"))
+_NAME_PREFIX_RE = re.compile(r"^(sym|dbg)\.")
+
+
+def default_excluded(name):
+    """True for a function the default exclusion drops."""
+    return (name.startswith("sym.imp.")
+            or _NAME_PREFIX_RE.sub("", name) in DEFAULT_EXCLUDE_NAMES)
 
 # Site list layout (fuzz/formats.h, docs/fuzz-formats.md).
 SITES_MAGIC = b"UAMS"
@@ -249,10 +277,12 @@ def site_flags(arch, fn_bits):
     return SITE_ALT_STATE if arch in ("arm", "mips") and fn_bits == 16 else 0
 
 
-def filter_functions(all_fns, include_re, exclude_re):
+def filter_functions(all_fns, include_re, exclude_re, default_exclude):
     out = []
     for f in all_fns:
         name = f.get("name", "")
+        if default_exclude and default_excluded(name):
+            continue
         if include_re and not include_re.search(name):
             continue
         if exclude_re and exclude_re.search(name):
@@ -289,13 +319,19 @@ def report_include_matches(fns, pattern, module_name, verbose):
                   f"address are deduplicated", file=sys.stderr)
 
 
-def get_block_insns(rz, block):
+def get_block_insns(rz, block, code=None):
     """The instructions of an `afbj` block. Bounded by the block's size:
     on MIPS rizin's ninstr counts a delay slot twice, so `pdj ninstr`
-    alone would run one instruction past the block."""
+    alone would run one instruction past the block. An instruction outside
+    the image's `code` ranges (image_resolve.code_ranges) is marked
+    "outside": it is data, whatever it decodes as."""
     addr, end = int(block["addr"]), int(block["addr"]) + int(block.get("size", 0))
     insns = rz.cmdj(f"pdj {int(block.get('ninstr', 0))} @ {addr}") or []
-    return [i for i in insns if int(i.get("offset", end)) < end]
+    insns = [i for i in insns if int(i.get("offset", end)) < end]
+    for i in insns:
+        if not in_ranges(code, int(i["offset"])):
+            i["outside"] = True
+    return insns
 
 
 def op_class(insn_type):
@@ -342,15 +378,16 @@ def _insn_mnemonic(insn):
 
 
 def is_data(insn):
-    """True if rizin decoded this "instruction" as data rather than code: an
-    invalid/undecodable opcode, or a data directive (a literal-pool word, a
+    """True if this "instruction" is data rather than code: it lies outside
+    the image's code ranges (get_block_insns), or rizin decoded it as an
+    invalid/undecodable opcode or a data directive (a literal-pool word, a
     tbb/tbh jump-table payload). Execution never reaches data, so a site
     there would never count, and its bytes would not be an instruction.
 
     A literal word that happens to decode as a plausible instruction can't be
     caught by type alone; the overlap check and --strategy entry are the
     backstops for that residual case."""
-    if (insn.get("type") or "") == "invalid":
+    if insn.get("outside") or (insn.get("type") or "") == "invalid":
         return True
     return _insn_mnemonic(insn) in _DATA_MNEMONICS
 
@@ -428,32 +465,46 @@ def pick_entry(insns, in_delay_slot):
     return None
 
 
+def returns_always(insn):
+    """True for an unconditional return. rizin types every PowerPC return
+    as conditional, the plain blr too."""
+    t = insn.get("type") or ""
+    return t == "ret" or (t == "cret" and _insn_mnemonic(insn) == "blr")
+
+
 def split_block(insns, is_mips):
     """Cut a block's instructions after every jump or return (on MIPS after
     its delay slot), so a block never runs on past a conditional transfer.
-    rizin lets some do -- PowerPC's conditional returns (bnelr, beqlr) do
-    not end its blocks -- which would hide the code after them; Ghidra
-    ends its blocks there. Calls do not cut, in either."""
-    out, cur, cut = [], [], None
+    rizin lets some do -- PowerPC's returns (blr, bnelr, beqlr) do not end
+    its blocks -- which would hide the code after them; Ghidra ends its
+    blocks there. Calls do not cut, in either. What follows an
+    unconditional return in the block is never reached from it (rizin runs
+    the block on into the padding, or the next function, after a blr), so
+    it is left out."""
+    out, cur, cut, last = [], [], None, False
     for i, insn in enumerate(insns):
         cur.append(insn)
         if cut is None and op_class(insn.get("type")) in ("jmp", "ret"):
             cut = i + 1 if is_mips else i
+            last = returns_always(insn)
         if cut is not None and i >= cut:
             out.append(cur)
             cur, cut = [], None
+            if last:
+                break
     if cur:
         out.append(cur)
     return out
 
 
-def pick_sites(rz, fn, strategy, arch):
-    """(address, size, bytes hex) of the site of each of fn's blocks."""
+def pick_sites(rz, fn, strategy, arch, code=None):
+    """(address, size, bytes hex) of the site of each of fn's blocks; none
+    outside the image's `code` ranges."""
     is_mips = arch == "mips"
     blocks = rz.cmdj(f"afbj @ {fn['offset']}") or []
     sites = []
     for b in blocks:
-        for part in split_block(get_block_insns(rz, b), is_mips):
+        for part in split_block(get_block_insns(rz, b, code), is_mips):
             start = int(part[0]["offset"])
             if strategy == "entry":
                 pick = pick_entry(part, is_mips and is_branch_at(rz, start - 4))
@@ -607,7 +658,8 @@ def validate_no_overlap(records, module_name, fail):
     addresses are deduped upstream, so only partial overlaps reach here.
 
     `records` is a list of (offset, len, module, orig, flags), module-
-    relative, so this is called per module. The later (higher-offset) site
+    relative, so this is called per module; len is the instruction's whole
+    length, also where the record will store fewer bytes. The later (higher-offset) site
     of an overlapping pair is dropped with a warning; with `fail` the first
     overlap is a hard error. Returns the surviving records in their
     original (discovery) order."""
@@ -700,24 +752,20 @@ def resolve_slice_specs(specs, module_idx, all_fns, found, stubs, flag, verbose)
 
 
 def collect_module_records(args, rz, module_idx, module_name, slicing,
-                           entries, compressed=(), image=None):
+                           entries, compressed=(), image=None, code=None):
     """Walk one module's functions and return its site records, each a
-    tuple (offset, len, module_idx, orig_bytes, flags) ready to pack.
+    tuple (offset, instruction length, module_idx, first bytes, flags).
     Only functions starting at an address in `entries` (symbol_entries)
     get sites, unless --all-functions; never the MIPS16e/microMIPS ones in
-    `compressed`, which rizin cannot decode.
+    `compressed`, which rizin cannot decode, and no site lies outside the
+    `code` ranges (image_resolve.code_ranges).
 
     `slicing` carries the parsed --root / --cutoff specs and the per-spec
     "resolved in" maps shared across modules (see run()). With
     --print-reachable the slice is printed and no records are returned.
     `image` describes a raw image / --symbols (module 0 only)."""
     inc = re.compile(args.include_pat) if args.include_pat else None
-    exc_pats = []
-    if not args.no_default_exclude:
-        exc_pats.append(DEFAULT_EXCLUDE)
-    if args.exclude_pat:
-        exc_pats.append(args.exclude_pat)
-    exc = re.compile("|".join(f"(?:{pat})" for pat in exc_pats)) if exc_pats else None
+    exc = re.compile(args.exclude_pat) if args.exclude_pat else None
 
     info = get_bin_info(rz, image)
     baddr = info["baddr"]
@@ -732,7 +780,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing,
 
     # One `aflj` snapshot, reused for filtering and slice resolution.
     all_fns_raw = get_all_functions(rz, image)
-    fns = filter_functions(all_fns_raw, inc, exc)
+    fns = filter_functions(all_fns_raw, inc, exc, not args.no_default_exclude)
     if inc:
         report_include_matches(fns, args.include_pat, module_name, args.verbose)
 
@@ -742,7 +790,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing,
     # regex may exclude intermediate functions between a --root and a
     # callee that should get sites.
     if args.root:
-        all_fns = filter_functions(all_fns_raw, None, None)
+        all_fns = filter_functions(all_fns_raw, None, None, False)
         roots = resolve_slice_specs(slicing["roots"], module_idx, all_fns,
                                     slicing["found_roots"], slicing["stub_roots"],
                                     "--root", args.verbose)
@@ -831,7 +879,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing,
                       f"--all-functions)", file=sys.stderr)
             continue
         flags = site_flags(arch, fn["bits"])
-        for addr, size, bhex in pick_sites(rz, fn, strategy, arch):
+        for addr, size, bhex in pick_sites(rz, fn, strategy, arch, code):
             if addr in seen:
                 continue
             try:
@@ -840,8 +888,9 @@ def collect_module_records(args, rz, module_idx, module_name, slicing,
                 continue
             if size < 1 or len(orig) != size:
                 continue
-            size = min(size, SITES_ORIG_MAX)
-            orig = orig[:size]
+            # The record keeps the instruction's whole length for the
+            # overlap check; write_sites stores at most SITES_ORIG_MAX.
+            orig = orig[:SITES_ORIG_MAX]
             offset = addr - baddr
             records.append((offset, size, module_idx, orig, flags))
             seen.add(addr)
@@ -850,9 +899,10 @@ def collect_module_records(args, rz, module_idx, module_name, slicing,
                       f"module={module_idx} bytes={orig.hex()} flags={flags} "
                       f"({fn['name']})", file=sys.stderr)
 
-    if unnamed and args.verbose:
-        print(f"  skipped {unnamed} function(s) without a function symbol "
-              f"(use --all-functions to give them sites)", file=sys.stderr)
+    if unnamed:
+        print(f"module[{module_idx}] '{module_name}': skipped {unnamed} "
+              f"function(s) without a function symbol (--all-functions gives "
+              f"them sites, --symbols FILE names them)", file=sys.stderr)
 
     return validate_no_overlap(records, module_name, args.fail_on_overlap)
 
@@ -860,7 +910,9 @@ def collect_module_records(args, rz, module_idx, module_name, slicing,
 def write_sites(output_path, module_names, records, module_bases):
     """Pack the records, the module name table and the base table into a
     site list (fuzz/formats.h). Records are in (module, offset) order, so
-    the site ids do not depend on the analyser's iteration order."""
+    the site ids do not depend on the analyser's iteration order. A record
+    stores the instruction's first bytes (at most SITES_ORIG_MAX) and their
+    count."""
     name_blob = b"".join(n.encode("utf-8") + b"\x00" for n in module_names)
     if len(name_blob) > SITES_NAMES_MAX:
         sys.exit(f"error: module names take {len(name_blob)} bytes; a site "
@@ -878,7 +930,8 @@ def write_sites(output_path, module_names, records, module_bases):
                                   modules_offset, modules_size))
         for offset, size, module_idx, orig, flags in records:
             padded = orig + b"\x00" * (SITES_ORIG_MAX - len(orig))
-            f.write(SITES_RECORD.pack(offset, module_idx, size, flags, 0, padded))
+            f.write(SITES_RECORD.pack(offset, module_idx, len(orig), flags, 0,
+                                      padded))
         f.write(name_blob)
         f.write(bases_blob)
 
@@ -918,9 +971,9 @@ def run(args):
         rz = open_rizin(path, image, entries, machine)
         try:
             module_bases.append(get_bin_info(rz, image)["baddr"])
-            all_records.extend(collect_module_records(args, rz, module_idx,
-                                                      name, slicing, entries,
-                                                      compressed, image))
+            all_records.extend(collect_module_records(
+                args, rz, module_idx, name, slicing, entries, compressed,
+                image, code_ranges(path, image)))
         finally:
             try:
                 rz.quit()
@@ -956,9 +1009,13 @@ def run(args):
             hint = (" Check --include-pat: rizin names functions with debug "
                     "info 'dbg.NAME' and others 'sym.NAME' (run with -v to "
                     "see what matched).")
-        if args.raw and not args.all_functions:
+        if not args.all_functions:
             hint += (" Only functions at a --symbols address of a raw image "
-                     "get sites; pass --symbols FILE or --all-functions.")
+                     "get sites; pass --symbols FILE or --all-functions."
+                     if args.raw else
+                     " Only functions at a function symbol of the ELF, at its "
+                     "entry point or at a --symbols address get sites; for a "
+                     "stripped ELF pass --symbols FILE or --all-functions.")
         sys.exit(f"error: no sites selected; not writing {args.output}."
                  f"{hint} Pass --allow-empty to write an empty site list "
                  f"anyway.")
@@ -991,9 +1048,12 @@ def main():
                          "regex; added to (not replacing) the built-in "
                          "exclusions. Use --no-default-exclude to drop those.")
     ap.add_argument("--no-default-exclude", action="store_true",
-                    help="do not apply the built-in exclusions "
-                         "(sym.imp.*, CRT/init stubs); only --exclude-pat, "
-                         "if given, is used")
+                    help="do not apply the built-in exclusions (import "
+                         "stubs sym.imp.*, and the C runtime's _init, _fini, "
+                         "frame_dummy, register_tm_clones, "
+                         "deregister_tm_clones, __do_global_dtors_aux, "
+                         "__libc_csu_init, __libc_csu_fini); only "
+                         "--exclude-pat, if given, is used")
     ap.add_argument("--all-functions", action="store_true",
                     help="give every function rizin found sites, also those "
                          "that start at no function symbol (fcn.*, code "

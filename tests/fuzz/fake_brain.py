@@ -14,6 +14,7 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
   - BYE ending the run with exit 0, and EOF before BYE being an error;
   - CRASH REJECTED (status 0) for an input the route refuses (mem:...,reject), the
     session going on after it;
+  - CRASH GUARD (the pc of the access) for a read of a --guard range;
   - --fuzz-net-timeout giving up on a brain that goes silent.
 Exit status 0 when everything holds.
 """
@@ -190,7 +191,7 @@ def main():
                 extra_frame = c.recv(1)
             except OSError:
                 extra_frame = b""
-            check(extra_frame == b"", f"{tag}: executor sent more after BYE")
+            check(extra_frame == b"", f"{tag}: ember sent more after BYE")
 
         rc, err = session(run, board, fw, extra, script)
         if not check(rc == 0, f"{tag}: exit {rc} after BYE"):
@@ -227,6 +228,27 @@ def main():
     rc, err = session(run, board, fw, [*blocks, "--fuzz-input", f"mem:{scratch:#x},max=4,reject"],
                       rejecting)
     if not check(rc == 0, f"{board} reject: exit {rc}"):
+        sys.stderr.write(err)
+
+    # A guarded buffer: the read that touches it is CRASH GUARD with the pc of the access,
+    # a reason of its own beside FAULT.
+    def guarded(c):
+        tag = f"{board} guard"
+        handshake(c, tag)
+        pcs = []
+        for iid in (1, 2):
+            send_input(c, iid, b"hello")
+            t, p = recv_frame(c)
+            rid, rsn, sts = struct.unpack(">QBI", p) if t == CRASH and len(p) == 13 else (None,) * 3
+            check(rid == iid and rsn == GUARD and sts, f"{tag}: input {iid}: CRASH GUARD with a pc "
+                  f"(type {t}, id {rid}, reason {rsn}, status {sts})")
+            pcs.append(sts)
+        check(pcs[0] == pcs[1], f"{tag}: GUARD status is stable")
+        send_frame(c, BYE)
+
+    rc, err = session(run, board, fw, [*blocks, "--guard", f"{sym(fw, 'g_buf'):#x}+256:r,name=g_buf"],
+                      guarded)
+    if not check(rc == 0, f"{board} guard: exit {rc}"):
         sys.stderr.write(err)
 
     # A brain that goes silent: --fuzz-net-timeout gives up instead of waiting forever.

@@ -187,7 +187,15 @@ if [ $rc -ne 20 ] \
    || ! python3 "$here/cov_region_check.py" "$tmp/region" 0x201 "$tmp/shm-1-ok.map" "$tmp/shm-3-ok.map" \
         > "$tmp/shm.out" 2>&1 \
    || [ "$(python3 "$tools/cov_region.py" gen "$tmp/region")" != 3 ] \
-   || [ "$(python3 "$tools/cov_region.py" scheme "$tmp/region")" != "n=2 model=site rotate=0" ]; then
+   || [ "$(python3 "$tools/cov_region.py" scheme "$tmp/region")" != "n=2 model=site rotate=0" ] \
+   || ! python3 "$tools/cov_region.py" extract "$tmp/region" "$tmp/cur.map" current 2>> "$tmp/shm.out" \
+   || ! cmp -s "$tmp/cur.map" "$tmp/shm-3-ok.map" \
+   || ! python3 "$tools/cov_region.py" extract "$tmp/region" "$tmp/g2.map" 2 2>> "$tmp/shm.out" \
+   || ! cmp -s "$tmp/g2.map" "$tmp/shm-1-ok.map" \
+   || ! python3 "$tools/cov_region.py" stats "$tmp/region" init > "$tmp/init.stats" 2>> "$tmp/shm.out" \
+   || [ "$(cut -d' ' -f1 "$tmp/init.stats")" -lt 1 ] \
+   || ! python3 "$tools/cov_region.py" header "$tmp/region" | grep -q '^ring_size=4$' \
+   || python3 "$tools/cov_region.py" stats "$tmp/region" 9 > /dev/null 2>&1; then
     echo "formats-check: $board: --cov-shm (exit $rc):" >&2
     cat "$tmp/shm.err" "$tmp/shm.out" >&2
     fail=1

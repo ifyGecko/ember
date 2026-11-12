@@ -14,9 +14,11 @@ The Ghidra counterpart of fuzz/tools/gen_boundaries.py and the sibling of
 gen_sites.py here, whose pick_entry / pick_terminator it uses: each named
 function's marker is the site gen_sites.py has for the function's first
 basic block under the same --strategy, so for the same image and options it
-writes the same file as the rizin tool. Pass --sites to check every marker
-against a site list. A marker in ARM Thumb code gets the alternate-state
-flag.
+writes the same file as the rizin tool wherever the two site lists agree on
+that block. Pass --sites to check every marker against a site list. A
+marker in ARM Thumb or MIPS16e/microMIPS code gets the alternate-state
+flag. Offsets are from module 0's link base, also for a
+position-independent ELF that Ghidra loaded at an image base of its own.
 
 As with gen_sites.py, there is no positional <binary> (module 0 is the
 open program); the first positional is OUTPUT.
@@ -52,14 +54,13 @@ if _HERE in sys.path:
     sys.path.remove(_HERE)
 sys.path.insert(0, _HERE)
 
-from image_resolve import NotFound, add_symbols_arg, load_symbols, \
-    program_entries, resolve_to_offset
+from image_resolve import NotFound, ProgramImage, add_symbols_arg, \
+    load_symbols, resolve_to_offset, run_script
 from gen_sites import (SITES_HEADER, SITES_MAGIC, SITES_RECORD, addr_of,
-                       block_instructions, check_strategy, default_strategy,
-                       ensure_functions, function_blocks, get_all_functions,
-                       get_bin_info,
-                       is_branch_at, monitor_or_dummy, pick_entry,
-                       pick_terminator, site_flags, split_block, uoff,
+                       check_strategy, default_strategy, ensure_functions,
+                       function_blocks, get_all_functions, get_bin_info,
+                       monitor_or_dummy, pick_entry, pick_terminator,
+                       site_flags, split_block, starts_in_delay_slot, uoff,
                        _func_bits, _text)
 
 # Boundary file layout (fuzz/formats.h, docs/fuzz-formats.md).
@@ -73,11 +74,12 @@ KIND_MAP = {"begin": 0, "end": 1}
 DEPTH_MAP = {"any": 0, "zero": 1}
 
 
-def get_function_addrs(program, symbols):
+def get_function_addrs(program, image):
     """Return ({name: vaddr}, all_fns): every symbol-table name as a
     fallback dict, and the analysed functions as the list
-    resolve_to_offset() expects. (The rizin tool's aflj + isj.)"""
-    all_fns = [f for f in get_all_functions(program, symbols) if f["name"]]
+    resolve_to_offset() expects. `image`: the program's ProgramImage. (The
+    rizin tool's aflj + isj.)"""
+    all_fns = [f for f in get_all_functions(program, image) if f["name"]]
     syms = {}
     for sym in program.getSymbolTable().getSymbolIterator(True):
         a = sym.getAddress()
@@ -86,7 +88,7 @@ def get_function_addrs(program, symbols):
         name = _text(sym.getName())
         if name:
             syms.setdefault(name, uoff(a))
-    for addr, name in symbols.items():
+    for addr, name in image.symbols.items():
         syms.setdefault(name, addr)
     return syms, all_fns
 
@@ -108,34 +110,31 @@ def resolve(name, all_fns, syms):
     raise ValueError("could not resolve '%s' to a function or symbol" % name)
 
 
-def first_bb_site(program, bbm, monitor, fn_addr, strategy, is_mips):
+def first_bb_site(program, bbm, monitor, fn_addr, strategy, is_mips, image):
     """Return (address, function bits) of the site gen_sites.py picks for
-    the first basic block of the function at fn_addr, or None."""
-    blocks = function_blocks(program, bbm, monitor, fn_addr)
+    the first basic block of the function at fn_addr, or None. `image`:
+    the program's ProgramImage."""
+    blocks = function_blocks(program, bbm, monitor, fn_addr, image)
     if not blocks:
         # A symbol-table name Ghidra did not make a function: make one.
         ensure_functions(program, [fn_addr])
-        blocks = function_blocks(program, bbm, monitor, fn_addr)
+        blocks = function_blocks(program, bbm, monitor, fn_addr, image)
     if not blocks:
         return None
     func = program.getFunctionManager().getFunctionAt(addr_of(program, fn_addr))
+    # The entry block starts at fn_addr; else the lowest block at or above
+    # it, and only then the lowest (function_blocks sorts by address).
     entry = None
     for b in blocks:
-        if uoff(b.getMinAddress()) == fn_addr:
+        if b[0]["offset"] == fn_addr:
             entry = b
             break
     if entry is None:
-        forward = [b for b in blocks if uoff(b.getMinAddress()) >= fn_addr]
-        entry = (min(forward, key=lambda b: uoff(b.getMinAddress()))
-                 if forward
-                 else min(blocks, key=lambda b: uoff(b.getMinAddress())))
-    insns = block_instructions(program, entry)
-    if not insns:
-        return None
-    insns = split_block(insns, is_mips)[0]
-    start = int(insns[0]["offset"])
+        forward = [b for b in blocks if b[0]["offset"] >= fn_addr]
+        entry = forward[0] if forward else blocks[0]
+    insns = split_block(entry, is_mips)[0]
     if strategy == "entry":
-        pick = pick_entry(insns, is_mips and is_branch_at(program, start - 4))
+        pick = pick_entry(insns, is_mips and starts_in_delay_slot(insns))
     else:
         pick = pick_terminator(insns)
     if pick is None:
@@ -256,13 +255,14 @@ def main():
     bbm = BasicBlockModel(program)
     sites = site_list_offsets(args.sites) if args.sites else None
 
-    info = get_bin_info(program)
+    image = ProgramImage(program, symbols)
+    info = get_bin_info(program, image)
     baddr, arch = info["baddr"], info["arch"]
     strategy = (args.strategy if args.strategy != "auto"
                 else default_strategy(arch))
     check_strategy(arch, strategy)
-    ensure_functions(program, program_entries(program, symbols))
-    syms, all_fns = get_function_addrs(program, symbols)
+    ensure_functions(program, image.entries)
+    syms, all_fns = get_function_addrs(program, image)
     if args.verbose:
         print("image base: 0x%x strategy=%s" % (baddr, strategy),
               file=sys.stderr)
@@ -276,7 +276,7 @@ def main():
         except ValueError as e:
             sys.exit("error: %s" % e)
         hit = first_bb_site(program, bbm, monitor, fn_addr, strategy,
-                            arch == "mips")
+                            arch == "mips", image)
         if hit is None:
             sys.exit("error: could not find a first-block %s site for %s @ 0x%x"
                      % (strategy, name, fn_addr))
@@ -301,4 +301,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_script(main)

@@ -74,7 +74,7 @@ NET_VERSION = 1
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
 HELLO, INPUT, COVERAGE, CRASH, BYE = 1, 2, 3, 4, 5
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
-INPUT_HDR_LEN, COVERAGE_HDR_LEN, CRASH_LEN = 12, 13, 13
+COVERAGE_HDR_LEN, CRASH_LEN = 13, 13
 KIND_INIT, KIND_ITER = 1, 2
 
 # HELLO flags: the coverage scheme (the coverage region's flags, same bits).
@@ -180,7 +180,7 @@ def main():
                     help="seconds to wait for each reply (0 = forever; "
                          "default 60)")
     ap.add_argument("--status-file",
-                    help="append a JSON-lines status feed here (watch it with "
+                    help="write a JSON-lines status feed here, anew each session (watch it with "
                          "fuzz/tools/status_tui.py)")
     ap.add_argument("--status-interval", type=float, default=1.0,
                     help="seconds between status snapshots (default 1.0)")
@@ -229,7 +229,7 @@ def main():
             corpus.append(data)
     if not corpus:
         corpus = [b"A", b"B", b"C"]
-    saved_corpus = set(hashlib.sha1(d).hexdigest() for d in corpus)
+    saved_corpus = set(hashlib.sha1(d).hexdigest() for d in resumed)
 
     def save_corpus_input(data):
         """Persist a new-coverage input so the campaign is resumable."""
@@ -239,6 +239,9 @@ def main():
         saved_corpus.add(h)
         with open(os.path.join(corpus_dir, "cov_%s" % h[:16]), "wb") as f:
             f.write(data)
+
+    for data in seeds:                   # so a later session resumes without --seeds
+        save_corpus_input(data)
 
     # ---- stop cleanly on Ctrl-C / SIGTERM (campaign state is on disk) ----
     stop = {"flag": False}
@@ -317,7 +320,7 @@ def main():
 
     # ---- optional JSON-lines status feed (for fuzz/tools/status_tui.py) --
     start = time.monotonic()
-    status_fp = open(args.status_file, "a", buffering=1) if args.status_file else None
+    status_fp = open(args.status_file, "w", buffering=1) if args.status_file else None
     last_status = [0.0]
     stage = ["baseline 0/%d" % len(corpus)]
     baseline_edges = [None]   # edges after the corpus replay; new_edges counts past it

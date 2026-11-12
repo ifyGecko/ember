@@ -3,7 +3,9 @@
 
 `uam-run --cov-shm PATH` publishes the harness's coverage maps in a shared
 memory region (or a file); this reads one. The layout is specified in
-docs/fuzz-formats.md (constants in fuzz/formats.h).
+docs/fuzz-formats.md (constants in fuzz/formats.h). REGION is a file path: for
+a shared-memory name (`--cov-shm NAME`, no slash) pass /dev/shm/NAME. A bare
+map file (`--cov-out`) is not a region.
 
   python3 fuzz/tools/cov_region.py header  REGION         every header field
   python3 fuzz/tools/cov_region.py gen     REGION         gen_current
@@ -16,20 +18,23 @@ WHICH picks the map: "bitmap" (default: the union of every published map),
 "current" (the slot of gen_current), "init" (the slot of gen_init) or a
 generation number. A slot is read with the region's seqlock: it is accepted
 only if its slot_gen equals the generation before and after copying the map,
-so reading a live region is safe (a slot that has since been overwritten is an
-error, not a torn map).
+so reading a live region is safe: a slot being written is read again a few
+times, and a generation the ring no longer holds is an error, not a torn map.
+The ring keeps the last ring_size - 1 generations, so "init" works only until
+that many iterations have been published; the INIT map is part of "bitmap".
 
 The region is in the byte order of the ember that wrote it; the reader tells
 it from the u16 version (1) at offset 4.
 """
 import struct
 import sys
+import time
 
 MAGIC = b"UAMC"
 VERSION = 1
 HEADER_LEN = 64
 SLOT_HDR_LEN = 24
-KIND_NAMES = {1: "INIT", 2: "ITER"}
+SLOT_TRIES = 100
 
 SCHEME, SCHEME_PC, SCHEME_ROTATE = 1 << 0, 1 << 1, 1 << 2
 NGRAM_SHIFT, NGRAM_MASK = 8, 0xf << 8
@@ -100,15 +105,17 @@ class Region:
             die("generation 0 was never published")
         h = self.hdr
         off = h["ring_offset"] + (gen % h["ring_size"]) * h["slot_stride"]
-        before = struct.unpack(self.order + "Q", self._read(off, 8))[0]
-        if before != gen:
-            die("generation %d is not in the ring (its slot holds %d)" % (gen, before))
-        raw = self._read(off, SLOT_HDR_LEN + h["map_size"])
-        after = struct.unpack(self.order + "Q", self._read(off, 8))[0]
-        slot_gen, ns, kind, _res = struct.unpack_from(self.order + "QQII", raw)
-        if slot_gen != gen or after != gen:
-            die("generation %d was overwritten while reading it" % gen)
-        return kind, ns, raw[SLOT_HDR_LEN:]
+        for _ in range(SLOT_TRIES):
+            if self.gen_current() - gen >= h["ring_size"]:
+                die("generation %d is no longer in the ring (it holds the last %d)"
+                    % (gen, h["ring_size"] - 1))
+            raw = self._read(off, SLOT_HDR_LEN + h["map_size"])
+            after = struct.unpack(self.order + "Q", self._read(off, 8))[0]
+            slot_gen, ns, kind, _res = struct.unpack_from(self.order + "QQII", raw)
+            if slot_gen == gen and after == gen:
+                return kind, ns, raw[SLOT_HDR_LEN:]
+            time.sleep(0.001)            # the writer is in this slot: read it again
+        die("generation %d could not be read (its slot kept changing)" % gen)
 
     def pick(self, which):
         if which in (None, "bitmap"):
@@ -155,8 +162,9 @@ def main(argv):
     elif cmd == "stats":
         print(stats(region.pick(argv[3] if len(argv) > 3 else None)))
     elif cmd == "extract":
+        data = region.pick(argv[4] if len(argv) > 4 else None)
         with open(argv[3], "wb") as f:
-            f.write(region.pick(argv[4] if len(argv) > 4 else None))
+            f.write(data)
     return 0
 
 

@@ -327,7 +327,7 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             return 1;
         }
         default:
-            continue;   /* unknown (or executor-bound) frame types are ignored */
+            continue;   /* any other frame type is ignored */
         }
     }
 }

@@ -6,8 +6,9 @@
 # FIRMWARE, a build of tests/fuzz/fuzztarget.h, with the entry strategy. ember must find
 # every site's bytes in memory (--cov-strict) and give the planted bugs' verdicts. With
 # headless Ghidra (analyzeHeadless on PATH, or GHIDRA_HEADLESS), the Ghidra route
-# (fuzz/tools/ghidra/) must write the same two files byte for byte; for an ARM BE8 image,
-# which rizin cannot decode, the lists come from the Ghidra route alone.
+# (fuzz/tools/ghidra/) must write the same two files byte for byte, and so again with
+# each tool's default strategy where that is not entry (every arch but MIPS); for an ARM
+# BE8 image, which rizin cannot decode, the lists come from the Ghidra route alone.
 set -eu
 run=$1
 board=$2
@@ -22,15 +23,30 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 panic=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
 headless=${GHIDRA_HEADLESS:-$(command -v analyzeHeadless || true)}
-ghidra_lists() {   # ghidra_lists SITES BOUNDS
+ghidra_lists() {   # ghidra_lists SITES BOUNDS [STRATEGY]: entry lists on import, others after
     gt=$(cd "$tools/ghidra" && pwd)
-    rm -rf "$tmp/gp" && mkdir "$tmp/gp"
-    "$headless" "$tmp/gp" p -import "$fw" -scriptPath "$gt" \
-        -postScript gen_sites.py "$1" --strategy entry > "$tmp/ghidra.log" 2>&1 \
-    && "$headless" "$tmp/gp" p -process "$(basename "$fw")" -noanalysis -scriptPath "$gt" \
-        -postScript gen_boundaries.py "$2" fuzz_iteration:begin \
-        --strategy entry --sites "$1" >> "$tmp/ghidra.log" 2>&1 \
-    && [ -s "$1" ] && [ -s "$2" ]
+    if [ "${3:-entry}" = entry ]; then
+        rm -rf "$tmp/gp" && mkdir "$tmp/gp"
+        set -- "$1" "$2" entry -import "$fw"
+    else
+        set -- "$1" "$2" "$3" -process "$(basename "$fw")" -noanalysis
+    fi
+    sites=$1 bounds=$2 strategy=$3
+    shift 3
+    rm -f "$sites" "$bounds"
+    "$headless" "$tmp/gp" p "$@" -scriptPath "$gt" \
+        -postScript gen_sites.py "$sites" --strategy "$strategy" \
+        -postScript gen_boundaries.py "$bounds" fuzz_iteration:begin \
+        --strategy "$strategy" --sites "$sites" > "$tmp/ghidra.log" 2>&1 || return 1
+    [ -s "$sites" ] && [ -s "$bounds" ]
+}
+ghidra_failed() {   # ghidra_failed SITES BOUNDS WHAT: say which, with the log's tail if a file is missing
+    if [ -s "$1" ] && [ -s "$2" ]; then
+        echo "gen-check: $board: the Ghidra route's $3 differ from rizin's" >&2
+    else
+        echo "gen-check: $board: the Ghidra route wrote no $3; its log ends:" >&2
+        grep -v -e '^INFO ' -e '^    /' "$tmp/ghidra.log" | tail -n 30 >&2
+    fi
 }
 route=rizin
 if ! python3 "$tools/gen_sites.py" --strategy entry "$fw" "$tmp/fw.uams" > "$tmp/gen.log" 2>&1 \
@@ -43,8 +59,7 @@ if ! python3 "$tools/gen_sites.py" --strategy entry "$fw" "$tmp/fw.uams" > "$tmp
             exit 0
         fi
         if ! ghidra_lists "$tmp/fw.uams" "$tmp/fw.uamb"; then
-            echo "gen-check: $board: the Ghidra route failed:" >&2
-            tail -n 30 "$tmp/ghidra.log" >&2
+            ghidra_failed "$tmp/fw.uams" "$tmp/fw.uamb" lists
             exit 1
         fi
         route=ghidra
@@ -82,10 +97,29 @@ elif [ -n "$headless" ]; then
        && cmp -s "$tmp/fw.uams" "$tmp/g.uams" && cmp -s "$tmp/fw.uamb" "$tmp/g.uamb"; then
         ghidra="; the Ghidra route wrote the same files"
     else
-        echo "gen-check: $board: the Ghidra route's files differ from rizin's (or it failed):" >&2
-        tail -n 30 "$tmp/ghidra.log" >&2
+        ghidra_failed "$tmp/g.uams" "$tmp/g.uamb" "entry lists"
         fail=1
     fi
+    # Each tool's default strategy: entry on MIPS (compared above), terminator elsewhere.
+    case $board in
+    mips*) ;;
+    *)
+        if ! python3 "$tools/gen_sites.py" "$fw" "$tmp/d.uams" > "$tmp/gen.log" 2>&1 \
+           || ! python3 "$tools/gen_boundaries.py" --sites "$tmp/d.uams" \
+                "$fw" "$tmp/d.uamb" fuzz_iteration:begin >> "$tmp/gen.log" 2>&1; then
+            echo "gen-check: $board: the generators failed with their default strategy:" >&2
+            cat "$tmp/gen.log" >&2
+            fail=1
+        elif [ $fail -eq 0 ]; then
+            if ghidra_lists "$tmp/gd.uams" "$tmp/gd.uamb" auto \
+               && cmp -s "$tmp/d.uams" "$tmp/gd.uams" && cmp -s "$tmp/d.uamb" "$tmp/gd.uamb"; then
+                ghidra="$ghidra, also with the default strategy"
+            else
+                ghidra_failed "$tmp/gd.uams" "$tmp/gd.uamb" "default-strategy lists"
+                fail=1
+            fi
+        fi ;;
+    esac
 fi
 [ $fail -eq 0 ] && echo "gen-check: $board: $(basename "$fw"): $(grep -o 'site check: [0-9]* of [0-9]*' "$tmp/run.err"); verdicts agree$ghidra"
 exit $fail

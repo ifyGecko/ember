@@ -494,6 +494,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_F80)
 	$(TEST_COV_FORMATS) tests/unit/cov_golden.txt
 	python3 fuzz/tools/mutate.py --selftest
+	python3 fuzz/tools/status_tui.py --selftest
 
 # The JIT differential test at length: JITDIFF_BLOCKS random blocks per seed, several seeds.
 JITDIFF_BLOCKS ?= 200000

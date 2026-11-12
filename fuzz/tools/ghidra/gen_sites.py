@@ -11,18 +11,27 @@ Ghidra: one coverage site per basic block. Jython 2.7; run as a Ghidra
 script.
 
 The Ghidra counterpart of fuzz/tools/gen_sites.py (the reference; its
-docstring documents the strategies and --root/--cutoff/--max-depth). For
-the same image and options it writes the same file, byte for byte: the
+docstring documents the strategies and --root/--cutoff/--max-depth). The
 site selection, the filters, the slice, the overlap check and the packing
-are the same code. Only the data source differs: the rizin queries are
-replaced by Ghidra's Program API on the already-analysed program.
+follow the same rules; only the data source differs: the rizin queries are
+replaced by Ghidra's Program API on the already-analysed program. So for
+the same image and options the two write the same file when both analysers
+recover the same functions and blocks. They can differ where one resolves
+a jump table and the other does not: the case blocks of a switch are then
+blocks, with sites, in one list only (Ghidra resolves ARM `add pc, pc, rN,
+lsl #2`, MIPS `jr` and PowerPC `bctr` tables that rizin leaves alone).
+Module 0's name is the program's name in the Ghidra project here and the
+image's file name in the rizin tool, so the files are identical only if
+the image was imported under its file name (what -import does).
 
   rizin                         Ghidra
   ----------------------------  --------------------------------------------
   rzpipe.open + aaa             currentProgram (import + auto-analysis)
   ij / bin info                 Language: processor, size, endianness, base
   aflj (functions)              FunctionManager.getFunctions(True)
-  afbj @ fn (basic blocks)      BasicBlockModel.getCodeBlocksContaining(body)
+  afbj @ fn (basic blocks)      BasicBlockModel.getCodeBlocksContaining(body),
+                                blocks entered only from the instruction
+                                before them joined to its block
   pdj N @ addr (instructions)   Listing.getInstructions(block, True)
   op type (call/jmp/ret/ind.)   Instruction.getFlowType()
   afij @@F callrefs (CALL)      Function.getCalledFunctions(monitor)
@@ -37,11 +46,17 @@ Interface differences from the rizin tool:
   - --module NAME:PROJECTPATH opens another module from the SAME Ghidra
     project (imported and analysed there); PROJECTPATH is the program's
     path inside the project (e.g. "/app.elf").
-  - rizin's name prefixes don't exist in Ghidra: import stubs are thunk
-    functions, and the CRT/init exclusion is the same names undecorated.
-    Which functions get sites is decided by the image, as in the rizin tool:
-    the ELF's function symbols and entry point (read from the original file
-    bytes Ghidra keeps) and --symbols addresses.
+  - rizin's name prefixes don't exist in Ghidra: import stubs are the
+    thunk functions at no function symbol, and the C-runtime exclusion is
+    the same exact names. Which functions get sites is decided by the
+    image, as in the rizin tool: the ELF's function symbols and entry point
+    (read from the original file bytes Ghidra keeps) and --symbols
+    addresses; so is what counts as code (its executable sections).
+  - Ghidra loads a position-independent ELF at an image base of its own.
+    The list is the rizin tool's all the same: offsets from the ELF's
+    lowest PT_LOAD address, which is the base in the list (0 for a PIE).
+    --symbols addresses are the image's link addresses; an address given
+    to --root or --cutoff is Ghidra's.
 
 Headless:
   analyzeHeadless <proj_dir> <proj_name> -import fw.elf \\
@@ -77,14 +92,26 @@ if _HERE in sys.path:
     sys.path.remove(_HERE)
 sys.path.insert(0, _HERE)
 
-from image_resolve import (NotFound, add_symbols_arg, apply_symbol_names,
-                           load_symbols, program_entries, resolve_to_offset)
+from image_resolve import (NotFound, ProgramImage, add_symbols_arg,
+                           apply_symbol_names, load_symbols,
+                           resolve_to_offset, run_script)
 
 
-# Functions that get no sites by default, besides import thunks
-# (Function.isThunk()): the rizin tool's CRT/init prefixes, undecorated.
-# --exclude-pat is ORed with this; --no-default-exclude drops both.
-DEFAULT_EXCLUDE = r"^(_init|_fini|deregister|register|frame_dummy|__libc_csu)"
+# Functions that get no sites by default: import stubs (thunks at no
+# function symbol; the rizin tool's sym.imp.*) and the C runtime's
+# start/stop stubs, matched by their whole name, so a firmware function
+# named register_handler or _init_board keeps its sites. --exclude-pat adds
+# to this; --no-default-exclude drops it.
+DEFAULT_EXCLUDE_NAMES = frozenset((
+    "_init", "_fini", "frame_dummy", "register_tm_clones",
+    "deregister_tm_clones", "__do_global_dtors_aux", "__libc_csu_init",
+    "__libc_csu_fini"))
+
+
+def default_excluded(f):
+    """True for a function (a get_all_functions entry) the default
+    exclusion drops."""
+    return bool(f.get("is_thunk")) or f.get("name", "") in DEFAULT_EXCLUDE_NAMES
 
 # Site list layout (fuzz/formats.h, docs/fuzz-formats.md).
 SITES_MAGIC = b"UAMS"
@@ -147,14 +174,17 @@ def addr_of(program, off):
 # Program facts (the ij / aflj equivalents).
 # ----------------------------------------------------------------------
 
-def get_bin_info(program):
+def get_bin_info(program, image):
+    """The program's arch, width and byte order, and "baddr": Ghidra's
+    address of the module's link base (image: its ProgramImage), which a
+    record's offset is relative to."""
     lang = program.getLanguage()
     proc = _text(lang.getProcessor().toString())
     arch = ARCH_MAP.get(proc, proc.lower())
     bits = int(lang.getLanguageDescription().getSize())
     endian = "BE" if lang.isBigEndian() else "LE"
     return {"arch": arch, "bits": bits, "endian": endian,
-            "baddr": uoff(program.getImageBase())}
+            "baddr": image.base}
 
 
 # The context register that says a function is in the ISA's alternate
@@ -178,8 +208,8 @@ def _func_bits(program, func):
 
 
 def ensure_functions(program, entries):
-    """Make every address in `entries` a function where Ghidra has none
-    (rizin's `af @ ADDR`)."""
+    """Make every address in `entries` (Ghidra addresses: ProgramImage's)
+    a function where Ghidra has none (rizin's `af @ ADDR`)."""
     fm = program.getFunctionManager()
     listing = program.getListing()
     tx = program.startTransaction("ember function entries")
@@ -195,9 +225,16 @@ def ensure_functions(program, entries):
         program.endTransaction(tx, True)
 
 
-def get_all_functions(program, symbols):
-    """Unfiltered function list, shaped like rizin's aflj entries, with
-    --symbols names applied. Caller filters via regex."""
+def get_all_functions(program, image):
+    """Unfiltered function list, shaped like rizin's aflj entries, with the
+    --symbols names of `image` (the program's ProgramImage) applied. Caller
+    filters via regex.
+
+    "is_thunk" marks the import stubs (rizin's sym.imp.*): the thunks that
+    start at no function symbol. A thunk at one -- a function that is only
+    a tail call -- is an ordinary function, as it is in rizin. Ghidra gives
+    a stub its target's name, so the stubs come last: a name resolves to
+    the function before its stub."""
     fm = program.getFunctionManager()
     out = []
     for func in fm.getFunctions(True):
@@ -215,9 +252,10 @@ def get_all_functions(program, symbols):
             "bits":     _func_bits(program, func),
             "size":     0,            # maxbound carries the extent for bounds
             "maxbound": maxbound,
-            "is_thunk": bool(func.isThunk()),
+            "is_thunk": bool(func.isThunk()) and entry not in image.entries,
         })
-    return apply_symbol_names(out, symbols)
+    out.sort(key=lambda f: f["is_thunk"])
+    return apply_symbol_names(out, image.symbols)
 
 
 def site_flags(arch, fn_bits):
@@ -226,11 +264,11 @@ def site_flags(arch, fn_bits):
     return SITE_ALT_STATE if arch in ("arm", "mips") and fn_bits == 16 else 0
 
 
-def filter_functions(all_fns, include_re, exclude_re, drop_thunks):
+def filter_functions(all_fns, include_re, exclude_re, default_exclude):
     out = []
     for f in all_fns:
         name = f.get("name", "")
-        if drop_thunks and f.get("is_thunk"):
+        if default_exclude and default_excluded(f):
             continue
         if include_re and not include_re.search(name):
             continue
@@ -271,26 +309,42 @@ def report_include_matches(fns, pattern, module_name, verbose):
 # helpers; they consume plain dicts).
 # ----------------------------------------------------------------------
 
-def _insn_dict(program, ins):
+def _insn_dict(ins, image):
     """One instruction as the pickers expect: offset, size, raw bytes, a
-    flow class ("call"/"jmp"/"ret"/"") and the lowercased mnemonic."""
+    flow class ("call"/"jmp"/"ret"/""), the lowercased mnemonic, "always"
+    (an unconditional return), "delay" (it is a branch's delay slot) and
+    "outside" (it is not in the image's code: ProgramImage.is_code).
+
+    PowerPC's `bcl 20,31,$+4` only loads the link register with the next
+    instruction's address (the get-pc idiom of position-independent code).
+    Ghidra decodes it as a branch to the next instruction; here, as in
+    rizin, it is no transfer."""
     ft = ins.getFlowType()
     if ft.isCall():
         cls = "call"
     elif ft.isJump():
         cls = "jmp"
+        if image.processor == "PowerPC" and ft.isUnConditional() \
+                and not ft.isComputed():
+            flows = ins.getFlows()
+            if len(flows) == 1 and flows[0] == ins.getMaxAddress().next():
+                cls = ""
     elif ft.isTerminal():
         cls = "ret"
     else:
         cls = ""
     jb = ins.getBytes()
     raw = "".join(chr(jb[i] & 0xFF) for i in range(len(jb)))
+    off = uoff(ins.getAddress())
     return {
-        "offset":   uoff(ins.getAddress()),
+        "offset":   off,
         "size":     int(ins.getLength()),
         "bytes":    raw,
         "type":     cls,
         "disasm":   _text(ins.getMnemonicString()).lower(),
+        "always":   cls == "ret" and not ft.isConditional(),
+        "delay":    bool(ins.isInDelaySlot()),
+        "outside":  not image.is_code(off),
     }
 
 
@@ -306,9 +360,11 @@ def _insn_mnemonic(insn):
 
 
 def _is_code(insn):
-    """Ghidra's Listing only hands back decoded instructions (never data),
-    so every instruction with bytes is code."""
-    return int(insn.get("size", 0)) > 0
+    """True if the instruction may be a site: it has bytes and lies in the
+    image's code. Ghidra's Listing hands back only decoded instructions,
+    but it also decodes bytes outside the code sections (a jump table in
+    .rodata reached past a call that never returns); those are data."""
+    return int(insn.get("size", 0)) > 0 and not insn.get("outside")
 
 
 def _it_continuations(insns):
@@ -349,8 +405,9 @@ def pick_terminator(insns):
 
 def pick_entry(insns, in_delay_slot):
     """The site of a block under the entry strategy, or None: its first
-    instruction, its second if the block starts in a MIPS delay slot;
-    never an IT-block continuation. (The rizin tool's helper.)"""
+    instruction, its second if the block starts in a MIPS delay slot
+    (starts_in_delay_slot); never an IT-block continuation. (The rizin
+    tool's helper.)"""
     cont = _it_continuations(insns)
     idx = 1 if in_delay_slot else 0
     while idx < len(insns):
@@ -361,65 +418,108 @@ def pick_entry(insns, in_delay_slot):
     return None
 
 
-def is_branch_at(program, off):
-    """MIPS delay-slot test: is the instruction at `off` (a block's start
-    - 4) a branch or call? (rizin decoded `pdj 1 @ addr-4`.)"""
-    ins = program.getListing().getInstructionAt(addr_of(program, off))
-    if ins is None:
-        return False
-    ft = ins.getFlowType()
-    return bool(ft.isCall() or ft.isJump() or ft.isTerminal())
+def starts_in_delay_slot(insns):
+    """MIPS delay-slot test: is a block's first instruction the delay slot
+    of the branch before it? Ghidra marks the instruction
+    (Instruction.isInDelaySlot), whatever the branch's length -- 4 bytes
+    in MIPS32 code, 2 or 4 in MIPS16e/microMIPS code. (The rizin tool looks
+    for a branch 4 bytes before the block.)"""
+    return bool(insns and insns[0].get("delay"))
 
 
-def block_instructions(program, block):
+def block_instructions(program, block, image):
     listing = program.getListing()
     out = []
     it = listing.getInstructions(block, True)
     while it.hasNext():
-        out.append(_insn_dict(program, it.next()))
+        out.append(_insn_dict(it.next(), image))
     return out
 
 
-def function_blocks(program, bbm, monitor, fn_addr):
-    """The basic blocks of the function at fn_addr, or [] if none."""
+def _entered_only_from(block, last, monitor):
+    """True if every flow into `block` comes from the instruction at
+    offset `last`."""
+    n = 0
+    it = block.getSources(monitor)
+    while it.hasNext():
+        n += 1
+        if uoff(it.next().getReferent()) != last:
+            return False
+    return n > 0
+
+
+def function_blocks(program, bbm, monitor, fn_addr, image):
+    """The basic blocks of the function at fn_addr, each the list of its
+    instructions, in address order; [] if there is none.
+
+    A block is rizin's: it starts at the function's entry, at an
+    instruction that one other than the instruction before it transfers
+    to, or after a jump or return (split_block). Ghidra's BasicBlockModel
+    also starts a block at every labelled instruction (the computed jump of
+    a switch has a label, as has the instruction after a get-pc `bcl`), so
+    a Ghidra block that is entered only from the instruction just before
+    it, in the same function, is joined to that instruction's block;
+    split_block then cuts after the jumps."""
     func = program.getFunctionManager().getFunctionAt(addr_of(program, fn_addr))
     if func is None:
         return []
-    out = []
+    raw = []
     bit = bbm.getCodeBlocksContaining(func.getBody(), monitor)
     while bit.hasNext():
-        out.append(bit.next())
+        raw.append(bit.next())
+    raw.sort(key=lambda b: uoff(b.getMinAddress()))
+    out = []
+    for block in raw:
+        insns = block_instructions(program, block, image)
+        if not insns:
+            continue
+        last = out[-1][-1] if out else None
+        if last is not None and insns[0]["offset"] != fn_addr \
+                and last["offset"] + last["size"] == insns[0]["offset"] \
+                and _entered_only_from(block, last["offset"], monitor):
+            out[-1].extend(insns)
+        else:
+            out.append(insns)
     return out
+
+
+def returns_always(insn):
+    """True for an unconditional return."""
+    return bool(insn.get("always"))
 
 
 def split_block(insns, is_mips):
     """Cut a block's instructions after every jump or return (on MIPS after
     its delay slot), so a block never runs on past a conditional transfer.
-    (The rizin tool's helper; Ghidra's blocks already end there, rizin's
-    do not always.)"""
-    out, cur, cut = [], [], None
+    What follows an unconditional return in the block is left out. (The
+    rizin tool's helper. A MIPS16e/microMIPS jump may have no delay slot,
+    so here the delay slot is the instruction Ghidra marks as one.)"""
+    out, cur, cut, last = [], [], None, False
     for i, insn in enumerate(insns):
         cur.append(insn)
         if cut is None and op_class(insn.get("type")) in ("jmp", "ret"):
-            cut = i + 1 if is_mips else i
+            slot = is_mips and i + 1 < len(insns) and insns[i + 1].get("delay")
+            cut = i + 1 if slot else i
+            last = returns_always(insn)
         if cut is not None and i >= cut:
             out.append(cur)
             cur, cut = [], None
+            if last:
+                break
     if cur:
         out.append(cur)
     return out
 
 
-def pick_sites(program, bbm, monitor, fn, strategy, arch):
-    """(address, size, bytes) of the site of each of fn's blocks."""
+def pick_sites(program, bbm, monitor, fn, strategy, arch, image):
+    """(address, size, bytes) of the site of each of fn's blocks; none
+    outside the image's code."""
     is_mips = arch == "mips"
     sites = []
-    for block in function_blocks(program, bbm, monitor, fn["offset"]):
-        for part in split_block(block_instructions(program, block), is_mips):
-            start = int(part[0]["offset"])
+    for block in function_blocks(program, bbm, monitor, fn["offset"], image):
+        for part in split_block(block, is_mips):
             if strategy == "entry":
-                pick = pick_entry(part, is_mips and is_branch_at(program,
-                                                                 start - 4))
+                pick = pick_entry(part, is_mips and starts_in_delay_slot(part))
             else:
                 pick = pick_terminator(part)
             if pick is not None:
@@ -525,7 +625,8 @@ def bfs_reachable(roots, adj, cutoffs, max_depth=None):
 
 def validate_no_overlap(records, module_name, fail):
     """Drop records whose [offset, offset+len) byte ranges overlap (one of
-    the two is not a real instruction). (The rizin tool's helper.)"""
+    the two is not a real instruction); len is the instruction's whole
+    length. (The rizin tool's helper.)"""
     ordered = sorted(records, key=lambda r: (r[0], r[1]))
     dropped = set()
     prev = None
@@ -577,7 +678,8 @@ def parse_slice_specs(tokens, module_specs, flag):
 
 def resolve_slice_specs(specs, module_idx, all_fns, found, stubs, flag, verbose):
     """Resolve the specs applying to `module_idx` to entry offsets. (The
-    rizin tool's helper; its sym.imp. import-stub case is a thunk check.)"""
+    rizin tool's helper; its sym.imp. import-stub case is the "is_thunk"
+    mark.)"""
     out = set()
     for i, sp in enumerate(specs):
         if sp["mod"] is not None and sp["mod"] != module_idx:
@@ -609,23 +711,17 @@ def resolve_slice_specs(specs, module_idx, all_fns, found, stubs, flag, verbose)
 # ----------------------------------------------------------------------
 
 def collect_module_records(args, program, monitor, module_idx, module_name,
-                           slicing, symbols=None):
+                           slicing, image):
     """Walk one module's functions and return its site records, each
-    (offset, len, module_idx, orig_bytes, flags). Only functions starting at
-    a program_entries() address get sites, unless --all-functions. (The
+    (offset, instruction length, module_idx, first bytes, flags). Only
+    functions starting at one of the image's entries (ProgramImage) get
+    sites, unless --all-functions, and no site lies outside its code. (The
     rizin tool's logic, data from Ghidra.)"""
     inc = re.compile(args.include_pat) if args.include_pat else None
-    exc_pats = []
-    if not args.no_default_exclude:
-        exc_pats.append(DEFAULT_EXCLUDE)
-    if args.exclude_pat:
-        exc_pats.append(args.exclude_pat)
-    exc = re.compile("|".join("(?:%s)" % p for p in exc_pats)) if exc_pats \
-        else None
-    drop_thunks = not args.no_default_exclude
+    exc = re.compile(args.exclude_pat) if args.exclude_pat else None
 
     bbm = BasicBlockModel(program)
-    info = get_bin_info(program)
+    info = get_bin_info(program, image)
     baddr = info["baddr"]
     arch = info["arch"]
     strategy = args.strategy if args.strategy != "auto" \
@@ -637,10 +733,11 @@ def collect_module_records(args, program, monitor, module_idx, module_name,
               "strategy=%s" % (module_idx, module_name, arch, info["bits"],
                                info["endian"], baddr, strategy), file=sys.stderr)
 
-    entries = program_entries(program, symbols)
+    entries = image.entries
     ensure_functions(program, entries)
-    all_fns_raw = get_all_functions(program, symbols)
-    fns = filter_functions(all_fns_raw, inc, exc, drop_thunks)
+    all_fns_raw = get_all_functions(program, image)
+    fns = filter_functions(all_fns_raw, inc, exc,
+                           not args.no_default_exclude)
     if inc:
         report_include_matches(fns, args.include_pat, module_name, args.verbose)
 
@@ -723,13 +820,14 @@ def collect_module_records(args, program, monitor, module_idx, module_name,
             continue
         flags = site_flags(arch, fn["bits"])
         for addr, size, orig in pick_sites(program, bbm, monitor, fn,
-                                           strategy, arch):
+                                           strategy, arch, image):
             if addr in seen:
                 continue
             if size < 1 or len(orig) != size:
                 continue
-            size = min(size, SITES_ORIG_MAX)
-            orig = orig[:size]
+            # The record keeps the instruction's whole length for the
+            # overlap check; write_sites stores at most SITES_ORIG_MAX.
+            orig = orig[:SITES_ORIG_MAX]
             offset = addr - baddr
             records.append((offset, size, module_idx, orig, flags))
             seen.add(addr)
@@ -739,10 +837,10 @@ def collect_module_records(args, program, monitor, module_idx, module_name,
                                          binascii.hexlify(orig), flags,
                                          fn["name"]), file=sys.stderr)
 
-    if unnamed and args.verbose:
-        print("  skipped %d function(s) without a function symbol (use "
-              "--all-functions to give them sites)" % unnamed,
-              file=sys.stderr)
+    if unnamed:
+        print("module[%d] '%s': skipped %d function(s) without a function "
+              "symbol (--all-functions gives them sites, --symbols FILE names "
+              "them)" % (module_idx, module_name, unnamed), file=sys.stderr)
 
     return validate_no_overlap(records, module_name, args.fail_on_overlap)
 
@@ -750,7 +848,9 @@ def collect_module_records(args, program, monitor, module_idx, module_name,
 def write_sites(output_path, module_names, records, module_bases):
     """Pack the records, the module name table and the base table into a
     site list (fuzz/formats.h). Records are in (module, offset) order, so
-    the site ids do not depend on the analyser's iteration order."""
+    the site ids do not depend on the analyser's iteration order. A record
+    stores the instruction's first bytes (at most SITES_ORIG_MAX) and their
+    count."""
     name_blob = b"".join(n.encode("utf-8") + b"\x00" for n in module_names)
     if len(name_blob) > SITES_NAMES_MAX:
         sys.exit("error: module names take %d bytes; a site list holds at "
@@ -769,7 +869,7 @@ def write_sites(output_path, module_names, records, module_bases):
                                   modules_offset, modules_size))
         for offset, size, module_idx, orig, flags in records:
             padded = orig + b"\x00" * (SITES_ORIG_MAX - len(orig))
-            f.write(SITES_RECORD.pack(offset, module_idx, size, flags, 0,
+            f.write(SITES_RECORD.pack(offset, module_idx, len(orig), flags, 0,
                                       padded))
         f.write(name_blob)
         f.write(bases_blob)
@@ -867,10 +967,11 @@ def run(args, primary_program, monitor):
             if args.verbose:
                 print("collecting module[%d] '%s'" % (module_idx, name),
                       file=sys.stderr)
-            symbols = args.symbols_map if module_idx == 0 else None
-            module_bases.append(get_bin_info(prog)["baddr"])
+            image = ProgramImage(prog, args.symbols_map if module_idx == 0
+                                 else None)
+            module_bases.append(image.link_base)
             all_records.extend(collect_module_records(
-                args, prog, monitor, module_idx, name, slicing, symbols))
+                args, prog, monitor, module_idx, name, slicing, image))
     finally:
         for release in releases:
             release()
@@ -903,6 +1004,11 @@ def run(args, primary_program, monitor):
         if args.include_pat:
             hint = (" Check --include-pat against Ghidra's function names "
                     "(run with -v to see what matched).")
+        if not args.all_functions:
+            hint += (" Only functions at a function symbol of the ELF, at its "
+                     "entry point or at a --symbols address get sites; for a "
+                     "raw image or a stripped ELF pass --symbols FILE or "
+                     "--all-functions.")
         sys.exit("error: no sites selected; not writing %s.%s Pass "
                  "--allow-empty to write an empty site list anyway."
                  % (args.output, hint))
@@ -935,7 +1041,10 @@ def build_arg_parser():
                          "regex; added to the built-in exclusions")
     ap.add_argument("--no-default-exclude", action="store_true",
                     help="do not apply the built-in exclusions (import "
-                         "thunks + CRT/init stubs)")
+                         "thunks, and the C runtime's _init, _fini, "
+                         "frame_dummy, register_tm_clones, "
+                         "deregister_tm_clones, __do_global_dtors_aux, "
+                         "__libc_csu_init, __libc_csu_fini)")
     ap.add_argument("--all-functions", action="store_true",
                     help="give every function Ghidra found sites, also those "
                          "that start at no function symbol (FUN_*, code "
@@ -987,4 +1096,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_script(main)

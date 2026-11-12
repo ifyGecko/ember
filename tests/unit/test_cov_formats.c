@@ -3,12 +3,15 @@
  * the coverage formula.
  *
  *   - golden maps: fixed pseudo-random emit sequences (site ids or pcs, with history
- *     resets) through every scheme - site/pc, N = 1, 2, 3, 4, 8, rotation off and on, 4 KiB
- *     and 64 KiB maps - as UAM_OP_COV on the interpreter, the JIT and the JIT without
+ *     resets, one long run on a single site that saturates its bucket) through every
+ *     scheme - site/pc, N = 1, 2, 3, 4, 8, rotation off and on, 4 KiB, 64 KiB and 1 MiB
+ *     maps - as UAM_OP_COV on the interpreter, the JIT and the JIT without
  *     chaining: the three must agree byte for byte, and each map's FNV-1a hash must be the
  *     one in the golden file (argv[1], tests/unit/cov_golden.txt), so the formula cannot
  *     change unnoticed. `--write-golden FILE` writes that file anew (only when a formula
  *     change is intended: it invalidates every saved corpus's coverage);
+ *   - the formula's parts against values worked out by hand: the mixer, the pc hash, the
+ *     rotation amounts and the scheme flags;
  *   - the default map-size rule against a table;
  *   - the site-list and boundary-file readers (every rejection of docs/fuzz-formats.md's
  *     checklists, the base table, the alternate-state flag), base resolution, boundaries,
@@ -126,9 +129,14 @@ static uint64_t fnv1a(const uint8_t *d, size_t n)
 #define GOLDEN_EMITS 3000u
 #define GOLDEN_SITES 400u
 
+#define GOLDEN_HOT_FROM 1000u
+#define GOLDEN_HOT_LEN 300u
+
 /* The emits of one scheme: site ids below GOLDEN_SITES (site model) or 4-aligned pcs in
- * three modules (pc model), loops and back edges included, and a history reset about every
- * hundred emits, as an iteration boundary makes. */
+ * three modules, the third far above 4 GiB (pc model), loops and back edges included, and
+ * a history reset about every hundred emits, as an iteration boundary makes. Emits
+ * GOLDEN_HOT_FROM.. are one site GOLDEN_HOT_LEN times with no reset, so its bucket
+ * saturates at 255. */
 static size_t golden_emits(const cf_scheme *s, emit *e)
 {
     uint64_t x = UINT64_C(0x9E3779B97F4A7C15);
@@ -137,10 +145,16 @@ static size_t golden_emits(const cf_scheme *s, emit *e)
         uint64_t r = rng_next(&x);
         uint32_t id = (r & 3) == 0 ? prev : (uint32_t)((r >> 8) % GOLDEN_SITES);   /* repeats */
         prev = id;
-        uint64_t offset = ((r >> 20) % 0x4000u) * 4;
         uint8_t mod = (uint8_t)((r >> 40) % 3);
+        uint64_t offset = ((r >> 20) % 0x4000u) * 4 + (mod == 2 ? UINT64_C(0x7f3a5c000000) : 0);
+        bool hot = k >= GOLDEN_HOT_FROM && k < GOLDEN_HOT_FROM + GOLDEN_HOT_LEN;
+        if (hot) {
+            id = 7;
+            mod = 2;
+            offset = UINT64_C(0x7f3a5c001230);
+        }
         cf_site_ab(s, id, offset, mod, &e[k].a, &e[k].b);
-        e[k].reset_before = ((r >> 50) % 100) == 0;
+        e[k].reset_before = !hot && ((r >> 50) % 100) == 0;
     }
     return GOLDEN_EMITS;
 }
@@ -167,9 +181,9 @@ static size_t golden_load(const char *path, golden *g, size_t max)
 static void test_golden(const char *path, bool write)
 {
     static const unsigned ngrams[] = { 1, 2, 3, 4, 8 };
-    static const uint32_t sizes[] = { 4096, 65536 };
-    golden want[64];
-    size_t n_want = write ? 0 : golden_load(path, want, 64);
+    static const uint32_t sizes[] = { 4096, 65536, 1048576 };
+    golden want[96];
+    size_t n_want = write ? 0 : golden_load(path, want, 96);
     FILE *out = write ? fopen(path, "w") : NULL;
     if (write) {
         CHECK(out != NULL, "write %s", path);
@@ -199,10 +213,13 @@ static void test_golden(const char *path, bool write)
                         free(map);
                     }
                     uint64_t hash = fnv1a(ref, s.map_size);
-                    size_t nz = 0;
-                    for (uint32_t i = 0; i < s.map_size; i++)
+                    size_t nz = 0, full = 0;
+                    for (uint32_t i = 0; i < s.map_size; i++) {
                         nz += ref[i] != 0;
+                        full += ref[i] == 255;
+                    }
                     CHECK(nz > 50, "%s: only %zu buckets hit", name, nz);
+                    CHECK(full >= 1, "%s: no bucket saturated", name);
                     free(ref);
                     if (write) {
                         fprintf(out, "%s %016llx\n", name, (unsigned long long)hash);
@@ -223,6 +240,56 @@ static void test_golden(const char *path, bool write)
         fclose(out);
     else
         CHECK(checked == n_want, "%u schemes checked, %zu in the golden file", checked, n_want);
+}
+
+/* The parts of the formula, against values worked out outside this code. */
+static void test_formula_parts(void)
+{
+    EQ64(cf_mix(0), 0, "mix(0)");
+    EQ64(cf_mix(1), UINT64_C(0xff51afd792fd5b26), "mix(1)");
+    EQ64(cf_mix(2), UINT64_C(0xfea35fafa5fab64d), "mix(2)");
+    EQ64(cf_mix(0x12345678), UINT64_C(0x05e9303903fe4604), "mix(0x12345678)");
+    EQ64(cf_mix(UINT64_C(0x7f3a5c001230)), UINT64_C(0xb5a321af4241bf5e), "mix(wide)");
+    EQ64(cf_spread(1, 0xfff), 0xb26, "spread(1) in 4 KiB");
+    EQ64(cf_spread(2, 0xffff), 0xb64d, "spread(2) in 64 KiB");
+    EQ64(cf_hash_pc(UINT64_C(0x7f3a5c001230), 0, 0xfffff), 0x1bf5e, "pc hash, module 0");
+    EQ64(cf_hash_pc(UINT64_C(0x7f3a5c001230), 2, 0xfffff), 0x5fd82, "pc hash, module 2");
+
+    static const struct { unsigned ngram; uint32_t size; uint8_t rot[7]; } r[] = {
+        { 2, 4096, { 1 } },
+        { 3, 4096, { 1, 6 } },
+        { 8, 4096, { 1, 2, 3, 4, 5, 6, 7 } },
+        { 4, 65536, { 1, 6, 11 } },
+        { 8, 65536, { 1, 3, 5, 7, 9, 11, 13 } },
+        { 3, 1048576, { 1, 10 } },
+    };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(r); i++) {
+        cf_scheme s = { .model = CF_MODEL_SITE, .ngram = r[i].ngram, .rotate = true,
+                        .map_size = r[i].size };
+        uam_cov_history h;
+        cf_cov_history(&s, &h);
+        EQ64(h.depth, r[i].ngram - 1, "history depth");
+        for (unsigned j = 0; j < 7; j++)
+            CHECK(h.rot[j] == r[i].rot[j], "N=%u, %u-byte map: rotation %u is %u, expected %u",
+                  r[i].ngram, r[i].size, j, h.rot[j], r[i].rot[j]);
+        s.rotate = false;
+        cf_cov_history(&s, &h);
+        for (unsigned j = 0; j < 7; j++)
+            CHECK(h.rot[j] == 0, "no rotation asked, rotation %u is %u", j, h.rot[j]);
+    }
+    cf_scheme n1 = { .model = CF_MODEL_PC, .ngram = 1, .rotate = true, .map_size = 4096 };
+    uam_cov_history h1;
+    cf_cov_history(&n1, &h1);
+    CHECK(h1.depth == 1 && h1.rot[0] == 0, "N=1 folds no history");
+
+    for (int model = 0; model < 2; model++)
+        for (unsigned n = 1; n <= CF_NGRAM_MAX; n++)
+            for (int rot = 0; rot < 2; rot++) {
+                cf_scheme s = { .model = model ? CF_MODEL_PC : CF_MODEL_SITE, .ngram = n,
+                                .rotate = rot != 0, .map_size = 4096 };
+                EQ64(cf_scheme_flags(&s), 1u | (model ? 2u : 0) | (rot ? 4u : 0) | (n << 8),
+                     cf_scheme_name(&s));
+            }
 }
 
 static void test_map_size(void)
@@ -627,6 +694,7 @@ int main(int argc, char **argv)
         printf("test_cov_formats: wrote %s\n", argv[2]);
         return n_failed ? 1 : 0;
     }
+    test_formula_parts();
     test_map_size();
     test_sites();
     test_bounds();

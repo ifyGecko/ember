@@ -70,8 +70,9 @@ static uam_status run_sites(const uam_cov_pass *cp, uam_block *blk)
             char name[128] = "";
             if (cp->namer)
                 cp->namer(cp->namer_ctx, pc, name, sizeof(name));
-            uam_log(UAM_LOG_ERROR, "cov", "coverage site 0x%llx%s%s%s is a continuation "
-                    "(delay-slot) instruction, which cannot be instrumented",
+            uam_log(UAM_LOG_ERROR, "cov", "coverage site 0x%llx%s%s%s continues the "
+                    "instruction before it (a delay slot, or inside an IT block), so it cannot "
+                    "be instrumented",
                     (unsigned long long)pc, name[0] ? " (" : "", name, name[0] ? ")" : "");
             return UAM_ERR_INVALID;
         }

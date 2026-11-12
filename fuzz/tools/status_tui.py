@@ -34,7 +34,6 @@ unknown keys are ignored, missing ones render as "?"):
   cycles         corpus cycles done (else derived execs//corpus)
   edges          map entries hit (cumulative)
   map_size       coverage map size (for the density %)
-  sites          coverage sites armed (optional)
   new_edges      edges found beyond the baseline (the initial corpus replay)
   init_edges     edges in ember's INIT map (boot up to the first begin)
   crashes        total crashes            crashes_unique  distinct (reason, status)
@@ -158,7 +157,7 @@ class Status:
     SCALARS = {
         "t": "t", "execs": "execs", "execs_per_sec": "execs_per_sec",
         "rate": "execs_per_sec", "corpus": "corpus", "cycles": "cycles",
-        "edges": "edges", "map_size": "map_size", "sites": "sites",
+        "edges": "edges", "map_size": "map_size",
         "new_edges": "new_edges", "crashes": "crashes",
         "crashes_unique": "crashes_unique", "hangs": "hangs",
         "hangs_unique": "hangs_unique", "hangs_saved": "hangs_saved",
@@ -173,7 +172,6 @@ class Status:
         self.cycles = None
         self.edges = 0
         self.map_size = DEFAULT_MAP
-        self.sites = None
         self.new_edges = 0
         self.crashes = 0
         self.crashes_unique = 0
@@ -248,7 +246,7 @@ class Status:
 
     # -- derived ----------------------------------------------------------------
     def uniq_crashes(self):
-        return max(self.crashes_unique, self._crash_evs)
+        return self.crashes_unique or self._crash_evs
 
     def uniq_hangs(self):
         # With hangs_saved in the feed, the hang events are saved inputs, not
@@ -295,7 +293,9 @@ class Status:
 # ---- JSON-lines feed follower --------------------------------------------------
 
 class JsonFeed:
-    """Follows a growing JSON-lines file (or a FIFO); handles each line."""
+    """Follows a growing JSON-lines file (or a FIFO); handles each line. The
+    brain starts its feed anew each session: when the file shrinks, the board
+    starts over with it."""
 
     def __init__(self, path, status):
         self.path = path
@@ -321,6 +321,9 @@ class JsonFeed:
             except OSError:
                 return 0
         try:
+            if os.fstat(self.fh.fileno()).st_size < self.off:
+                self.st.__init__()
+                self.off, self.buf = 0, b""
             self.fh.seek(self.off)
             data = self.fh.read(1 << 20)
         except OSError:
@@ -429,7 +432,6 @@ def render(st, w, h, title="ember fuzz status", source=None,
     rows += [(ln, "") for ln in _pair("map coverage", [
         _field("map edges", f"{fmt_n(st.edges)} / {fmt_n(st.map_size)}", 12),
         _field("map density", f"{pct:.2f}%", 12),
-        _field("sites armed", fmt_n(st.sites) if st.sites else "?", 12),
         _field("new edges", fmt_n(st.new_edges), 12),
         _field("boot (INIT)", "?" if st.init_edges is None else fmt_n(st.init_edges), 12),
     ], "stage progress", [
@@ -541,7 +543,7 @@ def make_demo_status():
         edges = int(700 + 760 * (1 - 0.5 ** (i / 10.0)))
         st.apply({"t": t, "execs": i * 6800, "execs_per_sec": 79.5,
                   "corpus": 180 + i, "edges": edges, "map_size": 131072,
-                  "sites": 3097, "new_edges": edges - 700, "init_edges": 640,
+                  "new_edges": edges - 700, "init_edges": 640,
                   "crashes": i * 4, "rejected": i // 3,
                   "crashes_unique": min(i, 3), "stage": "havoc + splice",
                   "config": {"arch": "mips32", "scheme": "n=3 model=site rotate=1",

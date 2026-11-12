@@ -388,13 +388,73 @@ def elf_code_entries(data):
                 _n, info, other, shndx, value, _s = struct.unpack_from(sym_fmt, data, at)
             if (info & 0xf) in (2, 10) and 0 < shndx < len(secs) and secs[shndx][1] & 4:
                 out.add(value & mask)
-                if machine == 8 and (other & 0xf0) in (0xf0, 0x80):   # STO_MIPS16, STO_MICROMIPS
+                # STO_MIPS16; STO_MICROMIPS, alone or with STO_MIPS_PIC
+                if machine == 8 and ((other & 0xf0) == 0xf0 or (other & 0xc0) == 0x80):
                     compressed.add(value & mask)
     for typ, flags, addr, size, _o, _l, _e in secs:
         if flags & 4 and addr <= (entry & mask) < addr + size:
             out.add(entry & mask)
             break
     return machine, out, compressed
+
+
+def elf_layout(data):
+    """(loads, code) of an ELF, or None if `data` is not one. `loads`: its
+    PT_LOAD segments as (file offset, address, file size), in program-header
+    order. `code`: the address ranges (start, end) that hold instructions --
+    the allocated SHF_EXECINSTR sections when the ELF has section headers
+    that name any, else the executable PT_LOAD segments; None when the ELF
+    names neither. Both generators (and their Ghidra ports) put a site only
+    on an instruction inside `code`: bytes an analyser disassembled anywhere
+    else (a jump table in .rodata) are data."""
+    if len(data) < 52 or data[:4] != b"\x7fELF":
+        return None
+    cls, enc = struct.unpack_from("BB", data, 4)
+    e = "<" if enc == 1 else ">"
+    if cls == 1:
+        phoff, shoff = struct.unpack_from(e + "II", data, 28)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from(e + "HHHH", data, 42)
+        ph_fmt, sh_fmt = e + "IIIIIIII", e + "IIIIIIIIII"
+    elif cls == 2 and len(data) >= 64:
+        phoff, shoff = struct.unpack_from(e + "QQ", data, 32)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from(e + "HHHH", data, 54)
+        ph_fmt, sh_fmt = e + "IIQQQQQQ", e + "IIQQQQIIQQ"
+    else:
+        return None
+    loads, exec_segs = [], []
+    for i in range(phnum):
+        at = phoff + i * phentsize
+        if at + struct.calcsize(ph_fmt) > len(data):
+            break
+        if cls == 1:
+            typ, off, vaddr, _p, filesz, memsz, flags, _a = struct.unpack_from(ph_fmt, data, at)
+        else:
+            typ, flags, off, vaddr, _p, filesz, memsz, _a = struct.unpack_from(ph_fmt, data, at)
+        if typ != 1:                            # PT_LOAD
+            continue
+        loads.append((off, vaddr, filesz))
+        if flags & 1 and memsz:                 # PF_X
+            exec_segs.append((vaddr, vaddr + memsz))
+    exec_secs = []
+    for i in range(shnum):
+        at = shoff + i * shentsize
+        if at + struct.calcsize(sh_fmt) > len(data):
+            break
+        _n, _t, flags, addr, _o, size = struct.unpack_from(sh_fmt, data, at)[:6]
+        if flags & 2 and flags & 4 and size:    # SHF_ALLOC, SHF_EXECINSTR
+            exec_secs.append((addr, addr + size))
+    return loads, (exec_secs or exec_segs or None)
+
+
+def in_ranges(ranges, addr):
+    """True if `addr` is inside one of the (start, end) `ranges`; None means
+    no restriction."""
+    if ranges is None:
+        return True
+    for start, end in ranges:
+        if start <= addr < end:
+            return True
+    return False
 
 
 def symbol_entries(path, image=None):
@@ -414,3 +474,17 @@ def symbol_entries(path, image=None):
     if image is not None:
         out |= set(image.symbols)
     return machine, out, compressed
+
+
+def code_ranges(path, image=None):
+    """The address ranges of the image at `path` that hold instructions
+    (elf_layout), or None for no restriction: a raw image, which is code
+    wherever the analyser finds a function, or an ELF that names none."""
+    if image is not None and image.raw:
+        return None
+    try:
+        with open(path, "rb") as f:
+            found = elf_layout(f.read())
+    except OSError as e:
+        sys.exit(f"error: {path}: {e}")
+    return found[1] if found is not None else None

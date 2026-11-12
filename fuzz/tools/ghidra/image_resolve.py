@@ -13,7 +13,9 @@ the same site in both, as in the rizin pair.
 What differs from the rizin version:
   - No --raw/--base/--arch/--bits/--endian/--cpu: Ghidra imported the image
     with a chosen processor, base and byte order, so those facts come from
-    `currentProgram`. The raw-image Image class is gone.
+    `currentProgram`. In place of the raw-image Image class, ProgramImage
+    holds what the image file says about the program, in Ghidra's
+    addresses.
   - rizin decorates names (sym./dbg./fcn./sym.imp.); Ghidra uses bare
     names (`main`) or namespaced ones (`ns::fn`). _resolve_name keeps the
     prefix tries anyway -- they never match in Ghidra and do no harm.
@@ -257,7 +259,9 @@ def add_symbols_arg(ap):
                          "lines, or a Ghidra symbol-table CSV export (Name and "
                          "Location columns). Applied to the functions at "
                          "those addresses, so --root/--cutoff and marker "
-                         "names can find them.")
+                         "names can find them. The addresses are the "
+                         "image's own (its link addresses), as in the rizin "
+                         "tool.")
 
 
 def apply_symbol_names(all_fns, symbols):
@@ -320,7 +324,8 @@ def elf_code_entries(data):
                 _n, info, other, shndx, value, _s = struct.unpack_from(sym_fmt, data, at)
             if (info & 0xf) in (2, 10) and 0 < shndx < len(secs) and secs[shndx][1] & 4:
                 out.add(value & mask)
-                if machine == 8 and (other & 0xf0) in (0xf0, 0x80):   # STO_MIPS16, STO_MICROMIPS
+                # STO_MIPS16; STO_MICROMIPS, alone or with STO_MIPS_PIC
+                if machine == 8 and ((other & 0xf0) == 0xf0 or (other & 0xc0) == 0x80):
                     compressed.add(value & mask)
     for typ, flags, addr, size, _o, _l, _e in secs:
         if flags & 4 and addr <= (entry & mask) < addr + size:
@@ -329,20 +334,169 @@ def elf_code_entries(data):
     return machine, out, compressed
 
 
-def program_entries(program, symbols):
-    """The function entries of `program` that get sites: those of the ELF it
-    was imported from (elf_code_entries, read from the original file bytes
-    Ghidra keeps) and every --symbols address -- the rizin tool's
-    symbol_entries()."""
-    out = set()
-    for fb in program.getMemory().getAllFileBytes():
-        n = int(fb.getSize())
-        buf = jarray.zeros(n, "b")
-        fb.getOriginalBytes(0, buf)
-        found = elf_code_entries(buf.tostring())
-        if found is not None:
-            out = found[1]
+def elf_layout(data):
+    """(loads, code) of an ELF, or None if `data` is not one. `loads`: its
+    PT_LOAD segments as (file offset, address, file size), in program-header
+    order. `code`: the address ranges (start, end) that hold instructions --
+    the allocated SHF_EXECINSTR sections when the ELF has section headers
+    that name any, else the executable PT_LOAD segments; None when the ELF
+    names neither. Both generators (and their Ghidra ports) put a site only
+    on an instruction inside `code`: bytes an analyser disassembled anywhere
+    else (a jump table in .rodata) are data."""
+    if len(data) < 52 or data[:4] != b"\x7fELF":
+        return None
+    cls, enc = struct.unpack_from("BB", data, 4)
+    e = "<" if enc == 1 else ">"
+    if cls == 1:
+        phoff, shoff = struct.unpack_from(e + "II", data, 28)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from(e + "HHHH", data, 42)
+        ph_fmt, sh_fmt = e + "IIIIIIII", e + "IIIIIIIIII"
+    elif cls == 2 and len(data) >= 64:
+        phoff, shoff = struct.unpack_from(e + "QQ", data, 32)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from(e + "HHHH", data, 54)
+        ph_fmt, sh_fmt = e + "IIQQQQQQ", e + "IIQQQQIIQQ"
+    else:
+        return None
+    loads, exec_segs = [], []
+    for i in range(phnum):
+        at = phoff + i * phentsize
+        if at + struct.calcsize(ph_fmt) > len(data):
             break
-    if symbols:
-        out |= set(symbols)
-    return out
+        if cls == 1:
+            typ, off, vaddr, _p, filesz, memsz, flags, _a = struct.unpack_from(ph_fmt, data, at)
+        else:
+            typ, flags, off, vaddr, _p, filesz, memsz, _a = struct.unpack_from(ph_fmt, data, at)
+        if typ != 1:                            # PT_LOAD
+            continue
+        loads.append((off, vaddr, filesz))
+        if flags & 1 and memsz:                 # PF_X
+            exec_segs.append((vaddr, vaddr + memsz))
+    exec_secs = []
+    for i in range(shnum):
+        at = shoff + i * shentsize
+        if at + struct.calcsize(sh_fmt) > len(data):
+            break
+        _n, _t, flags, addr, _o, size = struct.unpack_from(sh_fmt, data, at)[:6]
+        if flags & 2 and flags & 4 and size:    # SHF_ALLOC, SHF_EXECINSTR
+            exec_secs.append((addr, addr + size))
+    return loads, (exec_secs or exec_segs or None)
+
+
+def in_ranges(ranges, addr):
+    """True if `addr` is inside one of the (start, end) `ranges`; None means
+    no restriction."""
+    if ranges is None:
+        return True
+    for start, end in ranges:
+        if start <= addr < end:
+            return True
+    return False
+
+
+class ProgramImage(object):
+    """What the image file says about the program open in Ghidra, in
+    Ghidra's addresses. Ghidra loads a position-independent ELF (ET_DYN: a
+    PIE, a shared object) at an image base of its own, so its addresses
+    are the ELF's plus `delta`; for every other image `delta` is 0.
+
+      link_base  the module's link base in the site list: the ELF's lowest
+                 PT_LOAD address (0 for a PIE), which is what rizin
+                 reports; for a raw image the lowest address its bytes are
+                 loaded at (the rizin tool's --base)
+      delta      Ghidra address - image address
+      base       Ghidra's address of link_base: a record's offset is its
+                 Ghidra address - base
+      entries    the function entries that get sites: the ELF's function
+                 symbols and entry point (elf_code_entries) and every
+                 --symbols address -- the rizin tool's symbol_entries()
+      processor  Ghidra's name of the program's processor ("PowerPC")
+      code       the (start, end) ranges that hold instructions
+                 (elf_layout), or None when the image names none: then an
+                 executable memory block is code"""
+
+    def __init__(self, program, symbols):
+        self.program = program
+        self.processor = u"%s" % program.getLanguage().getProcessor().toString()
+        image_base = program.getImageBase().getOffset() & 0xFFFFFFFFFFFFFFFF
+        self.link_base, self.delta = _lowest_file_address(program), 0
+        if self.link_base is None:
+            self.link_base = image_base
+        self.entries, self.code = set(), None
+        for fb in program.getMemory().getAllFileBytes():
+            n = int(fb.getSize())
+            buf = jarray.zeros(n, "b")
+            fb.getOriginalBytes(0, buf)
+            data = buf.tostring()
+            found = elf_code_entries(data)
+            if found is None:
+                continue
+            loads, code = elf_layout(data)
+            if loads:
+                self.link_base = min(vaddr for _o, vaddr, _s in loads)
+                delta = _load_delta(program, loads)
+                self.delta = (image_base - self.link_base if delta is None
+                              else delta)
+            self.entries = set(a + self.delta for a in found[1])
+            if code is not None:
+                self.code = [(a + self.delta, b + self.delta) for a, b in code]
+            break
+        self.base = self.link_base + self.delta
+        # --symbols addresses are the image's, as in the rizin tool.
+        self.symbols = dict((a + self.delta, n)
+                            for a, n in (symbols or {}).items())
+        self.entries |= set(self.symbols)
+
+    def is_code(self, addr):
+        """True if the instruction at Ghidra address `addr` may be a site."""
+        if self.code is not None:
+            return in_ranges(self.code, addr)
+        space = self.program.getAddressFactory().getDefaultAddressSpace()
+        block = self.program.getMemory().getBlock(space.getAddress(addr))
+        return block is not None and bool(block.isExecute())
+
+
+def _lowest_file_address(program):
+    """The lowest address of a loaded memory block that holds bytes of the
+    imported file, or None."""
+    low = None
+    for block in program.getMemory().getBlocks():
+        if not block.isLoaded():
+            continue
+        for info in block.getSourceInfos():
+            if info.getFileBytes().isPresent():
+                start = info.getMinAddress().getOffset() & 0xFFFFFFFFFFFFFFFF
+                if low is None or start < low:
+                    low = start
+    return low
+
+
+def _load_delta(program, loads):
+    """Ghidra address - ELF address of the program's loaded bytes, from the
+    first memory block that holds file bytes of a PT_LOAD segment (`loads`,
+    elf_layout); None if no block does."""
+    for block in program.getMemory().getBlocks():
+        if not block.isLoaded():
+            continue
+        for info in block.getSourceInfos():
+            if not info.getFileBytes().isPresent():
+                continue
+            at = int(info.getFileBytesOffset())
+            start = info.getMinAddress().getOffset() & 0xFFFFFFFFFFFFFFFF
+            for off, vaddr, filesz in loads:
+                lo = max(at, off)
+                if lo < min(at + int(info.getLength()), off + filesz):
+                    return (start + lo - at) - (vaddr + lo - off)
+    return None
+
+
+def run_script(main):
+    """Run a script's main(). Ghidra shows only "SystemExit" for a
+    sys.exit("error: ..."), so the message is printed first: to stderr,
+    which the headless log and the script console both show."""
+    try:
+        main()
+    except SystemExit as e:
+        if e.code is not None and not isinstance(e.code, int):
+            print(e.code, file=sys.stderr)
+            sys.stderr.flush()
+        raise

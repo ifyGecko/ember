@@ -47,7 +47,8 @@ from gen_sites import (SITES_HEADER, SITES_MAGIC, SITES_RECORD,  # noqa: E402
                        get_bin_info, get_block_insns, is_branch_at, open_rizin,
                        pick_entry, pick_terminator, site_flags, split_block)
 from image_resolve import (NotFound, add_image_args,  # noqa: E402
-                           image_from_args, resolve_to_offset, symbol_entries)
+                           code_ranges, image_from_args, resolve_to_offset,
+                           symbol_entries)
 
 # Boundary file layout (fuzz/formats.h, docs/fuzz-formats.md).
 BOUNDS_MAGIC = b"UAMB"
@@ -103,10 +104,10 @@ def resolve(name, all_fns, syms):
     raise ValueError(f"could not resolve '{name}' to a function or symbol")
 
 
-def first_bb_site(rz, fn_addr, strategy, is_mips):
+def first_bb_site(rz, fn_addr, strategy, is_mips, code=None):
     """Return (address, function bits) of the site gen_sites.py picks for
     the first basic block of the function at fn_addr under `strategy`, or
-    None."""
+    None. `code`: the image's code ranges (image_resolve.code_ranges)."""
     blocks = rz.cmdj(f"afbj @ {fn_addr}") or []
     if not blocks:
         # A symbol-table name rizin did not analyse as a function.
@@ -122,7 +123,7 @@ def first_bb_site(rz, fn_addr, strategy, is_mips):
         forward = [b for b in blocks if int(b["addr"]) >= int(fn_addr)]
         first = (min(forward, key=lambda b: int(b["addr"])) if forward
                  else min(blocks, key=lambda b: int(b["addr"])))
-    insns = get_block_insns(rz, first)
+    insns = get_block_insns(rz, first, code)
     if not insns:
         return None
     insns = split_block(insns, is_mips)[0]
@@ -260,6 +261,7 @@ def main():
     sites = site_list_offsets(args.sites) if args.sites else None
 
     machine, entries, compressed = symbol_entries(args.binary, image)
+    code = code_ranges(args.binary, image)
     rz = open_rizin(args.binary, image, entries, machine)
     try:
         info = get_bin_info(rz, image)
@@ -281,7 +283,7 @@ def main():
             if fn_addr in compressed:
                 sys.exit(f"error: {name} is MIPS16e/microMIPS code, which rizin "
                          f"cannot decode; use the Ghidra script")
-            hit = first_bb_site(rz, fn_addr, strategy, arch == "mips")
+            hit = first_bb_site(rz, fn_addr, strategy, arch == "mips", code)
             if hit is None:
                 sys.exit(f"error: could not find a first-block {strategy} site "
                          f"for {name} @ 0x{fn_addr:x}")

@@ -16,9 +16,10 @@
  * hooks. A coverage site at a boundary pc is counted by its hook, before the map is
  * published: the begin's hit belongs to the map it closes (INIT, or the previous
  * iteration in begin-only mode), an end's to the iteration it ends, and an
- * iteration's first count is the site after the begin, with an empty history. Crash checks: crash pcs (an RTOS's fatal-error or exception handler), the
- * exception observer filtered by exception class, interrupts from chosen lines (a
- * watchdog's warning interrupt), a reset during an iteration, and the
+ * iteration's first count is the site after the begin, with an empty history. Crash
+ * checks: crash pcs (an RTOS's fatal-error or exception handler), the exception observer
+ * filtered by exception class, interrupts from chosen lines (a watchdog's warning
+ * interrupt), a reset during an iteration, a STOP guard touched (uam/guard.h), and the
  * executor's stop reasons (fault loop, internal error; deadlock and livelock are hangs;
  * the instruction budget is a timeout).
  *

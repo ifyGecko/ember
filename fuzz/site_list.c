@@ -103,8 +103,8 @@ bool cf_sites_parse(const uint8_t *d, size_t len, cf_sites *out, char *err, size
         return fail(err, errlen, "too short for a site list header (%zu bytes)", len);
     uint32_t version = (uint32_t)le(d + 4, 4);
     if (version != UAM_SITES_VERSION)
-        return fail(err, errlen, "site list version %u is not supported (only %u)", version,
-                    UAM_SITES_VERSION);
+        return fail(err, errlen, "site list version %u is not supported (only %u): make "
+                    "one with fuzz/tools/gen_sites.py", version, UAM_SITES_VERSION);
     uint32_t count = (uint32_t)le(d + 8, 4);
     uint8_t flags = d[12], n_mod = d[13];
     uint64_t mod_off = le(d + 16, 4), mod_size = le(d + 20, 4);
@@ -214,8 +214,8 @@ bool cf_bounds_parse(const uint8_t *d, size_t len, cf_markers *out, char *err, s
         return fail(err, errlen, "too short for a boundary file header (%zu bytes)", len);
     uint32_t version = (uint32_t)le(d + 4, 4);
     if (version != UAM_BOUNDS_VERSION)
-        return fail(err, errlen, "boundary file version %u is not supported (only %u)", version,
-                    UAM_BOUNDS_VERSION);
+        return fail(err, errlen, "boundary file version %u is not supported (only %u): "
+                    "make one with fuzz/tools/gen_boundaries.py", version, UAM_BOUNDS_VERSION);
     uint32_t count = (uint32_t)le(d + 8, 4);
     if (!zero(d + 12, 4))
         return fail(err, errlen, "reserved header bytes are not 0");

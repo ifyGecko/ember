@@ -39,7 +39,7 @@ wait "$brain_pid" || brc=$?
 brain_pid=
 crash=$(ls "$tmp/out/crashes" 2> /dev/null | grep -v '\.info$' | head -n 1 || true)
 if [ $rc -ne 0 ] || [ $brc -ne 0 ] || [ -z "$crash" ]; then
-    echo "brain-check: $board: executor exit $rc, brain exit $brc, crash '${crash}':" >&2
+    echo "brain-check: $board: ember exit $rc, brain exit $brc, crash '${crash}':" >&2
     cat "$tmp/brain.log" "$tmp/run.log" >&2
     fail=1
 elif ! grep -q -E '^reason_name=(FAULT|GUARD|ORACLE)$' "$tmp/out/crashes/$crash.info"; then

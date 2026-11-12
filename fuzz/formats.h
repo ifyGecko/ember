@@ -38,9 +38,10 @@
  *
  * record.offset is the site's address minus its module's link base, without any
  * instruction-set state bits; UAM_SITE_ALT_STATE says the site is in the ISA's alternate
- * state (ARM: Thumb), so ember sets the state bits in its pc. orig[] holds the first
- * `len` bytes of the instruction as they sit in memory (0..4; 0: nothing to check),
- * which --cov-strict compares with the guest's memory to catch a stale list. */
+ * state (ARM: Thumb; MIPS: MIPS16e or microMIPS), so ember sets the state bits in its pc.
+ * orig[] holds the first `len` bytes of the instruction as they sit in memory (0..4; 0:
+ * nothing to check), which --cov-strict compares with the guest's memory to catch a stale
+ * list. */
 
 #define UAM_SITES_MAGIC   "UAMS"
 #define UAM_SITES_VERSION 1u
