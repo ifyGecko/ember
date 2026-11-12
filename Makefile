@@ -10,19 +10,12 @@
 #                        models when sdas6500 is (its fuzz target SDCC too),
 #                        external-board example,
 #                        snapshot round trips through the runner, coverage maps across backends,
-#                        the fuzz harness on planted-bug firmware
-#   make suzzer          clone suzzer into ./suzzer (ignored by git) for the suzzer integration
+#                        the fuzz harness on planted-bug firmware, site lists, boundary files,
+#                        the coverage region and the fuzz brain (fuzz-lists-test)
 #   make net-check       boot the network test on rv32-test against a real tap and tun interface
 #                        (rootless: in a user+network namespace; skipped if unavailable)
 #   make install         install headers, libraries, uam-run and uam.pc under $(PREFIX)
 #   make clean
-#
-# suzzer (optional; docs/suzzer.md): ember works on its own. To use it with suzzer, either point
-# the build at an existing checkout with SUZZER_DIR=path, or run `make suzzer` once to clone one
-# into ./suzzer, which is then picked up automatically. Without either, the suzzer options
-# (--cov-sites, --cov-boundary, ...) are left out and their tests are skipped. The choice is
-# remembered in $(BUILD)/suzzer.cfg: a later plain `make` keeps it; `make SUZZER_DIR=` turns the
-# integration off until a path is given again.
 #
 # Out-of-tree use: `make -C path/to/uam BUILD=$PWD/build/uam lib` builds into another directory;
 # link $(BUILD)/libuam.a with -I path/to/uam/include (or use uam.pc after `make install`).
@@ -100,36 +93,6 @@ XTENSA_SKIP    = @echo "$@: Xtensa models without a toolchain skipped: $(XTENSA_
 xt_cross = $(if $(filter lx106,$(1)),$(XTENSA_LX106_CROSS),$(if $(filter lx6,$(1)),$(XTENSA_LX6_CROSS),$(XTENSA_LX7_CROSS)))
 xt_reset = $(if $(filter lx106,$(1)),0x40000080,0x40000400)
 
-# ---- suzzer ------------------------------------------------------------------------------
-# SUZZER_DIR: an existing suzzer checkout to use in place; empty turns the integration off.
-# Not given: the choice remembered in $(BUILD)/suzzer.cfg (a checkout's path, or "off"), else
-# ./suzzer if `make suzzer` cloned one there. Ember needs the format header suzzer publishes
-# (src/lcv_formats.h). SUZZER_URL unset: `make suzzer` tries SSH, then HTTPS.
-SUZZER_URL ?=
-SUZZER_REV ?=
-SUZZER_SAVED := $(strip $(shell cat $(BUILD)/suzzer.cfg 2>/dev/null))
-ifeq ($(origin SUZZER_DIR),undefined)
-ifeq ($(SUZZER_SAVED),off)
-SUZZER_DIR :=
-else ifneq ($(and $(SUZZER_SAVED),$(wildcard $(SUZZER_SAVED)/src/lcv_formats.h)),)
-SUZZER_DIR := $(SUZZER_SAVED)
-else
-ifneq ($(SUZZER_SAVED),)
-$(warning the suzzer checkout this build used ($(SUZZER_SAVED)) is gone; looking for ./suzzer)
-endif
-SUZZER_DIR := $(if $(wildcard suzzer/src/lcv_formats.h),suzzer,)
-endif
-SUZZER_RECORD := $(if $(SUZZER_DIR),$(abspath $(SUZZER_DIR)),$(if $(filter off,$(SUZZER_SAVED)),off,))
-else ifneq ($(SUZZER_DIR),)
-ifeq ($(wildcard $(SUZZER_DIR)/src/lcv_formats.h),)
-$(error SUZZER_DIR=$(SUZZER_DIR) has no src/lcv_formats.h: not a suzzer checkout, or one older than its published format header)
-endif
-SUZZER_RECORD := $(abspath $(SUZZER_DIR))
-else
-SUZZER_RECORD := off
-endif
-HAVE_SUZZER := $(if $(SUZZER_DIR),1,)
-
 # One list per module, mirroring the dependency rules in docs/architecture.md.
 IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c src/ir/pass.c
 CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
@@ -168,10 +131,8 @@ DEV_SRC     := devices/clint.c devices/plic.c devices/uart16550.c devices/test_f
 BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_64_ref.c boards/ppc_ref.c \
                boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c boards/m6502_ref.c boards/z80_ref.c boards/xtensa_ref.c \
                boards/stock.c boards/mmio_rules.c
-SUZZER_SRC  := fuzz/suzzer/scheme.c fuzz/suzzer/import.c fuzz/suzzer/cli.c \
-               fuzz/suzzer/frontend_szr1.c fuzz/suzzer/lcvs.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
-               $(if $(HAVE_SUZZER),$(SUZZER_SRC))
+               fuzz/cov_scheme.c fuzz/site_list.c fuzz/cov_cli.c fuzz/frontend_net.c fuzz/cov_region.c
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/blockdev_file.c \
                src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c src/runner/trace.c
@@ -217,7 +178,7 @@ TEST_X86 := $(BUILD)/test_x86
 TEST_RISCV := $(BUILD)/test_riscv
 TEST_ARM := $(BUILD)/test_arm
 TEST_FUZZ := $(BUILD)/test_fuzz
-TEST_SUZZER := $(BUILD)/test_suzzer
+TEST_COV_FORMATS := $(BUILD)/test_cov_formats
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
 FW_MIPS_BE := $(BUILD)/firmware-mips/selftest-be.elf
 FW_MIPS_EL := $(BUILD)/firmware-mips/selftest-el.elf
@@ -256,7 +217,7 @@ EXAMPLE   := $(BUILD)/examples/external-board/ext-run
         firmware-x86 x86-test firmware-ppc ppc-test firmware-avr avr-test firmware-avr32 avr32-test firmware-pic pic-test \
         firmware-mcs51 mcs51-test firmware-pic32 pic32-test firmware-6502 6502-test firmware-z80 z80-test \
         firmware-xtensa xtensa-test example-test \
-        snapshot-test cov-test fuzz-test suzzer-test suzzer net-check gdb-test jitdiff-soak \
+        snapshot-test cov-test fuzz-test fuzz-lists-test net-check gdb-test jitdiff-soak \
         bench-test xbench install \
         clean FORCE
 
@@ -267,23 +228,6 @@ lib: $(LIB) $(MODULE_LIBS) $(BUILD)/uam.pc
 $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(UAM_COMPILE) -MMD -MP -c $< -o $@
-
-# fuzz/suzzer/ alone sees suzzer, and only its format header (src/lcv_formats.h).
-$(BUILD)/obj/fuzz/suzzer/%.o: fuzz/suzzer/%.c $(BUILD)/suzzer.cfg
-	@mkdir -p $(dir $@)
-	$(CC) $(UAM_COMPILE) -I$(SUZZER_DIR)/src -MMD -MP -c $< -o $@
-
-# The stock runner extensions include the suzzer one only when suzzer is configured.
-$(BUILD)/obj/fuzz/stock_exts.o: fuzz/stock_exts.c $(BUILD)/suzzer.cfg
-	@mkdir -p $(dir $@)
-	$(CC) $(UAM_COMPILE) $(if $(HAVE_SUZZER),-DUAM_HAVE_SUZZER) -MMD -MP -c $< -o $@
-
-# Which suzzer the objects were built against (a path, "off" when turned off with
-# SUZZER_DIR=, empty when none was found): the choice a later plain `make` keeps. Rewritten
-# only when that changes, so switching SUZZER_DIR (or cloning one) rebuilds what depends on it.
-$(BUILD)/suzzer.cfg: FORCE
-	@mkdir -p $(BUILD)
-	@echo '$(SUZZER_RECORD)' | cmp -s - $@ || echo '$(SUZZER_RECORD)' > $@
 
 $(LIB): $(LIB_OBJ)
 	@rm -f $@
@@ -421,30 +365,20 @@ $(BUILD)/obj/tests/unit/test_xtensa_fpu.o: $(BUILD)/gen/xtensa_fpu_vectors.h
 $(TEST_XTENSA_FPU): $(BUILD)/obj/tests/unit/test_xtensa_fpu.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) -lm
 
-# test_suzzer checks fuzz/suzzer/ against suzzer's conformance vectors (its test/vectors).
-$(BUILD)/obj/tests/unit/test_suzzer.o: tests/unit/test_suzzer.c $(BUILD)/suzzer.cfg
+# test_cov_formats: the site-list and boundary readers, the coverage region's ownership and
+# the coverage formula's golden maps (tests/unit/cov_golden.txt) on every backend.
+$(BUILD)/obj/tests/unit/test_cov_formats.o: tests/unit/test_cov_formats.c
 	@mkdir -p $(dir $@)
-	$(CC) $(UAM_COMPILE) -Ifuzz/suzzer -I$(SUZZER_DIR)/src -MMD -MP -c $< -o $@
+	$(CC) $(UAM_COMPILE) -Ifuzz -MMD -MP -c $< -o $@
 
-$(TEST_SUZZER): $(BUILD)/obj/tests/unit/test_suzzer.o $(LIB)
+$(TEST_COV_FORMATS): $(BUILD)/obj/tests/unit/test_cov_formats.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-# suzzer's format header must build on its own with ember's strict flags.
-$(BUILD)/suzzer-header-check.stamp: $(SUZZER_DIR)/src/lcv_formats.h $(BUILD)/suzzer.cfg
+# fuzz/formats.h must build on its own with ember's strict flags.
+$(BUILD)/formats-header-check.stamp: fuzz/formats.h
 	@mkdir -p $(BUILD)
-	printf '#include "lcv_formats.h"\n' | $(CC) $(UAM_COMPILE) -I$(SUZZER_DIR)/src -x c -c - -o /dev/null
+	printf '#include "formats.h"\n' | $(CC) $(UAM_COMPILE) -Ifuzz -x c -c - -o /dev/null
 	@touch $@
-
-# Clone suzzer into ./suzzer (SUZZER_URL, SUZZER_REV); a no-op if one is already there.
-suzzer:
-	SUZZER_URL='$(SUZZER_URL)' SUZZER_REV='$(SUZZER_REV)' sh tools/fetch-suzzer.sh suzzer
-
-# The suzzer tests, or a note that they were skipped.
-ifeq ($(HAVE_SUZZER),1)
-SUZZER_UNIT := $(TEST_SUZZER) $(BUILD)/suzzer-header-check.stamp
-else
-SUZZER_UNIT :=
-endif
 
 firmware:
 	$(MAKE) -C tests/firmware OUT=$(abspath $(BUILD))/firmware
@@ -528,7 +462,8 @@ $(FIRMWARE): firmware
 
 unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
            $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA) $(TEST_XTENSA_FPU) $(TEST_ARM) $(TEST_RISCV) $(TEST_X86) $(TEST_MIPS) $(TEST_AVR32) \
-           $(TEST_JITDIFF) $(TEST_F80) $(SUZZER_UNIT)
+           $(TEST_JITDIFF) $(TEST_F80) $(TEST_COV_FORMATS) \
+           $(BUILD)/formats-header-check.stamp
 	$(TEST_IR)
 	$(TEST_CORE)
 	$(TEST_HOST)
@@ -557,11 +492,8 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	UAM_JIT_BASELINE=1 $(TEST_JITDIFF) 1000 2
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
 	$(TEST_F80)
-ifeq ($(HAVE_SUZZER),1)
-	$(TEST_SUZZER) $(SUZZER_DIR)/test/vectors
-else
-	@echo "test_suzzer: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
-endif
+	$(TEST_COV_FORMATS) tests/unit/cov_golden.txt
+	python3 fuzz/tools/mutate.py --selftest
 
 # The JIT differential test at length: JITDIFF_BLOCKS random blocks per seed, several seeds.
 JITDIFF_BLOCKS ?= 200000
@@ -954,44 +886,39 @@ else
 	$(AVR32_SKIP)
 endif
 
-# suzzer's formats and the SZR1 executor through the runner (lists written by
-# tests/suzzer/mk_lists.py, and by suzzer's own rizin generators when rizin is installed;
-# its Ghidra ports, which write the same files with headless Ghidra, are not run here):
-# the LCVS export read back by suzzer's test/shm_bitmap.py,
-# a session with suzzer's own brain (tools/suzzer_brain.py), and the protocol frame by
-# frame against a scripted brain (tests/szr/fake_brain.py).
-ifeq ($(HAVE_SUZZER),1)
-suzzer-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
-	sh tests/suzzer/suzzer-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/suzzer/suzzer-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
-	sh tests/suzzer/suzzer-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf $(SUZZER_DIR)
-	sh tests/suzzer/suzzer-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/suzzer/suzzer-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf $(SUZZER_DIR)
-	sh tests/suzzer/suzzer-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/suzzer/gen-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/suzzer/gen-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
-	sh tests/suzzer/gen-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf $(SUZZER_DIR)
-	sh tests/suzzer/gen-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/suzzer/gen-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf $(SUZZER_DIR)
-	sh tests/suzzer/gen-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/szr/brain-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/szr/brain-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf $(SUZZER_DIR)
-	sh tests/szr/brain-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/szr/brain-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf $(SUZZER_DIR)
-	sh tests/szr/szr-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
-	sh tests/szr/szr-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
-	sh tests/szr/szr-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
-	sh tests/szr/szr-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
-	sh tests/szr/szr-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf
-	sh tests/szr/szr-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf
-else
-suzzer-test:
-	@echo "suzzer-test: skipped (no suzzer: make suzzer, or SUZZER_DIR=path)"
-endif
+# Site lists, boundary files, the coverage region and the fuzz network frontend through the
+# runner: lists written by tests/fuzz/mk_lists.py, and by fuzz/tools' rizin generators when
+# rizin is installed (gen-check; with headless Ghidra on PATH, the Ghidra route must write
+# the same files); the region read back by fuzz/tools/cov_region.py and an independent
+# reader; a session with fuzz/tools/fuzz_brain.py; and the protocol frame by frame against
+# a scripted brain (tests/fuzz/fake_brain.py).
+fuzz-lists-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc
+	sh tests/fuzz/formats-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/fuzz/formats-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/fuzz/formats-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+	sh tests/fuzz/formats-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
+	sh tests/fuzz/formats-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf
+	sh tests/fuzz/formats-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf
+	sh tests/fuzz/gen-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/fuzz/gen-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/fuzz/gen-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+	sh tests/fuzz/gen-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
+	sh tests/fuzz/gen-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf
+	sh tests/fuzz/gen-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf
+	sh tests/fuzz/brain-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/fuzz/brain-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/fuzz/brain-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
+	sh tests/fuzz/brain-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf
+	sh tests/fuzz/fuzz-net-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
+	sh tests/fuzz/fuzz-net-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf
+	sh tests/fuzz/fuzz-net-check.sh $(RUN) mipsel-ref $(BUILD)/firmware-mips/fuzztarget-el.elf
+	sh tests/fuzz/fuzz-net-check.sh $(RUN) arm-ref $(BUILD)/firmware-arm/fuzztarget.elf
+	sh tests/fuzz/fuzz-net-check.sh $(RUN) armeb-ref $(BUILD)/firmware-arm/fuzztarget-be.elf
+	sh tests/fuzz/fuzz-net-check.sh $(RUN) ppc-ref $(BUILD)/firmware-ppc/fuzztarget.elf
 
 test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr32-test pic-test mcs51-test pic32-test 6502-test z80-test xtensa-test \
       example-test snapshot-test cov-test fuzz-test \
-      suzzer-test \
+      fuzz-lists-test \
       gdb-test runner-test bench-test
 
 # The cross-ISA benchmark (tests/bench): bench-test checks every guest build, with the
@@ -1036,4 +963,4 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
          $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/unit/test_avr32.d $(BUILD)/obj/tests/unit/test_mips.d $(BUILD)/obj/tests/unit/test_x86.d $(BUILD)/obj/tests/unit/test_riscv.d $(BUILD)/obj/tests/unit/test_arm.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \
          $(BUILD)/obj/tests/unit/test_f80.d \
-         $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_suzzer.d
+         $(BUILD)/obj/tests/unit/test_jitdiff.d $(BUILD)/obj/tests/unit/test_cov_formats.d

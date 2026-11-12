@@ -94,8 +94,7 @@ typedef struct uam_fuzz_config {
     uint64_t        boot_insns;    /* budget to reach the first begin (0: unlimited) */
     uint32_t        begin_skip;    /* boot passes the begin pc this many times and takes the
                                     * snapshot at the next arrival: firmware that runs its
-                                    * handler during start-up (libcov's
-                                    * LIBCOV_BOUNDARY_INIT_GRACE); all of it is INIT */
+                                    * handler during start-up; all of it is INIT */
     unsigned        crash_exc;     /* enum uam_fuzz_exc_class */
     const uint64_t *crash_pcs;     /* copied */
     size_t          n_crash_pcs;
@@ -258,7 +257,7 @@ extern const uam_fuzz_frontend uam_fuzz_replay_frontend;
 /* NULL if path cannot be read (logged). `f` gives the result details printed. */
 uam_fuzz_replay *uam_fuzz_replay_create(const char *path, uam_fuzz *f, FILE *out);
 /* The same, but in a directory a file named X<suffix> is skipped when X is there too, for
- * each of the n suffixes: notes a fuzzer saves beside each input (suzzer's brain writes
+ * each of the n suffixes: notes a fuzzer saves beside each input (fuzz_brain.py writes
  * X.info next to crash X), which would otherwise run as inputs. A FILE path always runs. */
 uam_fuzz_replay *uam_fuzz_replay_create_ex(const char *path, uam_fuzz *f, FILE *out,
                                            const char *const *sidecars, size_t n_sidecars);

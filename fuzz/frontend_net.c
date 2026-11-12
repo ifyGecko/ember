@@ -1,28 +1,29 @@
 /*
- * frontend_szr1.c - ember as an SZR1 executor (suzzer's docs/FORMATS.md section 4).
+ * frontend_net.c - ember's end of the fuzz protocol (docs/fuzz-formats.md "Fuzz
+ * protocol").
  *
- * Dials a suzzer brain over TCP and serves as a uam_fuzz_frontend: each INPUT frame
- * is one harness input, and each gets exactly one reply - COVERAGE (kind ITER) for an
- * iteration that ended normally, CRASH otherwise:
+ * Dials a fuzz brain (fuzz/tools/fuzz_brain.py, or any program that speaks the protocol)
+ * over TCP and serves as a uam_fuzz_frontend: each INPUT frame is one harness input, and
+ * each gets exactly one reply - COVERAGE (kind ITER) for an iteration that ended
+ * normally, CRASH otherwise:
  *
  *   UAM_FUZZ_OK            COVERAGE, kind ITER
- *   UAM_FUZZ_CRASH_FAULT   CRASH GUEST_FAULT, status = faulting pc (low 32 bits)
- *   UAM_FUZZ_CRASH_GUARD   CRASH GUEST_FAULT, status = pc of the guarded access (low
- *                                             32 bits): a redzone or --guard hit
- *   UAM_FUZZ_CRASH_ORACLE  CRASH ORACLE,      status = detail (low 32 bits): the crash
- *                                             pc, a halt status or interrupt lines
- *   UAM_FUZZ_HANG          CRASH HANG,        status = the uam_stop_reason
- *   UAM_FUZZ_TIMEOUT       CRASH TIMEOUT,     status 0
- *   UAM_FUZZ_REJECTED      CRASH DELIVERY,    status 0: the route refused the input
+ *   UAM_FUZZ_CRASH_FAULT   CRASH FAULT,    status = faulting pc (low 32 bits)
+ *   UAM_FUZZ_CRASH_GUARD   CRASH GUARD,    status = pc of the guarded access (low 32 bits)
+ *   UAM_FUZZ_CRASH_ORACLE  CRASH ORACLE,   status = detail (low 32 bits): the crash pc, a
+ *                                          halt status or interrupt lines
+ *   UAM_FUZZ_HANG          CRASH HANG,     status = the uam_stop_reason
+ *   UAM_FUZZ_TIMEOUT       CRASH TIMEOUT,  status 0
+ *   UAM_FUZZ_REJECTED      CRASH REJECTED, status 0: the route refused the input
  *
- * The boot map goes out once, unsolicited, as COVERAGE id 0 kind INIT. A malformed
- * INPUT is answered with CRASH MALFORMED and nothing runs. A BYE from the brain ends
- * the run; ember sends BYE when it stops first (an error, an interrupt). EOF before a
- * BYE is an error. Unknown frame types are ignored.
+ * The boot map goes out once, unsolicited, as COVERAGE id 0 kind INIT. A malformed INPUT
+ * is answered with CRASH MALFORMED and nothing runs. A BYE from the brain ends the run;
+ * ember sends BYE when it stops first (an error, an interrupt). EOF before a BYE is an
+ * error. Unknown frame types are ignored.
  *
  * A dead peer is noticed by TCP keepalive (a brain host that vanished without closing the
  * connection would otherwise leave ember waiting forever); a live brain that stops
- * answering, by the optional per-frame timeout (--fuzz-szr-timeout).
+ * answering, by the optional per-frame timeout (--fuzz-net-timeout).
  */
 #include <errno.h>
 #include <netdb.h>
@@ -35,23 +36,21 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "lcv_formats.h"
-#include "suzzer.h"
+#include "formats.h"
+#include "cov_formats.h"
 
-#define SZR_FRAME_MAX     (64u << 20)   /* suzzer-relay's limit: stay below it */
 #define CONNECT_TRIES     50            /* the brain may still be starting: ~5 s */
 #define CONNECT_DELAY_NS  100000000L
 #define KEEPALIVE_IDLE_S  60            /* probe after a minute of silence ... */
 #define KEEPALIVE_INTVL_S 10            /* ... every 10 s ... */
 #define KEEPALIVE_CNT     6             /* ... and give up after 6 unanswered: ~2 min */
 
-struct sz_szr {
+struct cf_net {
     int       fd;
     bool      broken;      /* a frame was cut short: the stream is out of sync */
     bool      peer_bye;    /* the brain said BYE */
     uint16_t  flags;       /* HELLO scheme flags */
     unsigned  timeout_s;   /* per-frame wait for the brain; 0: none */
-    uint64_t  gen;         /* COVERAGE generation counter */
     uint8_t  *in;          /* the last frame's payload */
     size_t    in_cap;
     uint8_t  *out;         /* one outgoing frame */
@@ -74,7 +73,7 @@ static uint64_t get64(const uint8_t *p) { return (uint64_t)get32(p) << 32 | get3
 
 /* All of buf, retrying short writes and interrupted ones (a signal only sets the abort
  * flag; finishing the frame keeps the stream in sync for a final BYE). */
-static bool write_all(sz_szr *z, const uint8_t *buf, size_t len)
+static bool write_all(cf_net *z, const uint8_t *buf, size_t len)
 {
     while (len) {
         ssize_t n = send(z->fd, buf, len, MSG_NOSIGNAL);
@@ -82,10 +81,10 @@ static bool write_all(sz_szr *z, const uint8_t *buf, size_t len)
             continue;
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                uam_log(UAM_LOG_ERROR, "szr", "%s: the brain took nothing for %u s "
-                        "(--fuzz-szr-timeout)", z->peer, z->timeout_s);
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: the brain took nothing for %u s "
+                        "(--fuzz-net-timeout)", z->peer, z->timeout_s);
             else
-                uam_log(UAM_LOG_ERROR, "szr", "%s: send: %s", z->peer, strerror(errno));
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: send: %s", z->peer, strerror(errno));
             z->broken = true;
             return false;
         }
@@ -99,7 +98,7 @@ enum { RD_OK, RD_EOF, RD_ERR, RD_INTR };
 
 /* All of buf. EOF counts only before the first byte; an interrupt returns RD_INTR
  * (the runner's signal handler has asked the harness to stop). */
-static int read_all(sz_szr *z, uint8_t *buf, size_t len, bool frame_start)
+static int read_all(cf_net *z, uint8_t *buf, size_t len, bool frame_start)
 {
     size_t got = 0;
     while (got < len) {
@@ -117,12 +116,12 @@ static int read_all(sz_szr *z, uint8_t *buf, size_t len, bool frame_start)
         if (n == 0 && !got && frame_start)
             return RD_EOF;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            uam_log(UAM_LOG_ERROR, "szr", "%s: nothing from the brain for %u s (--fuzz-szr-timeout)",
+            uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: nothing from the brain for %u s (--fuzz-net-timeout)",
                     z->peer, z->timeout_s);
         else if (n == 0)
-            uam_log(UAM_LOG_ERROR, "szr", "%s: connection closed in the middle of a frame", z->peer);
+            uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: connection closed in the middle of a frame", z->peer);
         else
-            uam_log(UAM_LOG_ERROR, "szr", "%s: recv: %s", z->peer, strerror(errno));
+            uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: recv: %s", z->peer, strerror(errno));
         return RD_ERR;
     }
     return RD_OK;
@@ -141,7 +140,7 @@ static bool reserve(uint8_t **buf, size_t *cap, size_t need)
 }
 
 /* One frame: payload_len bytes already in z->out after the 5-byte header. */
-static bool send_frame(sz_szr *z, uint8_t type, size_t payload_len)
+static bool send_frame(cf_net *z, uint8_t type, size_t payload_len)
 {
     if (z->broken)
         return false;
@@ -150,12 +149,12 @@ static bool send_frame(sz_szr *z, uint8_t type, size_t payload_len)
     return write_all(z, z->out, 5 + payload_len);
 }
 
-static bool send_crash(sz_szr *z, uint64_t id, uint8_t reason, uint32_t status)
+static bool send_crash(cf_net *z, uint64_t id, uint8_t reason, uint32_t status)
 {
     uint8_t *p = put64(z->out + 5, id);
     *p++ = reason;
     put32(p, status);
-    return send_frame(z, SZR_CRASH, SZR_CRASH_LEN);
+    return send_frame(z, UAM_NET_CRASH, UAM_NET_CRASH_LEN);
 }
 
 /* ---- connection ------------------------------------------------------- */
@@ -202,7 +201,7 @@ static int dial(const char *host, const char *port, char *err, size_t errlen)
     return fd;
 }
 
-sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, unsigned timeout_s, char *err,
+cf_net *cf_net_connect(const char *hostport, uint16_t flags, unsigned timeout_s, char *err,
                        size_t errlen)
 {
     /* HOST:PORT, or [V6ADDR]:PORT */
@@ -218,7 +217,7 @@ sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, unsigned timeout_s,
         hlen -= 2;
     }
     char *host = strndup(h, hlen);
-    sz_szr *z = calloc(1, sizeof(*z));
+    cf_net *z = calloc(1, sizeof(*z));
     if (!host || !z) {
         free(host);
         free(z);
@@ -239,11 +238,11 @@ sz_szr *sz_szr_connect(const char *hostport, uint16_t flags, unsigned timeout_s,
         setsockopt(z->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
     snprintf(z->peer, sizeof(z->peer), "%s", hostport);
-    uam_log(UAM_LOG_INFO, "szr", "connected to the brain at %s", hostport);
+    uam_log(UAM_LOG_INFO, "fuzz-net", "connected to the brain at %s", hostport);
     return z;
 }
 
-void sz_szr_close(sz_szr *z)
+void cf_net_close(cf_net *z)
 {
     if (!z)
         return;
@@ -256,50 +255,48 @@ void sz_szr_close(sz_szr *z)
 
 /* ---- the frontend --------------------------------------------------- */
 
-static uam_status szr_hello(void *ctx, const uam_fuzz_info *info)
+static uam_status net_hello(void *ctx, const uam_fuzz_info *info)
 {
-    sz_szr *z = ctx;
-    const char *arch = !strcmp(info->arch, "rv32imac") ? "rv32" : info->arch;
-    size_t alen = strlen(arch);
-    if (alen > SZR_HELLO_ARCH_MAX)
-        alen = SZR_HELLO_ARCH_MAX;
-    size_t cov = (size_t)5 + SZR_COVERAGE_HDR_LEN + info->map_size;
-    if (cov - 4 > SZR_FRAME_MAX) {
-        uam_log(UAM_LOG_ERROR, "szr", "a %u-byte coverage map does not fit an SZR1 frame",
+    cf_net *z = ctx;
+    size_t alen = strlen(info->arch);
+    if (alen > UAM_NET_ARCH_MAX)
+        alen = UAM_NET_ARCH_MAX;
+    size_t cov = (size_t)5 + UAM_NET_COVERAGE_HDR_LEN + info->map_size;
+    if (cov - 4 > UAM_FUZZ_NET_FRAME_MAX) {
+        uam_log(UAM_LOG_ERROR, "fuzz-net", "a %u-byte coverage map does not fit a frame",
                 info->map_size);
         return UAM_ERR_INVALID;
     }
-    const size_t hello = (size_t)5 + SZR_HELLO_FIXED_LEN + SZR_HELLO_ARCH_MAX;
+    const size_t hello = (size_t)5 + UAM_NET_HELLO_FIXED_LEN + UAM_NET_ARCH_MAX;
     if (!reserve(&z->out, &z->out_cap, cov > hello ? cov : hello))
         return UAM_ERR_NOMEM;
-    if (!write_all(z, (const uint8_t *)SZR_MAGIC, 4))
+    if (!write_all(z, (const uint8_t *)UAM_FUZZ_NET_MAGIC, 4))
         return UAM_ERR_INVALID;
-    uint8_t *p = put16(z->out + 5, SZR_PROTO_VERSION);
-    p = put16(p, z->flags);          /* never MT or LIVE_EMPTY: those describe libcov */
+    uint8_t *p = put16(z->out + 5, UAM_FUZZ_NET_VERSION);
+    p = put16(p, z->flags);
     p = put32(p, info->map_size);
-    p = put16(p, 1);                 /* ring_size: one snapshot per input */
     p = put16(p, (uint16_t)alen);
-    memcpy(p, arch, alen);
-    return send_frame(z, SZR_HELLO, SZR_HELLO_FIXED_LEN + alen) ? UAM_OK : UAM_ERR_INVALID;
+    memcpy(p, info->arch, alen);
+    return send_frame(z, UAM_NET_HELLO, UAM_NET_HELLO_FIXED_LEN + alen) ? UAM_OK : UAM_ERR_INVALID;
 }
 
-static int szr_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
+static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
 {
-    sz_szr *z = ctx;
+    cf_net *z = ctx;
     for (;;) {
         if (z->broken)
             return -1;
         uint8_t hdr[5];
         int rc = read_all(z, hdr, sizeof(hdr), true);
         if (rc == RD_EOF) {
-            uam_log(UAM_LOG_ERROR, "szr", "%s: the brain closed the connection without BYE", z->peer);
+            uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: the brain closed the connection without BYE", z->peer);
             return -1;
         }
         if (rc != RD_OK)
             return -1;
         uint32_t flen = get32(hdr);
-        if (flen < 1 || flen > SZR_FRAME_MAX) {
-            uam_log(UAM_LOG_ERROR, "szr", "%s: bad frame length %u", z->peer, flen);
+        if (flen < 1 || flen > UAM_FUZZ_NET_FRAME_MAX) {
+            uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: bad frame length %u", z->peer, flen);
             z->broken = true;
             return -1;
         }
@@ -311,22 +308,22 @@ static int szr_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
         if (plen && read_all(z, z->in, plen, false) != RD_OK)
             return -1;
         switch (hdr[4]) {
-        case SZR_BYE:
+        case UAM_NET_BYE:
             z->peer_bye = true;
             return 0;
-        case SZR_INPUT: {
-            uint32_t dlen = plen >= SZR_INPUT_HDR_LEN ? get32(z->in + 8) : 0;
-            if (plen < SZR_INPUT_HDR_LEN || dlen > plen - SZR_INPUT_HDR_LEN) {
+        case UAM_NET_INPUT: {
+            uint32_t dlen = plen >= UAM_NET_INPUT_HDR_LEN ? get32(z->in + 8) : 0;
+            if (plen < UAM_NET_INPUT_HDR_LEN || dlen > plen - UAM_NET_INPUT_HDR_LEN) {
                 uint64_t bad = plen >= 8 ? get64(z->in) : 0;
-                uam_log(UAM_LOG_WARN, "szr", "malformed INPUT (id %llu, %zu payload bytes)",
+                uam_log(UAM_LOG_WARN, "fuzz-net", "malformed INPUT (id %llu, %zu payload bytes)",
                         (unsigned long long)bad, plen);
-                if (!send_crash(z, bad, SZR_CRASH_MALFORMED, 0))
+                if (!send_crash(z, bad, UAM_NET_MALFORMED, 0))
                     return -1;
                 continue;
             }
             *id = get64(z->in);
             *len = dlen;
-            *data = z->in + SZR_INPUT_HDR_LEN;
+            *data = z->in + UAM_NET_INPUT_HDR_LEN;
             return 1;
         }
         default:
@@ -335,45 +332,44 @@ static int szr_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     }
 }
 
-static uam_status szr_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
+static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
                              const uint8_t *map, size_t map_size, int kind)
 {
-    sz_szr *z = ctx;
+    cf_net *z = ctx;
     bool ok;
     if (kind == UAM_FUZZ_KIND_INIT || v == UAM_FUZZ_OK) {
         uint8_t *p = put64(z->out + 5, kind == UAM_FUZZ_KIND_INIT ? 0 : id);
-        p = put64(p, ++z->gen);
-        *p++ = kind == UAM_FUZZ_KIND_INIT ? LIBCOV_SLOT_FLAG_INIT : LIBCOV_SLOT_FLAG_ITER;
+        *p++ = kind == UAM_FUZZ_KIND_INIT ? UAM_COV_KIND_INIT : UAM_COV_KIND_ITER;
         p = put32(p, (uint32_t)map_size);
         memcpy(p, map, map_size);
-        ok = send_frame(z, SZR_COVERAGE, SZR_COVERAGE_HDR_LEN + map_size);
+        ok = send_frame(z, UAM_NET_COVERAGE, UAM_NET_COVERAGE_HDR_LEN + map_size);
     } else {
         uint8_t reason;
         uint32_t status = (uint32_t)detail;
         switch (v) {
-        case UAM_FUZZ_CRASH_FAULT:
-        case UAM_FUZZ_CRASH_GUARD:  reason = SZR_CRASH_GUEST_FAULT; break;
-        case UAM_FUZZ_CRASH_ORACLE: reason = SZR_CRASH_ORACLE; break;
-        case UAM_FUZZ_HANG:         reason = SZR_CRASH_HANG; break;
-        case UAM_FUZZ_REJECTED:     reason = SZR_CRASH_DELIVERY; status = 0; break;
-        default:                    reason = SZR_CRASH_TIMEOUT; status = 0; break;
+        case UAM_FUZZ_CRASH_FAULT:  reason = UAM_NET_FAULT; break;
+        case UAM_FUZZ_CRASH_GUARD:  reason = UAM_NET_GUARD; break;
+        case UAM_FUZZ_CRASH_ORACLE: reason = UAM_NET_ORACLE; break;
+        case UAM_FUZZ_HANG:         reason = UAM_NET_HANG; break;
+        case UAM_FUZZ_REJECTED:     reason = UAM_NET_REJECTED; status = 0; break;
+        default:                    reason = UAM_NET_TIMEOUT; status = 0; break;
         }
         ok = send_crash(z, id, reason, status);
     }
     return ok ? UAM_OK : UAM_ERR_INVALID;
 }
 
-static void szr_bye(void *ctx)
+static void net_bye(void *ctx)
 {
-    sz_szr *z = ctx;
+    cf_net *z = ctx;
     if (!z->peer_bye && !z->broken && z->out)
-        send_frame(z, SZR_BYE, 0);
+        send_frame(z, UAM_NET_BYE, 0);
     shutdown(z->fd, SHUT_WR);
 }
 
-const uam_fuzz_frontend sz_szr_frontend = {
-    .hello = szr_hello,
-    .next_input = szr_next_input,
-    .report = szr_report,
-    .bye = szr_bye,
+const uam_fuzz_frontend cf_net_frontend = {
+    .hello = net_hello,
+    .next_input = net_next_input,
+    .report = net_report,
+    .bye = net_bye,
 };

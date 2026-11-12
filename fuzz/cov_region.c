@@ -1,22 +1,21 @@
 /*
- * lcvs.c - The harness's maps in an LCVS shared-memory region (FORMATS.md section 3).
+ * cov_region.c - The harness's maps in a coverage region (docs/fuzz-formats.md
+ * "Coverage region"), for readers outside ember (fuzz/tools/cov_region.py, a brain's
+ * status screen).
  *
- * A side channel for suzzer's region readers (shm_bitmap.py, ring readers): the INIT
- * map and every iteration's map go into the ring as INIT and ITER snapshots, written
- * with the seqlock protocol of section 3.5, and the live bitmap holds the union of
- * everything published so far (saturating sums), so LIVE_EMPTY stays clear. Crashed,
- * hung and timed-out iterations are not published: libcov's process never gets to
- * publish those either. Every field is in this host's byte order, as the format says
- * for its writer.
+ * The INIT map and every ok iteration's map go into the ring as INIT and ITER snapshots,
+ * written with the seqlock protocol, and the live bitmap holds the union of everything
+ * published so far (saturating sums). Crashed, hung and timed-out iterations are not
+ * published. Every field is in this host's byte order.
  *
- * PATH follows LIBCOV_SHM_PATH's rule: with a '/' after the first character it is a
- * file, otherwise a POSIX shared-memory name (/dev/shm on Linux; at most 31 characters
- * on macOS). The region is left in place at exit for readers that come late.
+ * PATH with a '/' after its first character is a file, otherwise a POSIX shared-memory
+ * name (/dev/shm on Linux; at most 31 characters on macOS). The region is left in place at
+ * exit for readers that come late.
  *
- * Ownership follows libcov's: the decision to take a region is made under an exclusive
- * flock, so two writers starting at once (ember or libcov) cannot both claim it, and an
- * owner counts as alive only if its pid exists with the recorded start time (a reused
- * pid has another one), or, without /proc, if the pid exists at all.
+ * Ownership: the decision to take a region is made under an exclusive flock, so two
+ * ember processes starting at once cannot both claim it, and an owner counts as alive
+ * only if its pid exists with the recorded start time (a reused pid has another one),
+ * or, without /proc, if the pid exists at all.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -29,13 +28,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "lcv_formats.h"
-#include "suzzer.h"
+#include "formats.h"
+#include "cov_formats.h"
 
-struct sz_lcvs {
+struct cf_region {
     uint8_t                     *base;
     size_t                       size;
-    struct libcov_shm_header    *hdr;
+    struct uam_cov_region_header *hdr;
     uint8_t                     *live;
     uint32_t                     map_size;
     uint16_t                     ring_size;
@@ -75,8 +74,7 @@ static uint32_t start_time(pid_t pid)
     return p ? (uint32_t)strtoull(p + 1, NULL, 10) : 0;
 }
 
-/* libcov's owner_alive: the recorded start time decides when /proc has one for the pid;
- * otherwise the pid's existence does (EPERM: it exists, as another user's). */
+/* The recorded start time decides when /proc has one for the pid; otherwise the pid's existence does (EPERM: it exists, as another user's). */
 static bool owner_alive(uint32_t pid, uint32_t start)
 {
     if (!pid)
@@ -90,8 +88,8 @@ static bool owner_alive(uint32_t pid, uint32_t start)
 /* An existing region whose owner is still alive and is not us belongs to someone else. */
 static bool owned_by_other(int fd)
 {
-    struct libcov_shm_header h;
-    if (pread(fd, &h, sizeof(h), 0) != (ssize_t)sizeof(h) || memcmp(h.magic, LIBCOV_SHM_MAGIC, 4))
+    struct uam_cov_region_header h;
+    if (pread(fd, &h, sizeof(h), 0) != (ssize_t)sizeof(h) || memcmp(h.magic, UAM_COV_REGION_MAGIC, 4))
         return false;
     if (h.owner_pid == (uint32_t)getpid() && h.owner_start == start_time(0))
         return false;
@@ -132,7 +130,7 @@ static bool size_region(int *fd, const char *shm_name, size_t size, bool *zero)
     return ftruncate(nfd, (off_t)size) == 0;
 }
 
-sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size, uint32_t scheme_flags,
+cf_region *cf_region_create(const char *path, uint32_t map_size, unsigned ring_size, uint32_t scheme_flags,
                         char *err, size_t errlen)
 {
     if (ring_size < 2 || ring_size > 0xffff) {
@@ -152,16 +150,16 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
         snprintf(err, errlen, "%s: %s", path, strerror(errno));
         return NULL;
     }
-    /* Check, truncate and initialise under the lock libcov takes for the same choice. */
+    /* Check, truncate and initialise under the lock. */
     if (flock(fd, LOCK_EX) != 0)
-        uam_log(UAM_LOG_WARN, "lcvs", "%s: flock: %s (continuing unlocked)", path, strerror(errno));
+        uam_log(UAM_LOG_WARN, "cov-region", "%s: flock: %s (continuing unlocked)", path, strerror(errno));
     if (owned_by_other(fd)) {
         snprintf(err, errlen, "%s: in use by another live process", path);
         unlock_close(fd);
         return NULL;
     }
-    const size_t slot_stride = sizeof(struct libcov_ring_slot_hdr) + map_size;
-    const size_t size = sizeof(struct libcov_shm_header) + map_size + (size_t)ring_size * slot_stride;
+    const size_t slot_stride = sizeof(struct uam_cov_slot) + map_size;
+    const size_t size = sizeof(struct uam_cov_region_header) + map_size + (size_t)ring_size * slot_stride;
     bool zero;
     if (!size_region(&fd, file ? NULL : name, size, &zero)) {
         snprintf(err, errlen, "%s: %s", path, strerror(errno));
@@ -169,7 +167,7 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
         return NULL;
     }
     void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    sz_lcvs *l = base == MAP_FAILED ? NULL : calloc(1, sizeof(*l));
+    cf_region *l = base == MAP_FAILED ? NULL : calloc(1, sizeof(*l));
     if (!l) {
         snprintf(err, errlen, "%s: %s", path, base == MAP_FAILED ? strerror(errno) : "out of memory");
         if (base != MAP_FAILED)
@@ -178,7 +176,7 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
         return NULL;
     }
     if (zero) {                              /* the magic first: readers stop trusting it */
-        memset(base, 0, sizeof(struct libcov_shm_header));
+        memset(base, 0, sizeof(struct uam_cov_region_header));
         __atomic_thread_fence(__ATOMIC_RELEASE);
         memset(base, 0, size);
     }
@@ -187,25 +185,25 @@ sz_lcvs *sz_lcvs_create(const char *path, uint32_t map_size, unsigned ring_size,
     l->hdr = base;
     l->map_size = map_size;
     l->ring_size = (uint16_t)ring_size;
-    l->live = l->base + sizeof(struct libcov_shm_header);
+    l->live = l->base + sizeof(struct uam_cov_region_header);
 
-    struct libcov_shm_header *h = l->hdr;
-    h->version = LIBCOV_SHM_VERSION;
+    struct uam_cov_region_header *h = l->hdr;
+    h->version = UAM_COV_REGION_VERSION;
     h->ring_size = (uint16_t)ring_size;
     h->map_size = map_size;
     h->slot_stride = (uint32_t)slot_stride;
-    h->flags = LIBCOV_SHM_FLAG_ACTIVE | scheme_flags;
-    h->bitmap_offset = sizeof(struct libcov_shm_header);
-    h->ring_offset = sizeof(struct libcov_shm_header) + map_size;
+    h->flags = scheme_flags;
+    h->bitmap_offset = sizeof(struct uam_cov_region_header);
+    h->ring_offset = sizeof(struct uam_cov_region_header) + map_size;
     h->owner_pid = (uint32_t)getpid();
     h->owner_start = start_time(0);
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    memcpy(h->magic, LIBCOV_SHM_MAGIC, 4);   /* last: the region is ready */
+    memcpy(h->magic, UAM_COV_REGION_MAGIC, 4);   /* last: the region is ready */
     unlock_close(fd);
     return l;
 }
 
-void sz_lcvs_close(sz_lcvs *l)
+void cf_region_close(cf_region *l)
 {
     if (!l)
         return;
@@ -213,25 +211,24 @@ void sz_lcvs_close(sz_lcvs *l)
     free(l);
 }
 
-uint64_t sz_lcvs_published(const sz_lcvs *l) { return l->published; }
+uint64_t cf_region_published(const cf_region *l) { return l->published; }
 
-/* One snapshot (section 3.5, writer). */
-static void publish(sz_lcvs *l, uint64_t slot_flags, const uint8_t *map)
+/* One snapshot (the seqlock writer). */
+static void publish(cf_region *l, uint32_t kind, const uint8_t *map)
 {
-    struct libcov_shm_header *h = l->hdr;
+    struct uam_cov_region_header *h = l->hdr;
     const uint64_t g = __atomic_add_fetch(&h->gen_current, 1, __ATOMIC_ACQ_REL);
     uint8_t *slot = l->base + h->ring_offset + (g % l->ring_size) * (uint64_t)h->slot_stride;
-    struct libcov_ring_slot_hdr *sh = (struct libcov_ring_slot_hdr *)slot;
+    struct uam_cov_slot *sh = (struct uam_cov_slot *)slot;
     __atomic_store_n(&sh->slot_gen, 0, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    sh->tid = (uint64_t)getpid();   /* one hart, one thread */
     sh->ns = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
-    sh->flags = slot_flags;
+    sh->kind = kind;
     memcpy(slot + sizeof(*sh), map, l->map_size);
     __atomic_store_n(&sh->slot_gen, g, __ATOMIC_RELEASE);
-    if (slot_flags == LIBCOV_SLOT_FLAG_INIT)
+    if (kind == UAM_COV_KIND_INIT)
         h->gen_init = g;
     for (uint32_t i = 0; i < l->map_size; i++) {
         unsigned v = (unsigned)l->live[i] + map[i];
@@ -240,16 +237,16 @@ static void publish(sz_lcvs *l, uint64_t slot_flags, const uint8_t *map)
     l->published++;
 }
 
-void sz_lcvs_observe(void *ctx, uint64_t id, int kind, uam_fuzz_verdict v, uint64_t detail,
+void cf_region_observe(void *ctx, uint64_t id, int kind, uam_fuzz_verdict v, uint64_t detail,
                      const uint8_t *map, size_t map_size)
 {
     (void)id;
     (void)detail;
-    sz_lcvs *l = ctx;
+    cf_region *l = ctx;
     if (map_size != l->map_size)
         return;
     if (kind == UAM_FUZZ_KIND_INIT)
-        publish(l, LIBCOV_SLOT_FLAG_INIT, map);
+        publish(l, UAM_COV_KIND_INIT, map);
     else if (v == UAM_FUZZ_OK)
-        publish(l, LIBCOV_SLOT_FLAG_ITER, map);
+        publish(l, UAM_COV_KIND_ITER, map);
 }
