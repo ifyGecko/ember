@@ -16,7 +16,6 @@
  */
 #include <getopt.h>
 #include <signal.h>
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -268,21 +267,14 @@ static void usage(FILE *out)
         "                          irq     interrupt input lines of the processors changing\n"
         "                                  level; at the stop, each line's counts and whether\n"
         "                                  an interrupt is pending and enabled\n"
-        "                          polls   loops that wait on a device register: the value they\n"
-        "                                  wait for, once one goes round --poll-report times,\n"
-        "                                  and a summary at the stop (what it was still\n"
-        "                                  waiting for); one-block loops only (no timeout\n"
-        "                                  counter, no call to a read function)\n"
         "                          console each line the guest prints, with its icount and pc\n"
-        "                          all     exc, mmio, sysreg, irq, polls, console\n"
+        "                          all     exc, mmio, sysreg, irq, console\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
         "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI)\n"
         "      --trace-after N     trace blocks, mmio, sysreg, irq and console only once the\n"
         "                          instruction count reaches N. N is absolute, like every\n"
         "                          icount the runner prints (a snapshot keeps the count); +N:\n"
         "                          N instructions after the run starts\n"
-        "      --poll-report N     passes in a row before --trace polls reports a loop\n"
-        "                          (1 or more; default 10000)\n"
         "      --log-stamp         start each log line made while the guest runs with\n"
         "                          @ICOUNT (@ICOUNT:cpuN on other processors)\n"
         "      --log-pc ADDR       log each arrival at ADDR (repeatable)\n"
@@ -380,8 +372,10 @@ static unsigned parse_trace(const char *s, unsigned *rt)
         if (!strcmp(tok, "blocks"))     t |= UAM_TRACE_BLOCKS;
         else if (!strcmp(tok, "ir"))    t |= UAM_TRACE_IR;
         else if (!strcmp(tok, "exc"))   t |= UAM_TRACE_EXC;
-        else if (!strcmp(tok, "polls")) t |= UAM_TRACE_POLL;
-        else if (!strcmp(tok, "all"))   { t |= UAM_TRACE_EXC | UAM_TRACE_POLL;
+        /* TODO: a trace that detects device polling loops of any shape ("polls" was
+         * removed: it only found single-block loops; see the TODO at the end of
+         * src/exec/spin.c). */
+        else if (!strcmp(tok, "all"))   { t |= UAM_TRACE_EXC;
                                           *rt |= RT_MMIO | RT_SYSREG | RT_IRQ | RT_CONSOLE; }
         else if (rtrace_flag(tok))      *rt |= rtrace_flag(tok);
         else fprintf(stderr, "uam-run: unknown trace flag '%s'\n", tok);
@@ -582,7 +576,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
-           OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE, OPT_POLL_REPORT,
+           OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
            OPT_LOG_STAMP, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
@@ -608,7 +602,6 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "trace-range", required_argument, NULL, OPT_TRACE_RANGE },
         { "trace-after", required_argument, NULL, OPT_TRACE_AFTER },
         { "trace-mmio-range", required_argument, NULL, OPT_TRACE_MMIO_RANGE },
-        { "poll-report", required_argument, NULL, OPT_POLL_REPORT },
         { "log-stamp", no_argument, NULL, OPT_LOG_STAMP },
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
@@ -679,8 +672,6 @@ static int run_main(int argc, char **argv, const ext_set *es)
     bool have_begin = false, fuzz_opts = false;
     const char *fuzz_input = NULL, *fuzz_replay = NULL;
     unsigned trace = 0, block_insns = 0;
-    uint64_t poll_report = 0;
-    bool have_poll_report = false;
     static rtrace rt;   /* large (tables); static, one run per process */
     memset(&rt, 0, sizeof(rt));
     uam_board_option options[MAX_LIST];
@@ -737,19 +728,6 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 return 2;
             }
             rt.flags |= RT_MMIO;
-            break;
-        }
-        case OPT_POLL_REPORT: {
-            char *end;
-            errno = 0;
-            poll_report = strtoull(optarg, &end, 0);
-            if (end == optarg || *end || errno || optarg[strspn(optarg, " \t")] == '-'
-                || poll_report == 0) {
-                fprintf(stderr, "uam-run: --poll-report wants a number of passes, 1 or more "
-                        "(got '%s')\n", optarg);
-                return 2;
-            }
-            have_poll_report = true;
             break;
         }
         case OPT_LOG_STAMP: uam_log_stamp = true; break;
@@ -1140,9 +1118,6 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 "traced from the start; --trace-after +N counts from the snapshot\n",
                 (unsigned long long)trace_after, (unsigned long long)start_icount);
     m.exec.trace_after = trace_after;
-    m.exec.poll_report = poll_report;
-    if (have_poll_report && !(trace & UAM_TRACE_POLL))
-        fprintf(stderr, "uam-run: --poll-report does nothing without --trace polls\n");
     rt.after = (trace_after || trace_after_rel) ? trace_after : 0;
     rtrace_attach(&rt, &m, console, m.exec.trace_out);
     m.exec.verify = verify;
@@ -1338,7 +1313,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 uam_stop_reason_str(why), (long long)m.exec.stop_status,
                 (unsigned long long)m.cpu.pc, (unsigned long long)uam_machine_icount(&m));
     if (!fuzzing)
-        rtrace_finish(&rt, trace);
+        rtrace_finish(&rt);
     if (stats) {
         uam_exec_stats sum;
         uam_machine_get_stats(&m, &sum);

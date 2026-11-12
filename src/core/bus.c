@@ -590,15 +590,10 @@ static uam_status read_bytewise(uam_bus *bus, uint64_t addr, unsigned size, unsi
     return UAM_OK;
 }
 
-/* After a guest read a device served: remember it (polls) and tell the observer. */
+/* After a guest read a device served: tell the observer. */
 static void dev_read_done(uam_bus *bus, const uam_region *r, uint64_t addr, unsigned size,
                           uam_status st, const uint64_t *val)
 {
-    if (st == UAM_OK) {
-        const uint32_t i = (uint32_t)(bus->n_dev_reads++ % UAM_BUS_DEV_READS);
-        bus->dev_reads[i].addr = addr;
-        bus->dev_reads[i].val = *val;
-    }
     if (bus->dev_obs)
         bus->dev_obs(bus->dev_obs_ctx, r, addr, size, false, st == UAM_OK ? *val : 0, st);
 }

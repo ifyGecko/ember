@@ -28,25 +28,9 @@
 
 bool uam_spin_candidate(const uam_block *blk);
 
-/* Spin loops may be skipped (UAM_SPIN_SKIP is not "0"); read at each uam_exec_run. */
-bool uam_spin_skip_enabled(void);
-
 /* `t`: temps for the evaluation (as many as the block has). *never is set when the
  * block can never qualify (a load that is not from plain RAM or ROM). */
 bool uam_spin_fixed(uam_cpu *cpu, const uam_block *blk, uint64_t *t, bool *never);
-
-/* `never` because of a device read (not plain RAM or ROM): the block may be a device
- * poll (uam_poll). Set by uam_spin_fixed along with *never. */
-extern bool uam_spin_never_dev;
-
-/* After a pass of a poll block went round: fill p's read, value and exit fields
- * (exec.h, uam_poll) by re-evaluating a pass with other values for its device reads.
- * first_read: the bus's n_dev_reads before that pass (its reads' values are the bus's
- * dev_reads from there). `t`: temps as for uam_spin_fixed. False if the pass cannot be
- * evaluated (more than UAM_POLL_MAX_READS device reads, a fault, read addresses that
- * depend on the values read). */
-bool uam_spin_poll_analyse(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint64_t first_read,
-                           uam_poll *p);
 
 /* Spin state of a cached block: 0 undecided, -1 never a candidate, SPIN_CAND + n a
  * candidate whose last n checks failed in a row. After SPIN_GIVE_UP failures it is
@@ -54,7 +38,6 @@ bool uam_spin_poll_analyse(uam_cpu *cpu, const uam_block *blk, uint64_t *t, uint
  * self-link back, so it costs no more than before. */
 #define SPIN_CAND    1
 #define SPIN_GIVE_UP 16
-#define SPIN_POLL    (-2)   /* never skipped: a device poll, whose passes are counted */
 
 /* tcache.c: the block for pc, as uam_tcache_lookup, and the spin state of its entry,
  * reset whenever the entry gets a new block. */

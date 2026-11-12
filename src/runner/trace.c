@@ -200,7 +200,7 @@ static int sr_cmp(const void *a, const void *b)
     return x->id < y->id ? -1 : x->id > y->id;
 }
 
-void rtrace_finish(rtrace *t, unsigned exec_trace)
+void rtrace_finish(rtrace *t)
 {
     if (!t->m)
         return;
@@ -237,32 +237,6 @@ void rtrace_finish(rtrace *t, unsigned exec_trace)
                 fprintf(t->out, "irq: at the stop cpu%u has an interrupt pending and enabled%s\n", c,
                         cpu->waiting ? " (waiting: it wakes)" : " (it is taken at the next instruction "
                         "boundary unless interrupts are globally off)");
-        }
-    }
-    if (exec_trace & UAM_TRACE_POLL) {
-        for (unsigned c = 0; c < uam_machine_ncpus(m); c++) {
-            const uam_poll *p;
-            size_t n = uam_exec_polls(uam_machine_exec(m, c), &p);
-            for (size_t i = 0; i < n; i++) {
-                if (!p[i].passes)
-                    continue;   /* the condition held at once: not a wait */
-                char d[400];
-                uam_poll_describe(&p[i], &m->bus, d, sizeof(d));
-                char tag[16] = "";
-                if (c)
-                    snprintf(tag, sizeof(tag), " cpu=%u", c);
-                fprintf(t->out, "poll: %s%s; %llu passes in %llu arrivals, longest %llu%s\n",
-                        p[i].active ? "STILL POLLING at the stop: " : "", d,
-                        (unsigned long long)p[i].passes, (unsigned long long)p[i].arrivals,
-                        (unsigned long long)p[i].max_run, tag);
-            }
-            const uint64_t dropped = uam_machine_exec(m, c)->polls_dropped;
-            if (dropped)
-                fprintf(t->out, c ? "poll: %llu more loops not tracked: the table of %u "
-                                    "loops is full cpu=%u\n"
-                                  : "poll: %llu more loops not tracked: the table of %u "
-                                    "loops is full\n",
-                        (unsigned long long)dropped, UAM_EXEC_MAX_POLLS, c);
         }
     }
     fflush(t->out);

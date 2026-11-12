@@ -322,26 +322,17 @@ ones a bring-up step needs, all on stderr:
 | `mmio` | every access a device serves (MMIO, a ROM device in device mode, an unmapped address, x86 ports): `mmio: r 1 0x10000005 uart0+0x5 = 0x60 pc=0x8000025e icount=141` | the register protocol a driver speaks: what to model, in which order, with which values |
 | `sysreg` | the first read and the first write of each system register (CSR, CP0, CP15, SPR, MSR, ...) with value and pc, every access that faults, and a per-register summary at the stop; `sysreg-all`: every access | which core and implementation registers the firmware relies on |
 | `irq` | each change of a processor's interrupt input lines; at the stop, each line's rises and falls and whether an interrupt is pending and enabled | "was the interrupt raised, did it reach the CPU, is it masked" |
-| `polls` | loops that wait on a device register, with the value they wait for: `poll: waiting: pc 0x80000004: loop at 0x80000004 reads 4 bytes at 0x20000014 (rule@0x20000014+0x0), last 0x0; leaves the loop if bit 5 (0x20) becomes 1`; a `done:` line with the value that ended a long wait, and a summary at the stop (`STILL POLLING at the stop: ...`) | the next blocker of a stalled run, and the `--mmio-rule` or device behaviour that clears it |
 | `console` | each line the guest prints, with the icount and pc of its first byte | lining console output up with `--trace-after`, `--snapshot-at`, `-n N -d` |
-| `all` | `exc,mmio,sysreg,irq,polls,console` | a first look at a short run |
+| `all` | `exc,mmio,sysreg,irq,console` | a first look at a short run |
 
-`--trace-mmio-range LO:HI` limits the `mmio` trace to physical addresses in [LO, HI);
-`--poll-report N` is how many passes in a row a loop makes before `polls` reports it
-(1 or more; default 10000). Polls are found among single-block loops that read up to four
-device registers and count nothing (a `readl()` that is not inlined, or a loop with a
-timeout counter, is not one); the value they wait for is worked out at each arrival by
-re-running one pass, without effects, with other values for a register: single bits, the
-loop's constants as masks ("all of bits 0x30 become 1") and as whole values, and "when the
-value changes from 0x7". A wait helper called for two registers gives two entries; a loop
-whose register keeps changing (a timer delay) is marked "a counter or a timer?". Each
-processor tracks up to 4096 loops, and the summary says how many more it did not. The catch-all logs (`unknown-mmio`, `unimp`, `mmio-stub`,
+`--trace-mmio-range LO:HI` limits the `mmio` trace to physical addresses in [LO, HI).
+To see what a stalled run waits on, `--trace mmio` on the register it reads over and over
+shows the value it keeps getting. The catch-all logs (`unknown-mmio`, `unimp`, `mmio-stub`,
 the PC `master-abort`) name the instruction of each first access (`pc=0x... icount=N`), and
 `--log-stamp` starts every log line made while the guest runs with `@ICOUNT`. All of it is
 the same with and without `--jit`.
 
 ```bash
-build/uam-run -t polls -n 50000000 fw.elf     # a stalled boot: what is it waiting for?
 build/uam-run -t mmio --trace-mmio-range 0x18040000:0x18041000 fw.elf   # one peripheral's protocol
 build/uam-run -t sysreg,irq,console fw.elf    # system registers, interrupt lines, stamped console
 ```

@@ -23,8 +23,7 @@ Prints, in order:
      (board option -o msr-trace=1), POST codes (-v -v), and the processors involved on a
      multiprocessor run (cpu=N)
   7. what the bring-up traces add, when the run had them (all off by default):
-     --trace polls (a loop still waiting at the stop is called out in section 1, with the
-     register and the bit or value it waits for), --trace mmio (accesses per device),
+     --trace mmio (accesses per device),
      --trace irq (interrupt input lines, a pending interrupt at the stop), --trace sysreg
      (system register accesses that fault). First-access lines carry the instruction that
      made them (pc=..., icount): shown with each event. --log-stamp prefixes are ignored.
@@ -113,10 +112,6 @@ RE_POST = re.compile(r"\] post: code (0x[0-9a-f]+)")
 RE_GUARD = re.compile(r"^(?:\S+: )?guard (\S+) \((stop|fault|log)\): cpu (\d+) pc (0x[0-9a-f]+) (read|write) (\d+) at (0x[0-9a-f]+)")
 RE_AT = re.compile(r" pc=0x([0-9a-f]+) icount=(\d+)(?: cpu=(\d+))?")
 RE_STAMP = re.compile(r"^@\d+(?::cpu\d+)? ")      # --log-stamp
-RE_POLL_STILL = re.compile(r"^poll: STILL POLLING at the stop: (.*); (\d+) passes in (\d+) arrivals")
-RE_POLL_WAIT = re.compile(r"^poll: waiting: (.*) \((\d+) passes\) icount=(\d+)")
-RE_POLL_DONE = re.compile(r"^poll: done: (.*) \((\d+) passes\) icount=(\d+)")
-RE_POLL_SUM = re.compile(r"^poll: (pc 0x.*); (\d+) passes in (\d+) arrivals, longest (\d+)")
 RE_MMIO = re.compile(r"^mmio: ([rw]) (\d) 0x([0-9a-f]+) (\S+?)(?:\+0x([0-9a-f]+))? = (0x[0-9a-f]+)")
 RE_IRQ_SUM = re.compile(r"^irq-in: cpu(\d+) line (\d+): (\d+) rises, (\d+) falls, level (-?\d+) at the stop")
 RE_IRQ_NONE = re.compile(r"^irq-in: no interrupt input line")
@@ -210,7 +205,6 @@ def main(argv=None):
     posts = []
     guards = Counter()               # (guard, action, access) -> hits
     console_left = None
-    polls_still, polls_done, polls_sum = [], [], []
     mmio_dev = Counter()             # (device, r/w) -> accesses (--trace mmio)
     irq_lines, irq_pending, irq_none = [], [], False
 
@@ -329,22 +323,6 @@ def main(argv=None):
         if m:
             mmio_dev[(m.group(4), m.group(1))] += 1
             continue
-        m = RE_POLL_STILL.match(ln)
-        if m:
-            polls_still.append((m.group(1), int(m.group(2))))
-            continue
-        m = RE_POLL_WAIT.match(ln)
-        if m:
-            note(i, "poll waiting (%s passes so far): %s" % (m.group(2), m.group(1)))
-            continue
-        m = RE_POLL_DONE.match(ln)
-        if m:
-            polls_done.append((m.group(1), int(m.group(2)), int(m.group(3))))
-            continue
-        m = RE_POLL_SUM.match(ln)
-        if m:
-            polls_sum.append((m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))))
-            continue
         m = RE_IRQ_SUM.match(ln)
         if m:
             irq_lines.append(tuple(int(x) for x in m.groups()))
@@ -434,10 +412,6 @@ def main(argv=None):
         elif "differs" in msg or "is of board" in msg or "holds state for" in msg:
             print("   -> load with the same board build, options, images, --ram, rules and ports")
 
-    for desc, passes in polls_still:
-        print("   -> stopped while polling a device (--trace polls, %d passes): %s\n"
-              "      make that register produce the value (try --mmio-rule ADDR=fixed:V first), or\n"
-              "      model the device behaviour that sets it" % (passes, desc))
     print("\n== first distinct events (log line: event)")
     for n, t in first:
         print("%7d: %s" % (n, t))
@@ -491,12 +465,6 @@ def main(argv=None):
               "   output only, not output from before a --load-snapshot)" % console_left)
     if posts:
         print("\n== POST codes in order (last is where the firmware got to): %s" % " ".join(posts[-24:]))
-    if polls_sum or polls_done:
-        print("\n== device polls that waited and finished (--trace polls; desc, passes, arrivals, longest)")
-        for desc, passes, arr, longest in sorted(polls_sum, key=lambda x: -x[1])[:a.top]:
-            print("   %8d passes, %d arrivals, longest %d: %s" % (passes, arr, longest, desc))
-        for desc, passes, ic in polls_done[:a.top]:
-            print("   done at icount %d after %d passes: %s" % (ic, passes, desc))
     if mmio_dev:
         print("\n== --trace mmio: accesses per device (device: reads / writes)")
         names = sorted({d for d, _ in mmio_dev}, key=lambda d: -(mmio_dev[(d, 'r')] + mmio_dev[(d, 'w')]))

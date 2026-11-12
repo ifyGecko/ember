@@ -2,7 +2,7 @@
  * trace.h - The runner's bring-up traces (internal to src/runner): what the guest does
  * to devices, system registers, interrupt lines and the console, on top of the
  * observers the core offers (bus.h uam_bus_set_dev_observer, cpu.h uam_cpu_observer,
- * chardev.h uam_chardev_set_tap, exec.h uam_poll). Everything here is off unless a
+ * chardev.h uam_chardev_set_tap). Everything here is off unless a
  * --trace kind asks for it.
  */
 #ifndef UAM_RUNNER_TRACE_H
@@ -54,14 +54,14 @@ typedef struct rtrace {
     uam_origin        line_origin;
 } rtrace;
 
-/* A --trace token this module owns: its RT_* bit, or 0. "polls" is the executor's
- * UAM_TRACE_POLL and not handled here. */
+/* A --trace token this module owns: its RT_* bit, or 0. */
 unsigned rtrace_flag(const char *tok);
 /* Install the observers the flags ask for. */
 void     rtrace_attach(rtrace *t, uam_machine *m, uam_chardev *console, FILE *out);
 /* The run stopped: a partial console line, the summaries (system registers, interrupt
- * lines, the device polls when the executor traced them: exec_trace & UAM_TRACE_POLL). */
-void     rtrace_finish(rtrace *t, unsigned exec_trace);
+ * lines). TODO: a summary of the device polling loops a run waited in, once a trace
+ * can detect polling loops of any shape (the removed --trace polls could not). */
+void     rtrace_finish(rtrace *t);
 /* Remove the observers (before the machine goes). */
 void     rtrace_detach(rtrace *t);
 
