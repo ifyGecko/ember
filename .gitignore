@@ -1,2 +1,10 @@
 # Build output (make, make test).
 /build/
+
+# Python bytecode caches (the tools run in place).
+__pycache__/
+*.py[cod]
+
+# Stray build output: object files, and benchmark builds made with OUT inside the tree.
+*.o
+/tests/bench/build/
