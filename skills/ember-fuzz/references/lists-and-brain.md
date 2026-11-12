@@ -32,9 +32,11 @@ exec "$PROJ/run.sh" -n 2000000000 \
 
 ## Making the lists
 
-Two routes write the same files, byte for byte: the rizin tools (need rizin and python3's
-`rzpipe`) and their Ghidra Jython ports (`fuzz/tools/ghidra/`; headless Ghidra, no rizin).
-Use whichever is installed. Ghidra also covers what rizin cannot decode: ARM BE8 images,
+Two routes follow the same rules: the rizin tools (need rizin and python3's `rzpipe`) and
+their Ghidra Jython ports (`fuzz/tools/ghidra/`; headless Ghidra, no rizin). Use whichever
+is installed, and make a site list and its boundary file with the same one: the files are
+the same, byte for byte, only where both analysers find the same functions and blocks (a
+jump table one of them does not resolve gives the other more sites). Ghidra also covers what rizin cannot decode: ARM BE8 images,
 AVR32 and 8-bit PIC ELFs, MIPS16e/microMIPS functions.
 
 With rizin:
@@ -67,8 +69,9 @@ IMAGE=fw.bin ./fuzz-lists.sh --fuzz-replay corpus/
 - **The Ghidra ports' command line** (`fuzz/tools/ghidra/README.md` is the authority): the
   first argument is the output file, since the program is the one Ghidra has open; there is
   no `--raw/--base/--arch/--bits/--endian/--cpu`, since the processor, base and byte order
-  are those of the import (recon's, here); names are Ghidra's bare ones. Output paths must be
-  absolute: the script runs in Ghidra's directory, not yours.
+  are those of the import (recon's, here); names are Ghidra's bare ones. A relative output
+  path is taken from the directory `analyzeHeadless` was started in. An error ends the
+  script without a file: look for its `error:` line in the headless log.
 - **They are Jython 2.7 scripts.** Ghidra 11.4 and later no longer bundle Jython: install
   the Jython extension (`Extensions/Ghidra/ghidra_*_Jython.zip`, unzipped into
   `Ghidra/Extensions/`) first.
@@ -82,8 +85,10 @@ IMAGE=fw.bin ./fuzz-lists.sh --fuzz-replay corpus/
   --endian E --symbols FILE` (`--cpu` for rizin's CPU variant). With Ghidra the import
   already has the base.
 - **Where the sites are.** The board places the image itself (`--image os=`), so the runner
-  has no image of its own to take a link base from. A list carries its module base table;
-  `--cov-module <module>=<base>` or `--raw-base <BOARD_IMAGE_BASE>` overrides it.
+  has no image of its own to take a link base from. A list carries its module base table,
+  and only `--cov-module <module>=<base>` overrides it (the module name is the image's file
+  name, or the program's name in the Ghidra project). `--raw-base` matters only for a
+  hand-made list without a base table.
   `--cov-strict` compares every site's bytes in memory with the list at the first begin
   (`cov: site check: N of N sites match the site list, 0 do not`) and catches a wrong base
   or byte order; always use it.
@@ -122,16 +127,19 @@ python3 $EMBER/fuzz/tools/status_tui.py fuzz/run/status.jsonl   # live status (-
   long boot is fine (the brain's `--hello-timeout`, 600 s by default; 0 waits forever). `-n`
   still bounds the boot. Any coverage source works: with `--cov-sites` HELLO describes the
   scheme, with `--cov-blocks` none. HELLO's arch is the ISA's name.
-- The brain keeps a resumable corpus in `--out`/`corpus` (a restart continues the campaign);
+- Start the brain first and ember within 15 s of it (`--accept-timeout`). The brain keeps a
+  resumable corpus in `--out`/`corpus`, seeds included (a restart continues the campaign);
   `--iters N` bounds a run, 0 (the default) runs until stopped. Set `--max-size` (default
   65536) to what the route can deliver: `mem:`'s `max` (default 4096) or the UART's buffer. A
   plain route tests only a longer input's prefix; a `reject` route answers CRASH
   `REJECTED`, which the brain counts (`rejected` in its status) and does not save.
 - Verdicts become CRASH frames: `FAULT` 1, `GUARD` 2 (a redzone or `--guard`, with the pc of
-  the access), `ORACLE` 3, `HANG` 4, `TIMEOUT` 5. The brain saves each distinct
-  `(reason, status)` under `--out/crashes/` (hangs and timeouts under `hangs/`) as the input
-  plus an `.info` sidecar (`reason_name=`, `status=`, `len=`, `hex=`), minimized. Both
-  directories replay directly (`--fuzz-replay fuzz/run/crashes/`, the `.info` notes are
+  the access), `ORACLE` 3, `HANG` 4, `TIMEOUT` 5. The brain saves one input per distinct
+  `(reason, status)` of a session under `--out/crashes/`, minimized, as
+  `crash_r<reason>_s<status>_<sha1>` plus an `.info` note (`reason=`, `reason_name=`,
+  `status=`, `status_hex=`, `len=`, `sig=`, `hex=`). Hangs and timeouts go under `hangs/`:
+  every distinct input, up to `--max-hangs` (64), not minimized unless
+  `--minimize-timeouts`. Both directories replay directly (`--fuzz-replay fuzz/run/crashes/`, the `.info` notes are
   skipped), so triage follows `harness.md`. A malformed INPUT gets CRASH `MALFORMED` (7).
 - The run ends with exit 0 on the brain's BYE, 2 when the brain closes without one or ember
   hits an internal error, 130 on SIGINT (BYE sent). `--fuzz-net-timeout SEC` ends it (with
@@ -139,8 +147,8 @@ python3 $EMBER/fuzz/tools/status_tui.py fuzz/run/status.jsonl   # live status (-
   TCP keepalive notices a vanished brain host.
 - `--cov-shm PATH` (`--cov-shm-ring N`, default 8 slots) publishes INIT and every ok
   iteration's map in a coverage region (`python3 $EMBER/fuzz/tools/cov_region.py stats
-  PATH`). A PATH with a `/` after its first character is a file, any other a shared-memory
-  name (`/dev/shm`); a region another live process owns is refused. It works next to
+  PATH`; the tool takes a file path, so a shared-memory name is `/dev/shm/NAME`). A PATH
+  with a `/` after its first character is a file, any other a shared-memory name; a region another live process owns is refused. It works next to
   `--fuzz-replay` too.
 
 ## How boundaries behave

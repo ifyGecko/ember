@@ -109,7 +109,10 @@ builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works t
 (`make CROSS=powerpc-linux-gnu- ppc-test`).
 
 The x86 self-tests are assembled with `nasm`; the BIOS boot and gdb stub checks need `python3`,
-as do the 8051, 6502, Z80, Xtensa and PIC32 firmware builds and their checks.
+as do the 8051, 6502, Z80, Xtensa and PIC32 firmware builds and their checks, the fuzz
+tools' self-tests in `make unit-test`, and `make fuzz-lists-test`. That target's generator
+check needs `rizin` with `rzpipe` (it is skipped without them) and also runs the Ghidra
+route when `analyzeHeadless` is on `PATH` or `GHIDRA_HEADLESS` names it.
 
 The AVR self-tests (one per core family) and the AVR builds of the fuzz target and the
 benchmark need `avr-gcc` and avr-libc (Debian: `gcc-avr`, `binutils-avr`, `avr-libc`), and

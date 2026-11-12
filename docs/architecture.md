@@ -199,6 +199,7 @@ tests/boards/     test_boards.c test_boards.h uam-test-run.c  (x86_64-test and r
                   the components only the tests use; build/uam-test-run)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_cov_formats.c
+                  (with cov_golden.txt, its golden map hashes)
                   test_smp.c test_f80.c test_xtensa_fpu.c, and one per ISA: test_riscv.c
                   test_mips.c test_arm.c test_x86.c test_ppc.c test_avr.c test_avr32.c
                   test_pic.c test_mcs51.c test_m6502.c test_z80.c test_xtensa.c
@@ -206,7 +207,7 @@ tests/cov/        cov-check.sh  (block-coverage maps across backends)
 tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmware, all ISAs)
                   formats-check.sh mk_lists.py cov_region_check.py  (site lists, boundary files
                   and the coverage region through the runner) gen-check.sh  (lists from
-                  fuzz/tools' generators; rizin and, when present, headless Ghidra)
+                  fuzz/tools' generators; rizin and, when found, headless Ghidra)
                   fuzz-net-check.sh fake_brain.py  (the fuzz protocol against a scripted brain)
                   brain-check.sh  (a session with fuzz_brain.py)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
@@ -634,9 +635,11 @@ devices.
   emits it inline (about ten host instructions, no call, chained blocks count too) and so that
   it provably touches nothing but the map: guest state, `icount` and timing are the same with
   coverage on, and the interpreter and the JIT produce byte-identical maps. With coverage off
-  no block contains COV. The map is never part of a snapshot. Sites in delay slots cannot be
-  instrumented (translation fails, naming the pc). Optionally a site counts only when another
-  counted since (`skip_repeat`), the emit stream of a trap-and-rearm coverage runtime.
+  no block contains COV. The map is never part of a snapshot. A site on an instruction that
+  continues the one before it (a delay slot, inside a Thumb IT block) cannot be instrumented
+  (translation fails, naming the pc). Optionally a site counts only when another
+  counted since (`skip_repeat`; `--cov-mode leapfrog`): a loop on one site counts once per
+  entry, and no self-edge appears.
 - **Exception observer** (`uam_exec_set_exc_hook`): sees each synchronous exception before
   the ISA takes it, with precise state, and may stop the run (`UAM_STOP_EXC_HOOK`) instead of
   delivering it. One slot (the fuzz harness owns it). Interrupts and resets are not reported.
@@ -862,16 +865,19 @@ Implemented (`make test`):
   and PIC, 8051, 6502, Z80) skip the exception-policy step (`FUZZ_CHECK_NO_TRAPS`), and AVR32A
   needs an AVR32 toolchain.
 - Fuzz formats: `test_cov_formats` runs fixed emit sequences through every coverage scheme
-  (site and pc, N=1..4 and 8, rotation off and on, two map sizes) on every backend, which must
-  agree byte for byte and match the golden map hashes in `tests/unit/cov_golden.txt`; it
-  checks the map-size rule and covers the site-list and boundary readers (every rejection of
+  (site and pc, N=1..4 and 8, rotation off and on, three map sizes, one bucket saturated) on
+  every backend, which must agree byte for byte and match the golden map hashes in
+  `tests/unit/cov_golden.txt`; it checks the mixer, the pc hash, the rotation amounts and
+  the scheme flags against values worked out by hand, and the map-size rule, and covers the site-list and boundary readers (every rejection of
   their checklists), base resolution, the alternate-state flag, boundaries, site naming, the
   site-byte check and the coverage region's ownership rules. `fuzz/formats.h` compiles on its
-  own with ember's strict flags, and `mutate.py --selftest` runs. `tests/fuzz/formats-check.sh`
+  own with ember's strict flags, and `mutate.py --selftest` and `status_tui.py --selftest`
+  run. `tests/fuzz/formats-check.sh`
   runs `--cov-sites`/`--cov-boundary` end to end on RV32, MIPS32 BE/LE, ARM (Thumb-2, LE and
   BE8) and PowerPC, including N=3 and N=8 with rotation, and the coverage region read back by
   `cov_region.py` and an independent reader; `gen-check.sh` does it with `fuzz/tools`'
-  generators (rizin, and the Ghidra route when headless Ghidra is installed);
+  generators (rizin, and the Ghidra route when `analyzeHeadless` is on `PATH` or
+  `GHIDRA_HEADLESS` names it);
   `fuzz-net-check.sh` checks the fuzz protocol frame by frame, and `brain-check.sh` a session
   with `fuzz_brain.py`, whose saved crash directory replays without its `.info` notes.
 - The external-board example is built and run against the library.

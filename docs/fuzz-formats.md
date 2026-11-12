@@ -3,8 +3,8 @@
 The files and the protocol of ember's fuzz layer: the **site list**, the **boundary file**,
 the **coverage region** and the **fuzz protocol**, and the **coverage bucket formula** their
 maps follow. The C definitions are in [`fuzz/formats.h`](../fuzz/formats.h). The writers are
-ember's own tools in `fuzz/tools/` and the readers are `fuzz/site_list.c`, `fuzz/cov_region.c`
-and `fuzz/frontend_net.c`; [`fuzzing.md`](fuzzing.md#site-lists-boundary-files-and-the-brain)
+ember's own tools in `fuzz/tools/`; `fuzz/site_list.c` reads the two files,
+`fuzz/cov_region.c` writes the region and `fuzz/frontend_net.c` speaks the protocol; [`fuzzing.md`](fuzzing.md#site-lists-boundary-files-and-the-brain)
 explains how to use them.
 
 | Format | Magic | Version | Byte order | Written by | Read by |
@@ -14,8 +14,8 @@ explains how to use them.
 | coverage region | `UAMC` | 1 | the writer's | `--cov-shm` | `cov_region.py`, outside readers |
 | fuzz protocol | `UAMF` | 1 | big-endian | ember and `fuzz_brain.py` | each other |
 
-Readers check the magic and the version, and refuse a file of any other version. The
-error message says which tool makes a current file.
+Readers check the magic and the version, and refuse a file of any other version. For a
+site list or a boundary file the error names the tool that makes a current one.
 
 ---
 
@@ -49,17 +49,17 @@ error message says which tool makes a current file.
 | 0 | offset | u64 | the site's address minus its module's link base, without ISA state bits |
 | 8 | module | u8 | index into the name table |
 | 9 | len | u8 | 0..4: bytes of `orig` that `--cov-strict` checks (0: none) |
-| 10 | flags | u8 | bit 0 `ALT_STATE`: the site is in the ISA's alternate state (ARM: Thumb); other bits 0 |
+| 10 | flags | u8 | bit 0 `ALT_STATE`: the site is in the ISA's alternate state (ARM: Thumb; MIPS: MIPS16e or microMIPS); other bits 0 |
 | 11 | reserved | u8 | 0 |
 | 12 | orig | 4 bytes | the instruction's first `len` bytes as they sit in memory; the rest 0 |
 
 The **name table** holds `module_count` non-empty NUL-terminated names, back to back. The
-**base table** gives each module's link base. Without it, ember takes a module's base from
-`--cov-module NAME=BASE`, and for module 0 also from the image (the lowest ELF `PT_LOAD`
-address, or `--raw-base`).
+**base table** gives each module's link base. `--cov-module NAME=BASE` overrides it for one
+module. With neither, module 0 takes the image's base (the lowest ELF `PT_LOAD` address, or
+`--raw-base`) and any other module is an error.
 
 A site's pc is `base[module] + offset`, reduced to the target's address width. With
-`ALT_STATE`, ember also sets the ISA's pc state bits (`uam_isa_pc_state_bits`: bit 0 on ARM).
+`ALT_STATE`, ember also sets the ISA's pc state bits (`uam_isa_pc_state_bits`: bit 0 on ARM and on MIPS).
 
 **Reading a site list.** A reader refuses the file if:
 - the magic or the version is wrong, or the file is shorter than the header;
@@ -82,7 +82,7 @@ u32 reserved 0. Each record is 16 bytes:
 | 0 | offset | u64 | from module 0's link base (the base the site list uses), without state bits |
 | 8 | kind | u8 | 0 BEGIN, 1 END |
 | 9 | depth | u8 | 0 any depth, 1 depth zero only |
-| 10 | flags | u8 | bit 0 `ALT_STATE`, as in the site list |
+| 10 | flags | u8 | bit 0 `ALT_STATE`, as in the site list; other bits 0 |
 | 11 | reserved | 5 bytes | 0 |
 
 A file with an END marker is **paired**: each iteration runs from a BEGIN to an END. A file
@@ -90,6 +90,13 @@ with only BEGIN markers is **begin-only**: each BEGIN ends the iteration before 
 the next. Every marker in a file must have the same depth filter. With **depth zero**, a
 BEGIN reached during an iteration opens a nested level and an END closes one, so recursion
 stays inside one input. With **any depth**, the first END ends the iteration.
+
+**Reading a boundary file.** A reader refuses the file if:
+- the magic or the version is wrong, or the file is shorter than the header;
+- the header's reserved field is not 0;
+- the records don't fit in the file;
+- a record has a kind or a depth above 1, an unknown flag, or a non-zero reserved byte;
+- it has no BEGIN marker, or its markers don't all have the same depth filter.
 
 ember takes its snapshot at the first BEGIN that the boot reaches. Every input starts from
 that snapshot, whichever BEGIN marker it ran through. A marker need not be a site.
@@ -219,7 +226,8 @@ width. So the order of sites changes the bucket.
 **Map size.** The pc model uses 64 KiB. The site model sizes the map from the site count *n*:
 `F = 2` for N = 1, `16 << (N − 2)` otherwise; `size = min(next_pow2(max(n,1) × F), 2^24)`,
 then at least 4 KiB and at least `next_pow2(n)`, so every site id has its own bucket.
-`--cov-map-size` overrides it. HELLO and the region header carry the actual size.
+No map is larger than 2 GiB. `--cov-map-size` overrides the rule. HELLO and the region
+header carry the actual size.
 
 **Which executions count.** In `--cov-mode leapfrog`, the default, a site counts again only
 after another site has counted: a block looping on itself counts once per entry, and no
@@ -234,5 +242,6 @@ These formats are ember's. A change that a current reader would misread gets a n
 number in that format's header, and the readers refuse the old version with a message
 naming the tool that writes the new one. New optional data goes into reserved fields only
 together with a flag bit that says it is there. A change to the bucket formula changes
-`tests/unit/cov_golden.txt` (`test_cov_formats --write-golden`) and makes every saved
-corpus's coverage incomparable, so make one only on purpose.
+`tests/unit/cov_golden.txt` (`build/test_cov_formats --write-golden
+tests/unit/cov_golden.txt` writes it anew) and makes every saved corpus's coverage
+incomparable, so make one only on purpose.

@@ -74,9 +74,9 @@ interpreter +4%.
    itself (a site it cannot instrument, bad IR) does: it would recur on every input, and
    it is not the input's doing.
 
-Iteration boundaries are those of a boundary file: *paired* (`--fuzz-begin` and one or more `--fuzz-end`:
-reaching any end pc ends the iteration) or *begin-only* (only `--fuzz-begin`: arriving there
-again ends the iteration). In paired mode, an input that never reaches an end runs out of
+Iteration boundaries are *paired* (`--fuzz-begin` and one or more `--fuzz-end`: reaching any
+end pc ends the iteration) or *begin-only* (only `--fuzz-begin`: arriving there again ends
+the iteration); a boundary file (`--cov-boundary`, below) expresses the same two modes. In paired mode, an input that never reaches an end runs out of
 budget (a timeout). All are PC hooks. The same input from the same snapshot gives the same map
 and verdict, on every backend.
 
@@ -335,9 +335,12 @@ name. A raw image needs `--raw --base ADDR --arch ARCH --bits N --endian E` (and
 `--entry`. `gen_boundaries.py` writes markers for named functions,
 `NAME[:begin|end[:any|zero]]`, and with `--sites` checks that each is a site of the list.
 
-**Headless Ghidra instead of rizin.** `fuzz/tools/ghidra/` holds Jython ports of both that
-write the same files, byte for byte, from a program analysed in Ghidra
-(`tests/fuzz/gen-check.sh` compares them when Ghidra is installed). They also cover what
+**Headless Ghidra instead of rizin.** `fuzz/tools/ghidra/` holds Jython ports of both, with
+the same rules, working on a program analysed in Ghidra. Where both analysers find the same
+functions and blocks the two routes write the same file, byte for byte, provided the
+program is imported under the image's file name (it becomes module 0's name); a jump table
+only one of them resolves is where they can differ. `tests/fuzz/gen-check.sh` compares them
+when `analyzeHeadless` is on `PATH` or `GHIDRA_HEADLESS` names it. The ports also cover what
 rizin cannot decode: ARM BE8 images, AVR32 and 8-bit PIC ELFs, and MIPS16e/microMIPS
 functions. Their first argument is the output file, and a raw image's processor and base
 are chosen at import:
@@ -397,9 +400,23 @@ formats end to end with lists written by `tests/fuzz/mk_lists.py`.
 
 `fuzz/tools/fuzz_brain.py` is a coverage-guided fuzzer that drives ember over TCP. It
 mutates inputs (`fuzz/tools/mutate.py`), keeps the ones that reach new coverage in a
-disk-backed corpus that a restart resumes, saves each distinct crash as the input plus a
-`.info` sidecar (reason, status, size, hex), deduplicated by `(reason, status)` and minimized,
-keeps hangs and timeouts apart under `hangs/`, and runs until stopped (`--iters N` caps it).
+disk-backed corpus that a restart resumes, saves crashes and hangs, and runs until stopped
+(`--iters N` caps it). Under `--out DIR`:
+
+- `corpus/cov_<sha1, 16 digits>`: the seeds and every input that reached new coverage. A
+  later session with the same `--out` starts from them, with or without `--seeds`.
+- `crashes/crash_r<reason>_s<status>_<sha1, 12 digits>`: one input per distinct
+  `(reason, status)` of a session, minimized (`--no-minimize` keeps it as found), with a
+  `.info` note beside it: `reason=`, `reason_name=`, `status=`, `status_hex=` (the pc, for
+  fault, guard and oracle), `len=`, `sig=`, `hex=`.
+- `hangs/hang_r<reason>_s<status>_<sha1>`: every distinct input that hung or timed out, up to
+  `--max-hangs` (64), not minimized unless `--minimize-timeouts`.
+
+Start ember within `--accept-timeout` (15 s) of the brain; each reply is waited for up to
+`--io-timeout` (60 s). `--max-size` bounds an input's length, `--seed-rng` fixes the
+mutator's random sequence, `--status-file FILE` writes the feed for the status screen (anew
+each session, every `--status-interval` seconds) and `--quiet` drops the log lines. The
+brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 
 ember dials the brain (retrying for a few seconds while it starts), runs each INPUT through
 the harness and answers it, in lockstep, with one COVERAGE or CRASH frame. It needs fuzzing
@@ -424,7 +441,7 @@ A malformed INPUT gets CRASH `MALFORMED` (7) and runs nothing; unknown frame typ
 ignored. A BYE from the brain ends the run (exit 0); the brain closing the connection without
 one is an error (exit 2), and so is an internal error of ember's, which sends BYE first. SIGINT
 sends BYE in place of the pending reply and exits 130. TCP keepalive (probes after a minute
-of silence, giving up after about two more) notices a brain host that vanished without
+of silence, giving up about a minute later) notices a brain host that vanished without
 closing the connection. A brain that is still there but stops answering is waited for
 unless `--fuzz-net-timeout SEC` is given: then SEC seconds without a frame from the brain
 (or without it taking one of ember's) ends the run with an error.
@@ -445,8 +462,12 @@ minimized, and the session ends with BYE).
 ### The coverage region (`--cov-shm PATH`)
 
 ember publishes the harness's maps in a coverage region, so a program outside it can watch a
-run (`fuzz/tools/cov_region.py`: `gen`, `scheme`, `stats`, `extract`, `header`). It is a side
-channel next to any frontend (`--fuzz-replay` or `--fuzz-net`) and needs fuzzing.
+run. It is a side channel next to any frontend (`--fuzz-replay` or `--fuzz-net`) and needs
+fuzzing. `fuzz/tools/cov_region.py` reads one: `header`, `gen`, `scheme`, `stats REGION
+[WHICH]` and `extract REGION OUT [WHICH]`, where WHICH is `bitmap` (the default), `current`,
+`init` or a generation number. It takes the region's file path, so a shared-memory name is
+`/dev/shm/NAME`; the ring holds the last ring − 1 generations, so `init` and old
+generations go away as the run publishes more.
 
 - The ring (`--cov-shm-ring N`, default 8 slots) gets the INIT map, then one ITER snapshot
   per ok iteration, written with the format's seqlock protocol. Crashed, hung and timed-out
