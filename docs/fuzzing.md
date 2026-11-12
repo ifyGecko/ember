@@ -340,8 +340,9 @@ the same rules, working on a program analysed in Ghidra. Where both analysers fi
 functions and blocks the two routes write the same file, byte for byte, provided the
 program is imported under the image's file name (it becomes module 0's name); a jump table
 only one of them resolves is where they can differ. `tests/fuzz/gen-check.sh` compares them
-when `analyzeHeadless` is on `PATH` or `GHIDRA_HEADLESS` names it. The ports also cover what
-rizin cannot decode: ARM BE8 images, AVR32 and 8-bit PIC ELFs, and MIPS16e/microMIPS
+when it finds headless Ghidra with Jython: `GHIDRA_HEADLESS` (the `analyzeHeadless` to run;
+empty for none), else `GHIDRA_HOME`, `PATH`, `~/ghidra*` or `/opt/ghidra*`. Its result line
+says when it did not compare. The ports also cover what rizin cannot decode: ARM BE8 images, AVR32 and 8-bit PIC ELFs, and MIPS16e/microMIPS
 functions. Their first argument is the output file, and a raw image's processor and base
 are chosen at import:
 

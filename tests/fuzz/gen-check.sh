@@ -5,10 +5,14 @@
 # the check is skipped) make the site list and a begin marker at fuzz_iteration for
 # FIRMWARE, a build of tests/fuzz/fuzztarget.h, with the entry strategy. ember must find
 # every site's bytes in memory (--cov-strict) and give the planted bugs' verdicts. With
-# headless Ghidra (analyzeHeadless on PATH, or GHIDRA_HEADLESS), the Ghidra route
-# (fuzz/tools/ghidra/) must write the same two files byte for byte, and so again with
+# headless Ghidra the Ghidra route (fuzz/tools/ghidra/) must write the same two files byte for byte, and so again with
 # each tool's default strategy where that is not entry (every arch but MIPS); for an ARM
 # BE8 image, which rizin cannot decode, the lists come from the Ghidra route alone.
+#
+# Headless Ghidra is GHIDRA_HEADLESS (the analyzeHeadless to run; empty: none), else
+# $GHIDRA_HOME/support/analyzeHeadless, analyzeHeadless on PATH, or the newest of
+# ~/ghidra*/support and /opt/ghidra*/support; one without Jython (the scripts' language)
+# is not used. Without one, the result line says the Ghidra route was not compared.
 set -eu
 run=$1
 board=$2
@@ -22,7 +26,24 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
 panic=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
-headless=${GHIDRA_HEADLESS:-$(command -v analyzeHeadless || true)}
+find_headless() {
+    if [ -n "${GHIDRA_HEADLESS+set}" ]; then
+        echo "$GHIDRA_HEADLESS"
+        return
+    fi
+    for c in "${GHIDRA_HOME:+$GHIDRA_HOME/support/analyzeHeadless}" \
+             "$(command -v analyzeHeadless || true)" \
+             $(ls -d "$HOME"/ghidra*/support/analyzeHeadless /opt/ghidra*/support/analyzeHeadless \
+                   2> /dev/null | sort -r); do
+        [ -n "$c" ] && [ -x "$c" ] || continue
+        g=$(dirname "$(dirname "$(readlink -f "$c")")")/Ghidra
+        if [ -d "$g/Extensions/Jython" ] || [ -d "$g/Features/Jython" ] || [ -d "$g/Features/Python" ]; then
+            echo "$c"
+            return
+        fi
+    done
+}
+headless=$(find_headless)
 ghidra_lists() {   # ghidra_lists SITES BOUNDS [STRATEGY]: entry lists on import, others after
     gt=$(cd "$tools/ghidra" && pwd)
     if [ "${3:-entry}" = entry ]; then
@@ -89,10 +110,11 @@ if [ $rc -ne 20 ] || ! grep -q 'site check: \([0-9]*\) of \1 sites match' "$tmp/
 fi
 
 # The Ghidra route, when headless Ghidra is there, must write the same files.
-ghidra=
+ghidra="; the Ghidra route was not compared (no headless Ghidra with Jython found)"
 if [ $route = ghidra ]; then
     ghidra="; lists from the Ghidra route (rizin cannot decode BE8)"
 elif [ -n "$headless" ]; then
+    ghidra=
     if ghidra_lists "$tmp/g.uams" "$tmp/g.uamb" \
        && cmp -s "$tmp/fw.uams" "$tmp/g.uams" && cmp -s "$tmp/fw.uamb" "$tmp/g.uamb"; then
         ghidra="; the Ghidra route wrote the same files"

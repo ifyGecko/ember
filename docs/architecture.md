@@ -876,8 +876,8 @@ Implemented (`make test`):
   runs `--cov-sites`/`--cov-boundary` end to end on RV32, MIPS32 BE/LE, ARM (Thumb-2, LE and
   BE8) and PowerPC, including N=3 and N=8 with rotation, and the coverage region read back by
   `cov_region.py` and an independent reader; `gen-check.sh` does it with `fuzz/tools`'
-  generators (rizin, and the Ghidra route when `analyzeHeadless` is on `PATH` or
-  `GHIDRA_HEADLESS` names it);
+  generators (rizin, and the Ghidra route when it finds headless Ghidra: `GHIDRA_HEADLESS`,
+  `GHIDRA_HOME`, `PATH`, `~/ghidra*`, `/opt/ghidra*`);
   `fuzz-net-check.sh` checks the fuzz protocol frame by frame, and `brain-check.sh` a session
   with `fuzz_brain.py`, whose saved crash directory replays without its `.info` notes.
 - The external-board example is built and run against the library.
