@@ -295,6 +295,7 @@ build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructi
 
 `--unknown-mmio zero|echo` keeps firmware running past unmodelled peripherals and
 logs the first access to each address. That log is the bring-up to-do list.
+`--unknown-mmio stop` instead stops at the first such access (exit 131), one item at a time.
 
 `--mmio-rule` answers individual unmodelled registers, for when firmware needs more than
 zero, for example a status register that must read "ready". The syntax is
@@ -369,6 +370,9 @@ count from where the run starts (after `--load-snapshot`, from the snapshot).
 
 ```bash
 build/uam-run --log-pc 0x8023f00c fw.elf      # report every arrival at a pc
+build/uam-run --log-pc 0x8023f00c,a0,a1,ra fw.elf   # ... with register values
+build/uam-run --history 64 -n 50000000 fw.elf # the last 64 blocks/exceptions/interrupts at the stop
+build/uam-run --unknown-mmio stop -d fw.elf   # stop at the first unmapped access, dump the hart
 build/uam-run --break 0x8023f00c -d fw.elf    # stop there and dump the hart
 build/uam-run --break 0x8023f00c --dump-mem 0x80100000+256 fw.elf   # and hex-dump guest memory
 build/uam-run --break 0x8023f00c --dump-mem p:0x100000+64K=heap.bin fw.elf  # physical, raw to a file
@@ -677,7 +681,8 @@ tests/fuzz/        also site lists, boundary files, the coverage region, the fuz
                    a session with the brain (make fuzz-lists-test)
 tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
 tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch;
-                   trace-check.sh: --trace mmio/sysreg/irq/polls/console, --log-stamp
+                   trace-check.sh: --trace exc/mmio/mmio-summary/sysreg/irq/console/dma,
+                   --history, --trace-file, --log-pc registers, --unknown-mmio stop, --log-stamp
 tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC (make bench-test,
                    make xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces

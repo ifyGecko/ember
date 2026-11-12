@@ -92,6 +92,8 @@ static const struct board_reg { ... } board_entry_regs[] = {      /* RECON entry
    architecture's stock interrupt controller already wired.
 7. The unknown-MMIO fallback for addresses no region covers (`--unknown-mmio zero|echo`;
    `fault`, the runner's default, makes them bus errors). `run.sh` passes `zero`.
+   `--unknown-mmio stop` needs nothing from the board: the board sees `fault`, and the
+   runner puts its own fallback on the bus that stops the run at the first such access.
 8. A first `uam_machine_reset`, so the processor is in its reset state, then the OS:
    `--image os=PATH` is placed with `uam_load_image()` (ELF segments at their load addresses
    `p_paddr`, anything else raw at `BOARD_IMAGE_BASE`), passing `&m->cpu` so addresses are
@@ -108,7 +110,7 @@ address, highest priority first:
 | real devices, RAM, ROM, ROMD, aliases | 0 (default) | the board |
 | per-register rules | `UAM_PRIO_STUB` (-900) + rule index: later rules win | `--mmio-rule`, or `uam_board_add_mmio_rules` in a board |
 | catch-all windows | `UAM_PRIO_BACKGROUND` (-1000) | the board's `board_windows[]` (`uam_unimp`) |
-| the unmapped fallback | - | `--unknown-mmio zero` or `echo` (`uam_unknown_mmio`), else a bus fault |
+| the unmapped fallback | - | `--unknown-mmio zero` or `echo` (`uam_unknown_mmio`), else a bus fault; `stop`: the runner's, which stops the run (exit 131) |
 
 **Do not also pass the image as the runner's positional argument.** The runner would load it
 a second time at `--raw-base` (default: the board's reset pc) and restart the hart at that

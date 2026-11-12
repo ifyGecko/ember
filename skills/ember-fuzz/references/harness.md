@@ -425,12 +425,18 @@ count into one map, each in its own history; edges between processors are not co
 
 1. `--fuzz-replay` the crash (and hang) directory; `replay_summary.py` it.
 2. For each group, replay its smallest input alone, with the interpreter and `--jit`. Both
-   must give the same verdict; if not, report an ember bug.
+   must give the same verdict; if not, report an ember bug. Add `--history 64` to see the
+   input's last blocks, exceptions and interrupt entries before the verdict (printed for
+   every input that is not ok), and traces as needed (`-t mmio,exc`, `--trace-file F`):
+   in replay the boot's traces come first, then each input's in its own `trace: input ID`
+   section with its own summaries. `--unknown-mmio stop` is refused while fuzzing (its stop
+   is not a verdict): use `fault` there, `stop` in the plain run of step 3.
 3. Reproduce it as a plain run for debugging: snapshot at the begin pc once
    (`./run.sh --snapshot-at <begin> --save-snapshot build/begin.snap --break <begin>`, plus
    `fuzz.sh`'s boot console script if it has one, so the snapshot is the harness's), then
    feed the input the same way and use ember-dev-build's probes (`--break`, `-d`,
-   `--log-pc`, `--trace blocks`, gdb). When the fuzzed UART is also the console, the input
+   `--log-pc ADDR,REG...`, `--history N`, `--trace blocks`, gdb; its
+   `references/diagnostics.md` lists them all). When the fuzzed UART is also the console, the input
    arrives the same way through it: `--load-snapshot build/begin.snap --console
    file:/dev/null,in=INPUT`; the run then reaches the crash at the snapshot's icount plus the
    replay's `insns=`. For other routes, keep the snapshot and use gdb (`--gdb`) to write the

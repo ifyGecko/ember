@@ -651,7 +651,11 @@ fi
 cat > "$PROJ/run.sh" <<EOF
 #!/usr/bin/env bash
 # run.sh - launch the $BOARD emulation. Extra args go to the runner, e.g.
-#   -n 200000000 (instruction budget)  --gdb 1234  --log-pc 0x...  --break 0x... -d  --jit
+#   -n 200000000 (instruction budget)  --gdb 1234  --log-pc 0x...[,a0,ra]  --break 0x... -d  --jit
+#   -t mmio-summary  -t mmio --trace-mmio-range LO:HI  -t irq,sysreg,dma,console  --history 64
+#   --trace-file build/trace.txt  (diagnostics: the skill's references/diagnostics.md)
+# Env: UNKNOWN_MMIO=zero|echo|fault|stop (stop: halt at the first unmodelled access, exit 131),
+#      TRACE=exc (the default; TRACE= for none, TRACE=exc,mmio-summary ...)
 # Console on stdout, diagnostics (catch-all logs, --trace exc, exit line, stats) on stderr:
 #   $RUN_USAGE timeout -k 5 300 ./run.sh -n 200000000 > build/console.txt 2> build/emu.log < /dev/null
 set -euo pipefail
@@ -675,6 +679,7 @@ exec "\$RUN" -b $BOARD \\
 #   --console string:'help\\r'                     (deterministic console input; ,after='> ' waits for
 #                                                  the prompt; script:FILE for expect/send steps)
 #   --watch p:0x80001000+4 / --guard ADDR+LEN:w   (log / stop on guest accesses to memory)
+#   --dump-mem 0x80100000+256                     (hex-dump guest memory when the run stops)
 #   --snapshot-at 0x... --save-snapshot build/booted.snap   then  --load-snapshot build/booted.snap
 #                                                 (boot once; same board, options and rules)
 EOF
@@ -709,6 +714,10 @@ with \`scripts/repin.sh\` (it rebases patches/ onto the new commit), and note ea
 ## Run
     IMAGE=/path/to/firmware timeout -k 5 300 ./run.sh -n 200000000 > build/console.txt 2> build/emu.log < /dev/null
     python3 scripts/log_summary.py build/emu.log
+## Diagnose (all off by default; see run.sh's header)
+    UNKNOWN_MMIO=stop ./run.sh -n 200000000 --history 32 -d ...   # stop at the next unmodelled register
+    ./run.sh -n 200000000 -t mmio-summary,exc ...                  # registers used / polled; exceptions
+    ./run.sh -n 200000000 -t mmio --trace-mmio-range LO:HI --trace-file build/dev.txt ...
 EOF
 
 if [[ -n "$RECON" ]]; then

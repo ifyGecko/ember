@@ -57,7 +57,11 @@ every device follows that shape.
 
 Write a device from what the firmware does to it, not from a guess: `--trace mmio
 --trace-mmio-range BASE:BASE+SIZE` lists every access the guest makes to the window (order,
-width, value, pc), first against the catch-all, then against your model to compare. A device
+width, value, pc), first against the catch-all, then against your model to compare. Its
+summary at the stop (also `-t mmio-summary` alone) is one line per register: reads and
+writes, the value reads always (or last) returned, the last write, the first pc - which
+registers to model at all, which are plain configuration storage, which are polled
+(`diagnostics.md`, section 4). A device
 that wants to say which code touched it (a first-access log) appends `uam_origin_format()`
 (`uam/common.h`: " pc=0x... icount=N"); it never asks for the processor itself.
 
@@ -206,7 +210,9 @@ uam_signal_connect(soc_intc_output(intc), uam_cpu_irq_sink, &m->cpu, UAM_MIPS_IR
 Sinks are called only when a level changes. `--trace irq` shows every change of a
 processor's interrupt inputs (and, at the stop, whether one is pending and enabled), so an
 interrupt that never arrives is either never raised there (follow the chain back with
-`--trace mmio` on the controller) or masked in the CPU. A line has one sink: an output that must reach
+`--trace mmio` on the controller) or masked in the CPU (`--trace sysreg`: the status/mask
+register writes). `--trace exc` ends with the handlers entered and how often, so a working
+chain shows up as a handler count. A line has one sink: an output that must reach
 two places needs a splitter. To find the routing (which CPU line, which status bit, which
 vector), look for the RTOS's interrupt table. VxWorks/MIPS keeps an `intPrioTable` of
 `{Cause IP bit, vector-or-demux function, SR mask, flag}`; Linux uses irq-domain setup in
@@ -274,7 +280,9 @@ uam_netdev_accept_input(nd);              /* the driver returned RX buffers: del
   and report link down. Link state comes from `link_changed`.
 - Decode the descriptor layout from the driver's RX/TX reap loops: which bit means "owned by
   hardware", where the length lives, whether it includes the 4-byte FCS (drivers often
-  subtract 4).
+  subtract 4). `-t dma,mmio` shows the ring base the driver programs and every transfer your
+  model then makes (`dma: r|w LEN 0xADDR region+0xOFF pc=.. icount=N`; `(fault)`: not RAM, a
+  wrong address or layout); `--dump-mem` the ring at a `--break` to read it whole.
 - Drivers often store **virtual** (kseg0/kseg1) pointers in descriptors; DMA takes physical
   addresses: mask with `& 0x1FFFFFFF` on MIPS. Bound every ring walk.
 - Several ports: the board names them (`"wan"`, `"lan1"`), one `uam_board_config_netdev`

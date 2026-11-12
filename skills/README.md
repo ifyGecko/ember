@@ -99,8 +99,8 @@ skills/
                               check-layering.sh, _common.sh, log_summary.py, gdb_trace_calls.py
                     templates/  board.c.in, board-pc.c.in, board.h.in, main.c.in, Makefile.in,
                                 master_abort_log.{c,h}
-                    references/  organization, iteration-loop, board-skeleton, device-anatomy,
-                                 snapshots, pc-platform, examples/ (tested device models;
+                    references/  organization, iteration-loop, diagnostics, board-skeleton,
+                                 device-anatomy, snapshots, pc-platform, examples/ (tested device models;
                                  examples/pc/ a Q35-class chipset)
   ember-fuzz/       SKILL.md
                     scripts/  replay_summary.py

@@ -275,6 +275,8 @@ come first and end with `trace: the boot to the begin pc ends` and its summaries
 input's begin with `trace: input ID` and end with its own summaries. `--history N` prints, for
 each input that is not ok, the last N blocks, exceptions and interrupt entries of its run (an
 exception the harness stopped on is in the replay line, not in the history).
+`--unknown-mmio stop` is refused while fuzzing: an unmapped access is a verdict there
+(`fault` makes it a crash), not a reason to stop the campaign.
 
 ### In a program
 

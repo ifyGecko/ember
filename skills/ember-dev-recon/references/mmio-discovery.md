@@ -153,8 +153,11 @@ the register must count. Many hot registers are written at init and never read a
 4. Once any ember board runs the code (even a bare one with catch-all windows), confirm
    statically found registers at run time: the catch-all first-access lines name the
    instruction (`pc=... icount=N`), `uam-run --trace mmio --trace-mmio-range LO:HI` gives the
-   real access order and values, including the reads a POLL row's loop repeats. Static
-   polls this table misses (computed addresses) show up there.
+   real access order and values, including the reads a POLL row's loop repeats, and
+   `--trace mmio-summary` the whole register map a run used (one line per register: reads,
+   writes, the value reads always returned, the first pc). Static polls this table misses
+   (computed addresses) show up there; `--unknown-mmio stop` stops at the first address no
+   window covers, naming its pc (ember-dev-build's `references/diagnostics.md`).
 
 The **interrupt routing** is part of the MMIO picture. Find the RTOS's interrupt table (VxWorks
 `intPrioTable`-style `{cause bit, vector or demux, mask}` entries; Linux irq-domain setup) and

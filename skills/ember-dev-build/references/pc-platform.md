@@ -126,7 +126,17 @@ serial console; a debug build prints from SEC, but often to a debug port (edk2: 
 - the `master-abort:` lines (`log_summary.py` groups them by 64 KiB page): every address
   nothing decodes, read as all ones. A missing ROM, flash or chipset window shows up here
   long before the failure it causes; check each page against RECON before assuming the
-  firmware meant to probe an absent device.
+  firmware meant to probe an absent device;
+- the traces (`references/diagnostics.md`): `-t mmio-summary` lists every port and register
+  the firmware used at the stop (a port at `0x10000000000 + port`), the most accessed one marked;
+  `-t exc` ends with its exceptions by vector and pc and the interrupt handlers entered;
+  `--history 64` shows the last blocks before a triple fault, a hang or the `-n` stop;
+  `--log-pc ADDR,rdi,rsi,rax` shows a function's arguments (`eax`, `ebx`, ... in 32-bit
+  code). `--unknown-mmio stop` halts at the first address nothing decodes, replacing the
+  master-abort answer: a PC firmware probes absent devices on purpose (all ones is the
+  answer it expects), so use it to locate one missing window, then go back to the default.
+  Put long traces in a file (`--trace-file build/trace.txt`): a PC boot is billions of
+  instructions.
 
 What a bare template does with OVMF (`OVMF_CODE_4M.fd`, no chipset, observed):
 
@@ -145,14 +155,14 @@ Triage specific to x86 (the general table is in `references/iteration-loop.md`):
 
 | symptom | usual cause | next step |
 |---|---|---|
-| `x86: triple fault` (then exit 125/128) | an exception with no usable IDT yet (SEC, early PEI), or a #PF while delivering one | the **first** `exc:` line before it; its pc in Ghidra (RECON module + XIP address) |
+| `x86: triple fault` (then exit 125/128) | an exception with no usable IDT yet (SEC, early PEI), or a #PF while delivering one | the **first** `exc:` line before it (the `exc:` summary gives its first icount); its pc in Ghidra (RECON module + XIP address); `--history 64` for the code before it |
 | a #GP at a `mov cr4, ...` early in boot | the firmware sets a CR4 bit for a feature the board's CPUID does not report (VME, OSXSAVE, SMEP, ...) | report the feature in the board's `cpuid` hook if the core implements it; otherwise the firmware checks CPUID wrongly |
 | SMM rendezvous times out / an AP never arrives in SMM | the AP is still waiting for its startup IPI: it holds the SMI, as hardware does | start the APs before the first broadcast SMI, or offer `UAM_X86_FEAT_SMM_BLOCKED` so the handler skips them |
 | `FETCH_FAULT (delivered as #GP: nothing decodes the address)` | a jump into a module that was never copied, or a flash window that moved (PAM, SPI BIOS window, a BAR) | which region should hold that address; the chipset register that maps it |
 | `#UD` in SEC/PEI | an instruction ember lacks (AVX, VMX: see the gate) or code executed as data after a wrong jump | disassemble at pc; if real, an ember gap, stop and say so |
 | reset loop (`resets=N` grows) | firmware asked for a reset: 0xCF9, port 92h, the 8042, a TCO timeout, or a "warm reset after memory init" its own state machine expects to survive | which writer; CMOS / chipset scratch / a sticky register usually records why |
-| exit 124, hot unclaimed port or window | polling a device that isn't there | `--trace mmio --trace-mmio-range` over it names the pc and the value it keeps reading; decompile the loop for the bit it waits for; model it, or `--mmio-rule ADDR=fixed:V` first (a port: `0x10000000000 + port`) |
-| exit 124, nothing hot, pc in a small range | spinning on RAM or a register that is now plain storage (MTRR-style), or an AP rendezvous | `--log-pc` / gdb on the loop; with `-o cpus=N`, check every processor reached its loop |
+| exit 124, hot unclaimed port or window | polling a device that isn't there | `-t mmio-summary` names the register and the value it always reads; `--trace mmio --trace-mmio-range` over it names the pc and the value it keeps reading; decompile the loop for the bit it waits for; model it, or `--mmio-rule ADDR=fixed:V` first (a port: `0x10000000000 + port`) |
+| exit 124, nothing hot, pc in a small range | spinning on RAM or a register that is now plain storage (MTRR-style), or an AP rendezvous | `--history 64` (each processor's last blocks), `--log-pc LOOP,REG` / gdb on the loop; with `-o cpus=N`, check every processor reached its loop |
 | exit 125 with interrupts expected | the PIT/HPET/APIC timer's line is not routed where the firmware unmasked it (8259 vs I/O APIC, PIRQ routing) | `--trace exc` to see deliveries, `--trace irq` whether the CPU's interrupt input ever rose; the routing registers the firmware wrote (`--trace mmio --trace-mmio-range` over the 8259 ports / I/O APIC) |
 | `SetVariable` returns `EFI_UNSUPPORTED`, variables never persist, SMM drivers silent; `log_summary.py`: "software SMI lost" | nothing decodes port 0xB2: without `-o apm-smi=1` or the chipset's APM/SMI device the write lands in the "io" catch-all and SMM never runs | `ich9_lpc.c`-style APM_CNT + SMI_EN, or `-o apm-smi=1` as a stand-in |
 | SMI raised, nothing happens / the run hangs after `0xB2` | SMI gated off (SMI_EN, GBL_SMI_EN, EOS), or SMRAM missing from the SMM view (the handler fetches all ones at SMBASE + 0x8000: no SMRAM window, or nothing mapped at `UAM_X86_SMM_VIEW` + address) | the LPC's SMI registers; the host bridge's `uam_x86_set_smram_window` calls and its SMM-view mapping; `--dump-mem p:0x400000000000+SMBASE+0x8000+16` |

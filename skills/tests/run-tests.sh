@@ -8,7 +8,9 @@
 #      must compile warning-free
 #   2. run ember's own self-tests on the bare boards: each must stall on (or, Z80, write
 #      to) the reference board's console UART, which the bare board does not have, and
-#      log_summary.py must report that address; the x86-64 PC template must run the x86
+#      log_summary.py must report that address; with UNKNOWN_MMIO=stop, --history and the
+#      exc/mmio summaries the RV run stops at the first unmodelled access (exit 131) and
+#      log_summary.py reports all of it; the x86-64 PC template must run the x86
 #      self-test (real, protected and long mode, SMM) to PASS, interpreter and JIT
 #   3. wire the example devices (references/examples) into the fixture board, build the
 #      fixture firmware, and run it: stride-4 16550 behind reg_stride, soc_uart byte stores,
@@ -124,6 +126,20 @@ open(sys.argv[1], 'wb').write(rom)" "$T/m6502/build/halt.bin"
 python3 "$T/m6502/scripts/log_summary.py" "$T/m6502/build/halt.log" | grep -q "core halted at pc 0x8000: store to nothing at bus address 0x9000" \
     && ok "log_summary: a halted 8-bit core is reported" \
     || { bad "log_summary: a halted 8-bit core is reported"; tail -5 "$T/m6502/build/halt.log"; }
+# diagnostics through run.sh: UNKNOWN_MMIO=stop halts at the first unmodelled access (exit 131),
+# and log_summary.py reports the access, the --history tail and the exc and mmio summaries
+if [[ -f "$UP/build/firmware/selftest.elf" ]]; then
+    (cd "$T/rv" && IMAGE="$UP/build/firmware/selftest.elf" UNKNOWN_MMIO=stop TRACE=exc,mmio-summary \
+        timeout -k 5 60 ./run.sh -n 2000000 --history 8 > build/c.txt 2> build/stop.log < /dev/null) || true
+    python3 "$T/rv/scripts/log_summary.py" "$T/rv/build/stop.log" > "$T/rv/build/stop.txt"
+    grep -q "exit 131" "$T/rv/build/stop.txt" \
+        && grep -q "^== --unknown-mmio stop" "$T/rv/build/stop.txt" \
+        && grep -q "^== --history" "$T/rv/build/stop.txt" \
+        && grep -q "^== device registers at the stop" "$T/rv/build/stop.txt" \
+        && ok "diagnostics: UNKNOWN_MMIO=stop, --history and the summaries through run.sh and log_summary" \
+        || { bad "diagnostics: UNKNOWN_MMIO=stop, --history and the summaries through run.sh and log_summary"; \
+             tail -8 "$T/rv/build/stop.log"; }
+fi
 # ember-fuzz: fuzz.sh's UNKNOWN_MMIO=fault is what turns a wild load into a crash
 python3 -c "
 import struct, sys

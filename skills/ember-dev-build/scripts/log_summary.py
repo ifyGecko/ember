@@ -23,10 +23,15 @@ Prints, in order:
      (board option -o msr-trace=1), POST codes (-v -v), and the processors involved on a
      multiprocessor run (cpu=N)
   7. what the bring-up traces add, when the run had them (all off by default):
-     --trace mmio (accesses per device),
-     --trace irq (interrupt input lines, a pending interrupt at the stop), --trace sysreg
-     (system register accesses that fault). First-access lines carry the instruction that
-     made them (pc=..., icount): shown with each event. --log-stamp prefixes are ignored.
+     --trace mmio (accesses per device) and its per-register summary at the stop (also
+     --trace mmio-summary: the registers used, the one most accessed, registers whose reads
+     always returned one value - a poll), --trace exc's summary at the stop (exceptions by
+     kind, cause and pc; interrupt handlers), --trace irq (interrupt input lines, a pending
+     interrupt at the stop), --trace sysreg (system register accesses that fault), --trace
+     dma (transfers per region), --history N (the last events before the stop),
+     --unknown-mmio stop (the access that stopped the run), --log-pc ADDR,REG... (the
+     registers at the last hit). First-access lines carry the instruction that made them
+     (pc=..., icount): shown with each event. --log-stamp prefixes are ignored.
 
 usage: log_summary.py [build/emu.log] [--isa mips|riscv|arm|x86|other] [--first 20] [--top 15]
 (default: from the project's run.sh ISA=; ppc, avr, avr32, pic, mcs51, m6502, z80 and xtensa
@@ -123,6 +128,16 @@ RE_IRQ_SUM = re.compile(r"^irq-in: cpu(\d+) line (\d+): (\d+) rises, (\d+) falls
 RE_IRQ_NONE = re.compile(r"^irq-in: no interrupt input line")
 RE_IRQ_PEND = re.compile(r"^irq-in: at the stop (cpu\d+) has an interrupt pending and enabled(.*)")
 RE_SYSREG_FAULT = re.compile(r"^sysreg: (?:first )?(read|write) (0x[0-9a-f]+) .*system register exception.*?(?: pc=0x([0-9a-f]+))?")
+RE_UNMAPPED_STOP = re.compile(r"^\S+: unmapped (read|write) of (\d+) bytes at 0x([0-9a-f]+)(?:: (0x[0-9a-f]+))?"
+                              r"(?: by cpu (\d+) pc 0x([0-9a-f]+) \(icount (\d+)\))?")
+RE_MMIO_REG = re.compile(r"^mmio:   0x([0-9a-f]+) (\S+): (\d+) reads(?: \((always|last) (0x[0-9a-f]+)\))?, "
+                         r"(\d+) writes(?: \(last (0x[0-9a-f]+)\))?(, some faulted)?, first pc=0x([0-9a-f]+)")
+RE_EXC_SUM = re.compile(r"^exc:   ([\w-]+) cause=(0x[0-9a-f]+) pc=0x([0-9a-f]+): (\d+) times?, last tval=(0x[0-9a-f]+)"
+                        r", first icount=(\d+)(?: cpu=(\d+))?")
+RE_IRQ_SUMH = re.compile(r"^irq:   0x([0-9a-f]+): (\d+) times?, last lines=(0x[0-9a-f]+), first icount=(\d+)(?: cpu=(\d+))?")
+RE_DMA = re.compile(r"^dma: ([rw]) (\d+) 0x([0-9a-f]+)(?: (\S+?)\+0x[0-9a-f]+)?( \([^)]*\))?")
+RE_HIST = re.compile(r"^history: ")
+RE_LOGPC_REGS = re.compile(r"\) ((?:\S+=(?:0x[0-9a-f]+|\?) ?)+)$")
 RE_CONSOLE_LEFT = re.compile(r"\] chardev: console input: (\d+) byte\(s\) never sent, waiting for '(.*)' \(step")
 PIO_BASE = 0x10000000000
 
@@ -213,6 +228,14 @@ def main(argv=None):
     console_left = None
     mmio_dev = Counter()             # (device, r/w) -> accesses (--trace mmio)
     irq_lines, irq_pending, irq_none = [], [], False
+    unmapped_stop = None             # --unknown-mmio stop: the access that stopped the run
+    mmio_regs = []                   # --trace mmio / mmio-summary: the per-register summary
+    exc_sum, irq_sum = [], []        # --trace exc: the summary at the stop
+    dma = Counter()                  # (region, r/w) -> [transfers]
+    dma_bytes = Counter()
+    dma_fail = 0
+    history = []                     # --history N: the lines, as printed
+    logpc_regs = {}                  # --log-pc ADDR,REG...: the registers at the last hit
 
     def note(i, text):
         if len(first) < a.first:
@@ -285,6 +308,40 @@ def main(argv=None):
         m = RE_LOGPC.match(ln)
         if m:
             logpc[m.group(1)] = (int(m.group(2)), int(m.group(3)))
+            r = RE_LOGPC_REGS.search(ln)
+            if r:
+                logpc_regs[m.group(1)] = r.group(1).strip()
+            continue
+        m = RE_UNMAPPED_STOP.match(ln)
+        if m:
+            unmapped_stop = m.groups()
+            rw, sz, addr, val, cpu, pc, ic = m.groups()
+            note(i, "STOP: unmapped %s of %sB at 0x%s%s%s (--unknown-mmio stop; it did not happen)" % (
+                rw, sz, addr, " = " + val if val else "",
+                "  by pc 0x%s @%s%s" % (pc, ic, " cpu " + cpu if cpu != "0" else "") if pc else ""))
+            continue
+        m = RE_MMIO_REG.match(ln)
+        if m:
+            mmio_regs.append(m.groups())
+            continue
+        m = RE_EXC_SUM.match(ln)
+        if m:
+            exc_sum.append(m.groups())
+            continue
+        m = RE_IRQ_SUMH.match(ln)
+        if m:
+            irq_sum.append(m.groups())
+            continue
+        m = RE_DMA.match(ln)
+        if m:
+            key = (m.group(4) or "?", m.group(1))
+            dma[key] += 1
+            dma_bytes[key] += int(m.group(2))
+            if m.group(5):
+                dma_fail += 1
+            continue
+        if RE_HIST.match(ln):
+            history.append(ln)
             continue
         m = RE_TRIPLE.match(ln)
         if m:
@@ -457,7 +514,8 @@ def main(argv=None):
     if stubs:
         print("== --mmio-rule stubs (name: reads, writes, registers): %s" % stubs)
     for pc, (hits, ic) in logpc.items():
-        print("== --log-pc 0x%s: %d hits, last at icount %d" % (pc, hits, ic))
+        print("== --log-pc 0x%s: %d hits, last at icount %d%s" % (
+            pc, hits, ic, "; registers then: " + logpc_regs[pc] if pc in logpc_regs else ""))
     if msrs:
         print("\n== MSRs answered by the MSR policy, not a device (op msr: count, last value)")
         for (op, msr), (c, val) in sorted(msrs.items(), key=lambda kv: int(kv[0][1], 16)):
@@ -484,6 +542,45 @@ def main(argv=None):
             print("   cpu%d line %d: %d rises, %d falls, level %d at the stop" % (cpu, line, r, f, lvl))
         for p_ in irq_pending:
             print("   %s: an interrupt pending and enabled at the stop%s" % (p_.split()[0], p_[len(p_.split()[0]):]))
+    if unmapped_stop:
+        rw, sz, addr, val, cpu, pc, ic = unmapped_stop
+        print("\n== --unknown-mmio stop: the run stopped at the first access nothing decodes")
+        print("   %s of %sB at 0x%s%s%s" % (rw, sz, addr, " (value %s)" % val if val else "",
+                                       ", pc 0x%s, icount %s" % (pc, ic) if pc else ""))
+        print("   -> decompile that pc; the address belongs to a RECON window or device: add the window /\n"
+              "      device, or answer it with --mmio-rule to test what the guest wants. With -d the\n"
+              "      state is the one before the access; --history N shows how it got there.")
+    if mmio_regs:
+        print("\n== device registers at the stop (--trace mmio / mmio-summary): %d used" % len(mmio_regs))
+        regs = sorted(mmio_regs, key=lambda g: -(int(g[2]) + int(g[5])))
+        for addr, where_, r, how, rv, w, wv, faulted, pc in regs[:a.top]:
+            r, w = int(r), int(w)
+            tag = "  <- polled? reads always %s" % rv if how == "always" and r > 100 and r > 10 * w else ""
+            print("   %10d  0x%-10s %-22s %d R%s / %d W%s, first pc 0x%s%s%s" % (
+                r + w, addr, where_, r, " (%s %s)" % (how, rv) if how else "", w,
+                " (last %s)" % wv if wv else "", pc, " FAULTED" if faulted else "", tag))
+        if len(regs) > a.top:
+            print("   ... %d more (the full list is in the log)" % (len(regs) - a.top))
+    if exc_sum or irq_sum:
+        print("\n== --trace exc summary at the stop (kind cause pc: count)")
+        for kind, cause, pc, c, tval, ic, cpu in sorted(exc_sum, key=lambda g: int(g[5]))[:a.top]:
+            print("   %8s  %s cause %s pc 0x%s, last tval %s, first icount %s%s" % (
+                c, kind, cause, pc, tval, ic, " cpu " + cpu if cpu else ""))
+        for pc, c, lines_, ic, cpu in irq_sum[:a.top]:
+            print("   %8s  interrupt handler 0x%s, last lines %s, first icount %s%s" % (
+                c, pc, lines_, ic, " cpu " + cpu if cpu else ""))
+        if exc_sum:
+            print("   (sorted by first occurrence: the first one is usually the blocker; a big count at\n"
+                  "    one pc is a storm - the vectors or the handler's own state are not set up yet)")
+    if dma:
+        print("\n== --trace dma: transfers per region (region, direction: count, bytes)%s" % (
+            "; %d FAILED (no RAM there: a bad descriptor or buffer address)" % dma_fail if dma_fail else ""))
+        for (region, rw), c in dma.most_common(a.top):
+            print("   %-20s %s: %d, %d bytes" % (region, "read" if rw == "r" else "write", c, dma_bytes[(region, rw)]))
+    if history:
+        print("\n== --history: the last events before the stop (oldest first)")
+        for ln in history[-(a.top * 3):]:
+            print("   " + ln[len("history: "):])
     print("\n%d lines total" % len(lines))
     return 0
 

@@ -70,10 +70,15 @@ starting at the entry (registers the loader would have set come from `board_entr
 catch-all `unimp` window over **every** RECON MMIO window, and the unknown-MMIO fallback. Fill
 the constants and windows from RECON.md. Iteration 0 succeeds when the run fails for a
 *specific, explainable* reason (typically: polling the console UART's status register).
+While the board has few devices, `UNKNOWN_MMIO=stop ./run.sh ... --history 32 -d` makes
+every run stop at the next register nothing models (exit 131): one run per register, no
+guessing which comes next (`diagnostics.md`, section 4).
 
 ## (1) Run, always bounded
-`run.sh` passes `--image os=$IMAGE --unknown-mmio zero --trace exc --stats`. Console output is
-stdout, everything diagnostic is stderr:
+`run.sh` passes `--image os=$IMAGE --unknown-mmio zero --trace exc --stats` (`UNKNOWN_MMIO=`
+and `TRACE=` change the last two; `--trace exc` also ends the run with its summary of
+exceptions and interrupt handlers). Console output is stdout, everything diagnostic is
+stderr (`--trace-file F` moves the traces to F):
 
 ```bash
 IMAGE=/path/to/os.bin timeout -k 5 300 ./run.sh -n 200000000 \
@@ -98,7 +103,8 @@ reports it: the prompt never came). Patterns only match output of the current ru
 `--load-snapshot` at a prompt, use plain `string:` input. All of it stays instruction-exact; a
 `pty` / `tcp:PORT` console typed by hand does not.
 
-**What `log_summary.py` reads** (all printed by ember itself):
+**What `log_summary.py` reads** (all printed by ember itself; `diagnostics.md` has every
+trace and probe, and when to use which):
 
 | line | source |
 |---|---|
@@ -135,8 +141,8 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 
 | Symptom | Likely cause | Next step |
 |---|---|---|
-| exit 124, one window offset read millions of times | spinning on a status/busy bit | rerun with `--trace mmio --trace-mmio-range` over that register: the pc and the value it keeps reading; decompile the loop for the bit it tests, then make it read "ready"/self-clear (try `--mmio-rule ADDR=fixed:V` first) |
-| exit 124, no hot offset, pc in a small range | spinning on RAM or a register that is now storage, or a delay loop calibrated against a timer that never moves | `-n N -d` / gdb: find the loop (below) |
+| exit 124, one window offset read millions of times (or a register `-t mmio-summary` shows read "always 0xV") | spinning on a status/busy bit | rerun with `--trace mmio --trace-mmio-range` over that register (or `--history 64`): the pc and the value it keeps reading; decompile the loop for the bit it tests, then make it read "ready"/self-clear (try `--mmio-rule ADDR=fixed:V` first) |
+| exit 124, no hot offset, pc in a small range | spinning on RAM or a register that is now storage, or a delay loop calibrated against a timer that never moves | `--history 64` (the loop's blocks), `--log-pc LOOP_PC,REG` (what it checks), `--watch` the RAM word; `-n N -d` / gdb (below) |
 | exit 124 "virtual time limit" (`--max-ticks`), few instructions | the hart mostly idled: a tick arrives, but too rarely or not where the guest looks | check the timer's rate (`ticks_per_count`) and which interrupt the guest enabled |
 | exit 129 (guarded memory access) | a data access touched a `--guard` range; the guard line names pc, access and address | the code at that pc (who writes there, and why) |
 | exit 131 (access to an unmapped address) | `--unknown-mmio stop`: the first access nothing decodes; the `unmapped read\|write` line names address, pc and icount | decompile that pc; add the window or device, or answer it with `--mmio-rule`; `-d` / `--history N` show the state and the path there |
@@ -147,8 +153,8 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 | killed by `timeout` while idle | waiting for console/network input (stdin not `/dev/null`, a pty/tcp console, a host `--nic`) | that is the guest waiting for you: script the input, or run unattended |
 | `exc: kind=0 cause=9` (MIPS Bp) early, no output | compiler divide-by-zero trap (`break 7`): a clock/divider register reads 0 | decompile the function at pc; give the register a sane reset value |
 | `exc: kind=2/3` (LOAD/STORE_FAULT, MIPS DBE) with tval in an MMIO range | an access outside every window with `--unknown-mmio fault`, or a write to a ROM region | add the window, or use ROMD for flash that takes commands |
-| exception storm at one vector | the vectors aren't installed yet, so the *first* exception is the real one | look at the first exception and its pc |
-| exit 126 "fetch fault loop" | jumped to unmapped code, or the exception vector itself is not fetchable (BEV vectors in an unmapped boot ROM) | check memory map, BEV/EBase, reset vector |
+| exception storm at one vector | the vectors aren't installed yet, so the *first* exception is the real one | the `exc:` summary at the stop lists each kind, cause and pc with its first icount: take the earliest, `-n ICOUNT -d` there, `--history 64` for the path |
+| exit 126 "fetch fault loop" | jumped to unmapped code, or the exception vector itself is not fetchable (BEV vectors in an unmapped boot ROM) | `--history 32` shows the jump that went astray; check memory map, BEV/EBase, reset vector |
 | `unknown-mmio` accesses all over, garbage-looking addresses | wrong base or wrong RAM size | re-validate recon, don't model these |
 | output stops after a banner | waiting for a timer tick or an interrupt (often then exit 125) | timer / interrupt controller |
 | a subsystem prints an error and continues | that feature's device is missing or wrong | trace its failing return code (below) |
@@ -177,6 +183,13 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 
 ```bash
 ./run.sh -n 200000000 --log-pc 0x8023f00c ...  # every arrival at a pc, with icount
+./run.sh --log-pc 0x8023f00c,a0,a1,ra ...      # ... and the registers (gdb names: a0 / r4 / r0 / rdi)
+UNKNOWN_MMIO=stop ./run.sh --history 32 -d ... # stop at the first unmodelled access (exit 131)
+./run.sh --history 64 ...                      # the last 64 blocks/exceptions/interrupts before the stop
+./run.sh -t mmio-summary ...                   # one line per device register used; the polled one
+./run.sh -t exc ...                            # exceptions by kind/cause/pc + handlers, at the stop
+./run.sh -t dma,mmio ...                       # a DMA device: what the driver programs, what it moves
+./run.sh -t mmio --trace-file build/mmio.txt ...  # a big trace in a file, the log stays readable
 ./run.sh --break 0x8023f00c -d ...             # stop there, dump the hart (exit 127)
 ./run.sh -n 123456789 -d ...                   # the hart at exactly instruction N
 ./run.sh --trace blocks --trace-range 0x80230000:0x80240000 --trace-after 100000000 ...
