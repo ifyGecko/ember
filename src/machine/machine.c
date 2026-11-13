@@ -438,6 +438,23 @@ uam_status uam_machine_set_block_coverage(uam_machine *m, uam_cov_state *state)
     return st;
 }
 
+uam_status uam_machine_set_cmp(uam_machine *m, uam_cmp_state *s)
+{
+    uam_status st = UAM_OK;
+    for (uint32_t i = 0; i <= m->n_aps && st == UAM_OK; i++)
+        st = uam_exec_set_cmp(uam_machine_exec(m, i), s);
+    if (st != UAM_OK)
+        for (uint32_t i = 0; i <= m->n_aps; i++)
+            uam_exec_set_cmp(uam_machine_exec(m, i), NULL);
+    return st;
+}
+
+void uam_machine_cmp_attach(uam_machine *m, bool on)
+{
+    for (uint32_t i = 0; i <= m->n_aps; i++)
+        uam_exec_cmp_attach(uam_machine_exec(m, i), on);
+}
+
 uam_cov_state *uam_machine_cov_state(uam_machine *m, unsigned i)
 {
     uam_cpu *cpu = uam_machine_cpu(m, i);

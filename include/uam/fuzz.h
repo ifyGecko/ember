@@ -229,6 +229,20 @@ const uint8_t         *uam_fuzz_map(const uam_fuzz *f, size_t *size);
  * iteration then follows what it touched, not the map size. */
 const uint32_t        *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n);
 const uam_fuzz_result *uam_fuzz_last_result(const uam_fuzz *f);
+
+/*
+ * Compare logging (uam/cmp.h), off by default. With UAM_FUZZ_CMP_LOG the target's
+ * compares are instrumented: an iteration armed with uam_fuzz_cmp_arm logs the values
+ * they saw; the others pay a load and an untaken branch per compare. Setting other modes
+ * discards translated code. uam_fuzz_cmp_arm (false without UAM_FUZZ_CMP_LOG) arms the
+ * next iteration only; uam_fuzz_cmp_log is that iteration's log (NULL, n = 0, unless the
+ * last iteration was armed), valid until the next one starts.
+ */
+#define UAM_FUZZ_CMP_LOG   (1u << 0)
+uam_status             uam_fuzz_set_cmp(uam_fuzz *f, unsigned modes);
+unsigned               uam_fuzz_cmp_modes(const uam_fuzz *f);
+bool                   uam_fuzz_cmp_arm(uam_fuzz *f);
+const uam_cmp_entry   *uam_fuzz_cmp_log(const uam_fuzz *f, size_t *n, uint64_t *dropped);
 void                   uam_fuzz_get_info(const uam_fuzz *f, uam_fuzz_info *info);
 
 /* Stop at the next instruction boundary and end uam_fuzz_run. Signal-safe. */

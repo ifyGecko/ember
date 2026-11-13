@@ -15,6 +15,11 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
   - OPTIONS asking for SPARSE: the same input's SPARSE list equals its COVERAGE map, with
     indices ascending and the iteration's instruction count; maps stay right across inputs
     (the harness then clears only the buckets it listed); crashes are still CRASH;
+  - compare logging: HELLO announces it; a CMP_INPUT before OPTIONS CMP_LOG gets an empty
+    CMPS, then its reply; after it, a CMP_INPUT of the magic-value input one bit off gets a
+    CMPS (its id, the layout exact) holding the equality compare of the input's word with
+    FUZZ_MAGIC, then the same SPARSE map as the plain INPUT; the exact value gets a CMPS
+    and CRASH FAULT; a plain INPUT gets no CMPS;
   - BYE ending the run with exit 0, and EOF before BYE being an error;
   - CRASH REJECTED (status 0) for an input the route refuses (mem:...,reject), the
     session going on after it;
@@ -29,8 +34,14 @@ import subprocess
 import sys
 import time
 
-HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE = 1, 2, 3, 4, 5, 6, 7
+HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 FLAG_BIG_ENDIAN = 1 << 15
+FLAG_CMP = 1 << 14
+OPT_SPARSE, OPT_CMP_LOG = 1, 2
+CMP_EQ = 1
+FUZZ_MAGIC = 0x6A3C91E5
+MAGIC_IN = b"Mabc" + struct.pack("<I", FUZZ_MAGIC)
+NEAR_IN = b"Mabc" + struct.pack("<I", FUZZ_MAGIC ^ 0x01000000)   # one bit off
 BIG_ENDIAN_BOARDS = ("mips-ref", "armeb-ref", "ppc-ref")
 FAULT, GUARD, ORACLE, HANG, TIMEOUT, REJECTED, MALFORMED = 1, 2, 3, 4, 5, 6, 7
 # RAM the fuzz target does not use: rv32-ref and the MIPS boards (kseg0) reach it at
@@ -98,6 +109,13 @@ def sparse(p):
     return iid, kind, insns, bytes(m), size, idx, len(p) == 25 + 5 * n
 
 
+def cmps(p):
+    """A CMPS payload as (id, dropped, [(site, width, kind, a, b)], exact layout)."""
+    iid, n, dropped = struct.unpack(">QII", p[:16])
+    ents = [struct.unpack(">IBBQQ", p[16 + 22 * k:38 + 22 * k]) for k in range(n)]
+    return iid, dropped, ents, len(p) == 16 + 22 * n
+
+
 def session(run, board, fw, extra, script):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -154,7 +172,7 @@ def main():
             ver, flags, msize, alen = struct.unpack(">HHIH", p[:10])
             check(ver == 1 and len(p) == 10 + alen, f"{tag}: HELLO version {ver}, {len(p)} bytes")
             check(p[10:10 + alen].decode() == arch, f"{tag}: HELLO arch {p[10:10 + alen]!r}")
-            want = want_flags | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
+            want = want_flags | FLAG_CMP | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
             check(flags == want, f"{tag}: HELLO flags {flags:#x}, expected {want:#x}")
             t, p = recv_frame(c)
             iid, kind, bitmap, size = coverage(p) if t == COVERAGE else (None,) * 4
@@ -204,6 +222,15 @@ def main():
             check(t == COVERAGE and coverage(p)[0] == 8, f"{tag}: input after MALFORMED")
             ok_map = coverage(p)[2] if t == COVERAGE else None
 
+            # CMP_INPUT with compare logging off: an empty CMPS, then the usual reply
+            send_frame(c, CMP_INPUT, struct.pack(">QI", 20, len(NEAR_IN)) + NEAR_IN)
+            t, p = recv_frame(c)
+            r = cmps(p) if t == CMPS else None
+            check(r and r[0] == 20 and r[2] == [] and r[3], f"{tag}: CMPS before CMP_LOG is empty "
+                  f"(type {t})")
+            t, p = recv_frame(c)
+            check(t == COVERAGE and coverage(p)[0] == 20, f"{tag}: CMP_INPUT reply (type {t})")
+
             # SPARSE: asked for once, then every map comes as its list of set buckets.
             send_frame(c, OPTIONS, struct.pack(">I", 1))
             for iid, data, want_map in ((9, b"hello", maps[0] if maps else None),
@@ -219,6 +246,42 @@ def main():
                 check(insns > 0, f"{tag}: input {iid}: SPARSE carries the instruction count")
                 check(m == want_map, f"{tag}: input {iid}: SPARSE list equals the COVERAGE map")
             check(crash(12, b"FUZ?", ORACLE, panic & 0xffffffff) is not None, f"{tag}: CRASH while SPARSE")
+
+            # compare logging on (SPARSE stays on)
+            send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG))
+            send_input(c, 13, NEAR_IN)
+            t, p = recv_frame(c)
+            near_map = sparse(p)[3] if t == SPARSE else None
+            check(near_map is not None, f"{tag}: plain INPUT with CMP_LOG on: SPARSE, no CMPS (type {t})")
+            send_frame(c, CMP_INPUT, struct.pack(">QI", 14, len(NEAR_IN)) + NEAR_IN)
+            t, p = recv_frame(c)
+            r = cmps(p) if t == CMPS else None
+            if check(r is not None and r[0] == 14 and r[3], f"{tag}: CMPS for CMP_INPUT 14 (type {t})"):
+                # the compiler may compare the word as loaded against the swapped constant
+                # (a big-endian core reading the little-endian word), or in 16-bit halves
+                # (PowerPC's cmplwi takes 16 bits)
+                pairs = []
+                for order in ("little", "big"):
+                    w = [int.from_bytes(x[4:8], order) for x in (MAGIC_IN, NEAR_IN)]
+                    pairs += [{w[0], w[1]}, {w[0] >> 16, w[1] >> 16}, {w[0] & 0xFFFF, w[1] & 0xFFFF}]
+                pairs = [q for q in pairs if len(q) == 2]
+                hit = [e for e in r[2] if {e[3], e[4]} in pairs]
+                if not hit:
+                    for e in r[2]:
+                        print(f"{tag}: cmps site {e[0]:08x} w{e[1]} kind {e[2]:x} {e[3]:#x} {e[4]:#x}",
+                              file=sys.stderr)
+                check(hit and hit[0][1] == 32 and hit[0][2] & CMP_EQ,
+                      f"{tag}: CMPS holds input word == FUZZ_MAGIC ({len(r[2])} entries)")
+                check(len({(e[0], e[3], e[4]) for e in r[2]}) == len(r[2]), f"{tag}: CMPS entries distinct")
+            t, p = recv_frame(c)
+            check(t == SPARSE and sparse(p)[0] == 14 and sparse(p)[3] == near_map,
+                  f"{tag}: CMP_INPUT's map is the plain INPUT's (type {t})")
+            send_frame(c, CMP_INPUT, struct.pack(">QI", 15, len(MAGIC_IN)) + MAGIC_IN)
+            t, p = recv_frame(c)
+            check(t == CMPS and cmps(p)[0] == 15, f"{tag}: CMPS before a crash (type {t})")
+            t, p = recv_frame(c)
+            check(t == CRASH and len(p) == 13 and struct.unpack(">QBI", p)[:2] == (15, FAULT),
+                  f"{tag}: the magic value: CRASH FAULT (type {t})")
 
             if st.get("eof"):
                 return                                            # close without BYE

@@ -11,7 +11,10 @@
 #   - the exception-class policy: with --fuzz-crash-exc none, the bad store reaches
 #     the firmware's trap handler, which calls fuzz_panic (an oracle crash);
 #   - with RAW (FIRMWARE as a flat binary), the raw image loaded at the ELF's first
-#     segment and started at _start with --entry giving the same verdicts.
+#     segment and started at _start with --entry giving the same verdicts;
+#   - the bug behind the 32-bit magic value (6-magic) is a crash of its own (another bad
+#     store), and a value one bit off (7-near) is not.
+# FUZZ_CHECK_NO_MAGIC=1: a target without the magic value (the PIC assembly one).
 # FUZZ_CHECK_ARGS: further runner options for every run (a board whose memory is all RAM
 # leaves a hole for the planted bad store with --ram).
 set -eu
@@ -44,6 +47,10 @@ printf 'FUZ!'  > "$tmp/in/2-store"
 printf 'FUZ?'  > "$tmp/in/3-panic"
 printf 'Lxx'   > "$tmp/in/4-loop"
 printf 'ok'    > "$tmp/in/5-ok"
+if [ -z "${FUZZ_CHECK_NO_MAGIC:-}" ]; then
+    printf 'Mabc\345\221\074\152' > "$tmp/in/6-magic"   # FUZZ_MAGIC, little-endian
+    printf 'Mabc\345\221\074\153' > "$tmp/in/7-near"    # one bit off
+fi
 
 # fuzz BACKEND-FLAGS OTHER-FLAGS: the replay lines on stdout (input names relative to
 # the input directory); returns the runner's exit status.
@@ -86,6 +93,17 @@ expect 2-store "crash-fault pc=0x[0-9a-f]* (store-fault"
 expect 3-panic "crash-oracle pc=$panic"
 expect 4-loop timeout
 expect 5-ok ok
+if [ -z "${FUZZ_CHECK_NO_MAGIC:-}" ]; then
+    expect 6-magic "crash-fault pc=0x[0-9a-f]* (store-fault"
+    expect 7-near ok
+    # its own bad store: another address (an 8-bit core's stores may share one helper's pc)
+    p2=$(sed -n 's/^replay: 2-store: \(crash-fault [^)]*)\).*/\1/p' "$out")
+    p6=$(sed -n 's/^replay: 6-magic: \(crash-fault [^)]*)\).*/\1/p' "$out")
+    if [ -z "$p6" ] || [ "$p2" = "$p6" ]; then
+        echo "fuzz-check: $board: the magic value's crash is not one of its own ($p2 vs $p6)" >&2
+        fail=1
+    fi
+fi
 
 for mode in jit jit-nochain; do
     if ! cmp -s "$tmp/interp.out" "$tmp/$mode.out" || ! cmp -s "$tmp/interp.map" "$tmp/$mode.map"; then

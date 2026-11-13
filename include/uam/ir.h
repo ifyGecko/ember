@@ -112,7 +112,8 @@ enum uam_op_prop {
     X(WAIT,    "wait",    1, UAM_RK_NONE, UAM_P_EFFECT | UAM_P_TERM)            \
     X(HELPER,  "helper",  3, UAM_RK_SPECIAL, UAM_P_GUARD | UAM_P_EFFECT)      \
     /* instrumentation (inserted by passes, never by lifters) */                \
-    X(COV,     "cov",     2, UAM_RK_NONE, UAM_P_EFFECT)
+    X(COV,     "cov",     2, UAM_RK_NONE, UAM_P_EFFECT)                         \
+    X(CMPLOG,  "cmplog",  2, UAM_RK_NONE, UAM_P_EFFECT)
 
 typedef enum uam_opcode {
 #define UAM_X_ENUM(name, mn, nsrc, rk, props) UAM_OP_##name,
@@ -173,6 +174,17 @@ typedef enum uam_exit_kind {
  * breakpoints), so that the hook runs at a block boundary with precise state.
  */
 #define UAM_IMARK_BREAK 0x2u
+
+/*
+ * CMPLOG kind flags (the `flags` field on a CMPLOG instruction, section 7.6): what the
+ * guest compared. A difference tested for zero (a flags ISA's compare) is EQ; a sign or
+ * overflow test of it is ORDER | SIGNED.
+ */
+#define UAM_CMP_EQ        0x1u   /* equality: EQ, NE, or a difference tested for zero */
+#define UAM_CMP_ORDER     0x2u   /* ordering: ULT, ULE, SLT, SLE, or a borrow/sign test */
+#define UAM_CMP_SIGNED    0x4u   /* the ordering is signed */
+#define UAM_CMP_IMM       0x8u   /* b is a constant of the code (an immediate) */
+#define UAM_CMP_KIND_MASK 0xFu
 
 /* TRAP classes (section 7.3). */
 typedef enum uam_trap_class {

@@ -438,6 +438,68 @@ static void test_hits(const target *t)
     uam_machine_fini(&m);
 }
 
+/* Compare logging (uam_fuzz_set_cmp): only armed iterations log, each its own compares; the
+ * maps and verdicts stay those of runs without it; the logs agree across backends. */
+static void test_cmp(const target *t)
+{
+    static outcome ref;
+    run_inputs(t, BK_INTERP, &ref);
+    uam_cmp_entry first[N_INPUTS][64];
+    size_t first_n[N_INPUTS] = { 0 };
+    for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++) {
+        uam_machine m;
+        machine_for(&m, t, (backend)bk);
+        uam_fuzz *f = harness_for(&m, t, NULL, 0, UAM_FUZZ_EXC_DEFAULT | UAM_FUZZ_EXC_TRAP);
+        const uint32_t passes0 = m.exec.n_passes;
+        CHECK(uam_fuzz_set_cmp(f, 0x80) == UAM_ERR_INVALID, "%s: cmp: unknown mode refused", t->name);
+        CHECK(!uam_fuzz_cmp_arm(f), "%s: cmp: arming without logging fails", t->name);
+        CHECK(uam_fuzz_set_cmp(f, UAM_FUZZ_CMP_LOG) == UAM_OK && uam_fuzz_cmp_modes(f) == UAM_FUZZ_CMP_LOG
+              && m.exec.n_passes == passes0 + 1 && m.cpu.cmp == NULL,
+              "%s: cmp: the pass on, the state detached", t->name);
+        uam_fuzz_result r;
+        CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "%s: cmp: boot", t->name);
+        for (int i = 0; i < N_INPUTS; i++) {
+            const size_t len = strlen(inputs[i]);
+            size_t n;
+            uint64_t dropped;
+            CHECK(uam_fuzz_run_one(f, (const uint8_t *)inputs[i], len, &r) == UAM_OK, "run");
+            CHECK(uam_fuzz_cmp_log(f, &n, &dropped) == NULL && n == 0,
+                  "%s: cmp: an unarmed iteration has no log", t->name);
+            CHECK(!memcmp(uam_fuzz_map(f, NULL), ref.map[i], MAP_SIZE) && r.verdict == ref.r[i].verdict,
+                  "%s/%d: cmp: '%s' runs as without it", t->name, bk, inputs[i]);
+            CHECK(uam_fuzz_cmp_arm(f), "arm");
+            CHECK(uam_fuzz_run_one(f, (const uint8_t *)inputs[i], len, &r) == UAM_OK, "run");
+            const uam_cmp_entry *e = uam_fuzz_cmp_log(f, &n, &dropped);
+            CHECK(e && dropped == 0 && n <= 64, "%s: cmp: an armed iteration has its log", t->name);
+            CHECK(!memcmp(uam_fuzz_map(f, NULL), ref.map[i], MAP_SIZE) && r.verdict == ref.r[i].verdict
+                  && m.cpu.cmp == NULL, "%s/%d: cmp: '%s' logged: the same run, detached after",
+                  t->name, bk, inputs[i]);
+            if (e && n <= 64) {
+                if (bk == BK_INTERP) {
+                    memcpy(first[i], e, n * sizeof(*e));
+                    first_n[i] = n;
+                } else {
+                    CHECK(n == first_n[i] && !memcmp(first[i], e, n * sizeof(*e)),
+                          "%s/%d: cmp: '%s': the interpreter's log", t->name, bk, inputs[i]);
+                }
+            }
+            if (len && bk == BK_INTERP) {
+                bool seen = false;
+                for (size_t k = 0; e && k < n; k++)
+                    seen |= e[k].a == (uint8_t)inputs[i][0] || e[k].b == (uint8_t)inputs[i][0];
+                CHECK(seen, "%s: cmp: '%s': its first byte is in a compare", t->name, inputs[i]);
+            }
+            CHECK(uam_fuzz_run_one(f, (const uint8_t *)inputs[i], len, &r) == UAM_OK, "run");
+            CHECK(uam_fuzz_cmp_log(f, &n, NULL) == NULL, "%s: cmp: armed for one iteration only",
+                  t->name);
+        }
+        CHECK(uam_fuzz_set_cmp(f, 0) == UAM_OK && m.exec.n_passes == passes0,
+              "%s: cmp: off removes the pass", t->name);
+        uam_fuzz_destroy(f);
+        uam_machine_fini(&m);
+    }
+}
+
 static void test_modes(const target *t)
 {
     /* Paired: the iteration ends at END, before the jump back. */
@@ -1337,6 +1399,7 @@ int main(void)
     for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {
         test_verdicts(&ts[i]);
         test_hits(&ts[i]);
+        test_cmp(&ts[i]);
         test_modes(&ts[i]);
         test_routes(&ts[i]);
         test_frontend(&ts[i]);

@@ -109,6 +109,9 @@ int      jit_br_syswr(uam_jit_ctx *jc, uint32_t id, uint64_t val);
 int      jit_br_helper(uam_jit_ctx *jc, uint32_t id, uint64_t a, uint64_t b, uint64_t c);
 /* a pure op through the interpreter's evaluator; packed = op | width << 8 | src_w << 16 */
 uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64_t y, uint64_t z);
+/* CMPLOG: uam_cmp_note(s, site, wk, a, b) with packed = site | (uint64_t)wk << 32 (no jc:
+ * it cannot fault, stop the block or read time) */
+void     jit_br_cmplog(struct uam_cmp_state *s, uint64_t packed, uint64_t a, uint64_t b);
 
 /* ---- the compiler's state ------------------------------------------------------ */
 

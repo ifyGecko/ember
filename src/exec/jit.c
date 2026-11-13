@@ -220,6 +220,11 @@ int jit_br_helper(uam_jit_ctx *jc, uint32_t id, uint64_t a, uint64_t b, uint64_t
     return 0;
 }
 
+void jit_br_cmplog(struct uam_cmp_state *s, uint64_t packed, uint64_t a, uint64_t b)
+{
+    uam_cmp_note(s, (uint32_t)packed, (uint32_t)(packed >> 32), a, b);
+}
+
 uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 {
     uint64_t out = 0;

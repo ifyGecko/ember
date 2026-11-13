@@ -14,7 +14,13 @@
 # explore, exploit, coe, rare, lin, quad, seek, mmopt; each must save the
 # seeded crash, keep a queue and end cleanly, with no unstable entry), and one with no
 # crashing seed at all but an ember dictionary holding the trigger (an integer token in the
-# target's byte order and a string): the brain must find the planted FAULT by mutation.
+# target's byte order and a string): the brain must find the planted FAULT by mutation
+# (compare logging off, so that the dictionary alone does it).
+#
+# Compare logging, with block coverage (it sees the branches inside the parser): on by
+# default, from the seed "hello world!" and no dictionary, it must find the bug behind the
+# 32-bit magic value (the saved input holds it, little-endian, at offset 4) through
+# input-to-state finds; the same session with --no-cmplog must not.
 set -eu
 run=$1
 board=$2
@@ -81,7 +87,10 @@ else
         fail=1
     fi
 fi
-# session NAME ITERS EXTRA-BRAIN-ARGS...: one brain + ember session into $tmp/NAME
+# session NAME ITERS EXTRA-BRAIN-ARGS...: one brain + ember session into $tmp/NAME; ember's
+# coverage is $cov (the site list unless set).
+cov_sites="--cov-sites $tmp/sites.uams --cov-boundary $tmp/begin.uamb --cov-ngram 3 --cov-rotate"
+cov=$cov_sites
 session() {
     sname=$1; iters=$2; shift 2
     sport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
@@ -89,8 +98,8 @@ session() {
         --iters "$iters" --seed-rng 7 --status-file "$tmp/$sname.status" "$@" > "$tmp/$sname.log" 2>&1 &
     brain_pid=$!
     src=0
-    "$run" -b "$board" --cov-sites "$tmp/sites.uams" --cov-boundary "$tmp/begin.uamb" \
-        --cov-ngram 3 --cov-rotate --fuzz-crash-pc "$panic" --fuzz-input uart0 \
+    # shellcheck disable=SC2086
+    "$run" -b "$board" $cov --fuzz-crash-pc "$panic" --fuzz-input uart0 \
         --fuzz-iter-insns 200000 --fuzz-net "127.0.0.1:$sport" "$fw" \
         < /dev/null > "$tmp/$sname.run" 2>&1 || src=$?
     sbrc=0
@@ -133,7 +142,7 @@ done
 mkdir "$tmp/plain"
 printf 'hello' > "$tmp/plain/a"
 printf '# the planted bug\n"FUZ!"\nu32be:0x46555a21\nu16be:0x4c78\n' > "$tmp/fuzz.dict"
-if session dict 6000 --seeds "$tmp/plain" --dict "$tmp/fuzz.dict"; then
+if session dict 6000 --seeds "$tmp/plain" --dict "$tmp/fuzz.dict" --no-cmplog; then
     if ! grep -q -l '^reason_name=FAULT$' "$tmp/dict/crashes/"*.info 2> /dev/null; then
         echo "brain-check: $board: the dictionary did not lead the brain to the planted FAULT:" >&2
         tail -n 5 "$tmp/dict.log" >&2
@@ -147,5 +156,35 @@ else
     fail=1
 fi
 
-[ $fail -eq 0 ] && echo "brain-check: $board: $(basename "$fw"): the brain saved and minimized the crash; every schedule; a dictionary find"
+# Compare logging (block coverage).
+begin=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_iteration" { print $2; exit }')")
+cov="--cov-blocks --fuzz-begin $begin"
+mkdir "$tmp/world"
+printf 'hello world!' > "$tmp/world/a"
+# magic_found DIR: a saved crash holds 'M' and FUZZ_MAGIC little-endian at offset 4
+magic_found() { grep -q -l '^hex=4d[0-9a-f]\{6\}e5913c6a' "$1"/crashes/*.info 2> /dev/null; }
+if session cmplog 3000 --seeds "$tmp/world"; then
+    if ! magic_found "$tmp/cmplog"; then
+        echo "brain-check: $board: compare logging did not find the magic value:" >&2
+        tail -n 8 "$tmp/cmplog.log" >&2
+        fail=1
+    elif ! grep -q 'compare logging on' "$tmp/cmplog.log" \
+         || ! tail -n 1 "$tmp/cmplog.status" | grep -q '"cmplog_finds": [1-9]'; then
+        echo "brain-check: $board: compare logging was not used, or found nothing itself" >&2
+        fail=1
+    fi
+else
+    fail=1
+fi
+if session nocmplog 3000 --seeds "$tmp/world" --no-cmplog; then
+    if magic_found "$tmp/nocmplog"; then
+        echo "brain-check: $board: the magic value was found without compare logging (the test" \
+             "no longer tells anything)" >&2
+        fail=1
+    fi
+else
+    fail=1
+fi
+
+[ $fail -eq 0 ] && echo "brain-check: $board: $(basename "$fw"): the brain saved and minimized the crash; every schedule; a dictionary find; compare logging"
 exit $fail

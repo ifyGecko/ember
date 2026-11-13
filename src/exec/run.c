@@ -128,6 +128,10 @@ void uam_exec_fini(uam_exec *x)
     uam_cov_pass_destroy(x->cov_pass);
     x->cov_pass = NULL;
     x->cpu->cov = NULL;
+    uam_cmp_pass_destroy(x->cmp_pass);
+    x->cmp_pass = NULL;
+    x->cmp_state = NULL;
+    x->cpu->cmp = NULL;
 }
 
 bool uam_exec_enable_jit(uam_exec *x)

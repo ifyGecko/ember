@@ -12,7 +12,7 @@ IR fits into the rest of the emulator.
 
 ## 1. Design goals
 
-1. **Small but proficient.** 47 opcodes, plus the instrumentation op `COV` (§7.5). (The native JIT was added without adding any: the
+1. **Small but proficient.** 47 opcodes, plus the instrumentation ops `COV` (§7.5) and `CMPLOG` (§7.6). (The native JIT was added without adding any: the
    optimizer and an inline memory fast path carried the speed, so the universal opcode set
    stayed exactly as below.)  Enough to express real ISAs (RISC-V, ARM, MIPS,
    PowerPC, x86) directly, without encoding tricks. Not so many that every backend and every
@@ -168,8 +168,8 @@ Ops that accept a guard: `PUT, LD, ST, AMO, CAS, SYSRD, SYSWR, HELPER (effectful
 | Select | `SELECT` | 1 |
 | Control | `EXIT` | 1 |
 | System / escape | `SYSRD SYSWR TRAP WAIT HELPER` | 5 |
-| Instrumentation | `COV` (inserted by passes only, §7.5) | 1 |
-| **Total** | | **48** |
+| Instrumentation | `COV CMPLOG` (inserted by passes only, §7.5, §7.6) | 2 |
+| **Total** | | **49** |
 
 Some opcodes are left out on purpose. `NOT`, `NEG`, `MOV`, `SGT`/`UGT`, `ROTL`, `MULHSU`, and
 partial-register insert/extract are all short compositions of the ops above (§10). Leaving them
@@ -300,9 +300,11 @@ effect ∈ { PURE, READS_STATE, WRITES_STATE, MAY_FAULT }   (a bitmask)
   and optimisers may move or remove them.
 - `MAY_FAULT` helpers count as faulting ops for the commit rule (§8). The optimizer never moves
   or removes a `HELPER`, and forgets what it knew about register values across one.
-- Instrumentation that needs host code (cmp-logging, taint) is inserted as helpers. Edge
-  coverage is the exception: it has its own opcode (§7.5), because it runs on every
-  instrumented instruction and must stay inline in native code.
+- Instrumentation that needs host code (taint) is inserted as helpers. Edge coverage and
+  compare logging are the exceptions, with opcodes of their own (§7.5, §7.6): coverage runs
+  on every instrumented instruction and must stay inline in native code, and a compare
+  record must cost next to nothing while nothing is logging, which a helper (a pass cannot
+  add one to an ISA's table, and a call flushes the instruction count) does not.
 
 Helpers are the pressure valve for complex semantics (floating point, crypto, `mret`-style mode
 switches). The rule of thumb: **if an operation can be expressed in fewer than ~10 core ops, do
@@ -344,6 +346,23 @@ inserts it directly after the `IMARK` of an instrumented instruction (§8 rule 8
 exactly once each time that instruction starts, including when a block is interrupted and
 resumed.
 
+### 7.6 Compare records
+
+`CMPLOG.W a, b` (W = 8, 16, 32 or 64; `aux` = a site id, `flags` = what was compared:
+`UAM_CMP_EQ`, `UAM_CMP_ORDER`, `UAM_CMP_SIGNED`, `UAM_CMP_IMM`) reports the two values of
+one guest compare to the hart's compare state (`cpu->cmp`, a `uam_cmp_state`, `cmp.h`):
+
+```
+if cmp != NULL: uam_cmp_note(cmp, aux, W | flags << 8, a, b)   // the log keeps (site, a, b)
+```
+
+`a` and `b` are temporaries or immediates of width `W`. Like `COV`, `CMPLOG` reads and
+writes no register, memory or bus, cannot fault, does not count as an instruction and
+never changes what the guest does; with no state attached it does nothing (native code
+tests `cpu->cmp` and branches past it). Lifters never emit it: the compare pass
+(`analysis/cmp.c`) inserts one in front of each compare it recognises (`cmp.h` lists the
+shapes), anywhere after the block's first `IMARK` (§8 rule 11).
+
 ---
 
 ## 8. Block well-formedness
@@ -376,6 +395,8 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
     (`BSWAP` 16). A conversion's source is a temporary, never an immediate. `TRAP` and `WAIT`
     operands are address-width. The fetch and debug access attributes are core-only and are
     rejected in IR.
+11. **Compare record.** `CMPLOG` has width 8..64, operands `a` and `b` of that width, no `c`,
+    no guard and no destination, only `UAM_CMP_*` flags, and does not start a block.
 
 The verifier runs after the lifter, again after the optimizer, and after each pass. The
 optimizer (`uam_optimize`) keeps side effects, `IMARK`s and the order of the remaining `PUT`s;

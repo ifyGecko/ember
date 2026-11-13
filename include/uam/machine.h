@@ -220,6 +220,11 @@ uam_status uam_machine_set_coverage(uam_machine *m, const uam_cov_site *sites, s
                                     uam_cov_state *state, char *err, size_t errlen);
 uam_status uam_machine_set_block_coverage(uam_machine *m, uam_cov_state *state);
 uam_cov_state *uam_machine_cov_state(uam_machine *m, unsigned i);
+/* Compare instrumentation on every processor (uam_exec_set_cmp), all reporting to `s`
+ * (processors run one at a time, so they can share it); NULL turns it off.
+ * uam_machine_cmp_attach is uam_exec_cmp_attach on every processor. */
+uam_status uam_machine_set_cmp(uam_machine *m, uam_cmp_state *s);
+void       uam_machine_cmp_attach(uam_machine *m, bool on);
 /* Every processor's executor statistics, added up. */
 void       uam_machine_get_stats(const uam_machine *m, uam_exec_stats *out);
 /* Instructions every processor has retired (their icounts added up). */

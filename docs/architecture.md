@@ -4,7 +4,7 @@ Status: phases 1 and 2 implemented, plus more ISAs (MIPS32 with a TLB, ARMv7-A w
 MMU, x86-64, 32-bit PowerPC with the classic and the Book E MMU, 8-bit AVR in every core family, AVR32A
 and AVR32B, 8-bit PIC in four core families, the 8051 in three core models, the 6502 in
 three core models, the Z80, Xtensa in three core models and both byte orders), the
-phase 3 except the cmp-log pass (snapshots, coverage, the fuzz harness, guards, site
+phase 3 (snapshots, coverage, compare logging, the fuzz harness, guards, site
 lists, boundary files and the fuzz brain) and the JIT from phase 4. IR, interpreter and optimizer, a
 JIT with block chaining for x86-64 and AArch64 hosts, bus (priorities, device byte order, ROM devices, aliases,
 watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/little-endian
@@ -64,7 +64,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into, and `insn_pc`, the instruction a bus, system register or helper access is made for), the core services ISA modules may call (`uam_cpu_xlate_changed`, ...), and observers of system register accesses, interrupt input lines, exceptions taken and interrupt handlers entered (`uam_cpu_observer`: `--trace sysreg`, `--trace irq`, the `--trace exc` summary) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), an execution history ring (`uam_exec_set_history`: `--history N`), stops at a refused access (`uam_exec_request_fault_stop`, `uam_exec_request_stop_at_fault`: guards, `--unknown-mmio stop`), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics, the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), compare logging (`uam_exec_set_cmp`, `uam_exec_cmp_attach`: the compare pass and the state `CMPLOG` reports to), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), an execution history ring (`uam_exec_set_history`: `--history N`), stops at a refused access (`uam_exec_request_fault_stop`, `uam_exec_request_stop_at_fault`: guards, `--unknown-mmio stop`), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, a stop at the faulting instruction requested from inside an access (`uam_exec_request_fault_stop`: `UAM_STOP_GUARD`), statistics, the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
@@ -73,6 +73,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `guard.h` | Guarded and watched guest memory: byte ranges (virtual or physical, around an anchor) whose data accesses stop the run at the instruction (`UAM_STOP_GUARD`), become a bus fault for the guest, or are logged; hit records and an observer; the text form `--guard`/`--watch` and fuzz redzones use | `src/machine` (on bus fault watches and `uam_exec_request_fault_stop`) |
 | `fuzz.h` | The persistent-mode fuzz harness (boot to a begin pc, snapshot, one restore per input, verdicts) and its frontend interface; the replay frontend | `fuzz/` (see [`fuzzing.md`](fuzzing.md)) |
 | `cov.h` | The edge-coverage pass: `UAM_OP_COV` at a table of guest pcs (or at every block start), knowing nothing about where the table came from | `analysis/cov.c` |
+| `cmp.h` | The compare pass (`UAM_OP_CMPLOG` in front of each compare it recognises in the IR, flags ISAs' compares and constant offsets included) and the state it reports to: the log of a run's distinct (site, a, b), for a fuzzer's input-to-state stage | `analysis/cmp.c` (the pass), `src/exec/cmp.c` (the state, `uam_exec_set_cmp`) |
 
 ## 3. Dependency rules
 
@@ -91,7 +92,7 @@ isa/*         → ir, isa.h, state.h      (x86 and PowerPC page-table walks also
                                          ARM, AVR32, MIPS, PowerPC, x86 and Xtensa; signal.h
                                          for the CPU output lines of MIPS and AVR32)
 exec/*        → ir, isa.h, bus.h, sched.h, pass.h, cov.h (it wires passes in)
-analysis/*    → ir, pass.h, cov.h        (never an ISA or a device)
+analysis/*    → ir, pass.h, cov.h, cmp.h (never an ISA or a device)
 core (bus, sched, signal, chardev, netdev, state) → their own headers only
                                          (bus: also device.h, whose ops it calls; state.h: also
                                          sched.h and signal.h, whose objects it saves)
@@ -145,9 +146,9 @@ include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h
                   xtensa.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
-src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c spin.c jit.h
+src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c cmp.c spin.c jit.h
                   jit_impl.h execops.h spin.h
-analysis/         cov.c (the edge-coverage pass)
+analysis/         cov.c (the edge-coverage pass) cmp.c (the compare pass)
 src/loader/       loader.c
 src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches)
 src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.c
@@ -189,6 +190,7 @@ fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists an
                   from rizin's analysis) ghidra/ (the same two from headless Ghidra, Jython)
                   fuzz_brain.py mutate.py (the coverage-guided brain and its mutator)
                   fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)
+                  cmplog.py (input-to-state candidates from ember's compare logs)
                   fuzz_launch.py (a parallel campaign of brain + ember workers)
                   status_tui.py (its status screen) cov_region.py (reads a coverage region)
 tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
@@ -211,7 +213,8 @@ tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmwa
                   and the coverage region through the runner) gen-check.sh  (lists from
                   fuzz/tools' generators; rizin and, when found, headless Ghidra)
                   fuzz-net-check.sh fake_brain.py  (the fuzz protocol against a scripted brain)
-                  brain-check.sh  (sessions with fuzz_brain.py: every schedule, a dictionary)
+                  brain-check.sh  (sessions with fuzz_brain.py: every schedule, a dictionary,
+                  compare logging)
                   parallel-check.sh  (a parallel campaign through fuzz_launch.py)
                   brain_unit.py  (the brain's campaign logic on synthetic data)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
@@ -261,7 +264,7 @@ tests/firmware-x86/   selftest.asm smp.asm legacy.asm smm-amd.asm biosrom.asm bi
                       (x86-64, built with nasm: flat images entered in real mode, and a BIOS ROM)
 ```
 
-Planned: more passes in `analysis/` (cmp-log, taint), an Intel HEX loader, more boards and
+Planned: more passes in `analysis/` (taint), an Intel HEX loader, more boards and
 devices.
 
 ## 5. Firmware specifics
@@ -693,8 +696,9 @@ devices.
   reaches the runner through the generic runner-extension interface (`runner.h`): only
   `fuzz/stock_exts.c` adds its extension.
 - **Planned** (phase 3, on top of snapshots):
-  - More passes: cmp-logging, memory hooks, taint (`HELPER` calls, which such passes would
-    insert, compile in the JIT like every other IR op).
+  - More passes: memory hooks, taint (`HELPER` calls, which such passes would
+    insert, compile in the JIT like every other IR op). Compare logging is done (its own
+    op, `CMPLOG`, and `analysis/cmp.c`).
   - More crash checks: execution outside code regions, an icount watchdog per function.
 
   PC hooks, watchpoints, guards (`guard.h`) and `uam_exec_stop` are already available to
@@ -726,7 +730,7 @@ devices.
 1. IR (builder, verifier, printer), interpreter, bus with RAM/ROM/MMIO, RV32I lifter. *Done.*
 2. RV32IMAC, M-mode CSRs and traps, CLINT/PLIC/UART board. Milestone: boot a FreeRTOS demo printing over UART. *Implemented* (the FreeRTOS milestone itself is not part of the test suite).
 3. Snapshots (*done*), coverage (*done*: IR passes, `UAM_OP_COV`, the coverage pass) and
-   cmp-log passes, unknown-MMIO fuzz policy (*done*: per-register rules with an `input`
+   compare logging (*done*: `UAM_OP_CMPLOG`, the compare pass, the brain's input-to-state stage), unknown-MMIO fuzz policy (*done*: per-register rules with an `input`
    policy), a persistent-mode fuzz harness (*done*, with a replay frontend).
 4. Board description format, more peripherals, ARMv7-M, JIT (*done*: x86-64 and AArch64 hosts, with block chaining; every IR op compiles, so no block falls back to the interpreter).
 
@@ -904,14 +908,22 @@ Implemented (`make test`):
   generators (rizin, and the Ghidra route when it finds headless Ghidra: `GHIDRA_HEADLESS`,
   `GHIDRA_HOME`, `PATH`, `~/ghidra*`, `/opt/ghidra*`);
   `fuzz-net-check.sh` checks the fuzz protocol frame by frame (SPARSE replies against the
-  whole maps, the big-endian HELLO flag), `brain-check.sh` sessions with `fuzz_brain.py`
+  whole maps, the big-endian HELLO flag, CMPS records of the magic-value compare),
+  `brain-check.sh` sessions with `fuzz_brain.py`
   (whose saved crash directory replays without its `.info` notes; one per power schedule; the
-  planted crash found from a dictionary alone), and `parallel-check.sh` a two-worker campaign
+  planted crash found from a dictionary alone; the 32-bit magic value found by compare logging
+  from an unrelated seed and not without it), and `parallel-check.sh` a two-worker campaign
   through `fuzz_launch.py` (imports, both planted crashes, a killed ember restarted).
   `tests/fuzz/brain_unit.py` checks the brain's campaign logic on synthetic data (hit-count
   classes, path ids, the favored set and skip rule, every schedule, operator weights, queue
-  files, sync bookkeeping), and `test_fuzz` the harness's hit lists (`uam_fuzz_map_hits`) and
-  the selective map clear they enable, against whole-map clears.
+  files, sync bookkeeping), `fuzz/tools/cmplog.py --selftest` the input-to-state candidates,
+  `test_fuzz` the harness's hit lists (`uam_fuzz_map_hits`) and the selective map clear they
+  enable, against whole-map clears, and compare logging (only armed iterations log, the same
+  maps and verdicts, the same logs on every backend), and `test_cov` the compare pass on
+  hand-built IR (flags ISAs' compares, constant offsets, swapped constants, what is left out)
+  and `CMPLOG` on every ISA's loop under the interpreter, the JIT and the JIT without
+  chaining (identical logs, runs unchanged). `fuzz-check.sh` adds a planted bug behind a
+  32-bit magic value to every board's fuzz target.
 - The external-board example is built and run against the library.
 - Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
   board but `pic-ref` (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, AVR32A

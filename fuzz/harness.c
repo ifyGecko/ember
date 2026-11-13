@@ -102,6 +102,12 @@ struct uam_fuzz {
     uam_fuzz_observer_fn obs_fn;
     void                *obs_ctx;
 
+    /* compare instrumentation (uam_fuzz_set_cmp) */
+    unsigned        cmp_modes;     /* UAM_FUZZ_CMP_* */
+    uam_cmp_state  *cmp;
+    bool            cmp_armed;     /* log the next iteration's compares */
+    bool            cmp_valid;     /* the log is the last iteration's */
+
     uam_fuzz_result last;
     uam_fuzz_stats  stats;
 };
@@ -432,6 +438,9 @@ void uam_fuzz_destroy(uam_fuzz *f)
     }
     if (f->has_cov)
         uam_machine_set_coverage(m, NULL, 0, NULL, NULL, 0);
+    if (f->cmp_modes)
+        uam_machine_set_cmp(m, NULL);
+    uam_cmp_state_destroy(f->cmp);
     mem_disarm(&f->mem, m);
     free(f->snap_last_pc);
     uam_snapshot_free(f->snap);
@@ -989,11 +998,24 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
         }
     }
     clear_flags(f);
+    const bool log_cmp = f->cmp_armed;
+    f->cmp_armed = false;
+    f->cmp_valid = false;
+    if (log_cmp) {
+        uam_cmp_reset(f->cmp);
+        uam_cmp_set_logging(f->cmp, true);
+        uam_machine_cmp_attach(m, true);
+    }
     st = f->deliver(f->deliver_ctx, m, data, len);
     if (st == UAM_ERR_REJECTED) {
         /* The input's fault, not the harness's: nothing ran, the next input goes on. */
         r->verdict = UAM_FUZZ_REJECTED;
         r->pc = m->cpu.pc;
+        if (log_cmp) {
+            uam_cmp_set_logging(f->cmp, false);
+            uam_machine_cmp_attach(m, false);
+            f->cmp_valid = true;   /* empty: nothing ran */
+        }
         f->stats.iterations++;
         f->stats.by_verdict[r->verdict]++;
         f->last = *r;
@@ -1010,6 +1032,11 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     f->ph = PH_ITER;
     r->stop = uam_exec_run(&m->exec, f->cfg.iter_insns);
     f->ph = PH_IDLE;
+    if (log_cmp) {
+        uam_cmp_set_logging(f->cmp, false);
+        uam_machine_cmp_attach(m, false);
+        f->cmp_valid = true;
+    }
     if (r->stop == UAM_STOP_GUARD && uam_machine_guard_last_hit(m))
         f->hit_cpu = uam_machine_cpu(m, uam_machine_guard_last_hit(m)->cpu);
     r->pc = f->hit_cpu->pc;   /* the processor that ended it (processor 0 otherwise) */
@@ -1028,6 +1055,48 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     f->stats.by_verdict[r->verdict]++;
     f->last = *r;
     return UAM_OK;
+}
+
+uam_status uam_fuzz_set_cmp(uam_fuzz *f, unsigned modes)
+{
+    if (modes & ~UAM_FUZZ_CMP_LOG)
+        return UAM_ERR_INVALID;
+    if (modes == f->cmp_modes)
+        return UAM_OK;
+    if (modes && !f->cmp && !(f->cmp = uam_cmp_state_create(0)))
+        return UAM_ERR_NOMEM;
+    f->cmp_armed = f->cmp_valid = false;
+    uam_status st = uam_machine_set_cmp(f->m, modes ? f->cmp : NULL);
+    if (st != UAM_OK) {
+        f->cmp_modes = 0;
+        return st;
+    }
+    f->cmp_modes = modes;
+    /* attached only during a logged iteration */
+    uam_machine_cmp_attach(f->m, false);
+    return UAM_OK;
+}
+
+unsigned uam_fuzz_cmp_modes(const uam_fuzz *f) { return f->cmp_modes; }
+
+bool uam_fuzz_cmp_arm(uam_fuzz *f)
+{
+    if (!(f->cmp_modes & UAM_FUZZ_CMP_LOG))
+        return false;
+    f->cmp_armed = true;
+    return true;
+}
+
+const uam_cmp_entry *uam_fuzz_cmp_log(const uam_fuzz *f, size_t *n, uint64_t *dropped)
+{
+    if (!f->cmp_valid) {
+        if (n)
+            *n = 0;
+        if (dropped)
+            *dropped = 0;
+        return NULL;
+    }
+    return uam_cmp_log(f->cmp, n, dropped);
 }
 
 void uam_fuzz_get_info(const uam_fuzz *f, uam_fuzz_info *info)

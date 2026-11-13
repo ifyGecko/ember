@@ -665,6 +665,30 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
         patch(j, rep);
 }
 
+/*
+ * UAM_OP_CMPLOG (docs/uam-isa.md section 7.6; uam_cmp_note in cmp.h is the reference):
+ * cpu->cmp is read at run time, so with nothing attached it costs a load and an untaken
+ * branch; otherwise a call to uam_cmp_note through jit_br_cmplog, with the live temps
+ * saved around it. The operands go to rdx and rcx (scratch) before rsi and rdi (temp
+ * registers, already saved and read) are written. It cannot fault, stop the block or read
+ * time, so icount is not flushed.
+ */
+static void emit_cmplog(uam_jit *j, const uam_block *blk, const uam_insn *in)
+{
+    const unsigned W = in->width;
+    ld_mem(j, RAX, R14, CPU(cmp));                         /* rax = cpu->cmp */
+    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX); /* test rax, rax */
+    size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    jit_ra_save(j, false);
+    load_operand(j, RDX, blk, in->a, W);
+    load_operand(j, RCX, blk, in->b, W);
+    mov_imm(j, RSI, (uint64_t)in->aux | (uint64_t)(W | (unsigned)in->flags << 8) << 32);
+    ld_mem(j, RDI, R14, CPU(cmp));
+    call_bridge(j, jit_br_cmplog);
+    jit_ra_save(j, true);
+    patch(j, off);
+}
+
 /* Store a block result into jc and jump to the epilogue. */
 static void set_res_pc(uam_jit *j, uint32_t kind, const uam_block *blk, uam_ref target, unsigned aw)
 {
@@ -772,7 +796,7 @@ bool jit_host_pure_inline(const uam_jit *j, uam_opcode op)
     switch (op) {
     case UAM_OP_POPCNT:
         return j->popcnt;
-    case UAM_OP_COV: case UAM_OP__COUNT:
+    case UAM_OP_COV: case UAM_OP_CMPLOG: case UAM_OP__COUNT:
         return false;
     default:
         return true;
@@ -783,7 +807,7 @@ static bool op_supported(uam_opcode op)
 {
     switch (op) {
     case UAM_OP_IMARK: case UAM_OP_GET: case UAM_OP_PUT: case UAM_OP_LD: case UAM_OP_ST:
-    case UAM_OP_EXIT: case UAM_OP_COV:
+    case UAM_OP_EXIT: case UAM_OP_COV: case UAM_OP_CMPLOG:
         return true;
     case UAM_OP_SYSRD: case UAM_OP_SYSWR: case UAM_OP_TRAP: case UAM_OP_WAIT:
     case UAM_OP_HELPER: case UAM_OP_AMO: case UAM_OP_CAS: case UAM_OP_FENCE:
@@ -1585,6 +1609,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
         case UAM_OP_COV:
             emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                      (uint32_t)blk->imm[uam_ref_index(in->b)]);
+            break;
+        case UAM_OP_CMPLOG:
+            emit_cmplog(j, blk, in);
             break;
         default:
             emit_pure(j, blk, in, rd);

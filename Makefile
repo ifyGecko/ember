@@ -98,8 +98,8 @@ IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c src/
 CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
                src/core/state.c
 EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit.c \
-               src/exec/jit_x86.c src/exec/jit_a64.c src/exec/coverage.c src/exec/spin.c
-ANALYSIS_SRC := analysis/cov.c
+               src/exec/jit_x86.c src/exec/jit_a64.c src/exec/coverage.c src/exec/cmp.c src/exec/spin.c
+ANALYSIS_SRC := analysis/cov.c analysis/cmp.c
 LOADER_SRC  := src/loader/loader.c
 MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c src/machine/guard.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
@@ -495,6 +495,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_COV_FORMATS) tests/unit/cov_golden.txt
 	python3 fuzz/tools/mutate.py --selftest
 	python3 fuzz/tools/status_tui.py --selftest
+	python3 fuzz/tools/cmplog.py --selftest
 	python3 tests/fuzz/brain_unit.py
 
 # The JIT differential test at length: JITDIFF_BLOCKS random blocks per seed, several seeds.
@@ -855,7 +856,7 @@ fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr 
 	    $(BUILD)/firmware-ppc/fuzztarget.bin
 	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) avr-ref $(FW_AVR)/fuzztarget.elf
 ifeq ($(HAVE_GPASM),1)
-	FUZZ_CHECK_NO_TRAPS=1 sh tests/fuzz/fuzz-check.sh $(RUN) pic-ref $(FW_PIC)/fuzztarget.elf
+	FUZZ_CHECK_NO_TRAPS=1 FUZZ_CHECK_NO_MAGIC=1 sh tests/fuzz/fuzz-check.sh $(RUN) pic-ref $(FW_PIC)/fuzztarget.elf
 else
 	$(PIC_SKIP)
 endif

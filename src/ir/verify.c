@@ -265,6 +265,16 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
             && define(v, in->dst, 0);
     }
 
+    case UAM_OP_CMPLOG:
+        if (W < 8)
+            return fail(v, "cmplog width must be 8..64");
+        if (in->flags & ~UAM_CMP_KIND_MASK)
+            return fail(v, "cmplog has unknown kind flags");
+        if (v->idx == 0)
+            return fail(v, "cmplog cannot start a block");
+        return use(v, in->a, W, "a") && use(v, in->b, W, "b") && none(v, in->c, "c")
+            && define(v, in->dst, 0);
+
     case UAM_OP__COUNT:
         break;
     }

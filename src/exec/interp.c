@@ -211,6 +211,13 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
             break;
         }
 
+        case UAM_OP_CMPLOG:
+            /* Compare record (section 7.6); no effect on guest state or icount. */
+            if (cpu->cmp)
+                uam_cmp_note(cpu->cmp, in->aux, W | (unsigned)in->flags << 8,
+                             opnd(blk, t, in->a, W), opnd(blk, t, in->b, W));
+            break;
+
         default: {
             /* Pure computation. */
             const uam_opinfo *oi = &uam_opinfo_table[in->op];

@@ -47,6 +47,15 @@ uint32_t trap_handler(void *frame)
     fuzz_panic();
 }
 
+#define FUZZ_MAGIC 0x6A3C91E5u
+
+/* The magic value's planted bug: a bad store of its own, so it is a crash of its own
+ * (another faulting pc than FUZ!'s). */
+static __attribute__((noinline)) void magic_fault(uint32_t v)
+{
+    *(volatile uint32_t *)(uintptr_t)(BAD_ADDR + 8) = v;
+}
+
 static __attribute__((noinline)) uint32_t parse(const uint8_t *p, unsigned n)
 {
     uint32_t sum = 0;
@@ -63,6 +72,14 @@ static __attribute__((noinline)) uint32_t parse(const uint8_t *p, unsigned n)
             g_sink++;                                          /* planted bug: endless loop */
     if (n >= 2 && p[0] == 'o' && p[1] == 'k')
         sum ^= 0x5A5A;
+    if (n >= 8 && p[0] == 'M') {
+        /* planted bug behind a 32-bit magic value (little-endian at offset 4): one compare
+         * that coverage alone cannot see progress on; compare logging and splitting can */
+        uint32_t v = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16
+                   | (uint32_t)p[7] << 24;
+        if (v == FUZZ_MAGIC)
+            magic_fault(v);
+    }
     return sum;
 }
 

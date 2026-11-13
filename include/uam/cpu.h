@@ -153,6 +153,7 @@ typedef struct uam_cpu {
     const struct uam_isa *isa;
     void                 *isa_state;
     uam_cov_state        *cov;      /* UAM_OP_COV target; NULL while coverage is off */
+    struct uam_cmp_state *cmp;      /* UAM_OP_CMPLOG target (cmp.h); NULL: CMPLOG does nothing */
     /* JIT data-TLB (see above). tag = guest vpage, base = host_page - vpage*4096. */
     uint64_t              dtlb_rt[UAM_DTLB_SIZE], dtlb_rb[UAM_DTLB_SIZE];
     uint64_t              dtlb_wt[UAM_DTLB_SIZE], dtlb_wb[UAM_DTLB_SIZE];

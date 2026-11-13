@@ -273,7 +273,8 @@ gives site-id or hashed-pc N-gram coverage (N=1..8, optionally order-sensitive),
 site's bytes in memory against the list. `--fuzz-net HOST:PORT` lets ember's coverage-guided
 brain (`fuzz/tools/fuzz_brain.py`) drive the campaign: a queue with a favored set,
 calibration, trimming and nine power schedules, ember dictionaries, adaptive mutation
-operators, and sparse coverage replies; `fuzz/tools/fuzz_launch.py` runs several brain +
+operators, compare logging (an input-to-state stage that writes the values the target's
+compares expected into the input) and sparse coverage replies; `fuzz/tools/fuzz_launch.py` runs several brain +
 ember workers that share their queues. `--cov-shm PATH` publishes the maps in a
 shared-memory coverage region. The formats are in [`docs/fuzz-formats.md`](docs/fuzz-formats.md).
 

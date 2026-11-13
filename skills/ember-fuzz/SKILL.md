@@ -1,6 +1,6 @@
 ---
 name: ember-fuzz
-description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage, replay or triage crashing inputs, or use generated site lists, boundary files and ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites'."
+description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage, replay or triage crashing inputs, or use generated site lists, boundary files and ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites', 'cmplog'."
 ---
 
 # ember-fuzz: fuzzing firmware on a working ember board
@@ -94,8 +94,11 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    different maps; identical maps mean the input never reaches the handler (begin pc after
    the read, wrong route, input dropped by a full FIFO).
 7. **Run the campaign**: the brain (`references/lists-and-brain.md`) or a program on
-   `uam/fuzz.h`. Give the brain a dictionary of the handler's magic values and command
-   words (`--dict`, ember's format: integers follow the target's byte order). Use every
+   `uam/fuzz.h`. The brain logs each queue entry's compares once and writes the values
+   they expected into the input (compare logging, on by default), which finds magic values
+   and command words by itself; still give it a dictionary of what you saw in Ghidra
+   (`--dict`, ember's format: integers follow the target's byte order) for compares done
+   byte by byte in a loop (`strcmp`, `memcmp`) or on computed values. Use every
    core: `fuzz_launch.py -n N` runs N brain + ember workers that share their queues, each
    on a different power schedule. An `UNSTABLE` line from the brain means the harness leaks
    state between iterations: back to the readiness gate. Keep inputs, crashes and hangs in

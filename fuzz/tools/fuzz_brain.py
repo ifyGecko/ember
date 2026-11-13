@@ -19,6 +19,11 @@ The brain
     difference is a harness bug, reported as UNSTABLE), **trimming**, and an
     **energy** per entry from a performance score times its **power schedule**
     (--schedule fast, explore, exploit, coe, rare, lin, quad, seek, mmopt);
+  - with **compare logging** (ember announces it in HELLO; --no-cmplog turns it off):
+    runs each queue entry once with its compares logged (CMP_INPUT) and tries the
+    **input-to-state** replacements fuzz/tools/cmplog.py derives from them (one
+    operand's bytes found in the input, the other written there), and adds the code's
+    constants the input lacks to the dictionary;
   - mutates with fuzz/tools/mutate.py (havoc + splice), an optional ember
     **dictionary** (--dict; integer tokens in the target's byte order, from
     HELLO), and operator weights it **adapts** to what finds coverage;
@@ -44,7 +49,7 @@ Usage:
 
   fuzz_brain.py --listen HOST:PORT [--seeds DIR] [--out DIR] [--iters N]
                 [--schedule S] [--dict FILE]... [--no-trim] [--trim-probes N]
-                [--no-calibrate] [--reweight-every N]
+                [--no-calibrate] [--reweight-every N] [--no-cmplog] [--cmplog-max N]
                 [--name NAME --sync-dir DIR [--sync-interval S] [--main|--secondary]]
                 [--max-size N] [--no-minimize] [--minimize-timeouts]
                 [--max-hangs N] [--seed-rng N] [--accept-timeout S]
@@ -72,7 +77,8 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mutate import DEFAULT_OP_WEIGHTS, Dictionary, Engine, parse_dict  # noqa: E402
+from cmplog import candidates as i2s_candidates, parse_cmps, tokens as i2s_tokens  # noqa: E402
+from mutate import DEFAULT_OP_WEIGHTS, Dictionary, Engine, IntToken, parse_dict  # noqa: E402
 from fuzz_queue import (SCHEDULES, Coverage, Entry, OpStats, Queue, entry_name,  # noqa: E402
                         hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
                         save_state, set_synced, synced_upto)
@@ -81,11 +87,14 @@ from fuzz_queue import (SCHEDULES, Coverage, Entry, OpStats, Queue, entry_name, 
 NET_MAGIC = b"UAMF"
 NET_VERSION = 1
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
-HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE = 1, 2, 3, 4, 5, 6, 7
+HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
 COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 13, 25
 HELLO_BIG_ENDIAN = 1 << 15               # HELLO flags: the target is big-endian
+HELLO_CMP = 1 << 14                      # HELLO flags: compare logging is understood
 OPT_SPARSE = 1 << 0                      # OPTIONS: reply with SPARSE, not COVERAGE
+OPT_CMP_LOG = 1 << 1                     # OPTIONS: instrument compares for CMP_INPUT
+CMPLOG_TOKENS_MAX = 256                  # dictionary tokens taken from compare logs
 KIND_INIT, KIND_ITER = 1, 2
 
 # HELLO flags: the coverage scheme (the coverage region's flags, same bits).
@@ -186,6 +195,11 @@ def main():
     ap.add_argument("--reweight-every", type=int, default=5000,
                     help="adapt the mutation operators' weights every N execs "
                          "(0 = keep the defaults; default 5000)")
+    ap.add_argument("--no-cmplog", dest="cmplog", action="store_false",
+                    help="no compare logging and input-to-state stage (on when ember "
+                         "offers it)")
+    ap.add_argument("--cmplog-max", type=int, default=256,
+                    help="most input-to-state candidates tried per queue entry (default 256)")
     ap.add_argument("--name", default=None,
                     help="this worker's name (parallel campaigns; default main)")
     ap.add_argument("--sync-dir", default=None,
@@ -332,7 +346,13 @@ def main():
         % (ver, arch, order, map_size, flags, scheme))
     # Ask for SPARSE replies: the hit buckets instead of the whole map. An ember that
     # does not know OPTIONS ignores it and keeps sending COVERAGE; both are handled.
-    send_frame(conn, OPTIONS, struct.pack(">I", OPT_SPARSE))
+    # Compare logging only from an ember that announced it (it answers CMP_INPUT).
+    cmplog_on = bool(args.cmplog and flags & HELLO_CMP)
+    send_frame(conn, OPTIONS, struct.pack(">I", OPT_SPARSE | (OPT_CMP_LOG if cmplog_on else 0)))
+    if cmplog_on:
+        log("compare logging on: an input-to-state stage for each new queue entry")
+    elif args.cmplog:
+        log("NOTE: this ember does not offer compare logging (an older build)")
 
     dictionary = None
     if args.dict:
@@ -358,6 +378,9 @@ def main():
 
     execs = mutated = new_cov = crashes = hangs = rejected = 0
     unstable = imported = trimmed_bytes = 0
+    cmplog_execs = cmplog_finds = cmplog_tokens = 0
+    cmplog_done = set()    # queue entry ids already through the input-to-state stage
+    last_cmps = [None]     # the records of the last CMP_INPUT
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
     hang_sigs = {}         # same, for HANG / TIMEOUT
@@ -376,7 +399,8 @@ def main():
                   "proto": ver, "ember": "%s:%d" % peer, "listen": listen_addr,
                   "out": out, "seeds": len(seeds), "resumed": len(resumed),
                   "max_size": args.max_size, "minimize": str(bool(args.minimize)),
-                  "schedule": args.schedule, "worker": name, "role": role_name}
+                  "schedule": args.schedule, "worker": name, "role": role_name,
+                  "cmplog": str(cmplog_on)}
     if args.iters:
         run_config["iters_limit"] = args.iters
     if args.dict:
@@ -399,6 +423,7 @@ def main():
             "cycles": queue.cycle, "favored": queue.favored_count(),
             "pending_favored": queue.pending_favored, "unstable": unstable,
             "imported": imported, "sparse": sparse_seen[0],
+            "cmplog_execs": cmplog_execs, "cmplog_finds": cmplog_finds,
             "worker": name, "role": role_name, "schedule": args.schedule,
             "stage": stage[0], "finished": finished, "config": run_config,
         }) + "\n")
@@ -417,17 +442,28 @@ def main():
             emit_status()
             last_status[0] = now
 
-    def probe(data):
+    def probe(data, cmp=False):
         """Send one input and return ember's verdict, with no accounting:
         ('crash', reason, status) | ('iter', hits, insns) | ('other', None, None).
-        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map."""
+        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map.
+        cmp: as CMP_INPUT; its compare records land in last_cmps[0]."""
         ident = next_id[0]
         next_id[0] += 1
-        send_frame(conn, INPUT, struct.pack(">QI", ident, len(data)) + data)
+        send_frame(conn, CMP_INPUT if cmp else INPUT, struct.pack(">QI", ident, len(data)) + data)
         while True:
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
                 raise EmberBye()
+            if ftype == CMPS:
+                try:
+                    cid, _dropped, recs = parse_cmps(payload)
+                except ValueError as e:
+                    raise ProtocolError(str(e)) from None
+                if cid != ident or not cmp:
+                    raise ProtocolError("CMPS for id=%d while input id=%d is a%s"
+                                        % (cid, ident, " CMP_INPUT" if cmp else "n INPUT"))
+                last_cmps[0] = recs
+                continue
             insns = 0
             if ftype == CRASH:
                 if len(payload) < CRASH_LEN:
@@ -669,6 +705,53 @@ def main():
         else:
             save_state(queue_dir, e)
 
+    def add_tokens(toks):
+        """Constants the target compares with, as dictionary integers (target order)."""
+        nonlocal cmplog_tokens
+        added = 0
+        for value, width in toks:
+            if cmplog_tokens >= CMPLOG_TOKENS_MAX:
+                break
+            if engine.dictionary is None:
+                engine.dictionary = Dictionary()
+            engine.dictionary.add_int(IntToken(value, width, order))
+            cmplog_tokens += 1
+            added += 1
+        if added:
+            engine.set_op_weights(opstats.weights(default_weights))
+
+    def i2s(e):
+        """The input-to-state stage: e's compares, logged once, each operand written where
+        the other one is in the input. Its candidates count as mutated execs."""
+        nonlocal mutated, cmplog_execs, cmplog_finds, new_cov
+        cmplog_done.add(e.id)
+        stage[0] = "cmplog %s" % e.name
+        last_cmps[0] = None
+        probe(e.data, cmp=True)
+        nonlocal_execs(1)
+        recs = last_cmps[0] or []
+        if not recs:
+            return
+        add_tokens(i2s_tokens(e.data, recs))
+        for cand in i2s_candidates(e.data, recs, args.cmplog_max):
+            if stop["flag"] or (args.iters and mutated >= args.iters):
+                break
+            if len(cand) > args.max_size:
+                continue
+            r = run(cand)
+            mutated += 1
+            cmplog_execs += 1
+            if r[0] == "iter" and r[5] > 0:
+                c = add_entry(cand, r[1], r[2], r[3], r[4], parent=e, op="cmplog")
+                cmplog_finds += 1
+                if r[4]:
+                    new_cov += 1
+                log("cmplog: new coverage +%d buckets, +%d classes (queue=%d) %s"
+                    % (r[4], r[5], len(queue.entries), c.name))
+                emit_event("find", "queue=%d %s" % (len(queue.entries), c.name), edges=r[4])
+            maybe_status()
+            sync()
+
     last_sync = [0.0]
 
     def sync(force=False):
@@ -767,6 +850,8 @@ def main():
                     continue
                 if args.trim and not e.trimmed:
                     trim(e)
+                if cmplog_on and e.id not in cmplog_done:
+                    i2s(e)
                 n = queue.energy(e)
                 if n <= 0:
                     continue
@@ -819,10 +904,11 @@ def main():
     # the keys, saved the distinct inputs kept under hangs/.
     log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d, "
         "saved=%d) rejected=%d queue=%d favored=%d cycles=%d edges=%d unstable=%d "
-        "imported=%d trimmed_bytes=%d"
+        "imported=%d trimmed_bytes=%d cmplog_execs=%d cmplog_finds=%d cmplog_tokens=%d"
         % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
            len(hang_inputs), rejected, len(queue.entries), queue.favored_count(),
-           queue.cycle, cov.edges, unstable, imported, trimmed_bytes))
+           queue.cycle, cov.edges, unstable, imported, trimmed_bytes, cmplog_execs,
+           cmplog_finds, cmplog_tokens))
     emit_status(finished=True)
     if status_fp:
         status_fp.close()

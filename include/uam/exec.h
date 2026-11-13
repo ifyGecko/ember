@@ -27,6 +27,7 @@
 #include <stdio.h>
 
 #include "uam/bus.h"
+#include "uam/cmp.h"
 #include "uam/cov.h"
 #include "uam/cpu.h"
 #include "uam/ir.h"
@@ -285,6 +286,10 @@ typedef struct uam_exec {
     uint32_t         n_passes, cap_passes;
     /* edge coverage (uam_exec_set_coverage): the pass the executor owns */
     uam_cov_pass    *cov_pass;
+    /* compare instrumentation (uam_exec_set_cmp): the pass, and the state CMPLOG reports
+     * to while attached (cpu->cmp) */
+    uam_cmp_pass    *cmp_pass;
+    uam_cmp_state   *cmp_state;
     /* exception and interrupt observers: one slot each */
     uam_exc_hook_fn  exc_hook;
     void            *exc_hook_ctx;
@@ -398,6 +403,17 @@ uam_status      uam_exec_set_coverage(uam_exec *x, const uam_cov_site *sites, si
 /* Block mode (uam_cov_pass_create_blocks): a site at every block start. NULL turns
  * coverage off. */
 uam_status      uam_exec_set_block_coverage(uam_exec *x, uam_cov_state *state);
+
+/*
+ * Compare instrumentation (cmp.h): the compare pass on every block translated from now on,
+ * and cpu->cmp = s, which CMPLOG reports to. NULL turns it off. Either way translated code
+ * is discarded; with it off no block contains CMPLOG, so runs are exactly as without
+ * this feature. The state is not part of any snapshot.
+ * uam_exec_cmp_attach detaches the state (cpu->cmp = NULL) or attaches it again, without
+ * retranslating: while detached, a CMPLOG costs a load and an untaken branch.
+ */
+uam_status      uam_exec_set_cmp(uam_exec *x, uam_cmp_state *s);
+void            uam_exec_cmp_attach(uam_exec *x, bool on);
 
 /* Install the exception observer (NULL removes it). There is one slot; the fuzz
  * harness owns it while it runs, so it cannot be shared with the gdb stub. */

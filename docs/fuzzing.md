@@ -294,6 +294,16 @@ for (each input)
 or hand the loop to a frontend (`uam_fuzz_run(f, &frontend, ctx)`: `hello`, an INIT report
 with id 0, then one report per input, `bye`).
 
+**Compare logging.** `uam_fuzz_set_cmp(f, UAM_FUZZ_CMP_LOG)` instruments the target's
+compares (the compare pass, `uam/cmp.h`; `CMPLOG` in [`uam-isa.md`](uam-isa.md) §7.6).
+`uam_fuzz_cmp_arm(f)` makes the next iteration log the values its compares saw, and
+`uam_fuzz_cmp_log(f, &n, &dropped)` returns that log afterwards: the distinct
+(site, width, kind, a, b), at most 8 per site and 1024 in all. Iterations that are not
+armed run with the state detached, at a cost of a load and an untaken branch per compare
+(1-3% on the cross-ISA benchmark with the JIT); a logged iteration is about twice as slow.
+Maps and verdicts are the same with or without it. The fuzz protocol carries it as
+CMP_INPUT and CMPS ([`fuzz-formats.md`](fuzz-formats.md)).
+
 ## Limitations
 
 - Sites are keyed on the virtual pc. Code reached through both kseg0 and kseg1 needs two
@@ -304,6 +314,11 @@ with id 0, then one report per input, `bye`).
   between processors are not counted.
 - Interrupts are reported only when taken, and only as a crash (`--fuzz-crash-irq`); an
   interrupt line that is raised but masked is invisible to the harness.
+- Compare logging sees compares in the IR, so a string compare done in a byte loop
+  (`strcmp`, `memcmp`) logs one byte per iteration, and a compared value the code computed
+  from the input in other ways than a constant offset (a parsed number, a checksum) is not
+  found in the input. Compares in a block whose operands the optimizer knows are constants
+  are folded away and not logged (they do not depend on the input).
 - `uam_fuzz_abort` (SIGINT in the runner) ends a campaign at the next instruction boundary
   under the interpreter, and with the JIT at a block boundary at most a few thousand blocks on.
 
@@ -464,6 +479,17 @@ in cycles:
 | `seek` | like `explore`, without the cost term: slow entries get as much as fast ones | targets where the slow inputs are the interesting ones |
 | `mmopt` | like `explore`, plus ×2 for entries within 3 generations of the deepest and ×1.5 within 5 | the newest discoveries |
 
+- **Compare logging (input-to-state):** when ember offers it (HELLO), each queue entry,
+  when first chosen and after trimming, runs once as CMP_INPUT. For every compare it logged,
+  `fuzz/tools/cmplog.py` finds one operand's bytes in the input (either byte order, at the
+  compare's width and at the narrowest width that holds both values) and writes the other
+  operand there, plus and minus one for ordered compares: at most `--cmplog-max` (256)
+  candidates per entry, each run and kept if it is new coverage (`op:cmplog` in the
+  queue). Constants of the code that the input lacks become dictionary integers (up to 256).
+  This finds what havoc cannot guess: a 32-bit magic value from `hello world!` in a few
+  thousand executions on every tested board. `--no-cmplog` turns it off; the candidates
+  count as mutated executions for `--iters`, and the status counts `cmplog_execs` and
+  `cmplog_finds`.
 - **Adaptive operators:** every `--reweight-every` (5000) mutated executions, the
   mutator's operators that produced interesting children get more weight (up to 4× their
   default, at least 1); 0 keeps the defaults.
@@ -541,13 +567,16 @@ python3 fuzz/tools/status_tui.py --sync-dir camp      # every worker
 
 Replaying the brain's `crashes/` or `hangs/` directory (`--fuzz-replay run/crashes`) runs
 the inputs and skips their `.info` notes. `make fuzz-lists-test` checks the protocol frame
-by frame against a scripted brain (`tests/fuzz/fake_brain.py`, SPARSE included), runs
+by frame against a scripted brain (`tests/fuzz/fake_brain.py`, SPARSE and CMPS included), runs
 sessions with the brain (`tests/fuzz/brain-check.sh`: the planted crash is reported, saved
 with its reason, minimized, and the session ends with BYE; a session per schedule; the
-planted crash found from a dictionary alone) and a parallel campaign
+planted crash found from a dictionary alone; the magic value found by compare logging and
+not without it) and a parallel campaign
 (`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
 crashes, and survive a killed ember). `make unit-test` runs `tests/fuzz/brain_unit.py` (the
-campaign logic on synthetic data) and `test_fuzz`'s check of the harness's hit lists.
+campaign logic on synthetic data), `fuzz/tools/cmplog.py --selftest` (the input-to-state
+candidates), `test_fuzz`'s checks of the harness's hit lists and compare logging, and
+`test_cov`'s of the compare pass and `CMPLOG` on every ISA and backend.
 
 ### The coverage region (`--cov-shm PATH`)
 

@@ -598,7 +598,11 @@ typedef struct run_cfg {
     void               *exc_ctx;
     bool                illegal_at_s3;  /* replace site 3's instruction by an illegal one */
     bool                skip_repeat;    /* uam_cov_state.skip_repeat */
+    unsigned            cmp;            /* compare instrumentation: CMP_* */
 } run_cfg;
+
+enum { CMP_ON = 1, CMP_LOG = 2 };   /* CMP_ON alone: attached, not logging */
+#define LOG_MAX 64u
 
 typedef struct run_out {
     uam_stop_reason why;
@@ -606,6 +610,9 @@ typedef struct run_out {
     uint8_t         regs[256];
     uint8_t         map[MAP_SIZE];
     uam_exec_stats  stats;
+    uam_cmp_entry   log[LOG_MAX];
+    size_t          n_log;
+    uint64_t        dropped;
 } run_out;
 
 static uam_hook_action stop_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
@@ -663,13 +670,27 @@ static void run_prog(const prog *p, backend bk, const run_cfg *cfg, run_out *out
         CHECK(uam_exec_add_pass(&m.exec, cfg->pass) == UAM_OK, "add pass");
     if (cfg->exc_hook)
         uam_exec_set_exc_hook(&m.exec, cfg->exc_hook, cfg->exc_ctx);
+    uam_cmp_state *cmp = NULL;
+    if (cfg->cmp) {
+        cmp = uam_cmp_state_create(LOG_MAX);
+        CHECK(cmp != NULL, "cmp state");
+        uam_cmp_set_logging(cmp, cfg->cmp & CMP_LOG);
+        CHECK(uam_exec_set_cmp(&m.exec, cmp) == UAM_OK && m.cpu.cmp == cmp, "set cmp");
+    }
 
     out->why = uam_exec_run(&m.exec, 200000);
+    if (cmp) {
+        size_t n;
+        const uam_cmp_entry *e = uam_cmp_log(cmp, &n, &out->dropped);
+        out->n_log = n;
+        memcpy(out->log, e, n * sizeof(*e));
+    }
     out->pc = m.cpu.pc;
     out->icount = m.cpu.icount;
     memcpy(out->regs, m.cpu.regfile, m.cpu.regfile_size < 256 ? m.cpu.regfile_size : 256);
     out->stats = m.exec.stats;
     uam_machine_fini(&m);
+    uam_cmp_state_destroy(cmp);
 }
 
 static bool same_state(const run_out *a, const run_out *b)
@@ -1028,10 +1049,250 @@ static void test_exc_hook(const prog *p)
     }
 }
 
+/* ======================================================================== */
+/* Compare instrumentation (cmp.h): CMPLOG, the pass, the state              */
+/* ======================================================================== */
+
+static unsigned count_op(const uam_block *blk, uam_opcode op)
+{
+    unsigned n = 0;
+    for (uint32_t i = 0; i < blk->n_insn; i++)
+        n += blk->insn[i].op == op;
+    return n;
+}
+
+static const uam_insn *nth_op(const uam_block *blk, uam_opcode op, unsigned k, uint32_t *at)
+{
+    for (uint32_t i = 0; i < blk->n_insn; i++)
+        if (blk->insn[i].op == op && !k--) {
+            if (at)
+                *at = i;
+            return &blk->insn[i];
+        }
+    return NULL;
+}
+
+static void test_cmplog_ir(void)
+{
+    char err[160];
+    /* the verifier */
+    uam_builder bd;
+    uam_builder_init(&bd, 32);
+    uam_builder_begin(&bd, 0x100);
+    uam_imark(&bd, 0x100, 4);
+    uam_ref x = uam_get(&bd, 32, 0);
+    uam_emit(&bd, UAM_OP_CMPLOG, 32, UAM_CMP_EQ | UAM_CMP_IMM, 7, UAM_REF_NONE, x,
+             uam_imm(&bd, 0x1234), UAM_REF_NONE, 0);
+    uam_exit(&bd, UAM_REF_NONE, uam_imm(&bd, 0x104), UAM_EXIT_JUMP);
+    uam_block *blk = uam_builder_finish(&bd);
+    CHECK(verifies(blk, err, sizeof(err)), "cmplog verifies: %s", err);
+    blk->insn[2].flags = 0x10;
+    CHECK(!verifies(blk, err, sizeof(err)), "cmplog: unknown kind flags rejected");
+    blk->insn[2].flags = UAM_CMP_EQ;
+    blk->insn[2].width = 1;
+    CHECK(!verifies(blk, err, sizeof(err)), "cmplog: width 1 rejected");
+    blk->insn[2].width = 32;
+    blk->insn[2].c = blk->insn[2].a;
+    CHECK(!verifies(blk, err, sizeof(err)), "cmplog: a third operand rejected");
+    uam_block_free(blk);
+    uam_builder_free(&bd);
+
+    /* the pass, on the shapes it recognises */
+    uam_builder_init(&bd, 32);
+    uam_builder_begin(&bd, 0x100);
+    uam_imark(&bd, 0x100, 4);
+    uam_ref a = uam_get(&bd, 32, 0), b = uam_get(&bd, 32, 4);
+    uam_ref d = uam_binop(&bd, UAM_OP_SUB, 32, a, b);               /* a flags ISA's cmp a, b */
+    uam_ref z = uam_binop(&bd, UAM_OP_EQ, 32, d, uam_imm(&bd, 0));
+    uam_ref sg = uam_binop(&bd, UAM_OP_SLT, 32, d, uam_imm(&bd, 0));
+    uam_ref v = uam_binop(&bd, UAM_OP_SBORROW, 32, a, b);
+    uam_put(&bd, 8, 8, uam_unop(&bd, UAM_OP_ZEXT, 8, z), UAM_REF_NONE);
+    uam_put(&bd, 8, 9, uam_unop(&bd, UAM_OP_ZEXT, 8, sg), UAM_REF_NONE);
+    uam_put(&bd, 8, 10, uam_unop(&bd, UAM_OP_ZEXT, 8, v), UAM_REF_NONE);
+    uam_imark(&bd, 0x104, 4);
+    uam_ref e1 = uam_binop(&bd, UAM_OP_EQ, 32, a, uam_imm(&bd, 0x1234));  /* a == magic */
+    uam_ref e2 = uam_binop(&bd, UAM_OP_ULT, 32, uam_imm(&bd, 5), b);      /* 5 < b: swapped */
+    uam_ref xo = uam_binop(&bd, UAM_OP_XOR, 32, b, uam_imm(&bd, 0xE5910000u));
+    uam_ref e7 = uam_binop(&bd, UAM_OP_EQ, 32, xo, uam_imm(&bd, 0x3C6A));   /* xoris + cmplwi */
+    uam_ref sb = uam_binop(&bd, UAM_OP_SUB, 32, a, uam_imm(&bd, 0x30));
+    uam_ref e8 = uam_binop(&bd, UAM_OP_ULE, 32, sb, uam_imm(&bd, 9));      /* '0' <= a <= '9' */
+    uam_ref s1 = uam_binop(&bd, UAM_OP_ADD, 32, a, uam_imm(&bd, 1));
+    uam_ref e3 = uam_binop(&bd, UAM_OP_EQ, 32, s1, uam_imm(&bd, 0));     /* zero flag of an add */
+    uam_ref e4 = uam_binop(&bd, UAM_OP_EQ, 32, a, uam_imm(&bd, 0));      /* a == 0 */
+    uam_ref e5 = uam_binop(&bd, UAM_OP_EQ, 32, a, a);                    /* a == a */
+    uam_ref e6 = uam_binop(&bd, UAM_OP_EQ, 1, uam_unop(&bd, UAM_OP_TRUNC, 1, a), z); /* booleans */
+    uam_ref any = uam_binop(&bd, UAM_OP_OR, 1, uam_binop(&bd, UAM_OP_OR, 1, e1, e2),
+                            uam_binop(&bd, UAM_OP_OR, 1, uam_binop(&bd, UAM_OP_OR, 1, e3, e4),
+                                      uam_binop(&bd, UAM_OP_OR, 1, e5,
+                                                uam_binop(&bd, UAM_OP_OR, 1, e6,
+                                                          uam_binop(&bd, UAM_OP_OR, 1, e7, e8)))));
+    uam_exit(&bd, any, uam_imm(&bd, 0x200), UAM_EXIT_JUMP);
+    uam_exit(&bd, UAM_REF_NONE, uam_imm(&bd, 0x108), UAM_EXIT_JUMP);
+    blk = uam_builder_finish(&bd);
+    CHECK(verifies(blk, err, sizeof(err)), "pass input verifies: %s", err);
+    uint32_t sub_at = 0;
+    nth_op(blk, UAM_OP_SUB, 0, &sub_at);
+    uam_cmp_pass *cp;
+    CHECK(uam_cmp_pass_create(&cp) == UAM_OK, "cmp pass");
+    const uam_pass *pass = uam_cmp_pass_get(cp);
+    CHECK(pass->run(pass->ctx, blk) == UAM_OK, "cmp pass runs");
+    CHECK(verifies(blk, err, sizeof(err)), "pass output verifies: %s", err);
+    CHECK(count_op(blk, UAM_OP_CMPLOG) == 5, "five records, not %u", count_op(blk, UAM_OP_CMPLOG));
+    uint32_t at;
+    const uam_insn *r0 = nth_op(blk, UAM_OP_CMPLOG, 0, &at);
+    CHECK(r0 && at == sub_at && r0->a == a && r0->b == b
+          && r0->flags == (UAM_CMP_EQ | UAM_CMP_ORDER | UAM_CMP_SIGNED)
+          && r0->aux == uam_cmp_site(0x100, 0) && r0->width == 32,
+          "the flags of cmp a, b: one record before the sub, kinds or-ed");
+    const uam_insn *r1 = nth_op(blk, UAM_OP_CMPLOG, 1, NULL);
+    CHECK(r1 && r1->a == a && uam_ref_is_imm(r1->b) && blk->imm[uam_ref_index(r1->b)] == 0x1234
+          && r1->flags == (UAM_CMP_EQ | UAM_CMP_IMM) && r1->aux == uam_cmp_site(0x104, 0),
+          "a == magic: the constant is b");
+    const uam_insn *r2 = nth_op(blk, UAM_OP_CMPLOG, 2, NULL);
+    CHECK(r2 && r2->a == b && uam_ref_is_imm(r2->b) && blk->imm[uam_ref_index(r2->b)] == 5
+          && r2->flags == (UAM_CMP_ORDER | UAM_CMP_IMM) && r2->aux == uam_cmp_site(0x104, 1),
+          "5 < b: swapped so that the constant is b");
+    const uam_insn *r3 = nth_op(blk, UAM_OP_CMPLOG, 3, NULL);
+    CHECK(r3 && r3->a == b && uam_ref_is_imm(r3->b) && blk->imm[uam_ref_index(r3->b)] == 0xE5913C6Au
+          && r3->flags == (UAM_CMP_EQ | UAM_CMP_IMM), "b ^ 0xE5910000 == 0x3C6A is b == 0xE5913C6A");
+    const uam_insn *r4 = nth_op(blk, UAM_OP_CMPLOG, 4, NULL);
+    CHECK(r4 && r4->a == a && uam_ref_is_imm(r4->b) && blk->imm[uam_ref_index(r4->b)] == 0x39
+          && r4->flags == (UAM_CMP_ORDER | UAM_CMP_IMM), "a - 0x30 <= 9 is a against 0x39");
+    CHECK(uam_cmp_site(0x100, 0) != uam_cmp_site(0x100, 1)
+          && uam_cmp_site(0x100, 0) != uam_cmp_site(0x104, 0), "site ids differ");
+    FILE *f = tmpfile();
+    if (f) {
+        uam_print_block(f, blk, NULL);
+        rewind(f);
+        char buf[8192];
+        size_t nr = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[nr] = 0;
+        CHECK(strstr(buf, "cmplog") != NULL, "the printer names cmplog");
+        fclose(f);
+    }
+    uam_block_free(blk);
+    uam_builder_free(&bd);
+    uam_cmp_pass_destroy(cp);
+}
+
+static void test_cmp_state(void)
+{
+    uam_cmp_state *s = uam_cmp_state_create(12);
+    CHECK(s && !uam_cmp_logging(s), "a new state does nothing");
+    size_t n;
+    uint64_t dropped;
+    const uint32_t eq32 = 32 | UAM_CMP_EQ << 8;
+    uam_cmp_note(s, 1, eq32, 5, 6);
+    uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 0, "not logging: nothing logged");
+    uam_cmp_set_logging(s, true);
+    uam_cmp_note(s, 1, eq32, 5, 6);
+    uam_cmp_note(s, 1, eq32, 5, 6);
+    uam_cmp_note(s, 2, eq32, 5, 6);
+    const uam_cmp_entry *e = uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 2 && dropped == 0 && e[0].site == 1 && e[1].site == 2 && e[0].a == 5 && e[0].b == 6
+          && e[0].width == 32 && e[0].kind == UAM_CMP_EQ, "distinct (site, a, b) once, in order");
+    for (uint64_t i = 0; i < 20; i++)
+        uam_cmp_note(s, 3, eq32, i, 100);
+    e = uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 2 + UAM_CMP_SITE_MAX && dropped == 20 - UAM_CMP_SITE_MAX,
+          "at most UAM_CMP_SITE_MAX pairs a site (n %zu, dropped %llu)", n, (unsigned long long)dropped);
+    uam_cmp_note(s, 4, eq32, 1, 2);
+    uam_cmp_note(s, 5, eq32, 1, 2);
+    uam_cmp_note(s, 6, eq32, 1, 2);
+    e = uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 12 && dropped == 20 - UAM_CMP_SITE_MAX + 1, "the log's capacity holds");
+    uam_cmp_reset(s);
+    e = uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 0 && dropped == 0, "reset empties the log");
+    uam_cmp_note(s, 1, eq32, 5, 6);
+    uam_cmp_note(s, 3, eq32, 50, 100);
+    e = uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 2 && e[0].site == 1 && e[1].a == 50, "after a reset, the same pairs log again");
+
+    uam_cmp_set_logging(s, false);
+    uam_cmp_note(s, 9, eq32, 1, 2);
+    uam_cmp_log(s, &n, &dropped);
+    CHECK(n == 2, "logging off again: nothing more logged");
+    uam_cmp_state_destroy(s);
+    CHECK(uam_cmp_state_create(1u << 25) == NULL, "an absurd capacity is refused");
+}
+
+/* The pairs (k, n) the loop's compare sees, k = 2..n (the first pass runs in the block that
+ * set both registers, where the optimizer folds the compare away): does the log hold all
+ * of them, as equality tests? */
+static bool log_has_loop(const run_out *o, uint64_t n)
+{
+    for (uint64_t k = 2; k <= n; k++) {
+        bool found = false;
+        for (size_t i = 0; i < o->n_log && !found; i++)
+            found = ((o->log[i].a == k && o->log[i].b == n) || (o->log[i].a == n && o->log[i].b == k))
+                    && (o->log[i].kind & UAM_CMP_EQ);
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+static void test_cmp_on(const prog *p)
+{
+    const run_cfg base_cfg = { .mode = COV_BLOCKS };
+    run_out base, o, first;
+    run_prog(p, BK_INTERP, &base_cfg, &base);
+    CHECK(base.why == UAM_STOP_HOOK, "%s: cmp baseline runs", p->name);
+    for (int bk = 0; bk < 3; bk++) {
+        /* attached with both uses off: nothing changes */
+        run_cfg c = base_cfg;
+        c.cmp = CMP_ON;
+        run_prog(p, (backend)bk, &c, &o);
+        CHECK(same_state(&o, &base) && !memcmp(o.map, base.map, MAP_SIZE) && o.n_log == 0,
+              "%s/%s: compare pass, nothing attached to do: the same run", p->name, bk_name[bk]);
+        /* logging: the same run, the same log on every backend */
+        c.cmp = CMP_ON | CMP_LOG;
+        run_prog(p, (backend)bk, &c, &o);
+        CHECK(same_state(&o, &base) && !memcmp(o.map, base.map, MAP_SIZE),
+              "%s/%s: logging changes nothing else", p->name, bk_name[bk]);
+        if (bk == 0)
+            first = o;
+        else
+            CHECK(o.n_log == first.n_log && !memcmp(o.log, first.log, o.n_log * sizeof(o.log[0])),
+                  "%s/%s: the same log as the interpreter (%zu vs %zu entries)", p->name,
+                  bk_name[bk], o.n_log, first.n_log);
+    }
+    CHECK(first.dropped == 0, "%s: nothing dropped", p->name);
+    if (getenv("UAM_TEST_CMP_DUMP"))
+        for (size_t i = 0; i < first.n_log; i++)
+            fprintf(stderr, "%s: site %08x w%u kind %x a 0x%llx b 0x%llx\n", p->name,
+                    first.log[i].site, first.log[i].width, first.log[i].kind,
+                    (unsigned long long)first.log[i].a, (unsigned long long)first.log[i].b);
+    /* every ISA whose loop compares two registers: the log holds each (x, n) */
+    static const char *const two_reg[] = { "rv32", "mips32be", "mips32le", "armv7", "thumb2",
+                                           "thumb2-be8", "ppc32", NULL };
+    for (unsigned i = 0; two_reg[i]; i++)
+        if (!strcmp(p->name, two_reg[i]))
+            CHECK(log_has_loop(&first, 3), "%s: the log holds the loop's compares", p->name);
+
+    /* off again: no pass, nothing attached */
+    uam_machine m;
+    CHECK(uam_machine_init(&m, p->isa) == UAM_OK, "machine");
+    uam_cmp_state *s = uam_cmp_state_create(0);
+    CHECK(uam_exec_set_cmp(&m.exec, s) == UAM_OK && m.exec.n_passes == 1, "%s: cmp on", p->name);
+    uam_exec_cmp_attach(&m.exec, false);
+    CHECK(m.cpu.cmp == NULL, "detached");
+    uam_exec_cmp_attach(&m.exec, true);
+    CHECK(m.cpu.cmp == s, "attached again");
+    CHECK(uam_exec_set_cmp(&m.exec, NULL) == UAM_OK && m.exec.n_passes == 0 && m.cpu.cmp == NULL,
+          "%s: cmp off removes the pass", p->name);
+    uam_machine_fini(&m);
+    uam_cmp_state_destroy(s);
+}
+
 int main(void)
 {
     test_ir_rules();
     test_ir_semantics();
+    test_cmplog_ir();
+    test_cmp_state();
 
     const prog progs3[] = { rv_prog(3), mips_prog(3, true), mips_prog(3, false),
                             arm_prog(3, false, false), arm_prog(3, true, false),
@@ -1049,6 +1310,7 @@ int main(void)
         test_skip_repeat(&progs3[i]);
         test_passes(&progs3[i]);
         test_exc_hook(&progs3[i]);
+        test_cmp_on(&progs3[i]);
     }
 
     printf("test_cov: %d/%d checks passed\n", n_checks - n_failed, n_checks);

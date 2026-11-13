@@ -155,6 +155,19 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   variants `lin`, `quad` (gentler `fast`), `seek` (`explore` ignoring cost) and `mmopt`
   (`explore` favoring the newest, deepest entries). After the
   baseline it suggests a `--fuzz-iter-insns` (5x the slowest entry).
+- Compare logging (on when ember offers it in HELLO; `--no-cmplog` turns it off): each
+  queue entry, when first chosen, runs once with its compares logged (CMP_INPUT, a CMPS
+  frame back), and `fuzz/tools/cmplog.py` writes each compare's other operand where one
+  operand's bytes are in the input (both byte orders, also at the narrowest width; ±1 for
+  ordered compares), up to `--cmplog-max` (256) runs per entry. Code constants the input
+  lacks join the dictionary. Normal runs pay 1-3% for it. It reaches what havoc cannot
+  guess (a 32-bit magic value from an unrelated seed in a few thousand runs), but not
+  compares done a byte at a time in a loop (`strcmp`, `memcmp`) or on values computed
+  from the input (parsed numbers, checksums): give those a dictionary. Its finds are
+  `op:cmplog` queue entries; the status shows `cmplog_execs` and `cmplog_finds`. The
+  log works with any coverage, but with function-entry sites only, an input that passes a
+  compare inside a function is not new coverage and is dropped: block coverage or real
+  site lists let compare logging chain one compare after another.
 - A dictionary (`--dict FILE`, repeatable) in ember's format: `"text"`, `hex:BYTES`,
   `u8:`/`u16:`/`u32:`/`u64:` integers in the target's byte order (from HELLO), `u32be:`
   and the like for a fixed order. Take the tokens from the handler's compares in Ghidra:

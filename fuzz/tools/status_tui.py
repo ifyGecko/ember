@@ -47,6 +47,8 @@ unknown keys are ignored, missing ones render as "?"):
   favored        favored queue entries   pending_favored  favored, never chosen yet
   unstable       entries that ran differently twice (a harness that leaks state)
   imported       entries imported from other workers
+  cmplog_execs, cmplog_finds   input-to-state candidates run, and those that were new
+                 coverage (compare logging)
   worker, role, schedule   the worker's name, main/secondary, its power schedule
   config         object of label:value pairs for the "run config" box
   finished       true when the run is over
@@ -171,6 +173,7 @@ class Status:
         "favored": "favored", "pending_favored": "pending_favored",
         "unstable": "unstable", "imported": "imported", "worker": "worker",
         "role": "role", "schedule": "schedule",
+        "cmplog_execs": "cmplog_execs", "cmplog_finds": "cmplog_finds",
     }
 
     def __init__(self):
@@ -194,6 +197,8 @@ class Status:
         self.pending_favored = None
         self.unstable = None
         self.imported = None
+        self.cmplog_execs = None
+        self.cmplog_finds = None
         self.worker = None
         self.role = None
         self.schedule = None
@@ -477,6 +482,8 @@ def render(st, w, h, title="ember fuzz status", source=None,
         _field("unstable", opt(st.unstable) + ("  (harness leaks state!)"
                                                if st.unstable else ""), 14),
         _field("imported", opt(st.imported), 14),
+        _field("cmplog finds", "—" if st.cmplog_execs is None
+               else f"{fmt_n(st.cmplog_finds or 0)}  ({fmt_n(st.cmplog_execs)} tried)", 14),
     ], "latest findings", [
         _field("find", st.last_msg.get("find", none), 5),
         _field("crash", st.last_msg.get("crash", none), 5),
@@ -718,7 +725,7 @@ def selftest():
     a, b = Status(), Status()
     a.apply({"t": 5, "execs": 500, "corpus": 9, "edges": 30, "worker": "main", "role": "main",
              "schedule": "fast", "favored": 4, "pending_favored": 1, "imported": 2,
-             "unstable": 0, "crashes_unique": 1})
+             "unstable": 0, "crashes_unique": 1, "cmplog_execs": 40, "cmplog_finds": 3})
     b.apply({"t": 5, "execs": 300, "corpus": 7, "edges": 25, "worker": "w1",
              "role": "secondary", "schedule": "rare", "unstable": 1, "finished": True})
     a.last_update_wall = b.last_update_wall = time.time()
@@ -728,6 +735,7 @@ def selftest():
     assert "unstable entries" in blob, blob
     blob = text(render(a, 100, 60))
     assert "favored" in blob and "imported" in blob, "queue fields on the single board"
+    assert "cmplog finds" in blob and "(40 tried)" in blob, "compare logging on the single board"
     print("[selftest] ok: static board renders at 60/80/100/132 cols, "
           "full config, run state, apply() works, the workers view")
     return 0

@@ -12,7 +12,7 @@ explains how to use them.
 | site list | `UAMS` | 1 | little-endian | `gen_sites.py` | `--cov-sites` |
 | boundary file | `UAMB` | 1 | little-endian | `gen_boundaries.py` | `--cov-boundary` |
 | coverage region | `UAMC` | 1 | the writer's | `--cov-shm` | `cov_region.py`, outside readers |
-| fuzz protocol | `UAMF` | 1 (OPTIONS and SPARSE are optional, negotiated) | big-endian | ember and `fuzz_brain.py` | each other |
+| fuzz protocol | `UAMF` | 1 (OPTIONS, SPARSE and compare logging are optional, negotiated) | big-endian | ember and `fuzz_brain.py` | each other |
 
 Readers check the magic and the version, and refuse a file of any other version. For a
 site list or a boundary file the error names the tool that makes a current one.
@@ -166,13 +166,15 @@ Every integer is big-endian, and maps are raw u8 counters.
 
 | Type | Direction | Payload |
 |---|---|---|
-| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits, and bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
+| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits; bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
 | 2 INPUT | brain → ember | u64 id (non-zero), u32 len, data |
 | 3 COVERAGE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u32 map_size, map |
 | 4 CRASH | ember → brain | u64 id, u8 reason, u32 status |
 | 5 BYE | either way | none |
-| 6 OPTIONS | brain → ember, optional, once after HELLO and before the first INPUT | u32 flags: bit 0 SPARSE (reply with SPARSE instead of COVERAGE); later fields, if any, are ignored |
+| 6 OPTIONS | brain → ember, optional, after HELLO (normally once, before the first INPUT; each one replaces the last) | u32 flags: bit 0 SPARSE (reply with SPARSE instead of COVERAGE), bit 1 CMP_LOG (instrument the target's compares, for CMP_INPUT); later fields, if any, are ignored |
 | 7 SPARSE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u64 insns (instructions the iteration ran; 0 for INIT), u32 map_size, u32 n, then n × (u32 index, u8 count), indices ascending |
+| 8 CMP_INPUT | brain → ember | as INPUT; the run also logs what its compares saw |
+| 9 CMPS | ember → brain, right before a CMP_INPUT's reply | u64 id, u32 n, u32 dropped, then n × (u32 site, u8 width (bits), u8 kind, u64 a, u64 b) |
 
 **Lockstep.** After HELLO, ember sends the boot's map once, unsolicited, as COVERAGE id 0,
 kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE (or SPARSE) kind
@@ -187,6 +189,19 @@ brain that asks for SPARSE handles both. The INIT map, sent before OPTIONS can a
 always COVERAGE. An ember that predates OPTIONS ignores it and keeps sending COVERAGE; a
 brain that sends no OPTIONS gets COVERAGE as before. `insns` is the iteration's cost, which
 the brain's schedules use.
+
+**Compare logging.** An ember whose HELLO has bit 14 instruments the target's compares
+when OPTIONS has bit 1 (the compare pass, [`uam-isa.md`](uam-isa.md) §7.6). From then on a
+CMP_INPUT runs like an INPUT, and its usual reply is preceded by one CMPS frame with the
+same id: the distinct (site, a, b) its compares saw, in the order first seen, at most 8
+per site and 1024 in all (`dropped` counts the records left out). `kind` says what was
+compared: bit 0 EQ (an equality, or a difference tested for zero: a flags ISA's compare),
+bit 1 ORDER, bit 2 SIGNED, bit 3 IMM (b is a constant of the code). A compare of `x ^ c1`,
+`x + c1` or `x - c1` with a constant comes as `x` against the constant `x` must equal.
+Compares with 0, of a value with itself and of two constants are left out. Without bit 1 a
+CMP_INPUT still gets an empty CMPS (n = 0). A brain sends CMP_INPUT only to an ember that
+announced it: an older one would ignore the frame and never answer. Plain INPUTs are not
+logged; while compare logging is on they cost a load and an untaken branch per compare.
 
 The session ends with BYE from either side. EOF before a BYE is an error. ember notices a
 vanished brain host through TCP keepalive, and a brain that stops answering through

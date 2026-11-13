@@ -186,7 +186,13 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * COVERAGE (or SPARSE) or CRASH reply carrying its id; ember sends one unsolicited COVERAGE
  * (id 0, kind INIT) first. A brain that sends OPTIONS with UAM_NET_OPT_SPARSE (after HELLO,
  * before its first INPUT) gets SPARSE replies in place of COVERAGE from then on; an ember
- * that predates OPTIONS ignores it, as every peer ignores unknown frame types. */
+ * that predates OPTIONS ignores it, as every peer ignores unknown frame types.
+ *
+ * Compare logging: an ember whose HELLO has UAM_NET_HELLO_CMP accepts OPTIONS with
+ * UAM_NET_OPT_CMP_LOG (which instruments the target's compares) and then CMP_INPUT, an
+ * INPUT whose run also logs the values its compares saw: ember sends them as one CMPS
+ * frame (with the input's id) right before the input's usual reply. A brain sends
+ * CMP_INPUT only to an ember that announced it. */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
 #define UAM_FUZZ_NET_VERSION   1u
@@ -200,13 +206,17 @@ enum uam_fuzz_net_frame {
     UAM_NET_BYE      = 5,   /* either way: clean shutdown */
     UAM_NET_OPTIONS  = 6,   /* brain -> ember, optional, once after HELLO: what it wants */
     UAM_NET_SPARSE   = 7,   /* ember -> brain: one map as its set buckets (OPTIONS asked) */
+    UAM_NET_CMP_INPUT = 8,  /* brain -> ember: an input whose compares are logged too */
+    UAM_NET_CMPS     = 9,   /* ember -> brain: a CMP_INPUT's compares, before its reply */
 };
 
 /* HELLO flags beyond the UAM_COV_SCHEME* bits */
 #define UAM_NET_HELLO_BIG_ENDIAN  (1u << 15)  /* the target's data byte order is big-endian */
+#define UAM_NET_HELLO_CMP         (1u << 14)  /* OPTIONS CMP_LOG and CMP_INPUT are understood */
 
 /* OPTIONS flags */
 #define UAM_NET_OPT_SPARSE        (1u << 0)   /* reply with SPARSE instead of COVERAGE */
+#define UAM_NET_OPT_CMP_LOG       (1u << 1)   /* instrument compares for CMP_INPUT (HELLO_CMP) */
 
 /* HELLO:    u16 version, u16 flags (UAM_COV_SCHEME* bits), u32 map_size,
  *           u16 arch_len (<= UAM_NET_ARCH_MAX), u8 arch[arch_len] (the ISA's name)
@@ -216,7 +226,13 @@ enum uam_fuzz_net_frame {
  * OPTIONS:  u32 flags (UAM_NET_OPT_*); more fields may follow, to be ignored
  * SPARSE:   u64 id (0: the INIT map), u8 kind, u64 insns (instructions the iteration ran),
  *           u32 map_size, u32 n, then n x (u32 index, u8 count), indices ascending. A map
- *           with too many set buckets for the list to be smaller goes as COVERAGE instead. */
+ *           with too many set buckets for the list to be smaller goes as COVERAGE instead.
+ * CMP_INPUT: as INPUT
+ * CMPS:     u64 id, u32 n, u32 dropped (records left out: the log or a site was full),
+ *           then n x (u32 site, u8 width (bits), u8 kind (UAM_NET_CMP_*), u64 a, u64 b),
+ *           in the order first seen; each distinct (site, a, b) once, at most 8 per site.
+ *           A difference tested for zero counts as EQ; with IMM, b is a constant of the
+ *           code. n = 0 when compare logging is off (no OPTIONS CMP_LOG). */
 #define UAM_NET_HELLO_FIXED_LEN    10u
 #define UAM_NET_ARCH_MAX           64u
 #define UAM_NET_INPUT_HDR_LEN      12u
@@ -225,6 +241,14 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_OPTIONS_MIN_LEN    4u
 #define UAM_NET_SPARSE_HDR_LEN     25u
 #define UAM_NET_SPARSE_ENTRY_LEN   5u
+#define UAM_NET_CMPS_HDR_LEN       16u
+#define UAM_NET_CMPS_ENTRY_LEN     22u
+
+/* CMPS kinds (the same bits as the IR's UAM_CMP_*) */
+#define UAM_NET_CMP_EQ     0x1u   /* equality */
+#define UAM_NET_CMP_ORDER  0x2u   /* ordering */
+#define UAM_NET_CMP_SIGNED 0x4u   /* signed ordering */
+#define UAM_NET_CMP_IMM    0x8u   /* b is a constant */
 
 /* (reason, status) is a crash's identity for deduplication. */
 enum uam_fuzz_net_reason {

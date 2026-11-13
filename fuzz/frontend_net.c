@@ -16,6 +16,10 @@
  *   UAM_FUZZ_TIMEOUT       CRASH TIMEOUT,  status 0
  *   UAM_FUZZ_REJECTED      CRASH REJECTED, status 0: the route refused the input
  *
+ * A brain that sends OPTIONS with UAM_NET_OPT_CMP_LOG gets compare logging (HELLO says
+ * UAM_NET_HELLO_CMP): each CMP_INPUT runs like an INPUT with its compares logged, and its
+ * reply is preceded by a CMPS frame listing them.
+ *
  * A brain that sends OPTIONS with UAM_NET_OPT_SPARSE gets SPARSE replies in place of
  * COVERAGE from then on: the map's set buckets as (index, count) pairs, plus the
  * iteration's instruction count; a map too dense for that to be smaller still goes as
@@ -44,6 +48,10 @@
 #include "formats.h"
 #include "cov_formats.h"
 
+_Static_assert(UAM_NET_CMP_EQ == UAM_CMP_EQ && UAM_NET_CMP_ORDER == UAM_CMP_ORDER
+               && UAM_NET_CMP_SIGNED == UAM_CMP_SIGNED && UAM_NET_CMP_IMM == UAM_CMP_IMM,
+               "CMPS kinds are the IR's compare kinds");
+
 #define CONNECT_TRIES     50            /* the brain may still be starting: ~5 s */
 #define CONNECT_DELAY_NS  100000000L
 #define KEEPALIVE_IDLE_S  60            /* probe after a minute of silence ... */
@@ -57,6 +65,7 @@ struct cf_net {
     uint16_t  flags;       /* HELLO scheme flags */
     bool      big_endian;  /* the target's data byte order (HELLO) */
     bool      sparse;      /* OPTIONS asked for SPARSE replies */
+    bool      cmp_pending; /* the input being run is a CMP_INPUT: CMPS before its reply */
     uam_fuzz *fuzz;        /* cf_net_attach: the harness (results, hit lists) */
     unsigned  timeout_s;   /* per-frame wait for the brain; 0: none */
     uint8_t  *in;          /* the last frame's payload */
@@ -285,7 +294,8 @@ static uam_status net_hello(void *ctx, const uam_fuzz_info *info)
     if (!write_all(z, (const uint8_t *)UAM_FUZZ_NET_MAGIC, 4))
         return UAM_ERR_INVALID;
     uint8_t *p = put16(z->out + 5, UAM_FUZZ_NET_VERSION);
-    p = put16(p, (uint16_t)(z->flags | (z->big_endian ? UAM_NET_HELLO_BIG_ENDIAN : 0)));
+    p = put16(p, (uint16_t)(z->flags | (z->big_endian ? UAM_NET_HELLO_BIG_ENDIAN : 0)
+                            | (z->fuzz ? UAM_NET_HELLO_CMP : 0)));
     p = put32(p, info->map_size);
     p = put16(p, (uint16_t)alen);
     memcpy(p, info->arch, alen);
@@ -324,10 +334,21 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             z->peer_bye = true;
             return 0;
         case UAM_NET_OPTIONS:
-            if (plen >= UAM_NET_OPTIONS_MIN_LEN)
-                z->sparse = (get32(z->in) & UAM_NET_OPT_SPARSE) && z->fuzz;
+            if (plen >= UAM_NET_OPTIONS_MIN_LEN && z->fuzz) {
+                const uint32_t o = get32(z->in);
+                z->sparse = o & UAM_NET_OPT_SPARSE;
+                unsigned modes = uam_fuzz_cmp_modes(z->fuzz) & ~UAM_FUZZ_CMP_LOG;
+                if (o & UAM_NET_OPT_CMP_LOG)
+                    modes |= UAM_FUZZ_CMP_LOG;
+                if (uam_fuzz_set_cmp(z->fuzz, modes) != UAM_OK)
+                    uam_log(UAM_LOG_WARN, "fuzz-net", "cannot turn compare logging %s",
+                            modes & UAM_FUZZ_CMP_LOG ? "on" : "off");
+                else if (modes & UAM_FUZZ_CMP_LOG)
+                    uam_log(UAM_LOG_INFO, "fuzz-net", "compare logging on (the brain asked)");
+            }
             continue;
-        case UAM_NET_INPUT: {
+        case UAM_NET_INPUT:
+        case UAM_NET_CMP_INPUT: {
             uint32_t dlen = plen >= UAM_NET_INPUT_HDR_LEN ? get32(z->in + 8) : 0;
             if (plen < UAM_NET_INPUT_HDR_LEN || dlen > plen - UAM_NET_INPUT_HDR_LEN) {
                 uint64_t bad = plen >= 8 ? get64(z->in) : 0;
@@ -340,6 +361,9 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             *id = get64(z->in);
             *len = dlen;
             *data = z->in + UAM_NET_INPUT_HDR_LEN;
+            z->cmp_pending = hdr[4] == UAM_NET_CMP_INPUT;
+            if (z->cmp_pending && z->fuzz)
+                uam_fuzz_cmp_arm(z->fuzz);   /* false with logging off: an empty CMPS */
             return 1;
         }
         default:
@@ -372,11 +396,42 @@ static bool send_sparse(cf_net *z, uint64_t id, int kind, size_t map_size, bool 
     return true;
 }
 
+/* The compares the last iteration logged (none unless it was armed). */
+static bool send_cmps(cf_net *z, uint64_t id)
+{
+    size_t n = 0;
+    uint64_t dropped = 0;
+    const uam_cmp_entry *e = z->fuzz ? uam_fuzz_cmp_log(z->fuzz, &n, &dropped) : NULL;
+    if (!e)
+        n = 0;
+    const size_t len = UAM_NET_CMPS_HDR_LEN + n * UAM_NET_CMPS_ENTRY_LEN;
+    if (!reserve(&z->out, &z->out_cap, 5 + len)) {
+        z->broken = true;
+        return false;
+    }
+    uint8_t *p = put64(z->out + 5, id);
+    p = put32(p, (uint32_t)n);
+    p = put32(p, dropped > UINT32_MAX ? UINT32_MAX : (uint32_t)dropped);
+    for (size_t i = 0; i < n; i++) {
+        p = put32(p, e[i].site);
+        *p++ = e[i].width;
+        *p++ = e[i].kind;
+        p = put64(p, e[i].a);
+        p = put64(p, e[i].b);
+    }
+    return send_frame(z, UAM_NET_CMPS, len);
+}
+
 static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
                              const uint8_t *map, size_t map_size, int kind)
 {
     cf_net *z = ctx;
     bool ok;
+    if (kind == UAM_FUZZ_KIND_ITER && z->cmp_pending) {
+        z->cmp_pending = false;
+        if (!send_cmps(z, id))
+            return UAM_ERR_INVALID;
+    }
     if ((kind == UAM_FUZZ_KIND_INIT || v == UAM_FUZZ_OK) && z->sparse
         && send_sparse(z, kind == UAM_FUZZ_KIND_INIT ? 0 : id, kind, map_size, &ok)) {
         /* sent (or failed) as SPARSE */
