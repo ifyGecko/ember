@@ -459,6 +459,10 @@ in cycles:
 | `exploit` | the score at full strength: small, cheap, new entries | depth |
 | `coe` | like `fast`, but nothing to entries whose path runs more often than the mean | aggressive rarity, next to `fast` |
 | `rare` | entries that hit the rarest buckets | narrow checks: parsers, protocols |
+| `lin` | like `fast`, but energy grows linearly with the times an entry was chosen (÷ its path's frequency + 1) | a gentler `fast` |
+| `quad` | like `lin`, but quadratic in the times chosen | between `lin` and `fast` |
+| `seek` | like `explore`, without the cost term: slow entries get as much as fast ones | targets where the slow inputs are the interesting ones |
+| `mmopt` | like `explore`, plus ×2 for entries within 3 generations of the deepest and ×1.5 within 5 | the newest discoveries |
 
 - **Adaptive operators:** every `--reweight-every` (5000) mutated executions, the
   mutator's operators that produced interesting children get more weight (up to 4× their
@@ -487,7 +491,8 @@ runs N brain + ember pairs, each on its own port with its own output directory `
 every `--sync-interval` seconds (60), each one runs the other workers' new queue entries
 once and keeps those that are new to it (`sync:` names; `.synced/PEER` records how far it
 read). Each worker gets a distinct RNG seed, derived from `--seed-rng` and its name
-(identical workers would only repeat each other), and the next schedule of `--schedules`
+(identical workers would only repeat each other), and the next schedule of `--schedules` (by default the five main ones; any of the nine can
+be listed)
 (default all five, round robin); `--dict` and `--seeds` go to every worker, `--brain-arg`
 passes anything else. A worker whose brain or ember exits unexpectedly is restarted from
 its queue (`--max-restarts`, 5); Ctrl-C stops them all with BYE.

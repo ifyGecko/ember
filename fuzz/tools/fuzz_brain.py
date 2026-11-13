@@ -18,7 +18,7 @@ The brain
     **calibration** (a new entry runs twice; ember is deterministic, so a
     difference is a harness bug, reported as UNSTABLE), **trimming**, and an
     **energy** per entry from a performance score times its **power schedule**
-    (--schedule fast, explore, exploit, coe, rare);
+    (--schedule fast, explore, exploit, coe, rare, lin, quad, seek, mmopt);
   - mutates with fuzz/tools/mutate.py (havoc + splice), an optional ember
     **dictionary** (--dict; integer tokens in the target's byte order, from
     HELLO), and operator weights it **adapts** to what finds coverage;
@@ -173,7 +173,7 @@ def main():
                          "budget, not a protocol limit)")
     ap.add_argument("--schedule", default="fast", choices=SCHEDULES,
                     help="power schedule: how much energy each queue entry gets "
-                         "(default fast; docs/fuzz-ideas.md)")
+                         "(default fast; docs/fuzzing.md has the table)")
     ap.add_argument("--dict", action="append", default=[],
                     help="ember dictionary file (fuzz/tools/mutate.py's format; "
                          "integer tokens follow the target's byte order); repeatable")

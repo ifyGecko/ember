@@ -109,6 +109,38 @@ def test_schedules():
         for e in (a, b):
             n = q.energy(e)
             check(0 <= n <= fq.HAVOC_BASE * fq.SCORE_MAX // 100, "%s: energy %d in range" % (s, n))
+    for s in ("lin", "quad"):
+        q, a, b = queue(s)
+        check(0 < q.factor(a) < q.factor(b), "%s: never chosen is not starved; rare paths get more" % s)
+    q, a, b = queue("lin")
+    f1 = q.factor(b)
+    b.times_chosen = 3
+    check(abs(q.factor(b) - 4 * f1) < 1e-9, "lin: linear in the times chosen")
+    q2, a2, b2 = queue("quad")
+    b2.times_chosen = 3
+    check(abs(q2.factor(b2) - 16 * q2.factor(entry(9, [3], path=b"B" * 8))) < 1e-9,
+          "quad: quadratic in the times chosen")
+    check(q2.factor(b2) > q.factor(b), "quad grows faster than lin")
+    b2.times_chosen = 1000
+    check(q2.factor(b2) == fq.MAX_FACTOR, "quad: capped")
+    q, a, b = queue("seek")
+    check(q.factor(a) == q.factor(b) == 1.0, "seek: no factor")
+    q = fq.Queue("seek")
+    cheap, dear = entry(0, [1], insns=10), entry(1, [2], insns=10000)
+    q.add(cheap)
+    q.add(dear)
+    check(q.energy(cheap) == q.energy(dear), "seek: the cost term is left out")
+    q = fq.Queue("mmopt")
+    old, mid, new = entry(0, [1], depth=1), entry(1, [2], depth=6), entry(2, [3], depth=9)
+    for e in (old, mid, new):
+        q.add(e)
+    check(q.factor(old) == 1.0, "mmopt: no factor")
+    ex = fq.Queue("explore")
+    for e in (old, mid, new):
+        ex.add(e)
+    check(q.energy(new) == 2 * ex.energy(new) and q.energy(mid) == int(1.5 * ex.energy(mid))
+          and q.energy(old) == ex.energy(old),
+          "mmopt: x2 within 3 generations of the deepest, x1.5 within 5, else as explore")
     q = fq.Queue("explore")
     cheap, dear = entry(0, [1], insns=10), entry(1, [2], insns=10000)
     q.add(cheap)

@@ -31,7 +31,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BRAIN = os.path.join(HERE, "fuzz_brain.py")
-SCHEDULES = ("fast", "explore", "exploit", "coe", "rare")
+sys.dont_write_bytecode = True
+sys.path.insert(0, HERE)
+from fuzz_queue import SCHEDULES  # noqa: E402
 
 
 def free_port():
@@ -124,7 +126,8 @@ def main():
     ap.add_argument("-n", "--workers", type=int, required=True, help="number of workers")
     ap.add_argument("--out", required=True, help="the sync directory (one subdirectory per worker)")
     ap.add_argument("--schedules", default="fast,explore,exploit,coe,rare",
-                    help="comma list, assigned round robin (default: all five)")
+                    help="comma list, assigned round robin (default: the five main ones; "
+                         "also lin, quad, seek, mmopt)")
     ap.add_argument("--seeds", help="seed directory for every worker")
     ap.add_argument("--dict", action="append", default=[], help="dictionary for every worker")
     ap.add_argument("--seed-rng", type=int, default=0xC0FFEE,

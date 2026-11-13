@@ -10,7 +10,8 @@
 # replays as a crash, and so does the whole crashes/ directory, running only the inputs
 # (not their .info notes). The brain asks for SPARSE replies and must get them.
 #
-# Then a short session per power schedule (explore, exploit, coe, rare: each must save the
+# Then a short session per power schedule (every one but fast, which the first session ran:
+# explore, exploit, coe, rare, lin, quad, seek, mmopt; each must save the
 # seeded crash, keep a queue and end cleanly, with no unstable entry), and one with no
 # crashing seed at all but an ember dictionary holding the trigger (an integer token in the
 # target's byte order and a string): the brain must find the planted FAULT by mutation.
@@ -116,7 +117,7 @@ session() {
     return 0
 }
 
-for sched in explore exploit coe rare; do
+for sched in explore exploit coe rare lin quad seek mmopt; do
     if session "s-$sched" 600 --seeds "$tmp/seeds" --schedule "$sched"; then
         if ! ls "$tmp/s-$sched/crashes" | grep -q -v '\.info$'; then
             echo "brain-check: $board: schedule $sched: the seeded crash was not saved" >&2

@@ -153,7 +153,7 @@ def name_id(name: str) -> Optional[int]:
 
 # ---- schedules -----------------------------------------------------------------------
 
-SCHEDULES = ("fast", "explore", "exploit", "coe", "rare")
+SCHEDULES = ("fast", "explore", "exploit", "coe", "rare", "lin", "quad", "seek", "mmopt")
 MAX_FACTOR = 32           # the most a schedule multiplies the performance score by
 HAVOC_BASE = 128          # mutations for a score of 100
 SCORE_MAX = 1600          # the highest performance score after the factor
@@ -249,9 +249,12 @@ class Queue:
 
     def perf_score(self, e: Entry, avg_insns: float, avg_buckets: float) -> float:
         """AFL's performance score: cheaper and wider than average scores higher, late
-        and deep entries get a bonus."""
+        and deep entries get a bonus. seek leaves out the cost term (every entry scores
+        as if it ran in average time); mmopt adds a bonus for the deepest lineages."""
         cost = max(1, e.insns)
-        if cost * 0.1 > avg_insns:
+        if self.schedule == "seek":
+            score = 100.0
+        elif cost * 0.1 > avg_insns:
             score = 10.0
         elif cost * 0.25 > avg_insns:
             score = 25.0
@@ -284,17 +287,30 @@ class Queue:
             score *= 2
         d = e.depth
         score *= 1 if d <= 3 else 2 if d <= 7 else 3 if d <= 13 else 4 if d <= 25 else 5
+        if self.schedule == "mmopt":
+            # the newest discoveries: entries within a few generations of the deepest
+            gap = self.max_depth() - d
+            score *= 2 if gap < 3 else 1.5 if gap < 5 else 1
         return score
+
+    def max_depth(self) -> int:
+        return max((x.depth for x in self.entries), default=0)
 
     def factor(self, e: Entry) -> float:
         """The schedule's multiplier (0: skip this entry for now)."""
         s = self.schedule
-        if s == "explore":
+        if s in ("explore", "seek", "mmopt"):
             return 1.0
         if s == "exploit":
             return float(MAX_FACTOR)
         freq = max(1, self.path_freq.get(e.path, 1))
         lvl = e.times_chosen
+        if s in ("lin", "quad"):
+            # AFL++'s fuzz_level / (freq + 1) and fuzz_level^2 / (freq + 1); the level
+            # counts this pick, so an entry never chosen is not starved at 0
+            n = lvl + 1
+            f = (n if s == "lin" else n * n) / (freq + 1)
+            return min(float(MAX_FACTOR), max(f, 1.0 / MAX_FACTOR))
         fast = ((1 << lvl) / freq) if lvl < 16 else MAX_FACTOR / _next_pow2(freq)
         fast = min(float(MAX_FACTOR), fast)
         if s == "fast":

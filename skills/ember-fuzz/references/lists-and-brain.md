@@ -151,7 +151,9 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
 - The campaign (`docs/fuzzing.md`, "The campaign"): a favored set, calibration (each new
   entry runs twice; an `UNSTABLE` line means the harness leaks state between iterations:
   fix that first, the readiness gate in `SKILL.md`), trimming, and energy from a power
-  schedule: `--schedule fast` (default), `explore`, `exploit`, `coe`, `rare`. After the
+  schedule: `--schedule fast` (default), `explore`, `exploit`, `coe`, `rare`, and the
+  variants `lin`, `quad` (gentler `fast`), `seek` (`explore` ignoring cost) and `mmopt`
+  (`explore` favoring the newest, deepest entries). After the
   baseline it suggests a `--fuzz-iter-insns` (5x the slowest entry).
 - A dictionary (`--dict FILE`, repeatable) in ember's format: `"text"`, `hex:BYTES`,
   `u8:`/`u16:`/`u32:`/`u64:` integers in the target's byte order (from HELLO), `u32be:`
