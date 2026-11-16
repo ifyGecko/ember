@@ -132,7 +132,8 @@ BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_6
                boards/avr_ref.c boards/avr32_ref.c boards/pic_ref.c boards/mcs51_ref.c boards/pic32_ref.c boards/m6502_ref.c boards/z80_ref.c boards/xtensa_ref.c \
                boards/stock.c boards/mmio_rules.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
-               fuzz/cov_scheme.c fuzz/site_list.c fuzz/cov_cli.c fuzz/frontend_net.c fuzz/cov_region.c
+               fuzz/cov_scheme.c fuzz/site_list.c fuzz/cov_cli.c fuzz/frontend_net.c fuzz/cov_region.c \
+               fuzz/mutate.c
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/blockdev_file.c \
                src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c src/runner/trace.c
@@ -178,6 +179,7 @@ TEST_X86 := $(BUILD)/test_x86
 TEST_RISCV := $(BUILD)/test_riscv
 TEST_ARM := $(BUILD)/test_arm
 TEST_FUZZ := $(BUILD)/test_fuzz
+TEST_MUTATE := $(BUILD)/test_mutate
 TEST_COV_FORMATS := $(BUILD)/test_cov_formats
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
 FW_MIPS_BE := $(BUILD)/firmware-mips/selftest-be.elf
@@ -309,6 +311,9 @@ $(TEST_COV): $(BUILD)/obj/tests/unit/test_cov.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_FUZZ): $(BUILD)/obj/tests/unit/test_fuzz.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_MUTATE): $(BUILD)/obj/tests/unit/test_mutate.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_SMP): $(BUILD)/obj/tests/unit/test_smp.o $(LIB)
@@ -460,7 +465,7 @@ endif
 
 $(FIRMWARE): firmware
 
-unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) \
+unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) $(TEST_MUTATE) \
            $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA) $(TEST_XTENSA_FPU) $(TEST_ARM) $(TEST_RISCV) $(TEST_X86) $(TEST_MIPS) $(TEST_AVR32) \
            $(TEST_JITDIFF) $(TEST_F80) $(TEST_COV_FORMATS) \
            $(BUILD)/formats-header-check.stamp
@@ -474,6 +479,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_MMIO)
 	$(TEST_COV)
 	$(TEST_FUZZ)
+	$(TEST_MUTATE)
 	$(TEST_SMP)
 	$(TEST_PPC)
 	$(TEST_AVR)
