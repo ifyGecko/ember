@@ -12,8 +12,9 @@ BUILD is the build directory (its firmware*/fuzztarget*.elf and firmware/irqtarg
     The handler and the parser are covered (--cov-range on each).
   - --fuzz-begin / --fuzz-crash-pc / --cov-range take ELF symbols: the same verdicts as the
     numbers; SYM, SYM+LEN, SYM-SYM2, LO-HI and LO+LEN ranges; ranges narrow the map.
+  - Block coverage is the default when fuzzing: the same map without --cov-blocks.
   - The errors: an unknown symbol, a symbol with a raw image, a symbol without a size,
-    --cov-range or --cov-irq without --cov-blocks, --cov-scheme with --cov-blocks.
+    --cov-range or --cov-irq with a site list, --cov-scheme with block coverage.
 Exit status 0 when everything holds.
 """
 import os
@@ -129,7 +130,21 @@ def main():
                     whole = buckets(out) if r0.returncode == 0 else frozenset()
                 check(b and len(b) < len(whole), "--cov-range %s: %d of %d buckets" % (rng, len(b), len(whole)))
 
+        # The default: block coverage without asking for it.
+        open(inp, "wb").write(b"hello there")
+        a = fuzz(run, "rv32-ref", fw, inp, ["--cov-ngram", "3", "--fuzz-begin", "fuzz_iteration"], out)
+        m_default = open(out, "rb").read() if a.returncode == 0 else None
+        b = fuzz(run, "rv32-ref", fw, inp, ["--cov-blocks", "--cov-ngram", "3", "--fuzz-begin",
+                                            "fuzz_iteration"], out)
+        check(a.returncode == b.returncode == 0 and m_default == open(out, "rb").read()
+              and any(m_default), "the default is not block coverage (exit %d, %d)"
+              % (a.returncode, b.returncode))
+
         # Errors, each with a useful message.
+        here = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run([sys.executable, os.path.join(here, "mk_lists.py"), fw, tmp],
+                       check=True, capture_output=True)
+        sites = os.path.join(tmp, "sites.uams")
         raw = os.path.join(build, "firmware-arm/fuzztarget.bin")
         for args, board, image, want in (
                 (["--cov-blocks", "--fuzz-begin", "no_such_function"], "rv32-ref", fw, "no such symbol"),
@@ -138,8 +153,10 @@ def main():
                  "bad range end"),
                 (["--cov-blocks", "--cov-range", "main-fuzz_panic", "--fuzz-begin", "fuzz_iteration"], "rv32-ref",
                  fw, "empty range"),
-                (["--cov-range", "main", "--fuzz-begin", "fuzz_iteration"], "rv32-ref", fw, "--cov-blocks"),
-                (["--cov-irq", "follow", "--fuzz-begin", "fuzz_iteration"], "rv32-ref", fw, "--cov-blocks"),
+                (["--cov-sites", sites, "--cov-range", "main", "--fuzz-begin", "fuzz_iteration"], "rv32-ref",
+                 fw, "not --cov-sites"),
+                (["--cov-sites", sites, "--cov-irq", "follow", "--fuzz-begin", "fuzz_iteration"], "rv32-ref",
+                 fw, "not --cov-sites"),
                 (["--cov-blocks", "--cov-scheme", "pc", "--fuzz-begin", "fuzz_iteration"], "rv32-ref", fw,
                  "site lists")):
             r = fuzz(run, board, image, inp, args)
@@ -153,8 +170,8 @@ def main():
         for f in failures:
             print("cov_blocks_check: FAIL: " + f, file=sys.stderr)
         return 1
-    print("cov_blocks_check: block maps independent of block size (4 ISAs, both backends) and of "
-          "interrupt timing; ranges and symbols")
+    print("cov_blocks_check: block coverage by default; maps independent of block size (4 ISAs, "
+          "both backends) and of interrupt timing; ranges and symbols")
     return 0
 
 

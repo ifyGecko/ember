@@ -188,7 +188,8 @@ fuzz/             harness.c frontend_replay.c (the harness and the replay fronte
                   coverage region, --cov-shm) cov_cli.c (the runner extension for all of them)
                   cov_formats.h
 fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files
-                  from rizin's analysis) ghidra/ (the same two from headless Ghidra, Jython)
+                  from rizin's analysis; opt-in, block coverage is the default) ghidra/ (the
+                  same two from headless Ghidra, Jython)
                   fuzz_brain.py fuzz_dict.py (the coverage-guided brain and its dictionaries;
                   ember mutates: fuzz/mutate.c)
                   fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)
@@ -693,8 +694,10 @@ devices.
   counted by the boundary hooks, in the map they close. Frontends sit behind
   `uam_fuzz_frontend`; the replay frontend runs saved inputs. Observers
   (`uam_fuzz_set_observer`) see every published map, for side channels.
-- **Site lists, boundary files and the fuzz brain** (`fuzz/`, formats in
-  [`fuzz-formats.md`](fuzz-formats.md)): site lists and boundary files in (made by
+- **Coverage, site lists, boundary files and the fuzz brain** (`fuzz/`, formats in
+  [`fuzz-formats.md`](fuzz-formats.md)): ember's own block coverage by default (N-gram block
+  edges, splits and resumes not counted, interrupt contexts, pc ranges; `--cov-blocks`),
+  opt-in site lists and boundary files in (made by
   `fuzz/tools/gen_sites.py` and `gen_boundaries.py`), the fuzz protocol (`--fuzz-net`, driven
   by `fuzz/tools/fuzz_brain.py`) and the coverage region (`--cov-shm`, an observer) out. It
   reaches the runner through the generic runner-extension interface (`runner.h`): only

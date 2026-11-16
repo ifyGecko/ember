@@ -102,10 +102,13 @@ typedef struct uam_fuzz_config {
     uint64_t        crash_irq_lines; /* an interrupt from any of these lines (bit i =
                                     * line i, as wired to the ISA) is a crash */
     uint32_t        map_size;      /* coverage map bytes, a power of two (0: 64 KiB) */
-    uam_cov_history history;       /* COV history shape for site coverage (zero: classic
-                                    * one-predecessor edges; block coverage always is) */
+    uam_cov_history history;       /* COV history shape (zero: classic one-predecessor
+                                    * edges; uam_fuzz_set_block_coverage always is) */
     bool            skip_repeats;  /* a site counts only when another site counted since
                                     * its last count (uam_cov_state.skip_repeat) */
+    const char     *save_snapshot; /* if set: the begin snapshot is also saved to this file
+                                    * (uam_snapshot_save) once the boot reached it, so that
+                                    * other processes can start from it (--fuzz-snapshot) */
 } uam_fuzz_config;
 
 #define UAM_FUZZ_DEFAULT_ITER_INSNS UINT64_C(10000000)

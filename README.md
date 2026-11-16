@@ -178,8 +178,8 @@ build/uam-run -b pic32-ref -o model=mz build/firmware-pic32/selftest-mz.elf  # P
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
-build/uam-run --cov-blocks --cov-out cov.map fw.elf  # block-edge coverage map (64 KiB by default)
-build/uam-run --cov-blocks --fuzz-begin 0x80000318 --fuzz-input uart0 --fuzz-replay crashes/ fw.elf
+build/uam-run --cov-blocks --cov-out cov.map fw.elf  # block coverage map of a plain run
+build/uam-run --fuzz-begin handler --fuzz-input uart0 --fuzz-replay crashes/ fw.elf  # fuzz: block coverage by default
 build/uam-run --help
 ```
 
@@ -249,11 +249,13 @@ blocks: an RTOS boot on a MIPS32 board ran 7.6x faster (19.8 s to 2.6 s for 3e9 
 Results are bit-identical with and without it, and to the interpreter. `--stats` reports how
 many blocks were entered by chaining.
 
-`--cov-blocks` counts AFL-style edges between translated blocks into a coverage map
-(`--cov-map-size`, a power of two), and `--cov-out FILE` writes the raw map when the run
-stops. Blocks are not basic blocks, so the edges are approximate; site-accurate coverage
-comes from a site table (`uam_exec_set_coverage`, `uam/exec.h`). The interpreter and the JIT
-produce byte-identical maps, and the guest runs exactly as without coverage. Overhead on a
+**Coverage is ember's own by default.** Fuzzing counts the blocks ember runs, with no site
+list and no static analysis: N-gram edges (`--cov-ngram N`, `--cov-rotate`), a block ember had
+to split counting once, a block resumed after a timer counting not at all, and interrupt
+handlers kept apart from the code they interrupt (`--cov-irq`), so the map follows the code's
+path only; `--cov-range SYM` keeps an RTOS's other tasks out. `--cov-blocks` asks for the same
+on a plain run, and `--cov-out FILE` writes the raw map when the run stops. The interpreter and
+the JIT produce byte-identical maps, and the guest runs exactly as without coverage. Overhead on a
 synthetic worst case (a MIPS loop of 2-7 instruction blocks, 3e8 instructions): JIT 0.145 s
 to 0.190 s (+31%), interpreter 2.93 s to 3.05 s (+4%). Real firmware has longer blocks.
 
@@ -266,16 +268,20 @@ in front of its buffer and past the input in it (`before=N`, `after`). `--fuzz-r
 FILE|DIR` runs saved inputs once each and exits with the most severe verdict of any input
 (20/21/25 crash, else 22 hang, else 23 timeout, else 24 rejected, else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
 
-Site lists and boundary files made by static analysis (`fuzz/tools/gen_sites.py` and
-`gen_boundaries.py`, on rizin or headless Ghidra) plug in directly: `--cov-sites fw.uams`
-gives site-id or hashed-pc N-gram coverage (N=1..8, optionally order-sensitive),
+Begin, end and crash pcs are addresses or ELF symbols (`--fuzz-begin net_rx`). **Site lists
+are opt-in**, for targets that are worth the static-analysis pass (instrumenting chosen points
+only, site names in errors, coverage keyed on a list you control: `docs/fuzzing.md`, "Block
+coverage or a site list"): made by `fuzz/tools/gen_sites.py` and `gen_boundaries.py` on rizin or
+headless Ghidra, `--cov-sites fw.uams` replaces block coverage with site-id or hashed-pc
+N-gram coverage (N=1..8, optionally order-sensitive),
 `--cov-boundary fw.uamb` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-strict` checks every
 site's bytes in memory against the list. `--fuzz-net HOST:PORT` lets ember's coverage-guided
 brain (`fuzz/tools/fuzz_brain.py`) drive the campaign: a queue with a favored set,
 calibration, trimming and nine power schedules, ember dictionaries, adaptive mutation
 operators, compare logging (an input-to-state stage that writes the values the target's
-compares expected into the input) and sparse coverage replies; `fuzz/tools/fuzz_launch.py` runs several brain +
-ember workers that share their queues. `--cov-shm PATH` publishes the maps in a
+compares expected into the input) and sparse coverage replies, with ember itself mutating
+(havoc, splice and dictionaries in batches); `fuzz/tools/fuzz_launch.py` runs several brain +
+ember workers that boot the firmware once and share their queues. `--cov-shm PATH` publishes the maps in a
 shared-memory coverage region. The formats are in [`docs/fuzz-formats.md`](docs/fuzz-formats.md).
 
 A run is as bounded as you make it: with neither option, a guest that spins forever runs
@@ -531,7 +537,7 @@ ember board and then fuzz it: `ember-dev-recon` (triage: architecture, load addr
 map, MMIO, whether ember can run it), `ember-dev-build` (an out-of-tree board brought up one
 device at a time, against a local ember clone pinned to the latest commit, with any change
 to ember kept as `git am`-ready patch files) and `ember-fuzz` (the snapshot
-fuzz harness, site lists and the brain). They are plain `SKILL.md` folders; `skills/install.sh` links them
+fuzz harness with ember's own block coverage, the brain, and opt-in site lists). They are plain `SKILL.md` folders; `skills/install.sh` links them
 into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agents/skills`).
 `skills/tests/run-tests.sh ~/ember` checks their tooling end to end. See `skills/README.md`.
 

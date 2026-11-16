@@ -339,7 +339,7 @@ folds the last N-1 sites, and rotation makes the fold order-sensitive (the site-
 [`fuzz-formats.md`](fuzz-formats.md); `uam_cov_count` in `cpu.h` is the reference implementation). `skip_repeat`, also part of
 the shape, makes a site count only when it is not the site that counted last (`last_pc`,
 which `uam_cov_reset_prev` keeps): back-to-back executions of one site count once and no
-site-to-itself edge is ever made (`--cov-mode leapfrog`, the default for site lists). `COV` reads and writes nothing else: no register, no
+site-to-itself edge is ever made (`--cov-mode leapfrog`, the default for block coverage and site lists). `COV` reads and writes nothing else: no register, no
 memory, no bus access, and it does not count as an instruction (`icount` is unchanged). With
 no coverage state attached (`cov` is NULL) it does nothing. Lifters never emit it; a pass
 inserts it directly after the `IMARK` of an instrumented instruction (§8 rule 8), so it runs

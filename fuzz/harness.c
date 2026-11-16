@@ -916,6 +916,12 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
         const uam_cov_state *cs = uam_machine_cov_state(m, i);
         f->snap_last_pc[i] = (cs ? cs : &f->cov)->last_pc;
     }
+    if (f->cfg.save_snapshot) {
+        st = uam_snapshot_save(f->snap, f->cfg.save_snapshot);   /* written whole, then renamed */
+        if (st != UAM_OK)
+            return st;
+        uam_log(UAM_LOG_INFO, "fuzz", "begin snapshot saved to %s", f->cfg.save_snapshot);
+    }
     f->booted = true;
     f->last = *r;
     return UAM_OK;

@@ -2,8 +2,9 @@
  * cov_cli.c - The runner extension for site lists, boundary files, the coverage region
  * and the fuzz network frontend (uam/runner.h; formats in docs/fuzz-formats.md).
  *
- *   --cov-sites FILE        coverage sites from a site list (fuzz/tools/gen_sites.py)
- *   (or the runner's --cov-blocks: ember's blocks, no list; N, rotation and mode apply)
+ *   --cov-sites FILE        coverage sites from a site list (fuzz/tools/gen_sites.py), in
+ *                           place of block coverage (ember's blocks, no list: the runner's
+ *                           --cov-blocks, the default when fuzzing; N, rotation, mode apply)
  *   --cov-range R           block coverage only in R: LO-HI, LO+LEN, SYM, SYM-SYM, SYM+LEN
  *   --cov-irq isolate|follow  block coverage: an interrupt handler's own history (default)
  *                           or the interrupted code's
@@ -330,7 +331,8 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
         return UAM_ERR_INVALID;
     }
     if ((c->n_ranges || c->irq_given) && !s->cov_blocks) {
-        snprintf(err, errlen, "--cov-range and --cov-irq are for block coverage (--cov-blocks)");
+        snprintf(err, errlen, "--cov-range and --cov-irq are for block coverage (the default when "
+                              "fuzzing; --cov-blocks otherwise), not --cov-sites");
         return UAM_ERR_INVALID;
     }
     if (s->cov_blocks) {

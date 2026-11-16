@@ -27,7 +27,7 @@ export TRACE="${TRACE-}"      # no per-input exception trace (TRACE=exc to get i
 export UNKNOWN_MMIO="${UNKNOWN_MMIO-fault}"   # a wild access faults instead of reading 0
 exec "$PROJ/run.sh" -n 2000000000 \
     --console "file:$PROJ/build/fuzz-console.txt" \
-    --cov-blocks \
+    --cov-ngram 3 --cov-rotate \
     --fuzz-begin 0x80123450 \
     --fuzz-crash-pc 0x80001234 \
     --fuzz-input uart0 \
@@ -410,11 +410,22 @@ and its range. A route's redzones are named `mem-before`, `mem-after` and `mem-a
 
 ## Coverage
 
-`--cov-blocks` counts AFL-style edges between translated blocks into a map (64 KiB,
-`--cov-map-size`). Interpreter and JIT give byte-identical maps and the guest runs exactly
-as without coverage, so maps from two runs compare directly. Blocks are not basic blocks;
-the edges are approximate but stable. Site-accurate coverage comes from a site table:
-a site list (`references/lists-and-brain.md`) or `uam_fuzz_set_sites` in a program. A site in a
+**By default the harness counts ember's own blocks** (`--cov-blocks` is implied when fuzzing
+without `--cov-sites`): N-gram edges (`--cov-ngram N`, default 2, `--cov-rotate`), with a
+block ember split counting once, a block resumed mid-way (a timer came due) not at all, and
+interrupt handlers counting with a history of their own (`--cov-irq isolate`; `follow`
+gives the plain behaviour). The maps depend only on the code's path: the same at
+`--block-insns 32` and 1, and wherever a timer interrupt lands. `--cov-range` (repeatable:
+`LO-HI`, `LO+LEN`, `SYM`, `SYM-SYM2`, `SYM+LEN`) counts only blocks starting in a range, to keep
+an RTOS's scheduler and other tasks out. The map is 64 KiB up to N=2 and 4x per N above
+(`--cov-map-size`); its size costs an iteration nothing, as the coverage op records which
+buckets it set. Interpreter and JIT give byte-identical maps and the guest runs exactly as
+without coverage, so maps from two runs compare directly. Begin, end and crash pcs may be ELF
+symbols (`--fuzz-begin net_rx`).
+
+**A site list** (`--cov-sites`, `references/lists-and-brain.md`; `uam_fuzz_set_sites` in a
+program) replaces it when the target is worth a rizin or Ghidra pass: only chosen points
+instrumented, site names in errors, ids stable across rebuilds of the same source. A site in a
 MIPS branch delay slot or a Thumb IT block cannot be instrumented (the run stops, naming it). Block coverage
 works on every ISA; ember's fuzz-check compares the maps of interpreter, JIT and unchained
 JIT on every stock board but `x86_64-ref` and `xtensaeb-ref` (several only when their

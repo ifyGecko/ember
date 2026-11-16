@@ -9,6 +9,11 @@ readers (see the end of this page; the formats are in [`fuzz-formats.md`](fuzz-f
 
 ## Coverage model
 
+**Ember collects coverage itself by default.** A fuzz run with no `--cov-sites` counts the
+blocks ember runs ("Block coverage" below): no site list, no rizin or Ghidra pass, and begin,
+end and crash pcs may be ELF symbols. A site list made by static analysis is an opt-in for
+targets worth it ("Block coverage or a site list").
+
 Coverage is one IR opcode, `UAM_OP_COV A, B` ([`uam-isa.md`](uam-isa.md) §7.5), which the
 coverage pass inserts right after the instruction marker of each instrumented instruction:
 
@@ -33,8 +38,9 @@ last; see the ISA document).
 | hashed-pc model, N=1 | `hash_pc(offset, module)` | `0` |
 | hashed-pc model, N=2 | `hash_pc(offset, module)` | `A >> 1` |
 
-Without a site table, block mode (`--cov-blocks`) puts a site at every translated block's
-start, so no site list (and no rizin or Ghidra) is needed; see "Block coverage" below.
+Without a site table, block mode (the default when fuzzing; `--cov-blocks` for a plain run)
+puts a site at every translated block's start, so no site list (and no rizin or Ghidra) is
+needed; see "Block coverage" below.
 
 Properties:
 
@@ -54,9 +60,11 @@ Properties:
 Overhead, synthetic worst case (a MIPS loop of 2-7 instruction blocks): JIT +31%,
 interpreter +4%.
 
-### Block coverage (`--cov-blocks`)
+### Block coverage (the default)
 
-`--cov-blocks` counts the blocks ember runs, with the same N-gram counting as site lists:
+A fuzz run counts the blocks ember runs unless `--cov-sites` gives a site list
+(`--cov-blocks` says so explicitly, and asks for it on a plain run, with `--cov-out`), with
+the same N-gram counting as site lists:
 `--cov-ngram N` (default 2), `--cov-rotate` and `--cov-mode` apply. Each block start is a site
 with `A = mix(pc) & mask`, `B = A >> 1` (the block model, `fuzz-formats.md`), and three
 things make an ember block stand for a basic block, so that the map depends only on the
@@ -94,6 +102,28 @@ Every coverage op also records each bucket it sets first (`uam_cov_touched`), so
 harness lists and clears an iteration's buckets in time proportional to what it set, not to
 the map size: a 4 MiB map costs a fuzz iteration no more than a 64 KiB one.
 
+### Block coverage or a site list
+
+Block coverage is the default because it needs nothing but the image and follows the code's
+path exactly. A site list (`--cov-sites`, "Site lists, boundary files and the brain" below)
+replaces it, and is worth the static-analysis pass when:
+
+- **Only chosen points should count.** A list instruments exactly the instructions you pick
+  (function entries, one module's blocks): in a huge image whose hot paths are mostly noise,
+  and where `--cov-range` cannot express the selection, fewer sites mean a smaller, quieter map
+  and a cheaper run.
+- **Names matter.** A site list names its sites, so an uninstrumentable site or a site check
+  names the function, and the brain's buckets map back to the list.
+- **Ids should survive a rebuild.** Site ids come from the list, not from addresses, so
+  maps of two builds of the same source compare when the list is regenerated alike; block
+  buckets follow the pcs.
+- **The list comes from elsewhere.** A list exported from another analysis, or made for
+  hashed-pc coverage with modules at their own bases (`--cov-module`).
+
+Otherwise keep the default. Site lists and block coverage share the counting (N, rotation,
+`--cov-mode`), the brain and the protocol; only block coverage has `--cov-range` and the
+interrupt contexts (`--cov-irq`).
+
 ## The harness (`uam/fuzz.h`)
 
 1. **Boot** until the first arrival at the begin pc. Coverage so far is the *INIT* map.
@@ -103,8 +133,14 @@ the map size: a 4 MiB map costs a fuzz iteration no more than a 64 KiB one.
    firmware that runs its handler during start-up (a self-test, a first request of its
    own): the snapshot is taken at arrival N+1, and everything before it, the skipped
    passes included, is INIT.
-2. **Snapshot** there.
-3. **Each input**: restore the snapshot, clear the map and `prev`, deliver the input, run
+2. **Snapshot** there. With `--fuzz-snapshot FILE` (`uam_fuzz_config.save_snapshot`) the
+   snapshot is also saved to FILE, and a later run given the same FILE starts from it with
+   no boot (the INIT map is then empty): parallel workers boot once. A stale FILE (another
+   build of the firmware with the same memory layout) would be used as is, so remove it when
+   the firmware changes (`fuzz_launch.py` does).
+3. **Each input**: restore the snapshot (only the memory lines the last input changed, and
+   the components; repeat restores reuse the device table and skip the compatibility
+   check), clear the map and `prev`, deliver the input, run
    until the iteration ends, a crash check fires or the budget runs out, then classify.
    A crash does not end the campaign; the next input starts from the snapshot. Neither
    does an input the route refuses (verdict *rejected*, below). An internal error of ember
@@ -365,9 +401,10 @@ CMP_INPUT and CMPS ([`fuzz-formats.md`](fuzz-formats.md)).
 
 ## Site lists, boundary files and the brain
 
-Instead of block coverage and `--fuzz-begin`/`--fuzz-end`, a campaign can take its coverage
-sites and iteration boundaries from files made by static analysis, and its inputs from
-ember's coverage-guided brain. The formats are in [`fuzz-formats.md`](fuzz-formats.md), the
+Instead of the default block coverage and `--fuzz-begin`/`--fuzz-end`, a campaign can opt
+into coverage sites and iteration boundaries from files made by static analysis ("Block
+coverage or a site list" says when that pays); either way its inputs can come from ember's
+coverage-guided brain. The formats are in [`fuzz-formats.md`](fuzz-formats.md), the
 tools in `fuzz/tools/` (python3; the generators need rizin with python3's `rzpipe`, or
 headless Ghidra with its Jython extension).
 
@@ -594,7 +631,11 @@ read). Each worker gets a distinct RNG seed, derived from `--seed-rng` and its n
 be listed)
 (default all five, round robin); `--dict` and `--seeds` go to every worker, `--brain-arg`
 passes anything else. A worker whose brain or ember exits unexpectedly is restarted from
-its queue (`--max-restarts`, 5); Ctrl-C stops them all with BYE.
+its queue (`--max-restarts`, 5); Ctrl-C stops them all with BYE. The firmware boots once:
+the launcher gives every ember `--fuzz-snapshot DIR/begin.snap`, starts `main` first, and
+starts the others when `main` has saved the begin snapshot there, so they (and every
+restart) skip the boot; a snapshot left from an earlier launch is removed first, and
+`--no-shared-boot` boots each worker.
 `python3 fuzz/tools/status_tui.py --sync-dir DIR` shows one row per worker and a total.
 
 ember dials the brain (retrying for a few seconds while it starts), runs each INPUT through

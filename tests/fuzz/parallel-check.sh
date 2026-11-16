@@ -9,6 +9,8 @@
 #   - between them, the workers saved the planted FAULT ("FUZ!") and ORACLE ("FUZ?");
 #   - killing w1's ember mid-run makes the launcher restart the worker, which resumes from
 #     its queue (its log says so) and still ends cleanly;
+#   - the firmware boots once: main saves the begin snapshot, w1 (and its restart) starts
+#     from it (fuzz_launch's shared boot, --fuzz-snapshot);
 #   - status_tui.py --sync-dir shows both workers.
 set -eu
 run=$1
@@ -56,6 +58,12 @@ grep -q 'w1: exited unexpectedly.*restarting from its queue' "$tmp/launch.log" |
     { cat "$tmp/launch.log" >&2; fail "the killed worker was not restarted"; }
 grep -q 'resumed [1-9][0-9]* queue entries' "$tmp/camp/w1/brain.log" ||
     fail "the restarted worker did not resume from its queue"
+grep -q 'main: booted; the other workers start from' "$tmp/launch.log" ||
+    { cat "$tmp/launch.log" >&2; fail "the workers did not share one boot"; }
+[ "$(grep -c 'starting from the begin snapshot' "$tmp/camp/w1/ember.log")" -ge 2 ] ||
+    fail "w1 and its restart did not start from the begin snapshot"
+! grep -q 'starting from the begin snapshot' "$tmp/camp/main/ember.log" ||
+    fail "main started from a snapshot left from before"
 for w in main w1; do
     grep -q "^fuzz_launch: $w: finished (brain 0, ember 0)" "$tmp/launch.log" ||
         { cat "$tmp/launch.log" >&2; fail "$w did not end cleanly"; }
@@ -69,4 +77,4 @@ done
 python3 "$tools/status_tui.py" --sync-dir "$tmp/camp" --once > "$tmp/tui.txt"
 grep -q ' main ' "$tmp/tui.txt" && grep -q ' w1 ' "$tmp/tui.txt" && grep -q '2 workers' "$tmp/tui.txt" ||
     { cat "$tmp/tui.txt" >&2; fail "the workers view does not show both workers"; }
-echo "parallel-check: $board: two workers shared their queues, found both planted crashes, survived a killed ember"
+echo "parallel-check: $board: one boot for two workers, which shared their queues, found both planted crashes, survived a killed ember"

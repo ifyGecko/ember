@@ -16,7 +16,10 @@ Ctrl-C / SIGTERM stops every worker cleanly (the brains say BYE).
   python3 fuzz/tools/status_tui.py --sync-dir camp          # every worker, one row each
 
 Everything after "--" is the ember command line; the launcher appends
-"--fuzz-net 127.0.0.1:PORT" to it. With --iters, each worker stops after that many
+"--fuzz-net 127.0.0.1:PORT" to it, and "--fuzz-snapshot SYNC_DIR/begin.snap": the firmware
+boots once, in the first worker, which saves the begin snapshot; the others (and every
+restart) start from it. A snapshot left from an earlier launch is removed first (the
+firmware may have changed). --no-shared-boot boots every worker itself. With --iters, each worker stops after that many
 mutated executions and the launcher ends when all have. Exit status: 0 when every worker
 ended cleanly, 1 otherwise (a worker that ran out of restarts), 2 on a usage error.
 """
@@ -139,6 +142,11 @@ def main():
     ap.add_argument("--status-interval", type=float, default=1.0)
     ap.add_argument("--max-restarts", type=int, default=5,
                     help="restarts per worker after an unexpected exit (default 5)")
+    ap.add_argument("--no-shared-boot", dest="shared_boot", action="store_false",
+                    help="every worker boots the firmware itself (default: the first boots "
+                         "and saves the begin snapshot, the others start from it)")
+    ap.add_argument("--boot-timeout", type=float, default=3600.0,
+                    help="seconds to wait for the first worker's begin snapshot (default 3600)")
     ap.add_argument("--brain-arg", action="append", default=[],
                     help="extra fuzz_brain.py argument for every worker (repeatable)")
     if "--" not in sys.argv:
@@ -157,6 +165,12 @@ def main():
     if not scheds or bad:
         ap.error("unknown schedule(s) %s (%s)" % (", ".join(bad) or "none", ", ".join(SCHEDULES)))
     os.makedirs(args.out, exist_ok=True)
+    snap = None
+    if args.shared_boot and not any(a in ("--fuzz-snapshot", "--load-snapshot") for a in ember_cmd):
+        snap = os.path.join(os.path.abspath(args.out), "begin.snap")
+        if os.path.exists(snap):
+            os.unlink(snap)
+        ember_cmd = ember_cmd + ["--fuzz-snapshot", snap]
 
     workers = []
     for i in range(args.workers):
@@ -171,7 +185,22 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    for w in workers:
+    workers[0].start()
+    if snap and len(workers) > 1:
+        # One boot: the others wait for the first worker's begin snapshot.
+        deadline = time.monotonic() + args.boot_timeout
+        while not os.path.exists(snap) and not stopping["flag"]:
+            if workers[0].ember.poll() is not None or time.monotonic() > deadline:
+                log("main: no begin snapshot (its ember %s); every worker boots itself"
+                    % ("exited" if workers[0].ember.poll() is not None else "is still booting"))
+                for w in workers[1:]:
+                    w.ember_cmd = [a for a in w.ember_cmd if a not in ("--fuzz-snapshot", snap)]
+                break
+            time.sleep(0.1)
+        else:
+            if os.path.exists(snap):
+                log("main: booted; the other workers start from %s" % snap)
+    for w in workers[1:]:
         w.start()
     stop_sent = False
     while True:

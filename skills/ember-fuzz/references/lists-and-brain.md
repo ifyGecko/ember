@@ -1,18 +1,22 @@
 # Site lists, boundary files and the brain
 
-Ember can take its coverage sites and iteration boundaries from files made by static
-analysis (`fuzz/tools/gen_sites.py`, `gen_boundaries.py`) and its inputs from its
-coverage-guided brain (`fuzz/tools/fuzz_brain.py`, over `--fuzz-net`). Everything ships in
+Ember collects coverage itself by default (its blocks: `references/harness.md`, "Coverage"),
+and begin, end and crash pcs can be ELF symbols, so a campaign needs no static analysis. It
+can instead take its coverage sites and iteration boundaries from files made by static
+analysis (`fuzz/tools/gen_sites.py`, `gen_boundaries.py`): opt in when a target is worth it
+(only chosen points instrumented, site names in errors, ids stable across rebuilds). Its
+inputs come from its coverage-guided brain (`fuzz/tools/fuzz_brain.py`, over `--fuzz-net`)
+either way. Everything ships in
 ember's tree; the project's pinned ember checkout has the tools at `$EMBER/fuzz/tools/`
 (`$EMBER` = the project's `ember-src`, or the clone `ember.src` names). That checkout's
 `docs/fuzzing.md` (section "Site lists, boundary files and the brain") and
 `docs/fuzz-formats.md` are the authority; this page is what matters on a custom board.
 
-## A `fuzz-lists.sh` next to `fuzz.sh`
+## Opting in: a `fuzz-lists.sh` next to `fuzz.sh`
 
-The two files replace two of `fuzz.sh`'s options, and the runner refuses both at once
+The two files replace two of `fuzz.sh`'s settings, and the runner refuses both at once
 (exit 2): `--cov-boundary` replaces `--fuzz-begin`/`--fuzz-end`, and `--cov-sites` replaces
-`--cov-blocks`. Keep the rest (oracles, route, budget) the same in a second script:
+the default block coverage (and `--cov-blocks`, `--cov-range`, `--cov-irq`). Keep the rest (oracles, route, budget) the same in a second script:
 
 ```bash
 #!/usr/bin/env bash
@@ -110,8 +114,8 @@ IMAGE=fw.bin ./fuzz-lists.sh --fuzz-replay corpus/
 LE and BE8) and 32-bit PowerPC. The generators also write correct lists (every site's bytes
 check out) for 8-bit AVR, Xtensa, 6502, Z80, 8051 (raw, with `--symbols`) and PIC32, though
 ember does not test those end to end; rizin and Ghidra disagree on AVR, so make both files
-with one route there. Where a list is not worth it, keep `--cov-blocks` and `--fuzz-begin`;
-the brain drives those too.
+with one route there. Where a list is not worth it (the usual case), keep the default block
+coverage and `--fuzz-begin`; the brain drives those too.
 
 ## Driving ember from the brain
 
@@ -126,7 +130,9 @@ python3 $EMBER/fuzz/tools/status_tui.py fuzz/run/status.jsonl   # live status (-
 **Parallel workers.** One brain drives one ember, and ember is single-threaded: use the
 cores with `fuzz_launch.py`, which runs N brain + ember pairs that share their queues through
 one directory, each with its own seed and the next of `--schedules` (round robin), and
-restarts a worker that dies:
+restarts a worker that dies. The firmware boots once: the first worker saves the begin
+snapshot (`--fuzz-snapshot DIR/begin.snap`) and the others, and every restart, start from it
+(`--no-shared-boot` boots each worker; a snapshot from an earlier launch is removed first):
 
 ```bash
 IMAGE=fw.bin python3 $EMBER/fuzz/tools/fuzz_launch.py -n 8 --out fuzz/camp \
@@ -141,13 +147,13 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
 
 - Ember connects, boots to the begin pc, and only then sends HELLO and the INIT map, so a
   long boot is fine (the brain's `--hello-timeout`, 600 s by default; 0 waits forever). `-n`
-  still bounds the boot. Any coverage source works: with `--cov-sites` HELLO describes the
-  scheme, with `--cov-blocks` none. HELLO's arch is the ISA's name.
+  still bounds the boot. Any coverage source works: HELLO describes the scheme (the block
+  model by default, or the site list's). HELLO's arch is the ISA's name.
 - Start the brain first and ember within 15 s of it (`--accept-timeout`). The brain keeps a
   resumable queue in `--out`/`queue` (`id:NNNNNN,...` names recording each entry's origin;
   a restart continues the campaign); `--iters N` bounds a run, 0 (the default) runs until
-  stopped. It asks ember for sparse replies (the hit buckets and the instruction count), so
-  a big site-list map costs nothing extra.
+  stopped. It asks ember for sparse replies (the hit buckets and the instruction count), and
+  ember lists those from what the coverage op recorded, so a big map costs nothing extra.
 - The campaign (`docs/fuzzing.md`, "The campaign"): a favored set, calibration (each new
   entry runs twice; an `UNSTABLE` line means the harness leaks state between iterations:
   fix that first, the readiness gate in `SKILL.md`), trimming, and energy from a power
@@ -166,8 +172,9 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   from the input (parsed numbers, checksums): give those a dictionary. Its finds are
   `op:cmplog` queue entries; the status shows `cmplog_execs` and `cmplog_finds`. The
   log works with any coverage, but with function-entry sites only, an input that passes a
-  compare inside a function is not new coverage and is dropped: block coverage or real
-  site lists let compare logging chain one compare after another.
+  compare inside a function is not new coverage and is dropped: the default block coverage
+  (or a site list with block-level sites) lets compare logging chain one compare after
+  another.
 - A dictionary (`--dict FILE`, repeatable) in ember's format: `"text"`, `hex:BYTES`,
   `u8:`/`u16:`/`u32:`/`u64:` integers in the target's byte order (from HELLO), `u32be:`
   and the like for a fixed order. Take the tokens from the handler's compares in Ghidra:

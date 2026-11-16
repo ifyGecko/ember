@@ -5,7 +5,8 @@ the **coverage region** and the **fuzz protocol**, and the **coverage bucket for
 maps follow. The C definitions are in [`fuzz/formats.h`](../fuzz/formats.h). The writers are
 ember's own tools in `fuzz/tools/`; `fuzz/site_list.c` reads the two files,
 `fuzz/cov_region.c` writes the region and `fuzz/frontend_net.c` speaks the protocol; [`fuzzing.md`](fuzzing.md#site-lists-boundary-files-and-the-brain)
-explains how to use them.
+explains how to use them. The site list and the boundary file are opt-in: by default ember
+counts its own blocks (the block model below) and takes begin pcs by address or symbol.
 
 | Format | Magic | Version | Byte order | Written by | Read by |
 |---|---|---|---|---|---|

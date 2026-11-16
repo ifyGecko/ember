@@ -1,6 +1,6 @@
 ---
 name: ember-fuzz
-description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage, replay or triage crashing inputs, or use generated site lists, boundary files and ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites', 'cmplog'."
+description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage (ember's own block coverage by default, site lists opt-in), replay or triage crashing inputs, or run ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites', 'cmplog'."
 ---
 
 # ember-fuzz: fuzzing firmware on a working ember board
@@ -17,11 +17,15 @@ snapshot gives the same verdict and the same coverage map, on the interpreter an
 It works the same on every ISA ember has; what differs per core is which crash oracles
 exist. Inputs come from a frontend: saved inputs (`--fuzz-replay`), ember's coverage-guided
 brain (`fuzz/tools/fuzz_brain.py` over `--fuzz-net`), or your own program on `uam/fuzz.h`.
+**Coverage is ember's own by default**: fuzzing counts the blocks ember runs (N-gram edges,
+split blocks counting once, interrupts kept apart), so no static-analysis pass is needed.
+Site lists (`--cov-sites`, made with rizin or Ghidra) are an opt-in for targets worth it
+(step 6).
 
 Read `references/harness.md` before configuring a target (routes, boundaries, oracles,
-per-ISA notes, verdicts, coverage, triage), and `references/lists-and-brain.md` for site lists, boundary files and
-the brain (the lists come from ember's rizin generators or, without rizin, from their Ghidra
-ports run by headless Ghidra on the recon project). This skill ships in ember's repository (`skills/ember-fuzz/`, beside
+per-ISA notes, verdicts, coverage, triage), and `references/lists-and-brain.md` for the brain
+and, when you opt in, site lists and boundary files (ember's rizin generators or, without
+rizin, their Ghidra ports run by headless Ghidra on the recon project). This skill ships in ember's repository (`skills/ember-fuzz/`, beside
 `skills/ember-dev-recon/` and `skills/ember-dev-build/`), but the project links the ember
 it pins: that checkout's `docs/fuzzing.md`, `docs/fuzz-formats.md` and `build/<board>-run --help`
 are the authority on option details, and a pin older than this skill may lack options used
@@ -91,23 +95,27 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    back to ember-dev-build. To see why an input crashed or hung, replay it alone with
    `--history 64` (its last blocks, exceptions and interrupt entries) and, as needed,
    `-t mmio,exc`: each input gets its own `trace: input ID` section and summaries.
-6. **Check coverage moves**: `--cov-blocks --cov-out` for two different inputs must give
-   different maps; identical maps mean the input never reaches the handler (begin pc after
-   the read, wrong route, input dropped by a full FIFO).
-   **Coverage without a site list**: `--cov-blocks --cov-ngram 3 --cov-rotate` is N-gram
-   coverage of ember's blocks, a split block counting once, and an interrupt handler with a
-   history of its own (`--cov-irq isolate`, the default), so timer interrupts add no noise.
-   Add `--cov-range` (`SYM`, `SYM-SYM2`, `LO-HI`) around the code under test so an RTOS's
-   scheduler and other tasks stay out of the map. That needs no rizin or Ghidra pass; site
-   lists remain the choice for instrumenting chosen points only, with names in errors.
+6. **Check coverage moves**: `--cov-out` with two different inputs must give different
+   maps; identical maps mean the input never reaches the handler (begin pc after the read,
+   wrong route, input dropped by a full FIFO). Fuzzing collects **ember's block coverage by
+   default**: N-gram edges of the blocks ember runs (`--cov-ngram 3 --cov-rotate` for
+   path-sensitive parsers), a split block counting once, a resumed one not at all, and an
+   interrupt handler with a history of its own (`--cov-irq isolate`, the default), so timer
+   interrupts add no noise. Add `--cov-range` (`SYM`, `SYM-SYM2`, `LO-HI`) around the code
+   under test so an RTOS's scheduler and other tasks stay out of the map.
+   **Opt into a site list** (`--cov-sites`, `references/lists-and-brain.md`) only when the
+   target is worth the rizin or Ghidra pass: you want to instrument chosen points only
+   (a huge image where most blocks are noise and ranges cannot express the selection), site
+   names in errors and reports, coverage keyed on a list that stays stable across rebuilds
+   of the same source, or a list you are reusing from another tool.
 7. **Run the campaign**: the brain (`references/lists-and-brain.md`) or a program on
    `uam/fuzz.h`. The brain logs each queue entry's compares once and writes the values
    they expected into the input (compare logging, on by default), which finds magic values
    and command words by itself; still give it a dictionary of what you saw in Ghidra
    (`--dict`, ember's format: integers follow the target's byte order) for compares done
    byte by byte in a loop (`strcmp`, `memcmp`) or on computed values. Use every
-   core: `fuzz_launch.py -n N` runs N brain + ember workers that share their queues, each
-   on a different power schedule. An `UNSTABLE` line from the brain means the harness leaks
+   core: `fuzz_launch.py -n N` runs N brain + ember workers that boot the firmware once
+   (`--fuzz-snapshot`) and share their queues, each on a different power schedule. An `UNSTABLE` line from the brain means the harness leaks
    state between iterations: back to the readiness gate. Keep inputs, crashes and hangs in
    `fuzz/` of the project.
 8. **Triage**: replay the crash directory, group with `scripts/replay_summary.py`, reproduce

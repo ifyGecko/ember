@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "uam/boards.h"
 #include "uam/fuzz.h"
@@ -403,9 +404,10 @@ static void usage(FILE *out)
         "      --jit-opmap FILE    with --jit, append which IR instruction each piece of\n"
         "                          native code came from to FILE, for tools/jitprof.py (env\n"
         "                          UAM_JIT_OPMAP=FILE)\n"
-        "      --cov-blocks        coverage without a site list: ember's blocks, a split block\n"
-        "                          counting once; with the stock extensions --cov-ngram,\n"
-        "                          --cov-rotate, --cov-mode, --cov-range and --cov-irq apply\n"
+        "      --cov-blocks        coverage of ember's blocks, a split block counting once (the\n"
+        "                          default when fuzzing without --cov-sites; for a plain run,\n"
+        "                          ask for it); --cov-ngram, --cov-rotate, --cov-mode,\n"
+        "                          --cov-range and --cov-irq apply\n"
         "      --cov-map-size N    coverage map bytes, a power of two (default 64K; with a\n"
         "                          site list, from the number of sites; blocks: 4x per N > 2)\n"
         "      --cov-out FILE      write the raw coverage map to FILE when the run stops\n"
@@ -434,6 +436,8 @@ static void usage(FILE *out)
         "      --fuzz-crash-irq N  an interrupt from line N (as the board wires it to the\n"
         "                          CPU) is a crash (repeatable)\n"
         "      --fuzz-iter-insns N instruction budget per input (default 10000000; timeout)\n"
+        "      --fuzz-snapshot F   start from the begin snapshot in F if it exists (no boot),\n"
+        "                          else boot and save it to F: parallel workers boot once\n"
         "      --fuzz-replay PATH  run each input in FILE or DIR once and print the verdict;\n"
         "                          -n bounds the boot; exit 0 ok, 20 fault, 21 oracle,\n"
         "                          22 hang, 23 timeout, 24 rejected, 25 guard (the most severe of\n"
@@ -860,6 +864,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
+           OPT_FUZZ_SNAPSHOT,
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
            OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
@@ -916,6 +921,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "fuzz-crash-irq", required_argument, NULL, OPT_FUZZ_CRASH_IRQ },
         { "fuzz-iter-insns", required_argument, NULL, OPT_FUZZ_ITER_INSNS },
         { "fuzz-replay", required_argument, NULL, OPT_FUZZ_REPLAY },
+        { "fuzz-snapshot", required_argument, NULL, OPT_FUZZ_SNAPSHOT },
         { "fuzz-begin-skip", required_argument, NULL, OPT_FUZZ_BEGIN_SKIP },
         { "stats", no_argument, NULL, 's' },
         { "dump-state", no_argument, NULL, 'd' },
@@ -964,7 +970,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uint64_t fuzz_crash_pcs[MAX_LIST], fuzz_end_pcs[MAX_LIST], fuzz_more_begins[MAX_LIST];
     size_t n_fuzz_end = 0, n_more_begins = 0;
     bool have_begin = false, fuzz_opts = false;
-    const char *fuzz_input = NULL, *fuzz_replay = NULL;
+    const char *fuzz_input = NULL, *fuzz_replay = NULL, *fuzz_snapshot = NULL;
     unsigned trace = 0, block_insns = 0;
     static rtrace rt;   /* large (tables); static, one run per process */
     memset(&rt, 0, sizeof(rt));
@@ -1258,6 +1264,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         case OPT_FUZZ_ITER_INSNS: fz.iter_insns = strtoull(optarg, NULL, 0); fuzz_opts = true; break;
         case OPT_FUZZ_REPLAY: fuzz_replay = optarg; fuzz_opts = true; break;
+        case OPT_FUZZ_SNAPSHOT: fuzz_snapshot = optarg; fuzz_opts = true; break;
         case OPT_FUZZ_BEGIN_SKIP: {
             char *end;
             unsigned long n = strtoul(optarg, &end, 0);
@@ -1341,6 +1348,21 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: --cov-out needs a coverage source (--cov-blocks, a site list)\n");
         return 2;
     }
+    /* --fuzz-snapshot: start from the begin snapshot another process saved, else boot and
+     * save it there (written whole, then renamed: a reader never sees half of it). */
+    if (fuzz_snapshot && load_snap) {
+        fprintf(stderr, "uam-run: --fuzz-snapshot and --load-snapshot are both given\n");
+        return 2;
+    }
+    if (fuzz_snapshot && access(fuzz_snapshot, F_OK) == 0) {
+        load_snap = fuzz_snapshot;
+        fprintf(stderr, "uam-run: fuzz: starting from the begin snapshot %s (no boot)\n", fuzz_snapshot);
+    } else if (fuzz_snapshot) {
+        fz.save_snapshot = fuzz_snapshot;
+    }
+    /* Fuzzing counts ember's blocks unless a site list is given: no list is needed. */
+    if (fuzzing && !(provides & UAM_RUNNER_EXT_SITES))
+        cov_blocks = true;
     fz.crash_pcs = fuzz_crash_pcs;
     fz.end_pcs = fuzz_end_pcs;
     fz.n_end_pcs = n_fuzz_end;
