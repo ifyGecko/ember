@@ -748,6 +748,36 @@ static void emit_cmplog(uam_jit *j, const uam_block *blk, const uam_insn *in)
     patch(j, off);
 }
 
+/*
+ * UAM_OP_FRAME (docs/uam-isa.md section 7.7): with cpu->frames NULL a load and an untaken
+ * branch; with the exit's guard false another; otherwise jit_br_frame(frames, flags, a, c)
+ * with the live temps saved around it, the operands loaded as for CMPLOG.
+ */
+static void emit_frame(uam_jit *j, const uam_block *blk, const uam_insn *in)
+{
+    const unsigned W = in->width;
+    const bool guarded = !uam_ref_is_imm(in->b);
+    size_t off2 = 0;
+    ld_mem(j, RAX, R14, CPU(frames));                      /* rax = cpu->frames */
+    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX); /* test rax, rax */
+    size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    if (guarded) {
+        load_operand(j, RAX, blk, in->b, 1);
+        g8(j, 0xA8); g8(j, 1);                             /* test al, 1 */
+        off2 = jcc_fwd(j, 0x84);
+    }
+    jit_ra_save(j, false);
+    load_operand(j, RDX, blk, in->a, W);
+    load_operand(j, RCX, blk, in->c, W);
+    mov_imm(j, RSI, in->flags);
+    ld_mem(j, RDI, R14, CPU(frames));
+    call_bridge(j, jit_br_frame);
+    jit_ra_save(j, true);
+    patch(j, off);
+    if (guarded)
+        patch(j, off2);
+}
+
 /* Store a block result into jc and jump to the epilogue. */
 static void set_res_pc(uam_jit *j, uint32_t kind, const uam_block *blk, uam_ref target, unsigned aw)
 {
@@ -855,7 +885,7 @@ bool jit_host_pure_inline(const uam_jit *j, uam_opcode op)
     switch (op) {
     case UAM_OP_POPCNT:
         return j->popcnt;
-    case UAM_OP_COV: case UAM_OP_CMPLOG: case UAM_OP__COUNT:
+    case UAM_OP_COV: case UAM_OP_CMPLOG: case UAM_OP_FRAME: case UAM_OP__COUNT:
         return false;
     default:
         return true;
@@ -866,7 +896,7 @@ static bool op_supported(uam_opcode op)
 {
     switch (op) {
     case UAM_OP_IMARK: case UAM_OP_GET: case UAM_OP_PUT: case UAM_OP_LD: case UAM_OP_ST:
-    case UAM_OP_EXIT: case UAM_OP_COV: case UAM_OP_CMPLOG:
+    case UAM_OP_EXIT: case UAM_OP_COV: case UAM_OP_CMPLOG: case UAM_OP_FRAME:
         return true;
     case UAM_OP_SYSRD: case UAM_OP_SYSWR: case UAM_OP_TRAP: case UAM_OP_WAIT:
     case UAM_OP_HELPER: case UAM_OP_AMO: case UAM_OP_CAS: case UAM_OP_FENCE:
@@ -1674,6 +1704,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             break;
         case UAM_OP_CMPLOG:
             emit_cmplog(j, blk, in);
+            break;
+        case UAM_OP_FRAME:
+            emit_frame(j, blk, in);
             break;
         default:
             emit_pure(j, blk, in, rd);

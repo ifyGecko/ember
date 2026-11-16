@@ -225,6 +225,16 @@ void jit_br_cmplog(struct uam_cmp_state *s, uint64_t packed, uint64_t a, uint64_
     uam_cmp_note(s, (uint32_t)packed, (uint32_t)(packed >> 32), a, b);
 }
 
+void jit_br_frame(struct uam_frame_state *s, uint64_t flags, uint64_t a, uint64_t c)
+{
+    if (flags & UAM_FRAME_CALL)
+        uam_frame_call(s, a, c);
+    else if (flags & UAM_FRAME_RET)
+        uam_frame_ret(s, a, c);
+    else
+        uam_frame_eret(s);
+}
+
 uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64_t y, uint64_t z)
 {
     uint64_t out = 0;

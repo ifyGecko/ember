@@ -100,7 +100,17 @@ enum { UAM_WATCH_READ = 1u << 0, UAM_WATCH_WRITE = 1u << 1,
         * and DMA are exempt. The watch's fn is called BEFORE the access faults, with
         * `val` the value a write would have stored (0 for a read); it must not add or
         * remove watches. Guards with a stop/fault/log policy: uam/guard.h. */
-       UAM_WATCH_FAULT = 1u << 2 };
+       UAM_WATCH_FAULT = 1u << 2,
+       /* UAM_WATCH_CHECK (uam_bus_add_check): the watch's check function is asked before
+        * each matching access and decides: true refuses it, as a UAM_WATCH_FAULT watch
+        * would; false lets it through. The same accesses are exempt. */
+       UAM_WATCH_CHECK = 1u << 3 };
+
+/* The decision of a UAM_WATCH_CHECK watch: true to refuse the access (it then faults like
+ * an unmapped page). `val`: the value a write would store (0 for a read). It must not add
+ * or remove watches. */
+typedef bool (*uam_watch_check_fn)(void *ctx, uint64_t addr, unsigned size, bool is_write,
+                                   uint64_t val);
 
 typedef struct uam_watch {
     int          id;
@@ -108,6 +118,7 @@ typedef struct uam_watch {
     unsigned     kinds;     /* UAM_WATCH_READ | UAM_WATCH_WRITE [| UAM_WATCH_FAULT] */
     uam_watch_fn fn;
     void        *ctx;
+    uam_watch_check_fn check;   /* UAM_WATCH_CHECK: asked instead of fn */
 } uam_watch;
 
 /*
@@ -233,6 +244,11 @@ uam_status uam_bus_dma_write(uam_bus *bus, uint64_t addr, const void *buf, size_
  * debug accesses). Returns an id (> 0), or a negative value on failure. */
 int        uam_bus_add_watch(uam_bus *bus, uint64_t base, uint64_t size, unsigned kinds,
                              uam_watch_fn fn, void *ctx);
+/* A watch that decides per access (UAM_WATCH_CHECK): `kinds` is UAM_WATCH_READ and/or
+ * UAM_WATCH_WRITE. One such watch over a large range costs each access to its pages one
+ * call, where a guard per object would cost a scan of them all. Returns its id, or -1. */
+int        uam_bus_add_check(uam_bus *bus, uint64_t base, uint64_t size, unsigned kinds,
+                             uam_watch_check_fn check, void *ctx);
 bool       uam_bus_remove_watch(uam_bus *bus, int id);
 
 /*

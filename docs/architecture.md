@@ -71,6 +71,8 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `boards.h` | The stock boards and their registration, and board helpers (`uam_board_add_mmio_rules`, `uam_board_add_uart_input`, `uam_board_open_disk`) | `boards/stock.c`, `boards/mmio_rules.c` |
 | `pass.h` | IR → IR transformations run on every new block, after the optimizer and before native compilation (instrumentation); block editing helpers | `analysis/*`; registered with `uam_exec_add_pass` |
 | `guard.h` | Guarded and watched guest memory: byte ranges (virtual or physical, around an anchor) whose data accesses stop the run at the instruction (`UAM_STOP_GUARD`), become a bus fault for the guest, or are logged; hit records and an observer; the text form `--guard`/`--watch` and fuzz redzones use | `src/machine` (on bus fault watches and `uam_exec_request_fault_stop`) |
+| `frames.h` | Call tracking: the frame pass (`UAM_OP_FRAME` before every exit a lifter marked a call, a return or an exception return), the per-processor stack of frames it keeps, the set of return addresses, and the machine-level switch and backtrace; the return guard on top is `guard.h`'s `uam_machine_guard_returns` | `analysis/frames.c` (the pass), `src/exec/frames.c` (the state), `src/machine/frames.c` (machines, snapshots, the guard) |
+| `heap.h` | The guarded heap: an allocator for an arena of guest memory that a board runs in place of the firmware's own (the board hooks the firmware's functions; ember names none), with redzones, a quarantine and byte-exact checks of every guest access to the arena; hits are guard hits | `src/machine/heap.c` (on a checked bus watch, `uam_bus_add_check`) |
 | `fuzz.h` | The persistent-mode fuzz harness (boot to a begin pc, snapshot, one restore per input, verdicts) and its frontend interface; the replay frontend | `fuzz/` (see [`fuzzing.md`](fuzzing.md)) |
 | `cov.h` | The edge-coverage pass: `UAM_OP_COV` at a table of guest pcs (or at every block start), knowing nothing about where the table came from | `analysis/cov.c` |
 | `cmp.h` | The compare pass (`UAM_OP_CMPLOG` in front of each compare it recognises in the IR, flags ISAs' compares and constant offsets included) and the state it reports to: the log of a run's distinct (site, a, b), for a fuzzer's input-to-state stage | `analysis/cmp.c` (the pass), `src/exec/cmp.c` (the state, `uam_exec_set_cmp`) |
@@ -146,11 +148,12 @@ include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h
                   xtensa.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
 src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
-src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c cmp.c spin.c jit.h
+src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c cmp.c frames.c spin.c jit.h
                   jit_impl.h execops.h spin.h
-analysis/         cov.c (the edge-coverage pass) cmp.c (the compare pass)
+analysis/         cov.c (the edge-coverage pass) cmp.c (the compare pass) frames.c (the frame pass)
 src/loader/       loader.c
-src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches)
+src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches) frames.c (call tracking
+                  and the return guard for a machine) heap.c (the guarded heap)
 src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.c
 src/debug/        gdbstub.c
 src/runner/       runner.c
@@ -205,9 +208,11 @@ skills/           ember-dev-recon/ ember-dev-build/ ember-fuzz/ (agent skills: S
                   references, templates) install.sh tests/ (run-tests.sh: the skills' tooling
                   against an ember checkout; never part of the library)
 tests/boards/     test_boards.c test_boards.h uam-test-run.c  (x86_64-test and rv32-test: reference boards plus
-                  the components only the tests use; build/uam-test-run)
+                  the components only the tests use; build/uam-test-run) heap_hooks.c (a board's
+                  hooks from a firmware's allocator to a guarded heap)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_cov_formats.c
+                  test_oracles.c (call tracking, the return guard, the guarded heap)
                   (with cov_golden.txt, its golden map hashes)
                   test_smp.c test_f80.c test_xtensa_fpu.c, and one per ISA: test_riscv.c
                   test_mips.c test_arm.c test_x86.c test_ppc.c test_avr.c test_avr32.c

@@ -321,12 +321,15 @@ static uam_status rv32_test_build(uam_machine *m, const uam_board_config *cfg)
             return st;
         uam_signal_connect(uam_virtio_net_irq_line(dev), uam_plic_input, plic, RV32TEST_VIRTIO_IRQ + i);
     }
+    if ((st = test_heap_hooks_install(m, cfg)) != UAM_OK)
+        return st;
     uam_machine_reset(m, m->reset_pc);
     return UAM_OK;
 }
 
 const uam_board test_board_rv32 = {
     .name = "rv32-test",
-    .description = "rv32-ref plus virtio-net ports net0..net7 (tests only)",
+    .description = "rv32-ref plus virtio-net ports net0..net7 and, with -o heap=BASE+SIZE, a guarded "
+                   "heap behind -o malloc=ADDR, free=ADDR, realloc=ADDR (tests only)",
     .build = rv32_test_build,
 };

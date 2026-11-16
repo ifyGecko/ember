@@ -113,7 +113,8 @@ enum uam_op_prop {
     X(HELPER,  "helper",  3, UAM_RK_SPECIAL, UAM_P_GUARD | UAM_P_EFFECT)      \
     /* instrumentation (inserted by passes, never by lifters) */                \
     X(COV,     "cov",     2, UAM_RK_NONE, UAM_P_EFFECT)                         \
-    X(CMPLOG,  "cmplog",  2, UAM_RK_NONE, UAM_P_EFFECT)
+    X(CMPLOG,  "cmplog",  2, UAM_RK_NONE, UAM_P_EFFECT)                         \
+    X(FRAME,   "frame",   3, UAM_RK_NONE, UAM_P_EFFECT)
 
 typedef enum uam_opcode {
 #define UAM_X_ENUM(name, mn, nsrc, rk, props) UAM_OP_##name,
@@ -183,6 +184,19 @@ typedef enum uam_exit_kind {
  */
 #define UAM_COV_SPLIT 0x1u
 #define UAM_COV_ERET  0x2u
+
+/*
+ * FRAME flags (the `flags` field on a FRAME instruction; docs/uam-isa.md section 7.7):
+ * exactly one. A FRAME stands before the EXIT it describes (fences and other markers
+ * between) and reports that exit to the call tracker (frames.h) when operand b, the
+ * exit's guard as a 1-bit value (the immediate 1 if it has none), is 1.
+ *   UAM_FRAME_CALL  a = the address the call returns to, c = the call's target;
+ *   UAM_FRAME_RET   a = the return's target, c = the pc of the returning instruction;
+ *   UAM_FRAME_ERET  an exception return; a and c are 0.
+ */
+#define UAM_FRAME_CALL 0x1u
+#define UAM_FRAME_RET  0x2u
+#define UAM_FRAME_ERET 0x4u
 
 /*
  * UAM_IMARK_BREAK asks the executor to stop *before* this instruction, as if

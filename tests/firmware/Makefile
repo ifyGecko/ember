@@ -12,7 +12,7 @@ FW_CFLAGS     := $(ARCH_FLAGS) -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -f
 FW_LDFLAGS    := -static -T link.ld -Wl,--build-id=none
 
 all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf $(OUT)/smptest.elf $(OUT)/consoletest.elf \
-     $(OUT)/irqtarget.elf
+     $(OUT)/irqtarget.elf $(OUT)/heaptarget.elf
 
 $(OUT)/selftest.elf: start.S selftest.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
@@ -34,6 +34,11 @@ $(OUT)/irqtarget.elf: start.S irqtarget.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
 	@mkdir -p $(OUT)
 	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S irqtarget.c -o $@
+
+$(OUT)/heaptarget.elf: start.S heaptarget.c link.ld
+	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
+	@mkdir -p $(OUT)
+	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S heaptarget.c -o $@
 
 $(OUT)/consoletest.elf: start.S consoletest.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }

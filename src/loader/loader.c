@@ -272,6 +272,154 @@ uam_status uam_elf_symbol(const char *path, const char *name, uint64_t *value, u
     return w ? UAM_ERR_INVALID : UAM_OK;
 }
 
+/* ---- symbols for naming addresses ---------------------------------------- */
+
+typedef struct sym_ent {
+    uint64_t addr, size;
+    uint32_t name;   /* offset into names */
+} sym_ent;
+
+struct uam_symtab {
+    sym_ent *e;
+    size_t   n;
+    char    *names;
+};
+
+static int sym_cmp(const void *x, const void *y)
+{
+    const sym_ent *a = x, *b = y;
+    return a->addr < b->addr ? -1 : a->addr > b->addr;
+}
+
+/* Collect the function symbols of the table of type `want` into t. false: bad file or
+ * out of memory. */
+static bool collect_symbols(uam_symtab *t, const uint8_t *d, size_t len, bool is64, bool be,
+                            uint32_t want, bool arm)
+{
+    const uint64_t shoff = is64 ? rd(d + 40, 8, be) : rd(d + 32, 4, be);
+    const unsigned shentsize = (unsigned)rd(d + (is64 ? 58 : 46), 2, be);
+    const unsigned shnum = (unsigned)rd(d + (is64 ? 60 : 48), 2, be);
+    if (!shnum)
+        return true;
+    if (shoff > len || shentsize < (is64 ? 64u : 40u) || (uint64_t)shnum * shentsize > len - shoff)
+        return false;
+    for (unsigned i = 0; i < shnum; i++) {
+        const uint8_t *sh = d + shoff + (uint64_t)i * shentsize;
+        if ((uint32_t)rd(sh + 4, 4, be) != want)
+            continue;
+        uint64_t off = is64 ? rd(sh + 24, 8, be) : rd(sh + 16, 4, be);
+        uint64_t sz = is64 ? rd(sh + 32, 8, be) : rd(sh + 20, 4, be);
+        uint32_t link = (uint32_t)rd(sh + (is64 ? 40 : 24), 4, be);
+        uint64_t ent = is64 ? rd(sh + 56, 8, be) : rd(sh + 36, 4, be);
+        if (link >= shnum || ent < (is64 ? 24u : 16u) || off > len || sz > len - off)
+            return false;
+        const uint8_t *st = d + shoff + (uint64_t)link * shentsize;
+        uint64_t stroff = is64 ? rd(st + 24, 8, be) : rd(st + 16, 4, be);
+        uint64_t strsz = is64 ? rd(st + 32, 8, be) : rd(st + 20, 4, be);
+        if (stroff > len || strsz > len - stroff || !strsz || strsz > UINT32_MAX)
+            return false;
+        const size_t max = (size_t)(sz / ent);
+        sym_ent *e = realloc(t->e, sizeof(*e) * (t->n + max + 1));
+        char *names = malloc((size_t)strsz + 1);
+        if (!e || !names) {
+            free(names);
+            if (e)
+                t->e = e;
+            return false;
+        }
+        t->e = e;
+        memcpy(names, d + stroff, (size_t)strsz);
+        names[strsz - 1] = '\0';
+        names[strsz] = '\0';
+        free(t->names);   /* one table's names are kept: .symtab's, else .dynsym's */
+        t->names = names;
+        t->n = 0;
+        for (uint64_t k = 0; k + ent <= sz; k += ent) {
+            const uint8_t *sym = d + off + k;
+            const uint32_t nm = (uint32_t)rd(sym, 4, be);
+            const uint8_t info = sym[is64 ? 4 : 12];
+            const uint16_t shndx = (uint16_t)rd(sym + (is64 ? 6 : 14), 2, be);
+            const unsigned type = info & 0xF;
+            /* functions, and untyped labels (hand-written assembly) that are not ARM's
+             * mapping symbols ($a, $t, $d) or local labels */
+            if (!shndx || shndx >= 0xFF00 || nm >= strsz || !names[nm] || (type != 2 && type != 0)
+                || names[nm] == '$' || (type == 0 && names[nm] == '.'))
+                continue;
+            uint64_t v = is64 ? rd(sym + 8, 8, be) : rd(sym + 4, 4, be);
+            if (arm && type == 2)
+                v &= ~UINT64_C(1);
+            t->e[t->n++] = (sym_ent){ .addr = v, .size = is64 ? rd(sym + 16, 8, be) : rd(sym + 8, 4, be),
+                                      .name = nm };
+        }
+        return true;
+    }
+    return true;
+}
+
+uam_symtab *uam_elf_symtab(const char *path)
+{
+    uint8_t *d;
+    size_t len;
+    if (read_file(path, &d, &len) != UAM_OK)
+        return NULL;
+    uam_symtab *t = NULL;
+    if (len >= 64 && !memcmp(d, "\177ELF", 4) && (d[4] == 1 || d[4] == 2) && (d[5] == 1 || d[5] == 2)
+        && (t = calloc(1, sizeof(*t)))) {
+        const bool is64 = d[4] == 2, be = d[5] == 2;
+        const bool arm = rd(d + 18, 2, be) == 40;
+        bool ok = collect_symbols(t, d, len, is64, be, SHT_SYMTAB, arm);
+        if (ok && !t->n)
+            ok = collect_symbols(t, d, len, is64, be, SHT_DYNSYM, arm);
+        if (!ok || !t->n) {
+            uam_symtab_free(t);
+            t = NULL;
+        } else {
+            qsort(t->e, t->n, sizeof(*t->e), sym_cmp);
+        }
+    }
+    free(d);
+    return t;
+}
+
+void uam_symtab_free(uam_symtab *t)
+{
+    if (!t)
+        return;
+    free(t->e);
+    free(t->names);
+    free(t);
+}
+
+bool uam_symtab_find(const uam_symtab *t, uint64_t addr, const char **name, uint64_t *off)
+{
+    size_t lo = 0, hi = t->n;   /* the last symbol with addr <= the address */
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (t->e[mid].addr <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (!lo)
+        return false;
+    /* Among symbols at one address the sized one names the function. */
+    size_t k = lo - 1;
+    for (size_t i = k; t->e[i].addr == t->e[k].addr; i--) {
+        if (t->e[i].size) {
+            k = i;
+            break;
+        }
+        if (!i)
+            break;
+    }
+    const sym_ent *e = &t->e[k];
+    if (e->size && addr - e->addr >= e->size)
+        return false;
+    *name = t->names + e->name;
+    *off = addr - e->addr;
+    return true;
+}
+
 uam_status uam_load_file(const char *path, uint8_t **data, size_t *len)
 {
     return read_file(path, data, len);

@@ -77,8 +77,90 @@ static struct uam_guard_set *guard_set(uam_machine *m)
     return m->guards;
 }
 
+const char *uam_guard_kind_str(uam_guard_kind k)
+{
+    switch (k) {
+    case UAM_GUARD_ACCESS:           return "access";
+    case UAM_GUARD_RETURN:           return "return";
+    case UAM_GUARD_HEAP_REDZONE:     return "heap-redzone";
+    case UAM_GUARD_HEAP_FREED:       return "heap-freed";
+    case UAM_GUARD_HEAP_WILD:        return "heap-wild";
+    case UAM_GUARD_HEAP_DOUBLE_FREE: return "heap-double-free";
+    case UAM_GUARD_HEAP_BAD_FREE:    return "heap-bad-free";
+    }
+    return "?";
+}
+
+void uam_guard_hit_describe(const uam_guard_hit *h, char *buf, size_t n)
+{
+    const unsigned long long a = h->addr, s0 = h->start, len = h->len;
+    char acc[48];
+    int k = 0;
+    if (n)
+        buf[0] = '\0';
+    snprintf(acc, sizeof(acc), "%s %u at 0x%llx", h->is_write ? "write" : "read", h->size, a);
+    switch (h->kind) {
+    case UAM_GUARD_ACCESS: {
+        const int64_t rel = (int64_t)(h->addr - h->start);
+        if (rel < 0)
+            snprintf(buf, n, "%s: %llu before guard %s [0x%llx, 0x%llx)", acc,
+                     (unsigned long long)-rel, h->name, s0, s0 + len);
+        else
+            snprintf(buf, n, "%s: +%llu into guard %s [0x%llx, 0x%llx)", acc,
+                     (unsigned long long)rel, h->name, s0, s0 + len);
+        return;
+    }
+    case UAM_GUARD_RETURN:
+        snprintf(buf, n, "returns to 0x%llx, which no call returns to", a);
+        return;
+    case UAM_GUARD_HEAP_REDZONE:
+        if (h->addr < h->start)
+            k = snprintf(buf, n, "%s: %llu before the %llu-byte block at 0x%llx", acc,
+                         s0 - a, len, s0);
+        else
+            k = snprintf(buf, n, "%s: %llu past the end of the %llu-byte block at 0x%llx", acc,
+                         a + h->size - (s0 + len), len, s0);
+        break;
+    case UAM_GUARD_HEAP_FREED:
+        k = snprintf(buf, n, "%s: +%llu in the freed %llu-byte block at 0x%llx", acc, a - s0, len, s0);
+        break;
+    case UAM_GUARD_HEAP_WILD:
+        snprintf(buf, n, "%s: heap memory in no block", acc);
+        return;
+    case UAM_GUARD_HEAP_DOUBLE_FREE:
+        k = snprintf(buf, n, "frees the %llu-byte block at 0x%llx again", len, s0);
+        break;
+    case UAM_GUARD_HEAP_BAD_FREE:
+        if (h->len || h->start)
+            k = snprintf(buf, n, "frees 0x%llx, +%llu in the %llu-byte block at 0x%llx", a, a - s0,
+                         len, s0);
+        else
+            k = snprintf(buf, n, "frees 0x%llx, which starts no block", a);
+        break;
+    }
+    if (k < 0 || (size_t)k >= n)
+        return;
+    if (h->site[0])
+        k += snprintf(buf + k, n - (size_t)k, ", allocated at 0x%llx", (unsigned long long)h->site[0]);
+    if (h->site[1] && (size_t)k < n)
+        snprintf(buf + k, n - (size_t)k, ", freed at 0x%llx", (unsigned long long)h->site[1]);
+}
+
+/* The hits that are not an access to a guard's own range. */
+static void format_other(const uam_guard_hit *h, char *buf, size_t n)
+{
+    int k = snprintf(buf, n, "guard %s (%s): cpu %u pc 0x%llx ", h->name ? h->name : "?",
+                     uam_guard_action_str(h->action), h->cpu, (unsigned long long)h->pc);
+    if (k >= 0 && (size_t)k < n)
+        uam_guard_hit_describe(h, buf + k, n - (size_t)k);
+}
+
 void uam_guard_hit_format(const uam_guard_hit *h, char *buf, size_t n)
 {
+    if (h->kind != UAM_GUARD_ACCESS) {
+        format_other(h, buf, n);
+        return;
+    }
     int64_t rel = (int64_t)(h->addr - h->start);
     char where[64];
     if (rel < 0)
@@ -100,6 +182,8 @@ void uam_guard_hit_format(const uam_guard_hit *h, char *buf, size_t n)
         snprintf(buf + k, n - (size_t)k, ")");
 }
 
+static void recorded(struct uam_guard_set *s, bool in_access);
+
 static void on_access(void *ctx, uint64_t pa, unsigned size, bool is_write, uint64_t val)
 {
     const piece *p = ctx;
@@ -115,13 +199,21 @@ static void on_access(void *ctx, uint64_t pa, unsigned size, bool is_write, uint
         .start = g->spec.addr, .len = g->spec.len, .paddr = pa, .size = size,
         .is_write = is_write, .val = refused && !is_write ? 0 : val,
     };
+    recorded(s, true);
+}
+
+/* s->last was just set: count it, act on it, tell the observer. */
+static void recorded(struct uam_guard_set *s, bool in_access)
+{
+    uam_machine *m = s->m;
     s->has_last = true;
     s->hits++;
-    if (g->spec.action == UAM_GUARD_STOP)
-        uam_exec_request_fault_stop(uam_machine_exec(m, hart), &s->last.pc);
-    if (g->spec.action == UAM_GUARD_LOG && s->log) {
+    if (s->last.action == UAM_GUARD_STOP)
+        uam_exec_request_fault_stop(uam_machine_exec(m, s->last.cpu),
+                                    in_access ? &s->last.pc : NULL);
+    if (s->last.action == UAM_GUARD_LOG && s->log) {
         /* The icount, as every trace line has it, so the line can be placed among them. */
-        char line[256];
+        char line[320];
         uam_origin o;
         uam_guard_hit_format(&s->last, line, sizeof(line));
         if (uam_origin_get(&o))
@@ -131,6 +223,15 @@ static void on_access(void *ctx, uint64_t pa, unsigned size, bool is_write, uint
     }
     if (s->observer)
         s->observer(s->observer_ctx, m, &s->last);
+}
+
+void uam_machine_guard_report(uam_machine *m, const uam_guard_hit *hit, bool in_access)
+{
+    struct uam_guard_set *s = guard_set(m);
+    if (!s)
+        return;
+    s->last = *hit;
+    recorded(s, in_access);
 }
 
 static void free_guard(uam_machine *m, guard *g)

@@ -263,6 +263,7 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
         if (in->flags) {
             uint32_t k = v->idx + 1;   /* only fences and such markers, then an exit */
             while (k < v->blk->n_insn && (v->blk->insn[k].op == UAM_OP_FENCE
+                                          || v->blk->insn[k].op == UAM_OP_FRAME
                                           || (v->blk->insn[k].op == UAM_OP_COV && v->blk->insn[k].flags)))
                 k++;
             if (k >= v->blk->n_insn || v->blk->insn[k].op != UAM_OP_EXIT)
@@ -289,6 +290,31 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
             return fail(v, "cmplog cannot start a block");
         return use(v, in->a, W, "a") && use(v, in->b, W, "b") && none(v, in->c, "c")
             && define(v, in->dst, 0);
+
+    case UAM_OP_FRAME: {
+        static const uint8_t kind_of[] = { [UAM_FRAME_CALL] = UAM_EXIT_CALL,
+                                           [UAM_FRAME_RET] = UAM_EXIT_RET,
+                                           [UAM_FRAME_ERET] = UAM_EXIT_EXC_RETURN };
+        if (in->flags != UAM_FRAME_CALL && in->flags != UAM_FRAME_RET && in->flags != UAM_FRAME_ERET)
+            return fail(v, "bad frame flags");
+        if (W != v->blk->addr_width)
+            return fail(v, "frame width must be the address width");
+        uint32_t k = v->idx + 1;   /* only fences and markers, then the exit it describes */
+        while (k < v->blk->n_insn && (v->blk->insn[k].op == UAM_OP_FENCE
+                                      || v->blk->insn[k].op == UAM_OP_FRAME
+                                      || (v->blk->insn[k].op == UAM_OP_COV && v->blk->insn[k].flags)))
+            k++;
+        if (k >= v->blk->n_insn || v->blk->insn[k].op != UAM_OP_EXIT
+            || v->blk->insn[k].aux != kind_of[in->flags])
+            return fail(v, "a frame must precede an exit of its kind (fences between)");
+        const uam_ref g = v->blk->insn[k].guard;
+        if (uam_ref_is_none(g) ? !uam_ref_is_imm(in->b) : in->b != g)
+            return fail(v, "a frame's b must be its exit's guard");
+        if ((in->flags & UAM_FRAME_CALL) && !uam_ref_is_imm(in->a))
+            return fail(v, "a call frame's return address must be an immediate");
+        return use(v, in->a, W, "a") && use(v, in->b, 1, "b") && use(v, in->c, W, "c")
+            && define(v, in->dst, 0);
+    }
 
     case UAM_OP__COUNT:
         break;

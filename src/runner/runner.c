@@ -452,6 +452,9 @@ static void usage(FILE *out)
         "                          exceptions, interrupt entries) and print them at the stop\n"
         "                          (fuzzing: for each input that is not ok); --jit does not\n"
         "                          chain blocks while it is on\n"
+        "      --backtrace         track calls and returns, and print each processor's call\n"
+        "                          stack at the stop (fuzzing: for each input that is not ok),\n"
+        "                          innermost first, named from the ELF image's symbols\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
         "      --guard SPEC        guard guest memory (repeatable): a data access that\n"
         "                          touches it stops the run before it happens (exit 129).\n"
@@ -462,6 +465,15 @@ static void usage(FILE *out)
         "                          instead, log only reports it. ADDR is virtual, translated\n"
         "                          as processor 0 maps data when the run starts; p: physical\n"
         "      --watch SPEC        --guard SPEC,log: report each access to it on stderr\n"
+        "      --guard-returns[=log]  stop (exit 129) when a return goes to an address that\n"
+        "                          no call instruction returns to: a smashed return address.\n"
+        "                          Returns into another task or out of a longjmp pass. =log:\n"
+        "                          report each such address once and go on (to find the ones\n"
+        "                          a firmware uses on purpose, for --return-ok)\n"
+        "      --return-ok ADDR    with --guard-returns: ADDR (or SYMBOL[+OFFSET]) is a valid\n"
+        "                          return target (repeatable): code that jumps through a\n"
+        "                          return instruction on purpose, such as a scheduler starting\n"
+        "                          a task by returning into its entry function\n"
         "      --dump-mem [p:]ADDR+LEN[=FILE]  when the run stops (--break, -n, ...), hex-dump\n"
         "                          LEN bytes of guest memory at ADDR to stderr, or write them\n"
         "                          raw to FILE (repeatable). ADDR is virtual, translated as\n"
@@ -739,6 +751,42 @@ static void print_history(uam_machine *m, FILE *out)
         uam_exec_history_print(uam_machine_exec(m, i), out, "history: ");
 }
 
+/* ---- --backtrace -------------------------------------------------------------- */
+
+typedef struct bt_syms {
+    bool        on;
+    uam_symtab *tab;
+    uint64_t    mask;   /* clears the ISA's pc state bits */
+} bt_syms;
+
+static bt_syms g_bt;   /* the image's symbols, loaded for --backtrace */
+
+static bool bt_name(void *ctx, uint64_t pc, char *buf, size_t n)
+{
+    const bt_syms *b = ctx;
+    const char *name;
+    uint64_t off;
+    if (!b->tab || !uam_symtab_find(b->tab, pc & b->mask, &name, &off))
+        return false;
+    if (off)
+        snprintf(buf, n, "%s+0x%llx", name, (unsigned long long)off);
+    else
+        snprintf(buf, n, "%s", name);
+    return true;
+}
+
+static void print_backtrace(uam_machine *m, FILE *out)
+{
+    for (unsigned i = 0, n = uam_machine_ncpus(m); i < n; i++) {
+        char prefix[40];
+        if (n > 1)
+            snprintf(prefix, sizeof(prefix), "backtrace: cpu%u ", i);
+        else
+            snprintf(prefix, sizeof(prefix), "backtrace: ");
+        uam_machine_backtrace_print(m, i, out, prefix, bt_name, &g_bt);
+    }
+}
+
 /* --snapshot-at: save once, on the first arrival. */
 typedef struct snap_at {
     uam_machine *m;
@@ -780,6 +828,7 @@ typedef struct trace_fe {
     rtrace                  *rt;
     uam_machine             *m;
     bool                     history;   /* --history: print it for each input that is not ok */
+    bool                     backtrace; /* --backtrace: the same for the call stack */
 } trace_fe;
 
 static uam_status trace_fe_hello(void *ctx, const uam_fuzz_info *info)
@@ -807,8 +856,12 @@ static uam_status trace_fe_report(void *ctx, uint64_t id, uam_fuzz_verdict v, ui
     trace_fe *t = ctx;
     if (kind == UAM_FUZZ_KIND_INIT)
         fprintf(t->rt->out, "trace: the boot to the begin pc ends\n");
-    else if (t->history && v != UAM_FUZZ_OK)
-        print_history(t->m, t->rt->out);
+    else if (v != UAM_FUZZ_OK) {
+        if (t->history)
+            print_history(t->m, t->rt->out);
+        if (t->backtrace)
+            print_backtrace(t->m, t->rt->out);
+    }
     rtrace_finish(t->rt);
     return t->fe->report(t->ctx, id, v, detail, map, map_size, kind);
 }
@@ -882,8 +935,9 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
         .rt = rt,
         .m = m,
         .history = m->exec.hist != NULL,
+        .backtrace = g_bt.on,
     };
-    uam_status st = rt->flags || m->exec.trace || tfe.history ? uam_fuzz_run(f, &trace_frontend, &tfe)
+    uam_status st = rt->flags || m->exec.trace || tfe.history || tfe.backtrace ? uam_fuzz_run(f, &trace_frontend, &tfe)
                               : uam_fuzz_run(f, tfe.fe, tfe.ctx);
     g_fuzz = NULL;
     fflush(stdout);
@@ -945,7 +999,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
            OPT_FUZZ_SNAPSHOT,
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
-           OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_EXT_BASE = 1000 };
+           OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_GUARD_RETURNS, OPT_RETURN_OK,
+           OPT_BACKTRACE, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -973,6 +1028,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "log-stamp", no_argument, NULL, OPT_LOG_STAMP },
         { "trace-file", required_argument, NULL, OPT_TRACE_FILE },
         { "history", required_argument, NULL, OPT_HISTORY },
+        { "guard-returns", optional_argument, NULL, OPT_GUARD_RETURNS },
+        { "return-ok", required_argument, NULL, OPT_RETURN_OK },
+        { "backtrace", no_argument, NULL, OPT_BACKTRACE },
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
         { "guard", required_argument, NULL, OPT_GUARD },
@@ -1031,6 +1089,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
     const char *trace_file = NULL;
     FILE *trace_fp = NULL;
     uint32_t history = 0;
+    bool guard_returns = false, backtrace = false;
+    uam_guard_action returns_action = UAM_GUARD_STOP;
+    uint64_t return_ok[MAX_LIST];
+    unsigned n_return_ok = 0;
     bool unknown_stop = false;
     stop_unmapped *su = NULL;
     const char *guard_texts[MAX_LIST];
@@ -1225,6 +1287,25 @@ static int run_main(int argc, char **argv, const ext_set *es)
             history = (uint32_t)n;
             break;
         }
+        case OPT_GUARD_RETURNS:
+            guard_returns = true;
+            if (optarg && strcmp(optarg, "log") == 0) {
+                returns_action = UAM_GUARD_LOG;
+            } else if (optarg && strcmp(optarg, "stop") != 0) {
+                fprintf(stderr, "uam-run: bad --guard-returns=%s (stop or log)\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_BACKTRACE: backtrace = true; break;
+        case OPT_RETURN_OK:
+            if (n_return_ok == MAX_LIST
+                || !pc_arg(&syms, "return-ok", optarg, &return_ok[n_return_ok], NULL, 0)) {
+                fprintf(stderr, "uam-run: bad --return-ok '%s' (ADDR or SYMBOL[+OFFSET], at most "
+                        "64)\n", optarg);
+                return 2;
+            }
+            n_return_ok++;
+            break;
         case OPT_GUARD:
         case OPT_WATCH: {
             uam_guard_spec gs;
@@ -1576,6 +1657,25 @@ static int run_main(int argc, char **argv, const ext_set *es)
         uam_machine_fini(&m);
         goto out_host;
     }
+    /* Call tracking is machine state: it must be on before a snapshot is loaded or taken. */
+    if (n_return_ok && !guard_returns)
+        fprintf(stderr, "uam-run: --return-ok does nothing without --guard-returns\n");
+    if (guard_returns || backtrace) {
+        st = guard_returns ? uam_machine_guard_returns(&m, true, returns_action)
+                           : uam_machine_track_calls(&m, true);
+        for (unsigned i = 0; st == UAM_OK && guard_returns && i < n_return_ok; i++)
+            st = uam_machine_add_return_site(&m, return_ok[i]);
+        if (st != UAM_OK) {
+            fprintf(stderr, "uam-run: cannot turn call tracking on\n");
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        if (backtrace) {
+            g_bt.on = true;
+            g_bt.mask = ~uam_isa_pc_state_bits(m.cpu.isa);
+            g_bt.tab = image ? uam_elf_symtab(image) : NULL;
+        }
+    }
     if (load_snap) {
         uam_snapshot *snap;
         st = uam_snapshot_load(load_snap, &snap);
@@ -1821,7 +1921,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
 
     if (!fuzzing && why == UAM_STOP_GUARD && uam_machine_guard_last_hit(&m)) {
-        char line[256];
+        char line[320];
         uam_guard_hit_format(uam_machine_guard_last_hit(&m), line, sizeof(line));
         fprintf(stderr, "uam-run: %s\n", line);
     }
@@ -1842,6 +1942,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 (unsigned long long)m.cpu.pc, (unsigned long long)uam_machine_icount(&m));
     if (!fuzzing && history)
         print_history(&m, m.exec.trace_out);
+    if (!fuzzing && backtrace)
+        print_backtrace(&m, m.exec.trace_out);
     if (!fuzzing)
         rtrace_finish(&rt);
     if (stats) {
@@ -1933,6 +2035,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     rtrace_detach(&rt);
     uam_machine_fini(&m);
 out_host:
+    uam_symtab_free(g_bt.tab);
+    g_bt = (bt_syms){ 0 };
     uam_host_destroy(host);
     for (size_t i = 0; i < cfg.n_netdevs; i++)
         uam_netdev_destroy(nics[i].nd);   /* after the machine: devices detach first */

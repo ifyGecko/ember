@@ -84,6 +84,12 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    take the plain data address: "Per ISA"). A `--guard` is armed
    during boot: guard only what the boot does not write (`:r` otherwise), or the boot
    stops at it and never reaches the begin pc.
+   **Stack and heap**: add `--guard-returns` (a return to an address no call returns to: a
+   smashed return address; name a target the boot reports with `--return-ok`), and, when
+   the handler allocates, have the board put ember's guarded heap behind the firmware's
+   allocator (`-o guard-heap=1` once ember-dev-build's `board-skeleton.md` recipe is in the
+   board): overflows by one byte, use after free, double frees
+   (`references/harness.md`, "Return guard and guarded heap").
    **An x86 SMM handler** also wants SMM code-fetch confinement (`uam_x86_set_smm_confine`,
    `-o smm-confine=1` on the PC template and `x86_64-ref`): a call-out of SMRAM becomes a `fetch` crash at its
    first instruction; a `--guard` in SMRAM decoded through the SMM view takes
@@ -125,7 +131,9 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    before it happened: its replay line names the guard and the access's offset into it
    (`read 1 at 0x80000470: +0 into guard mem-after [...]`), which says whether it is an
    off-by-one, a trusted length or an underflow (`references/harness.md`, "Reading a
-   crash-guard line"). Decide for each: firmware bug, or emulation gap (a device that
+   crash-guard line"). A line that starts `(heap-...:` or `(return:` comes from the heap or
+   return guard and names the block, its allocation and free sites, or the bad return
+   target; `--backtrace` adds the call stack. Decide for each: firmware bug, or emulation gap (a device that
    behaves unlike hardware). Emulation gaps go back to ember-dev-build as iterations.
 
 ## Journaling: `fuzz-XX.md` (required)

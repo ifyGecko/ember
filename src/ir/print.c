@@ -108,6 +108,10 @@ void uam_print_insn(FILE *out, const uam_block *blk, const uam_insn *in, const u
     case UAM_OP_EXIT:
         fprintf(out, " {%s}", in->aux < 5 ? exit_names[in->aux] : "?");
         break;
+    case UAM_OP_FRAME:
+        fprintf(out, " {%s}", in->flags == UAM_FRAME_CALL ? "call" : in->flags == UAM_FRAME_RET ? "ret"
+                              : in->flags == UAM_FRAME_ERET ? "eret" : "?");
+        break;
     case UAM_OP_TRAP:
         fprintf(out, " {%s}", in->aux < 3 ? trap_names[in->aux] : "?");
         break;

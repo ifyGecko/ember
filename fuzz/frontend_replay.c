@@ -223,8 +223,15 @@ static int replay_next(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
 }
 
 /* " (read 4 at 0x7ffc: 4 before guard mem-before [0x7ff8, 0x8000))" */
+/* The other kinds: " (heap-redzone: write 1 at 0x...: 1 past the end of ...)" */
 static void print_guard(FILE *out, const uam_guard_hit *h)
 {
+    if (h->kind != UAM_GUARD_ACCESS) {
+        char what[320];
+        uam_guard_hit_describe(h, what, sizeof(what));
+        fprintf(out, " (%s: %s)", uam_guard_kind_str(h->kind), what);
+        return;
+    }
     int64_t rel = (int64_t)(h->addr - h->start);
     fprintf(out, " (%s %u at 0x%llx: ", h->is_write ? "write" : "read", h->size,
             (unsigned long long)h->addr);

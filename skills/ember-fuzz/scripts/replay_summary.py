@@ -27,10 +27,15 @@ RANK = {"crash-fault": 0, "crash-guard": 1, "crash-oracle": 2, "hang": 3, "timeo
 RE_GUARD = re.compile(r" \((read|write) (\d+) at 0x[0-9a-f]+: (?:\+\d+ into|\d+ before)"
                       r" guard (.*) \[0x[0-9a-f]+, 0x[0-9a-f]+\)\)")
 
+# " (heap-redzone: write 1 at 0x80000d18: 1 past the end of the 24-byte block at ...)",
+# " (return: returns to 0x8000031a, which no call returns to)": the kind names the bug
+RE_KIND = re.compile(r" \((return|heap-[a-z-]+): .*\)")
+
 
 def signature(verdict, rest):
     rest = rest.strip()
     rest = RE_GUARD.sub(r" (\1 \2, guard \3)", rest)
+    rest = RE_KIND.sub(r" (\1)", rest)
     if verdict == "crash-fault":
         rest = re.sub(r" tval 0x[0-9a-f]+", "", rest)
     elif verdict == "crash-oracle":

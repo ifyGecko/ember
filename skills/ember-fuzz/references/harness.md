@@ -370,6 +370,48 @@ name defaults to the text before the first `,`.
   place across the harness's restores.
 - `--watch` is a debugging aid for triage (who writes this word?), not an oracle.
 
+## Return guard and guarded heap
+
+Two more memory oracles, for what redzones and guards cannot cover because the address is
+not known beforehand. Both report as `crash-guard` (exit 25) with a kind in the replay line.
+
+**`--guard-returns`** stops when a return goes to an address that no call instruction
+returns to: a return address overwritten on the stack. Add it to `fuzz.sh`; it costs a few
+percent on ordinary code (more where tiny functions are called in a tight loop: measure).
+
+- The boot is held to it. A stop during the boot (`boot did not reach the begin pc ...:
+  guarded memory access`) is nearly always a scheduler entering a new task by *returning*
+  into its entry function. Run the plain boot once with `--guard-returns=log`: each such
+  target is listed once (`guard return (log): ... returns to 0x...`); check in Ghidra that
+  it is a task entry or a deliberate computed return, then name it: `--return-ok ADDR` (or a
+  symbol), repeatable. Journal each one.
+- It passes returns into other tasks, `longjmp` and frames built before tracking, and it
+  misses a return address overwritten with another valid return address.
+- Not for x86 code built with return trampolines (retpolines).
+- `replay: ...: crash-guard pc=0x... (return: returns to 0x..., which no call returns to)`:
+  the pc is the returning instruction, so the function that owns it is the one whose frame
+  was overwritten. `--backtrace` shows the calls above it.
+
+**The guarded heap** needs the board: ember-dev-build's `board-skeleton.md` ("A guarded heap
+behind the firmware's allocator") hooks the firmware's allocation functions into
+`uam/heap.h`. With that in the board, switch it on in `fuzz.sh` (`-o guard-heap=1`).
+
+- Kinds: `heap-redzone` (an access just outside a live block: the off-by-one, the trusted
+  length), `heap-freed` (inside a freed block, also through a pointer `realloc` left
+  behind), `heap-wild` (arena memory in no block), `heap-double-free`, `heap-bad-free`.
+- The line names the block and where it was allocated and freed (`allocated at 0x...,
+  freed at 0x...`: return addresses in the callers); look those up in Ghidra first.
+- Every input starts from the heap as it was at the begin pc (it is in the snapshot).
+- It replaces the firmware's allocator, so it finds the firmware's misuse of the heap, not
+  bugs of the allocator itself. A hit inside allocator-looking code after the boot means a
+  heap routine the board did not hook: back to ember-dev-build.
+- Heap-heavy handlers run slower with it (accesses to the arena are checked one by one).
+  For throughput, run most workers without and one or two with it, sharing their queues.
+
+A snapshot (`--fuzz-snapshot`, `--save-snapshot`) carries both oracles' state and is only
+loaded with the same oracles on; `fuzz_launch.py`'s shared boot does that by itself as long
+as every worker gets the same options.
+
 ## Verdicts and replay
 
 `--fuzz-replay FILE|DIR` runs each input once (a directory in name order) and prints one line
@@ -445,7 +487,7 @@ count into one map, each in its own history; edges between processors are not co
 2. For each group, replay its smallest input alone, with the interpreter and `--jit`. Both
    must give the same verdict; if not, report an ember bug. Add `--history 64` to see the
    input's last blocks, exceptions and interrupt entries before the verdict (printed for
-   every input that is not ok), and traces as needed (`-t mmio,exc`, `--trace-file F`):
+   every input that is not ok), `--backtrace` for the call stack at the verdict, and traces as needed (`-t mmio,exc`, `--trace-file F`):
    in replay the boot's traces come first, then each input's in its own `trace: input ID`
    section with its own summaries. `--unknown-mmio stop` is refused while fuzzing (its stop
    is not a verdict): use `fault` there, `stop` in the plain run of step 3.

@@ -241,6 +241,22 @@ int uam_bus_add_watch(uam_bus *bus, uint64_t base, uint64_t size, unsigned kinds
     return id;
 }
 
+static void no_watch_fn(void *ctx, uint64_t addr, unsigned size, bool is_write, uint64_t val)
+{
+    (void)ctx; (void)addr; (void)size; (void)is_write; (void)val;
+}
+
+int uam_bus_add_check(uam_bus *bus, uint64_t base, uint64_t size, unsigned kinds,
+                      uam_watch_check_fn check, void *ctx)
+{
+    if (!check || (kinds & ~(unsigned)(UAM_WATCH_READ | UAM_WATCH_WRITE)))
+        return -1;
+    int id = uam_bus_add_watch(bus, base, size, kinds | UAM_WATCH_CHECK, no_watch_fn, ctx);
+    if (id >= 0)
+        bus->watches[bus->n_watches - 1].check = check;
+    return id;
+}
+
 bool uam_bus_remove_watch(uam_bus *bus, int id)
 {
     for (uint32_t i = 0; i < bus->n_watches; i++) {
@@ -272,8 +288,12 @@ static bool guard_hit(uam_bus *bus, uint64_t addr, unsigned size, bool is_write,
     bool hit = false;
     for (uint32_t i = 0; i < bus->n_watches; i++) {
         const uam_watch *w = &bus->watches[i];
-        if ((w->kinds & UAM_WATCH_FAULT) && (w->kinds & dir)
-            && overlaps(addr, size, w->base, w->size)) {
+        if (!(w->kinds & (UAM_WATCH_FAULT | UAM_WATCH_CHECK)) || !(w->kinds & dir)
+            || !overlaps(addr, size, w->base, w->size))
+            continue;
+        if (w->kinds & UAM_WATCH_CHECK) {
+            hit |= w->check(w->ctx, addr, size, is_write, val);
+        } else {
             w->fn(w->ctx, addr, size, is_write, val);
             hit = true;
         }
@@ -285,7 +305,7 @@ static void fire_watches(uam_bus *bus, uint64_t addr, unsigned size, bool is_wri
 {
     for (uint32_t i = 0; i < bus->n_watches; i++) {
         const uam_watch *w = &bus->watches[i];
-        if ((w->kinds & (is_write ? UAM_WATCH_WRITE : UAM_WATCH_READ))
+        if ((w->kinds & (is_write ? UAM_WATCH_WRITE : UAM_WATCH_READ)) && !(w->kinds & UAM_WATCH_CHECK)
             && overlaps(addr, size, w->base, w->size))
             w->fn(w->ctx, addr, size, is_write, val);
     }

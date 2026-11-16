@@ -112,6 +112,9 @@ uint64_t jit_br_eval(uam_jit_ctx *jc, uint32_t packed, uint64_t x, uint64_t y, u
 /* CMPLOG: uam_cmp_note(s, site, wk, a, b) with packed = site | (uint64_t)wk << 32 (no jc:
  * it cannot fault, stop the block or read time) */
 void     jit_br_cmplog(struct uam_cmp_state *s, uint64_t packed, uint64_t a, uint64_t b);
+/* FRAME: uam_frame_call / uam_frame_ret / uam_frame_eret by `flags` (no jc: it cannot
+ * fault, and a stop it asks for is seen at the block's exit). */
+void     jit_br_frame(struct uam_frame_state *s, uint64_t flags, uint64_t a, uint64_t c);
 
 /* ---- the compiler's state ------------------------------------------------------ */
 

@@ -30,6 +30,7 @@
 #include "uam/cmp.h"
 #include "uam/cov.h"
 #include "uam/cpu.h"
+#include "uam/frames.h"
 #include "uam/ir.h"
 #include "uam/isa.h"
 #include "uam/pass.h"
@@ -290,6 +291,8 @@ typedef struct uam_exec {
      * to while attached (cpu->cmp) */
     uam_cmp_pass    *cmp_pass;
     uam_cmp_state   *cmp_state;
+    /* call tracking (uam_exec_set_frames, frames.h): the pass the executor owns */
+    struct uam_frame_pass *frame_pass;
     /* exception and interrupt observers: one slot each */
     uam_exc_hook_fn  exc_hook;
     void            *exc_hook_ctx;

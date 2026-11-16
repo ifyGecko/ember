@@ -227,6 +227,20 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
                              opnd(blk, t, in->a, W), opnd(blk, t, in->b, W));
             break;
 
+        case UAM_OP_FRAME: {
+            /* Call tracking (section 7.7); no effect on guest state or icount. */
+            uam_frame_state *fs = cpu->frames;
+            if (!fs || !opnd(blk, t, in->b, 1))
+                break;
+            if (in->flags & UAM_FRAME_CALL)
+                uam_frame_call(fs, opnd(blk, t, in->a, W), opnd(blk, t, in->c, W));
+            else if (in->flags & UAM_FRAME_RET)
+                uam_frame_ret(fs, opnd(blk, t, in->a, W), opnd(blk, t, in->c, W));
+            else
+                uam_frame_eret(fs);
+            break;
+        }
+
         default: {
             /* Pure computation. */
             const uam_opinfo *oi = &uam_opinfo_table[in->op];

@@ -47,4 +47,15 @@ uam_status uam_load_file(const char *path, uint8_t **data, size_t *len);
 uam_status uam_elf_symbol(const char *path, const char *name, uint64_t *value, uint64_t *size,
                           const char **why);
 
+/*
+ * The function symbols of an ELF file, for naming addresses (a backtrace). NULL: not an
+ * ELF file, no symbol table, or out of memory. uam_symtab_find gives the symbol at or
+ * before `addr` (inside it, when the symbol has a size) and how far into it addr is;
+ * pass the address without ISA state bits (a Thumb symbol is stored without bit 0).
+ */
+typedef struct uam_symtab uam_symtab;
+uam_symtab *uam_elf_symtab(const char *path);
+void        uam_symtab_free(uam_symtab *t);
+bool        uam_symtab_find(const uam_symtab *t, uint64_t addr, const char **name, uint64_t *off);
+
 #endif /* UAM_LOADER_H */

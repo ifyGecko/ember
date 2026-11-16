@@ -98,10 +98,11 @@ IR_SRC      := src/ir/builder.c src/ir/verify.c src/ir/print.c src/ir/opt.c src/
 CORE_SRC    := src/core/common.c src/core/bus.c src/core/sched.c src/core/chardev.c src/core/netdev.c \
                src/core/state.c
 EXEC_SRC    := src/exec/interp.c src/exec/tcache.c src/exec/run.c src/exec/cpu.c src/exec/jit.c \
-               src/exec/jit_x86.c src/exec/jit_a64.c src/exec/coverage.c src/exec/cmp.c src/exec/spin.c
-ANALYSIS_SRC := analysis/cov.c analysis/cmp.c
+               src/exec/jit_x86.c src/exec/jit_a64.c src/exec/coverage.c src/exec/cmp.c src/exec/frames.c src/exec/spin.c
+ANALYSIS_SRC := analysis/cov.c analysis/cmp.c analysis/frames.c
 LOADER_SRC  := src/loader/loader.c
-MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c src/machine/guard.c
+MACHINE_SRC := src/machine/machine.c src/machine/snapshot.c src/machine/guard.c \
+               src/machine/frames.c src/machine/heap.c
 RISCV_SRC   := isa/riscv/rv_lift.c isa/riscv/rv_system.c
 MIPS_SRC    := isa/mips32/mips_lift.c isa/mips32/mips_system.c isa/mips32/mips16.c \
                isa/mips32/mips_umips.c isa/mips32/mips_fpu.c isa/mips32/mips_dsp.c
@@ -179,6 +180,7 @@ TEST_X86 := $(BUILD)/test_x86
 TEST_RISCV := $(BUILD)/test_riscv
 TEST_ARM := $(BUILD)/test_arm
 TEST_FUZZ := $(BUILD)/test_fuzz
+TEST_ORACLES := $(BUILD)/test_oracles
 TEST_MUTATE := $(BUILD)/test_mutate
 TEST_COV_FORMATS := $(BUILD)/test_cov_formats
 FIRMWARE  := $(BUILD)/firmware/selftest.elf
@@ -268,7 +270,8 @@ $(BUILD)/uam.pc: Makefile
 $(RUN): $(BUILD)/obj/tools/uam-run.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(TRUN): $(BUILD)/obj/tests/boards/uam-test-run.o $(BUILD)/obj/tests/boards/test_boards.o $(LIB)
+$(TRUN): $(BUILD)/obj/tests/boards/uam-test-run.o $(BUILD)/obj/tests/boards/test_boards.o \
+         $(BUILD)/obj/tests/boards/heap_hooks.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # The MIPS16e decoder's oracle harness sees the module's internal header.
@@ -311,6 +314,9 @@ $(TEST_COV): $(BUILD)/obj/tests/unit/test_cov.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_FUZZ): $(BUILD)/obj/tests/unit/test_fuzz.o $(LIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_ORACLES): $(BUILD)/obj/tests/unit/test_oracles.o $(LIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_MUTATE): $(BUILD)/obj/tests/unit/test_mutate.o $(LIB)
@@ -465,7 +471,7 @@ endif
 
 $(FIRMWARE): firmware
 
-unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) $(TEST_MUTATE) \
+unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_SPIN) $(TEST_CODESTORE) $(TEST_MMIO) $(TEST_COV) $(TEST_FUZZ) $(TEST_MUTATE) $(TEST_ORACLES) \
            $(TEST_SMP) $(TEST_PPC) $(TEST_AVR) $(TEST_PIC) $(TEST_MCS51) $(TEST_M6502) $(TEST_Z80) $(TEST_XTENSA) $(TEST_XTENSA_FPU) $(TEST_ARM) $(TEST_RISCV) $(TEST_X86) $(TEST_MIPS) $(TEST_AVR32) \
            $(TEST_JITDIFF) $(TEST_F80) $(TEST_COV_FORMATS) \
            $(BUILD)/formats-header-check.stamp
@@ -480,6 +486,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_COV)
 	$(TEST_FUZZ)
 	$(TEST_MUTATE)
+	$(TEST_ORACLES)
 	$(TEST_SMP)
 	$(TEST_PPC)
 	$(TEST_AVR)
@@ -848,9 +855,10 @@ endif
 
 # The fuzz harness end to end: planted bugs found, the same on every backend, crash
 # files reproduce on their own.
-fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
+fuzz-test: $(RUN) $(TRUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
            firmware-pic32 firmware-6502 firmware-z80 firmware-xtensa
 	python3 tests/fuzz/cov_blocks_check.py $(RUN) $(BUILD)
+	sh tests/fuzz/oracle-check.sh $(TRUN) $(BUILD)/firmware/heaptarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin
@@ -973,6 +981,7 @@ FORCE:
          $(BUILD)/obj/tests/unit/test_codestore.d \
          $(BUILD)/obj/tests/unit/test_mmio.d \
          $(BUILD)/obj/tests/unit/test_cov.d $(BUILD)/obj/tests/unit/test_fuzz.d \
+         $(BUILD)/obj/tests/unit/test_oracles.d $(BUILD)/obj/tests/boards/heap_hooks.d \
          $(BUILD)/obj/tests/unit/test_smp.d $(BUILD)/obj/tests/unit/test_ppc.d \
          $(BUILD)/obj/tests/unit/test_avr.d $(BUILD)/obj/tests/unit/test_pic.d \
          $(BUILD)/obj/tests/unit/test_mcs51.d $(BUILD)/obj/tests/unit/test_m6502.d $(BUILD)/obj/tests/unit/test_z80.d $(BUILD)/obj/tests/unit/test_xtensa.d $(BUILD)/obj/tests/unit/test_xtensa_fpu.d $(BUILD)/obj/tests/unit/test_avr32.d $(BUILD)/obj/tests/unit/test_mips.d $(BUILD)/obj/tests/unit/test_x86.d $(BUILD)/obj/tests/unit/test_riscv.d $(BUILD)/obj/tests/unit/test_arm.d $(BUILD)/obj/tests/isa-xtensa/xt-dec.d \

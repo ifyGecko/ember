@@ -31,20 +31,31 @@ a handshake, then a payload, with the firmware's replies in between.
 
 ## Memory oracles
 
-Guards cover ranges fixed on the command line. On flat memory an overflow in the heap or on
-the stack faults nowhere and passes as ok.
+The return guard (`--guard-returns`) and the guarded heap (`uam/heap.h`) exist
+(`docs/fuzzing.md`, "Memory oracles"). What they leave open:
 
-- Heap redzones and use-after-free: pc hooks on the firmware's `malloc`, `free` and
-  `realloc` (by symbol or address), guards around each live block, a quarantine for freed
-  ones.
-- A shadow stack from the IR's CALL and RET exit kinds: a return to an address other than
-  the one the call pushed is a crash. The same stack would give crashes a call history.
-- Reads of memory never written since the snapshot (uninitialised reads), per range.
+- The return guard's rule is "a return to an address no call returns to". A stricter one,
+  "a return from the innermost call that does not go where that call returns to", would also
+  catch a return address overwritten with another valid one, and would not need
+  `--return-ok` for schedulers that enter tasks by returning. It needs the stack pointer at
+  each call and return (which register that is per ISA, an exact register file at the FRAME
+  op in the JITs, and how far a return moves it on the ISAs that keep return addresses in
+  memory).
+- Call tracking inline in the JITs (a push for a call, a compare and pop for a return that
+  matches the innermost frame): today each is a call out of translated code, about 3.5 ns
+  for a call with its return.
+- Frame stacks per task: today one history per processor, so a task switch mixes them.
+- The guarded heap's checks leave the JIT's inline memory path for the arena's pages; a
+  shadow the JIT tests inline would keep heap-heavy targets fast.
+- Reads of memory never written since the snapshot (uninitialised reads), per range, and of
+  heap blocks never written since their allocation.
+- A guard crash's kind (heap-redzone, return, ...) in the fuzz protocol's CRASH frame, so
+  the brain can name and group crashes by it.
 
 ## Crash triage
 
-- Grouping by call history (needs the shadow stack above); today a crash is known by its
-  reason, its pc and whether it reached code no earlier crash reached.
+- Grouping by call history (the frame stack `--backtrace` prints is there to hash); today a
+  crash is known by its reason, its pc and whether it reached code no earlier crash reached.
 - A standalone minimiser for a saved input (the brain minimises only what it finds itself),
   and a corpus minimiser: the smallest set of queue entries with the same coverage.
 - A report per crash group: the reproducer, the history (`--history`), the faulting access.

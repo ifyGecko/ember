@@ -50,7 +50,8 @@ boards have one processor) takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
-`--watch`), bring-up traces that are off until asked for (device accesses, system registers,
+`--watch`), a return guard and call stacks (`--guard-returns`, `--backtrace`), a guarded heap
+a board puts behind a firmware's allocator, bring-up traces that are off until asked for (device accesses, system registers,
 interrupt lines, the register and value a polling loop waits for, stamped console lines), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
 pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
 dependencies beyond libc and libm.
@@ -296,8 +297,8 @@ nothing (the default 4194304 events take about 0.1 s). Virtual time never passes
 All of these are counted in virtual time, so runs stay deterministic.
 The other exit statuses: the firmware's own status when it ends the run (0-123 or 130; any other value exits 1), 2 usage or setup error
 (including a library/header ABI mismatch), 125 deadlock (waiting with nothing that could wake it),
-126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 129 a `--guard` stopped the
-run, 130 SIGINT/SIGTERM, 131 `--unknown-mmio stop` stopped it at an unmapped access. `--fuzz-replay` has its own (20-25, above).
+126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 129 a `--guard`, the return
+guard or a guarded heap stopped the run, 130 SIGINT/SIGTERM, 131 `--unknown-mmio stop` stopped it at an unmapped access. `--fuzz-replay` has its own (20-25, above).
 
 ```bash
 build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructions and idle time
@@ -412,6 +413,17 @@ instruction (`stop`, the default: exit 129, SIGSEGV in gdb), becomes a bus fault
 (`fault`), or is allowed and logged (`log`; `--watch SPEC` is `--guard SPEC,log`). Instruction
 fetches, gdb and `--dump-mem` reads and DMA are not guarded. `uam/guard.h` is the same in a
 program; the fuzz harness builds its redzones on it ([`docs/fuzzing.md`](docs/fuzzing.md#guards---guard---watch)).
+
+`--guard-returns` stops the run (exit 129) when a return goes to an address that no call
+instruction returns to, which is what a smashed return address looks like on memory where
+nothing faults; `--return-ok ADDR` names a target a firmware returns to on purpose (a
+scheduler entering a new task), and `--guard-returns=log` lists those. `--backtrace` prints
+the calls each processor is inside when the run stops, named from the ELF's symbols. For
+heap bugs ember has a guarded allocator (`uam/heap.h`: redzones, a quarantine, byte-exact
+checks, double and bad frees) that a board runs in place of the firmware's own by hooking
+the firmware's allocation functions; which functions those are is the board's knowledge, so
+there is no switch for it. All of it is in
+[`docs/fuzzing.md`](docs/fuzzing.md#memory-oracles-the-return-guard-and-the-guarded-heap).
 
 Fixed console input (`string:TEXT`, `file:OUT,in=FILE`) reaches the guest when the run starts,
 after the board's power-on reset and any `--load-snapshot`, never while the board is being built.
@@ -546,7 +558,8 @@ into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agen
 ```
 include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.h signal.h sched.h
                    cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
-                   blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h fuzz.h
+                   blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h frames.h
+                   heap.h fuzz.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
                    pic.h mcs51.h m6502.h z80.h xtensa.h)
@@ -556,7 +569,8 @@ src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: ana
                    linking; code generators jit_x86.c and jit_a64.c), coverage, spin-loop
                    skipping
 src/loader/        ELF / raw loaders
-src/machine/       machine lifecycle, resets, board registry, snapshots, guards
+src/machine/       machine lifecycle, resets, board registry, snapshots, guards, call tracking,
+                   the guarded heap
 src/host/          chardev/netdev/block-device backends, host loop, real-time pacing
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)

@@ -131,6 +131,9 @@ void uam_exec_fini(uam_exec *x)
     uam_cmp_pass_destroy(x->cmp_pass);
     x->cmp_pass = NULL;
     x->cmp_state = NULL;
+    uam_frame_pass_destroy(x->frame_pass);
+    x->frame_pass = NULL;
+    x->cpu->frames = NULL;
     x->cpu->cmp = NULL;
 }
 
@@ -688,6 +691,8 @@ static bool deliver(uam_exec *x, const uam_exception *exc)
         if (x->exc_hook(x->exc_hook_ctx, x->cpu, exc) == UAM_HOOK_STOP)
             return false;
     }
+    if (x->cpu->frames)   /* the handler's exception return pops it (frames.h) */
+        uam_frame_mark(x->cpu->frames, (exc->flags & UAM_EXC_F_CONT) ? exc->parent_pc : exc->pc);
     x->stats.exceptions++;
     if (x->hist)
         hist_add(x, UAM_HIST_EXC, exc->kind, exc->pc, exc->cause, exc->tval);
@@ -809,6 +814,8 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         /* Between blocks the origin (uam_origin) is the next instruction: what timers,
          * interrupts and hooks that run now act before. */
         cpu->insn_pc = cpu->pc;
+        if (x->fault_stop)   /* asked for between blocks (a hook, a device's timer) */
+            return fault_stopped(x, NULL);
         if (c->stop_request)
             return UAM_STOP_REQUEST;
         if (smp && c->smp_resync)
@@ -874,6 +881,8 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
             /* Block coverage: the handler gets a history of its own (cpu.h). */
             if (cpu->cov && cpu->cov->contexts && uam_cov_pass_covers(x->cov_pass, from_pc))
                 uam_cov_irq_enter(cpu->cov, from_pc);
+            if (cpu->frames)
+                uam_frame_mark(cpu->frames, from_pc);
             if (x->hist || (cpu->obs && cpu->obs->interrupt)) {
                 const uint64_t lines = isa->irq_lines ? isa->irq_lines(cpu) : 0;
                 if (x->hist)
@@ -918,7 +927,11 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
             uint64_t pc = cpu->pc;
             if (run_hooks(x))
                 return UAM_STOP_HOOK;
-            if (cpu->pc != pc || x->stop_request || x->reset_request || c->smp_resync)
+            /* A hook that emulated the function it hooks and returned for it. */
+            if (cpu->pc != pc && cpu->frames)
+                uam_frame_hook_return(cpu->frames, cpu->pc);
+            if (cpu->pc != pc || x->stop_request || x->reset_request || c->smp_resync
+                || x->fault_stop)
                 continue;
         }
 

@@ -219,6 +219,78 @@ uam_status board_hle_install(uam_machine *m, const uam_board_config *cfg)
 branch delay slot. Adding a hook discards translated code once; it costs nothing afterwards.
 The board calls the install function before `uam_machine_reset`.
 
+## A guarded heap behind the firmware's allocator, in `<board>_heap.c`
+For fuzzing (ember-fuzz, "Memory oracles"): on flat memory a heap overflow or a use after
+free faults nowhere. `uam/heap.h` is an allocator ember runs **in place of** the firmware's
+own, over the memory the firmware's heap used (the arena): redzones around every block, a
+quarantine for freed ones, every access to the arena checked to the byte, double and bad
+frees reported. Ember does not know which functions of your firmware allocate or how they
+take arguments; the board does, and says so with hooks (the HLE mechanism above). Tested
+version: `tests/boards/heap_hooks.c` in ember (RISC-V).
+
+1. **Find the functions** in Ghidra: the allocate, release and (if any) resize, zeroing
+   and aligned variants the firmware's code calls (`malloc`/`free`, `pvPortMalloc`,
+   `memPartAlloc`, a pool's `get`/`put`), their arguments, and the arena: the memory range
+   the firmware's allocator was given (a linker symbol, an array, the range its init is
+   called with). Hook the innermost functions every caller goes through.
+2. **Create the heap and hook them**, before `uam_machine_reset`:
+
+```c
+static uam_heap *g_heap;
+
+static uam_hook_action on_malloc(void *ctx, uam_cpu *cpu, uint64_t pc)   /* void *malloc(size) */
+{
+    (void)ctx; (void)pc;
+    const uam_regdesc *a0 = reg(cpu, "a0"), *ra = reg(cpu, "ra");   /* this ISA's convention */
+    uint64_t caller = uam_cpu_reg_read(cpu, ra->offset, ra->width);
+    hle_return(cpu, uam_heap_alloc(g_heap, uam_cpu_reg_read(cpu, a0->offset, a0->width), 0, caller));
+    return UAM_HOOK_CONTINUE;
+}
+
+static uam_hook_action on_free(void *ctx, uam_cpu *cpu, uint64_t pc)     /* void free(ptr) */
+{
+    (void)ctx; (void)pc;
+    const uam_regdesc *a0 = reg(cpu, "a0"), *ra = reg(cpu, "ra");
+    uam_heap_free(g_heap, uam_cpu_reg_read(cpu, a0->offset, a0->width),
+                  uam_cpu_reg_read(cpu, ra->offset, ra->width));    /* a bad free is reported */
+    hle_return(cpu, 0);
+    return UAM_HOOK_CONTINUE;
+}
+
+uam_status board_heap_install(uam_machine *m, const uam_board_config *cfg)
+{
+    if (!uam_board_config_option(cfg, "guard-heap"))      /* opt-in: -o guard-heap=1 */
+        return UAM_OK;
+    uam_heap_opts o = UAM_HEAP_OPTS_INIT;
+    char err[256];
+    o.base = 0x80200000;   /* the firmware's heap, guest-virtual (o.phys = true: physical) */
+    o.size = 0x00100000;
+    if (!(g_heap = uam_heap_create(m, &o, err, sizeof(err)))) {
+        uam_log(UAM_LOG_ERROR, "board", "guarded heap: %s", err);
+        return UAM_ERR_INVALID;
+    }
+    uam_status st = uam_machine_add_pc_hook(m, 0x80012340 /* malloc */, on_malloc, NULL);
+    return st != UAM_OK ? st : uam_machine_add_pc_hook(m, 0x800123a0 /* free */, on_free, NULL);
+}
+```
+
+   `uam_heap_realloc(h, ptr, size, site)` and `uam_heap_calloc(h, n, size, site)` are there
+   for those variants, `uam_heap_alloc`'s third argument for an aligned one, and
+   `uam_heap_block` for a "size of this block" function. The last argument of each is what
+   reports call the allocation or free site; pass the caller's return address. Free the heap
+   in the board's `board_fini` (`uam_heap_destroy`).
+3. **Check the boot still passes** with the option on. Checking starts with the first
+   allocation, so start-up code clearing the arena is fine. A hit during the boot after that
+   is firmware code touching its old heap structures: the allocator's init, a heap walker,
+   a statistics or integrity routine. Hook or stub those as well (they have nothing to walk
+   now), or disarm the heap around them (`uam_heap_arm`). A function that returns the heap's
+   free space gets a hook that answers from `uam_heap_get_stats`.
+4. The heap is machine state: create it before any snapshot is taken or loaded, and a
+   snapshot taken with it is loaded with it (and the same name and arena).
+
+What this does not test: the firmware's own allocator (its bugs, its fragmentation, its
+reuse order). Keep the option off for bring-up and on for fuzzing.
+
 ## Snapshots
 Snapshots save memory, the hart, virtual time, every device's `save` stream and registered
 extra state; `snapshots.md` has the whole picture. What the board itself must do:

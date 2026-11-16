@@ -115,12 +115,14 @@ uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_ab
 }
 
 void uam_machine_guards_fini(uam_machine *m);   /* guard.c */
+void uam_machine_frames_fini(uam_machine *m);   /* frames.c */
 
 void uam_machine_fini(uam_machine *m)
 {
     if (!m->cpu.isa)        /* zeroed and never initialized: a board that failed early */
         return;
     uam_machine_guards_fini(m);
+    uam_machine_frames_fini(m);
     if (m->board_fini)
         m->board_fini(m);
     m->board_fini = NULL;
@@ -545,6 +547,20 @@ uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_sav
         return UAM_ERR_NOMEM;
     m->state_parts[m->n_state_parts++] = (uam_state_part){ copy, save, restore, ctx };
     return UAM_OK;
+}
+
+bool uam_machine_remove_state(uam_machine *m, const char *name)
+{
+    for (uint32_t i = 0; i < m->n_state_parts; i++) {
+        if (strcmp(m->state_parts[i].name, name))
+            continue;
+        free(m->state_parts[i].name);
+        memmove(&m->state_parts[i], &m->state_parts[i + 1],
+                sizeof(*m->state_parts) * (m->n_state_parts - i - 1));
+        m->n_state_parts--;
+        return true;
+    }
+    return false;
 }
 
 void uam_machine_stop_cb(void *ctx, int64_t status)

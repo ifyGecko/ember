@@ -62,8 +62,23 @@ typedef struct uam_guard_spec {
     const char      *name;        /* copied; NULL: "guardN" */
 } uam_guard_spec;
 
+/* What a hit is. ACCESS: an access to a guard added here. The others come from the
+ * return guard (uam_machine_guard_returns) and from guarded heaps (heap.h). */
+typedef enum uam_guard_kind {
+    UAM_GUARD_ACCESS,
+    UAM_GUARD_RETURN,            /* a return to an address no call returns to */
+    UAM_GUARD_HEAP_REDZONE,      /* an access just outside a live heap block */
+    UAM_GUARD_HEAP_FREED,        /* an access inside a freed block */
+    UAM_GUARD_HEAP_WILD,         /* an access to heap memory never handed out */
+    UAM_GUARD_HEAP_DOUBLE_FREE,  /* a free of a block already freed */
+    UAM_GUARD_HEAP_BAD_FREE,     /* a free of an address that starts no block */
+} uam_guard_kind;
+
+const char *uam_guard_kind_str(uam_guard_kind k);   /* "access", "return", "heap-redzone", ... */
+
 typedef struct uam_guard_hit {
-    int              id;          /* the guard's */
+    uam_guard_kind   kind;
+    int              id;          /* the guard's (0: not a guard added here) */
     const char      *name;        /* valid while the guard exists */
     uam_guard_action action;
     unsigned         cpu;         /* the processor that made the access (hartid) */
@@ -80,6 +95,11 @@ typedef struct uam_guard_hit {
     bool             is_write;
     uint64_t         val;         /* a write's value (stored for LOG, refused otherwise);
                                    * LOG reads: the value read; 0 otherwise */
+    /* RETURN: addr is where the return went; size is 0. HEAP_*: start and len are the
+     * block the access (or the free) is about (len 0: none nearby), site[0] is where that
+     * block was allocated and site[1] where it was freed, as the board gave them to the
+     * heap (0: not known); a bad or double free has size 0 and addr the address freed. */
+    uint64_t         site[2];
 } uam_guard_hit;
 
 /* Add a guard; returns its id (> 0), or -1 with err saying why (a virtual range
@@ -104,6 +124,26 @@ bool uam_guard_parse(const char *text, uam_guard_action default_action, uam_guar
 int  uam_machine_add_guard_text(uam_machine *m, const char *text, uam_guard_action default_action,
                                 char *err, size_t errlen);
 
+/*
+ * Report a hit found by something other than a guard added here (the return guard and
+ * the guarded heap do; a board's own check may): it becomes the last hit, counts, and
+ * gets the hit's action - STOP ends the run with UAM_STOP_GUARD, LOG prints a line -
+ * then the observer is told. hit->cpu and hit->pc must be set. `in_access`: called from
+ * a bus watch refusing an access, so that STOP reports the faulting instruction's pc
+ * (as for a guard); otherwise the run stops at the next instruction boundary and
+ * hit->pc stays as given.
+ */
+void uam_machine_guard_report(uam_machine *m, const uam_guard_hit *hit, bool in_access);
+
+/*
+ * The return guard (frames.h): report a return to an address that no call returns to,
+ * with `action` (STOP or LOG). Turns call tracking on (uam_machine_track_calls) and
+ * leaves it on. uam_machine_add_return_site makes `pc` a valid return target (for code
+ * that jumps through a return instruction on purpose).
+ */
+uam_status uam_machine_guard_returns(uam_machine *m, bool on, uam_guard_action action);
+uam_status uam_machine_add_return_site(uam_machine *m, uint64_t pc);
+
 /* The most recent hit (NULL before the first), and how many there have been. */
 const uam_guard_hit *uam_machine_guard_last_hit(const uam_machine *m);
 uint64_t             uam_machine_guard_hits(const uam_machine *m);
@@ -117,5 +157,8 @@ void uam_machine_set_guard_observer(uam_machine *m, uam_guard_observer_fn fn, vo
 void uam_machine_set_guard_log(uam_machine *m, FILE *out);
 /* The one-line description used there, without a newline. */
 void uam_guard_hit_format(const uam_guard_hit *hit, char *buf, size_t n);
+/* What happened, without who and where: "write 1 at 0x...: 1 past the end of the 24-byte
+ * block at 0x..., allocated at 0x...", "returns to 0x..., which no call returns to". */
+void uam_guard_hit_describe(const uam_guard_hit *hit, char *buf, size_t n);
 
 #endif /* UAM_GUARD_H */

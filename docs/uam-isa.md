@@ -168,7 +168,7 @@ Ops that accept a guard: `PUT, LD, ST, AMO, CAS, SYSRD, SYSWR, HELPER (effectful
 | Select | `SELECT` | 1 |
 | Control | `EXIT` | 1 |
 | System / escape | `SYSRD SYSWR TRAP WAIT HELPER` | 5 |
-| Instrumentation | `COV CMPLOG` (inserted by passes only, §7.5, §7.6) | 2 |
+| Instrumentation | `COV CMPLOG FRAME` (inserted by passes only, §7.5, §7.6, §7.7) | 3 |
 | **Total** | | **49** |
 
 Some opcodes are left out on purpose. `NOT`, `NEG`, `MOV`, `SGT`/`UGT`, `ROTL`, `MULHSU`, and
@@ -285,7 +285,7 @@ Comparisons and flag ops take W-bit operands and produce a 1-bit result.
 | `HELPER` | `[g] dst = HELPER a,b,c {aux=id}` | Call a native function registered by an ISA module or analysis pass (§7.4). |
 | `TRAP` | `[g] TRAP cause, tval {aux=class}` | Raise a synchronous event. Ends the block. Classes: `EXCEPTION` (guest exception, passed to `isa->take_exception` in a `uam_exception` with an ISA-defined `cause`), `DEBUG` (stop into the emulator's debugger, not the guest), `HALT` (stop emulation, e.g. semihosting exit). |
 | `WAIT` | `WAIT next_pc` | The hart idles until `isa->irq_wakeup` is true (an interrupt pending and enabled, whether or not interrupts are globally on). The scheduler may fast-forward virtual time to the next event, and execution resumes at `next_pc`. Terminator. |
-| `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, a temporary target an *indirect* one; the JIT may chain both. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN`, `RETRY` are hints for analysis (call graphs, shadow stacks) and do not change semantics; `RETRY` marks an exit that sends the hart back to run the block's own code another way (Xtensa's loop-end check), not a guest branch. |
+| `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, a temporary target an *indirect* one; the JIT may chain both. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN`, `RETRY` are hints for analysis (call graphs, the call tracker of §7.7) and do not change semantics; `RETRY` marks an exit that sends the hart back to run the block's own code another way (Xtensa's loop-end check), not a guest branch. A lifter marks `CALL` every transfer that leaves a return address behind and `RET` every transfer through one (`jr ra`, `blr`, `bx lr`, a pop of the pc, `ret`), conditional ones included; transfers that only look like one stay `JUMP`: x86 far calls and returns (firmware switches segments, modes and privilege with them), and a return directly behind a push on the AVR, 8051, 6502 and Z80 (the jump-table idiom; the lifter reads the bytes before the return, and a misreading takes a return for a jump). |
 
 ### 7.4 Helpers
 
@@ -386,6 +386,33 @@ tests `cpu->cmp` and branches past it). Lifters never emit it: the compare pass
 (`analysis/cmp.c`) inserts one in front of each compare it recognises (`cmp.h` lists the
 shapes), anywhere after the block's first `IMARK` (§8 rule 11).
 
+### 7.7 Call frames
+
+`FRAME a, b, c` (width = the address width; `flags` = exactly one of `UAM_FRAME_CALL`,
+`UAM_FRAME_RET`, `UAM_FRAME_ERET`) reports the exit it stands before to the hart's call
+tracker (`cpu->frames`, a `uam_frame_state`, `frames.h`):
+
+```
+if frames != NULL and b == 1:
+    CALL: uam_frame_call(frames, a, c)   // a: the address the call returns to, c: its target
+    RET:  uam_frame_ret(frames, a, c)    // a: where the return goes, c: the returning instruction's pc
+    ERET: uam_frame_eret(frames)         // an exception return; a and c are 0
+```
+
+`b` is the exit's guard as a value (the immediate 1 for an unguarded exit), so a
+conditional call or return is reported only when taken. A call's `a` is an immediate: the
+end of the instruction the exit belongs to (the delay slot included), with the ISA's pc
+state bits cleared. Like `COV` and `CMPLOG`, `FRAME` reads and writes no register, memory or
+bus, cannot fault, does not count as an instruction and never changes what the guest does;
+with no state attached it does nothing. Lifters never emit it: the frame pass
+(`analysis/frames.c`) inserts one before each `EXIT` of kind `CALL`, `RET` or `EXC_RETURN`,
+except a call whose target is its own return address (the get-pc idiom). It stands before
+the exit, the fences that must directly precede the exit and any `COV` marker there (§8
+rule 12).
+
+What the tracker keeps, and the return guard built on it, is in `frames.h` and
+`docs/fuzzing.md` ("Memory oracles").
+
 ---
 
 ## 8. Block well-formedness
@@ -422,6 +449,10 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
     rejected in IR.
 11. **Compare record.** `CMPLOG` has width 8..64, operands `a` and `b` of that width, no `c`,
     no guard and no destination, only `UAM_CMP_*` flags, and does not start a block.
+12. **Call frame.** `FRAME` has the address width, exactly one of the `UAM_FRAME_*` flags, no
+    guard and no destination, and comes before an `EXIT` of its kind (`CALL`, `RET`,
+    `EXC_RETURN`) with only fences, other `FRAME`s and `COV` markers between; its `b` is that
+    exit's guard (an immediate if the exit has none), and a call's `a` is an immediate.
 
 The verifier runs after the lifter, again after the optimizer, and after each pass. The
 optimizer (`uam_optimize`) keeps side effects, `IMARK`s and the order of the remaining `PUT`s;

@@ -147,6 +147,7 @@ struct uam_machine {
     uint32_t           n_aps;
     uam_cov_state     *ap_cov;             /* coverage state of processor i + 1 (uam_machine_set_coverage) */
     struct uam_guard_set *guards;          /* guarded and watched memory (guard.h); NULL: none yet */
+    struct uam_machine_frames *frames;     /* call tracking (frames.h); NULL: never turned on */
 };
 
 /*
@@ -260,6 +261,8 @@ unsigned   uam_machine_current_cpu(void *machine);
  */
 uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_save_fn save,
                                  uam_state_restore_fn restore, void *ctx);
+/* Take it out again (false: no such state). Snapshots taken with it no longer fit. */
+bool       uam_machine_remove_state(uam_machine *m, const char *name);
 /* Publish a named input (see uam_input_fn); `name` must be unique. */
 uam_status uam_machine_add_input(uam_machine *m, const char *name, uam_input_fn fn, void *ctx);
 /* Give the input `name` a fix-up for mutated inputs (uam_input_fixup_fn; NULL: none). */

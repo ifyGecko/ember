@@ -329,6 +329,115 @@ are not machine state: snapshots neither save nor restore them. In a program:
 `uam_machine_add_guard` (or `uam_machine_add_guard_text` with the same text form),
 `uam_machine_guard_last_hit`, `uam_machine_set_guard_observer` for every hit.
 
+### Memory oracles: the return guard and the guarded heap
+
+On flat memory a heap overflow, a use of a freed block or a smashed return address faults
+nowhere: the input ends "ok", or at best as a timeout when the processor wanders off. Two
+opt-in oracles turn those into guard crashes (verdict `crash-guard`, exit 129 outside
+fuzzing). Like guards they are ember's, not the harness's, and work in any run. The fuzz
+target `tests/firmware/heaptarget.c` plants one bug of each kind, and
+`tests/fuzz/oracle-check.sh` holds both oracles to them on every backend.
+
+**The return guard** (`--guard-returns`, `uam/frames.h`). Ember records where every call
+instruction it translates returns to, and stops when a return goes to an address that is not
+one of those: a return address overwritten with data.
+
+```
+replay: s: crash-guard pc=0x80000364 (return: returns to 0x8000031a, which no call returns to)
+```
+
+The rule is deliberately loose, so that it does not misfire: a return into another task, out
+of a `longjmp` or into a frame built before tracking began all go to some call's return
+address, and pass. What it cannot see is a return address overwritten with another call's
+return address. What it does report although nothing is wrong is code that jumps through a
+return instruction on purpose to an address no call returns to; the usual case is a
+scheduler that starts a new task by returning into its entry function. Such a target shows
+up during the boot, once, by address and symbol, and is named with `--return-ok ADDR`
+(repeatable; a symbol works). `--guard-returns=log` lists every such target in one run and
+goes on:
+
+```
+build/uam-run --guard-returns=log -n 30000 fw.elf
+guard return (log): cpu 0 pc 0x80000318 returns to 0x80000370, which no call returns to icount=5487
+build/uam-run --guard-returns --return-ok co_entry ...
+```
+
+Calls and returns are what the lifters mark as such (`docs/uam-isa.md` §7.3); a few idioms
+are jumps to it rather than returns and so are not checked: x86 far calls and returns
+(`push cs; push ip; retf` switches modes), and a return directly behind a push on the AVR,
+8051, 6502 and Z80 (their jump-table idiom). x86 code built with return trampolines
+(retpolines) returns to computed addresses everywhere and cannot use the guard.
+
+`--backtrace` prints the calls each processor is inside when the run stops (when fuzzing:
+for each input that is not ok), innermost first, named from the ELF image's symbols. It uses
+the same tracking and can be used alone:
+
+```
+backtrace: #0 0x80000336 <smash> called, returns to 0x80000524 <parse+0xbe>
+backtrace: #1 0x800005c2 <fuzz_iteration> called, returns to 0x8000060e <main+0x6>
+backtrace: #2 0x80000608 <main> called, returns to 0x8000003c <_start+0x3c>
+```
+
+The stack is a best-effort history: code that leaves functions without returning leaves
+frames behind until a return to an older frame drops them, tasks are not told apart, and at
+most 512 frames are kept per processor. The guard's verdict does not depend on it.
+
+Tracking costs one call out of translated code per call and per return: about 3.5 ns for a
+call with its return on the x86-64 JIT, which is a few percent on ordinary code and much more
+on code that does little but call tiny functions (a loop of six instructions around a call
+runs 3.4 times slower). Nothing when off. Its state (the frames and the set of return addresses)
+is machine state: `--fuzz-snapshot` and `--save-snapshot` carry it, and a snapshot taken
+without `--guard-returns`/`--backtrace` cannot be loaded with them, nor the reverse. In a
+program: `uam_machine_guard_returns`, `uam_machine_add_return_site`,
+`uam_machine_track_calls`, `uam_machine_backtrace`.
+
+**The guarded heap** (`uam/heap.h`) is an allocator ember runs *in place of* the firmware's
+own, over the memory the firmware's heap used. Every block lies between redzones, every byte
+of the arena that is not inside a live block is poisoned, the bookkeeping is the host's, and
+freed blocks sit in a quarantine before their memory is handed out again. A guest access
+that touches a poisoned byte is a hit, to the byte:
+
+| Hit | What happened |
+|---|---|
+| `heap-redzone` | an access just outside a live block: an overflow or underflow, by one byte or more |
+| `heap-freed` | an access inside a freed block (also through the pointer a `realloc` left behind: blocks always move) |
+| `heap-wild` | an access to arena memory that is in no block |
+| `heap-double-free` | a free of a block already freed |
+| `heap-bad-free` | a free of an address that starts no block |
+
+```
+replay: o: crash-guard pc=0x80000508 (heap-redzone: write 1 at 0x80000d18: 1 past the end of the 24-byte block at 0x80000d00, allocated at 0x80000474)
+replay: f: crash-guard pc=0x800004c0 (heap-freed: read 1 at 0x80000d00: +0 in the freed 24-byte block at 0x80000d00, allocated at 0x80000474, freed at 0x800004b8)
+replay: d: crash-guard pc=0x80000410 (heap-double-free: frees the 24-byte block at 0x80000d00 again, allocated at 0x80000474, freed at 0x800004b4)
+```
+
+There is no command-line switch for it, because ember does not know which functions of a
+firmware allocate, nor how they take their arguments. **The board does**: it creates the
+heap over the arena and hooks the firmware's allocation and release functions at their
+first instruction (`uam_machine_add_pc_hook`); each hook reads the arguments from the
+registers its calling convention uses, calls `uam_heap_alloc` / `uam_heap_free` /
+`uam_heap_realloc` / `uam_heap_calloc`, writes the result and continues at the return
+address, so the firmware's allocator never runs. `tests/boards/heap_hooks.c` is a complete
+example (60 lines for a RISC-V board), and `skills/ember-dev-build/references/board-skeleton.md`
+has the recipe. What to know:
+
+- Checking starts with the heap's first allocation, so start-up code that clears the arena
+  (it is usually in `.bss`) is not a hit. Firmware code that walks or sets up its own heap
+  structures in the arena *after* that must be hooked or stubbed too, or the heap disarmed
+  around it (`uam_heap_arm`).
+- The heap replaces the firmware's allocator: bugs inside that allocator, and behaviour that
+  depends on its layout or reuse order, are not exercised.
+- The blocks and the quarantine are machine state, so each fuzz input starts from the heap
+  as it was at the begin pc, and `--fuzz-snapshot` carries it. Create the heap before the
+  machine runs.
+- Accesses to the arena's pages leave the JIT's direct memory access (each is checked);
+  the allocator itself is host code. A heap's action is `stop` (default), `fault` or `log`,
+  as for a guard; a board may create several heaps (pools, partitions).
+
+Both oracles report through the guard machinery (`uam_guard_hit.kind`,
+`uam_machine_guard_last_hit`, the guard observer), so the harness, the fuzz protocol and the
+brain treat their hits like any guard crash: reason "guard", status the pc.
+
 ### Replay (`--fuzz-replay FILE|DIR`)
 
 Runs each input once (a directory in name order) and prints one line per input:
@@ -403,6 +512,9 @@ CMP_INPUT and CMPS ([`fuzz-formats.md`](fuzz-formats.md)).
   from the input in other ways than a constant offset (a parsed number, a checksum) is not
   found in the input. Compares in a block whose operands the optimizer knows are constants
   are folded away and not logged (they do not depend on the input).
+- The fuzz protocol's CRASH frame carries a guard crash's pc, not its kind: the brain names
+  a heap or return crash "guard" like any other, and a replay of the saved input says which
+  it is.
 - `uam_fuzz_abort` (SIGINT in the runner) ends a campaign at the next instruction boundary
   under the interpreter, and with the JIT at a block boundary at most a few thousand blocks on.
 
