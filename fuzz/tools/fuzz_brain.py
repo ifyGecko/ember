@@ -12,8 +12,9 @@ are in fuzz/formats.h. The design of the campaign is docs/fuzz-ideas.md; its
 logic lives in fuzz/tools/fuzz_queue.py.
 
 The brain
-  - asks ember for SPARSE replies (OPTIONS): each iteration's set buckets and its
-    instruction count, folded in O(buckets hit) with AFL-style hit-count classes;
+  - keeps no coverage record of its own: ember judges every run (JUDGE before each
+    INPUT's reply, FIND in a batch) with AFL-style hit-count classes, and replies with
+    each iteration's set buckets and instruction count (SPARSE);
   - keeps a disk-backed **queue** under <out>/queue (id:NNNNNN,... names that
     record lineage) and **resumes** it on start;
   - walks the queue in cycles: a **favored** set (the cheapest entry per bucket),
@@ -55,7 +56,8 @@ Usage:
                 [--schedule S] [--dict FILE]... [--no-trim] [--trim-probes N]
                 [--no-calibrate] [--reweight-every N] [--no-cmplog] [--cmplog-max N]
                 [--batch N] [--min-energy N] [--stack LO-HI] [--splice PERMILLE]
-                [--name NAME --sync-dir DIR [--sync-interval S] [--main|--secondary]]
+                [--iter-insns N|auto] [--crashes-per-sig N]
+                [--name NAME --sync-dir DIR [--sync-interval S]]
                 [--max-size N] [--no-minimize] [--minimize-timeouts]
                 [--max-hangs N] [--seed-rng N] [--accept-timeout S]
                 [--hello-timeout S] [--io-timeout S]
@@ -84,8 +86,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cmplog import candidates as i2s_candidates, parse_cmps, tokens as i2s_tokens  # noqa: E402
 from fuzz_dict import Dictionary, IntToken, parse_dict  # noqa: E402
-from fuzz_queue import (SCHEDULES, Coverage, Entry, OpStats, Queue, entry_name,  # noqa: E402
-                        hits_from_map, load_queue, new_peer_inputs, path_id, peers, save_entry,
+from fuzz_queue import (SCHEDULES, Entry, OpStats, Queue, entry_name,  # noqa: E402
+                        hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
                         save_state, set_synced, synced_upto)
 
 # ---- the fuzz protocol (fuzz/formats.h, docs/fuzz-formats.md) ----------
@@ -94,7 +96,9 @@ NET_VERSION = 1
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
-FIND_HDR_LEN = 33
+JUDGE, PROGRESS = 16, 17
+FIND_HDR_LEN, JUDGE_LEN = 49, 25
+OPT_JUDGE = 1 << 2                       # OPTIONS: a JUDGE frame before each INPUT's reply
 HAVOC_EDGES = 1 << 0                     # HAVOC flags: HAVOC_DONE lists executions per bucket
 HAVOC_STATUS = {1: "no accepted MUTATOR", 2: "no such corpus entry", 3: "a bad batch size"}
 HAVOC_MAX = 1 << 20                      # most mutations in one HAVOC
@@ -230,16 +234,18 @@ def main():
                          "are in SYNC_DIR (this one's is SYNC_DIR/NAME)")
     ap.add_argument("--sync-interval", type=float, default=60.0,
                     help="seconds between imports from the other workers (default 60)")
-    role = ap.add_mutually_exclusive_group()
-    role.add_argument("--main", dest="role", action="store_const", const="main",
-                      help="this worker is the main one of a parallel campaign")
-    role.add_argument("--secondary", dest="role", action="store_const", const="secondary",
-                      help="this worker is a secondary one")
     ap.add_argument("--no-minimize", dest="minimize", action="store_false",
                     help="skip crash minimization (on by default)")
     ap.add_argument("--minimize-timeouts", action="store_true",
                     help="also minimize HANG/TIMEOUT inputs (off by default: "
                          "every probe costs ember a full per-input budget)")
+    ap.add_argument("--crashes-per-sig", type=int, default=4,
+                    help="save at most N crashes with one (reason, status): the first, "
+                         "minimized, then those that ran code no earlier crash ran (default 4)")
+    ap.add_argument("--iter-insns", default=None,
+                    help="set ember's per-input instruction budget: N, or auto for 5x the "
+                         "slowest queue entry after the baseline (default: ember's own "
+                         "--fuzz-iter-insns)")
     ap.add_argument("--max-hangs", type=int, default=64,
                     help="save at most N distinct HANG/TIMEOUT inputs "
                          "(default 64)")
@@ -266,6 +272,13 @@ def main():
     if not m or not 1 <= int(m.group(1)) <= int(m.group(2)) <= 1024:
         sys.exit("brain: --stack must be LO-HI with 1 <= LO <= HI <= 1024, got %r" % args.stack)
     stack_lo, stack_hi = int(m.group(1)), int(m.group(2))
+    if args.iter_insns not in (None, "auto"):
+        try:
+            args.iter_insns = int(args.iter_insns, 0)
+            if args.iter_insns < 1:
+                raise ValueError
+        except ValueError:
+            sys.exit("brain: --iter-insns must be a positive number or auto")
     if not 0 <= args.splice <= 1000:
         sys.exit("brain: --splice is per mille, 0..1000")
     if args.min_energy < 1:
@@ -288,7 +301,7 @@ def main():
             sys.exit("brain: with --sync-dir the output directory is SYNC_DIR/NAME (%s)" % out)
     else:
         out = args.out or os.path.join(os.getcwd(), "fuzz_out")
-    role_name = args.role or ("main" if not args.sync_dir else "secondary")
+    role_name = "main" if name == "main" else "secondary"   # a label for the status screen
     crash_dir = os.path.join(out, "crashes")
     hang_dir = os.path.join(out, "hangs")
     queue_dir = os.path.join(out, "queue")
@@ -386,7 +399,12 @@ def main():
     # does not know OPTIONS ignores it and keeps sending COVERAGE; both are handled.
     # Compare logging only from an ember that announced it (it answers CMP_INPUT).
     cmplog_on = bool(args.cmplog and flags & HELLO_CMP)
-    send_frame(conn, OPTIONS, struct.pack(">I", OPT_SPARSE | (OPT_CMP_LOG if cmplog_on else 0)))
+    opt_flags = OPT_SPARSE | OPT_JUDGE | (OPT_CMP_LOG if cmplog_on else 0)
+
+    def send_options(iter_insns=0):
+        """Each OPTIONS replaces the last; iter_insns 0 leaves ember's budget as it is."""
+        send_frame(conn, OPTIONS, struct.pack(">IQ", opt_flags, iter_insns))
+    send_options(args.iter_insns if isinstance(args.iter_insns, int) else 0)
     if cmplog_on:
         log("compare logging on: an input-to-state stage for each new queue entry")
     elif args.cmplog:
@@ -403,7 +421,8 @@ def main():
             % (len(dictionary), len(dictionary.ints), order, len(args.dict)))
 
     rng = random.Random(args.seed_rng)
-    cov = Coverage(map_size)
+    edges = [0]            # buckets ever hit, as ember judged (JUDGE, FIND)
+    last_judge = [None]    # (new_buckets, new_classes, path, novel_crash) of the last INPUT
     queue = Queue(args.schedule)
     opstats = OpStats()
     default_weights = {}   # op -> ember's default weight (MUTATOR_INFO)
@@ -417,6 +436,7 @@ def main():
     last_cmps = [None]     # the records of the last CMP_INPUT
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
+    saved_per_sig = {}     # (reason, status) -> crashes saved (--crashes-per-sig)
     hang_sigs = {}         # same, for HANG / TIMEOUT
     hang_inputs = set()    # sha1 of every hang input already saved
     next_id = [1]          # protocol input ids
@@ -445,12 +465,11 @@ def main():
         if not status_fp:
             return
         el = time.monotonic() - start
-        edges = cov.edges
         status_fp.write(json.dumps({
             "t": round(el, 1), "execs": execs,
             "execs_per_sec": round(execs / el, 1) if el > 0 else 0.0,
-            "corpus": len(queue.entries), "edges": edges, "map_size": map_size,
-            "new_edges": edges - baseline_edges[0] if baseline_edges[0] is not None else 0,
+            "corpus": len(queue.entries), "edges": edges[0], "map_size": map_size,
+            "new_edges": edges[0] - baseline_edges[0] if baseline_edges[0] is not None else 0,
             "init_edges": init_edges[0],
             "crashes": crashes, "crashes_unique": len(crash_sigs),
             "hangs": hangs, "hangs_unique": len(hang_sigs),
@@ -528,7 +547,8 @@ def main():
 
     def havoc(e, n):
         """One HAVOC batch: n mutations of e, run and judged by ember. Returns its FINDs as
-        (reason, status, insns, ops, data, hits); the totals are accounted here."""
+        (reason, status, insns, new_buckets, new_classes, path, data, hits); the totals are
+        accounted here."""
         nonlocal execs, mutated, crashes, hangs, rejected, batches
         first = next_id[0]
         next_id[0] += n
@@ -539,8 +559,8 @@ def main():
             ftype, payload = next_frame()
             if ftype == FIND:
                 try:
-                    fid, reason, status, insns, ops, dlen = struct.unpack(">QBIQQI",
-                                                                          payload[:FIND_HDR_LEN])
+                    (fid, reason, status, insns, ops, nb, nc, path,
+                     dlen) = struct.unpack(">QBIQQIIQI", payload[:FIND_HDR_LEN])
                     data = payload[FIND_HDR_LEN:FIND_HDR_LEN + dlen]
                     p = FIND_HDR_LEN + dlen
                     (nh,) = struct.unpack(">I", payload[p:p + 4])
@@ -552,7 +572,10 @@ def main():
                     raise ProtocolError("FIND id=%d is not in the batch %d..%d"
                                         % (fid, first, first + n - 1))
                 hits = list(struct.iter_unpack(">IB", payload[p + 4:]))
-                finds.append((reason, status, insns, ops, data, hits))
+                finds.append((reason, status, insns, nb, nc, path.to_bytes(8, "big"), data, hits))
+                continue
+            if ftype == PROGRESS:         # the batch is alive: the reply timeout starts anew
+                maybe_status()
                 continue
             if ftype != HAVOC_DONE:
                 raise ProtocolError("expected FIND or HAVOC_DONE in a batch, got frame type %d"
@@ -600,14 +623,12 @@ def main():
     def take_finds(e, finds):
         """After a batch: keep its new coverage as queue entries, save its crashes."""
         nonlocal new_cov
-        for reason, status, insns, _ops, data, hits in finds:
+        for reason, status, insns, nb, nc, path, data, hits in finds:
             if reason:
-                save_crash(data, reason, status, counted=True)
+                save_crash(data, reason, status, counted=True, novel=True)
                 continue
-            nb, nc = cov.fold(hits)
-            if not nc:
-                continue                  # ember saw it first in an INPUT this brain ran
-            c = add_entry(data, hits, insns, path_id(hits), nb, parent=e, op="havoc")
+            edges[0] += nb                # ember judged it: its record is the only one
+            c = add_entry(data, hits, insns, path, nb, parent=e, op="havoc")
             if nb:
                 new_cov += 1
             log("new coverage +%d buckets, +%d classes (queue=%d, %d bytes) %s"
@@ -621,11 +642,22 @@ def main():
         cmp: as CMP_INPUT; its compare records land in last_cmps[0]."""
         ident = next_id[0]
         next_id[0] += 1
+        last_judge[0] = None
         send_frame(conn, CMP_INPUT if cmp else INPUT, struct.pack(">QI", ident, len(data)) + data)
         while True:
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
                 raise EmberBye()
+            if ftype == JUDGE:
+                if len(payload) < JUDGE_LEN:
+                    raise ProtocolError("JUDGE payload is %d bytes (needs %d)"
+                                        % (len(payload), JUDGE_LEN))
+                jid, nb, nc, path, novel = struct.unpack(">QIIQB", payload[:JUDGE_LEN])
+                if jid != ident:
+                    raise ProtocolError("JUDGE for id=%d while input id=%d is running"
+                                        % (jid, ident))
+                last_judge[0] = (nb, nc, path.to_bytes(8, "big"), bool(novel))
+                continue
             if ftype == CMPS:
                 try:
                     cid, _dropped, recs = parse_cmps(payload)
@@ -681,6 +713,9 @@ def main():
                 raise ProtocolError("input id=%d answered with id=%d (lockstep "
                                     "broken: one reply per INPUT, echoing its id)"
                                     % (ident, cid))
+            if last_judge[0] is None:
+                raise ProtocolError("input id=%d was answered without a JUDGE frame "
+                                    "(OPTIONS asked for one)" % ident)
             if ftype == CRASH:
                 return ("crash", reason, status)
             if kind != KIND_ITER:      # only per-input (ITER) coverage is scored
@@ -703,10 +738,20 @@ def main():
             while i < len(best) and budget > 0:
                 cand = best[:i] + best[i + chunk:]
                 budget -= 1
-                if cand and probe(cand) == ("crash", reason, status):
+                r = probe(cand) if cand else None
+                if r == ("crash", reason, status):
                     best = cand           # the drop kept the crash
-                else:
-                    i += chunk
+                    continue
+                if (r and r[0] == "crash" and r[1] not in HANG_REASONS and r[1] != REJECTED
+                        and (r[1], r[2]) not in crash_sigs):
+                    # Another bug on the way: keep it (as found; it is not minimized in turn).
+                    crash_sigs[(r[1], r[2])] = 1
+                    fname = write_finding(crash_dir, "crash", cand, r[1], r[2])
+                    log("CRASH %s status=%s NEW while minimizing (saved %s)"
+                        % (reason_name(r[1]), fmt_status(r[1], r[2]), fname))
+                    emit_event("crash", "%s status=%s %s"
+                               % (reason_name(r[1]), fmt_status(r[1], r[2]), fname))
+                i += chunk
             chunk //= 2
         return best
 
@@ -732,8 +777,9 @@ def main():
             except OSError:
                 pass
 
-    def save_crash(data, reason, status, counted=False):
-        """counted: a HAVOC batch's totals already counted it."""
+    def save_crash(data, reason, status, counted=False, novel=False):
+        """counted: a HAVOC batch's totals already counted it. novel: ember judged that the
+        crash ran code no earlier crash ran (or has a new (reason, status))."""
         nonlocal crashes, hangs, rejected
         if reason == REJECTED:            # the input route refused it: no bug
             rejected += 0 if counted else 1
@@ -760,15 +806,19 @@ def main():
                        else "--max-hangs %d reached" % args.max_hangs))
                 return
             hang_inputs.add(h)
-        elif n > 1:                       # already have this bug: don't flood
-            log("%s #%d %s status=%s dup (count=%d, not saved)"
+        elif n > 1 and not (novel and saved_per_sig.get(sig, 0) < args.crashes_per_sig):
+            log("%s #%d %s status=%s dup (count=%d, not saved)"   # this bug again: don't flood
                 % (label, nth, rname, st, n))
             return
+        variant = not is_hang and n > 1   # the same (reason, status) through other code
+        if not is_hang:
+            saved_per_sig[sig] = saved_per_sig.get(sig, 0) + 1
         prefix = "hang" if is_hang else "crash"
         # Save the input as found first: minimizing re-sends it, and a BYE, a
         # timeout or a dropped connection there must not lose the finding.
         fname = write_finding(where, prefix, data, reason, status)
-        small = minimize(data, reason, status)
+        # A variant stays as found: minimizing it would lead back to the first one.
+        small = data if variant else minimize(data, reason, status)
         if small != data:
             drop_finding(where, fname)
             fname = write_finding(where, prefix, small, reason, status)
@@ -783,15 +833,16 @@ def main():
         nonlocal execs
         r = probe(data)
         execs += 1
+        nb, nc, path, novel = last_judge[0]
         if r[0] == "crash":
-            save_crash(data, r[1], r[2])
+            save_crash(data, r[1], r[2], novel=novel)
             return r
         if r[0] != "iter":
             return r
         hits, insns = r[1], r[2]
-        pid = queue.note_execution(hits)
-        nb, nc = cov.fold(hits)
-        return ("iter", hits, insns, pid, nb, nc)
+        queue.note_execution(hits, path)
+        edges[0] += nb
+        return ("iter", hits, insns, path, nb, nc)
 
     def calibrate(e, hits):
         """Run a new entry again: ember is deterministic, so the hits must match. A
@@ -1019,12 +1070,17 @@ def main():
                 add_entry(data, r[1], r[2], r[3], r[4], orig=src)
             maybe_status()
         next_eid[0] = max([e.id for e in queue.entries], default=-1) + 1
-        baseline_edges[0] = cov.edges
+        baseline_edges[0] = edges[0]
         slow = max((e.insns for e in queue.entries), default=0)
-        if slow:
+        if slow and args.iter_insns == "auto":
+            budget = max(5 * slow, 10000)
+            send_options(budget)
+            log("calibration: the slowest queue entry ran %d instructions; ember's per-input "
+                "budget is now %d (--iter-insns auto)" % (slow, budget))
+        elif slow:
             log("calibration: the slowest queue entry ran %d instructions; a per-input "
-                "budget of about 5x that (uam-run --fuzz-iter-insns %d) catches hangs early"
-                % (slow, 5 * slow))
+                "budget of about 5x that catches hangs early (--iter-insns auto, or "
+                "--iter-insns %d)" % (slow, 5 * slow))
         sync(force=True)
         if not queue.entries:
             log("no queue entry ran normally (every seed crashed, hung or was rejected); "
@@ -1033,7 +1089,7 @@ def main():
             if r[0] == "iter":
                 add_entry(b"", r[1], r[2], r[3], r[4], orig="empty")
         log("baseline: %d queue entries, %d edges; schedule %s"
-            % (len(queue.entries), cov.edges, args.schedule))
+            % (len(queue.entries), edges[0], args.schedule))
 
         # ---- the campaign: cycles over the queue, energy from the schedule ----
         def limit():
@@ -1100,7 +1156,7 @@ def main():
         "imported=%d trimmed_bytes=%d cmplog_execs=%d cmplog_finds=%d cmplog_tokens=%d"
         % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
            len(hang_inputs), rejected, len(queue.entries), queue.favored_count(),
-           queue.cycle, cov.edges, unstable, imported, trimmed_bytes, cmplog_execs,
+           queue.cycle, edges[0], unstable, imported, trimmed_bytes, cmplog_execs,
            cmplog_finds, cmplog_tokens))
     emit_status(finished=True)
     if status_fp:

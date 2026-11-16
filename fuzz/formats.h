@@ -200,8 +200,11 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * with MUTATOR_INFO; mirrors its queue into ember with CORPUS; and asks for a batch with
  * HAVOC: n mutations of one corpus entry, run back to back with no frame in between.
  * ember reports the inputs worth keeping as FIND frames while the batch runs (an input
- * with a bucket/count class it has not seen, a crash with a new (reason, status), a hang
- * or timeout up to MUTATOR's cap) and closes the batch with one HAVOC_DONE. Plain INPUTs
+ * with a bucket/count class it has not seen, a novel crash, a hang or timeout up to
+ * MUTATOR's cap), sends PROGRESS when a batch has been silent for a second, and closes the
+ * batch with one HAVOC_DONE. ember is the one owner of what has been seen: with
+ * UAM_NET_OPT_JUDGE it tells the brain, in a JUDGE frame before each INPUT's reply, what
+ * that run added. Plain INPUTs
  * keep working alongside (seeds, trimming, input-to-state, minimizing). */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
@@ -224,6 +227,9 @@ enum uam_fuzz_net_frame {
     UAM_NET_HAVOC    = 13,  /* brain -> ember: run a batch of mutations of one entry */
     UAM_NET_FIND     = 14,  /* ember -> brain: an input of the batch worth keeping */
     UAM_NET_HAVOC_DONE = 15, /* ember -> brain: the batch ended; its totals */
+    UAM_NET_JUDGE    = 16,  /* ember -> brain: the campaign's judgement of an INPUT's run,
+                             * before its reply (OPTIONS asked) */
+    UAM_NET_PROGRESS = 17,  /* ember -> brain: a batch is running (no other frame for 1 s) */
 };
 
 /* HELLO flags beyond the UAM_COV_SCHEME* bits */
@@ -234,13 +240,16 @@ enum uam_fuzz_net_frame {
 /* OPTIONS flags */
 #define UAM_NET_OPT_SPARSE        (1u << 0)   /* reply with SPARSE instead of COVERAGE */
 #define UAM_NET_OPT_CMP_LOG       (1u << 1)   /* instrument compares for CMP_INPUT (HELLO_CMP) */
+#define UAM_NET_OPT_JUDGE         (1u << 2)   /* a JUDGE frame before each INPUT's reply (HELLO_HAVOC) */
 
 /* HELLO:    u16 version, u16 flags (UAM_COV_SCHEME* bits), u32 map_size,
  *           u16 arch_len (<= UAM_NET_ARCH_MAX), u8 arch[arch_len] (the ISA's name)
  * INPUT:    u64 id (non-zero), u32 len, u8 data[len]
  * COVERAGE: u64 id (0: the INIT map), u8 kind (UAM_COV_KIND_*), u32 map_size, u8 map[]
  * CRASH:    u64 id, u8 reason (enum uam_fuzz_net_reason), u32 status
- * OPTIONS:  u32 flags (UAM_NET_OPT_*); more fields may follow, to be ignored
+ * OPTIONS:  u32 flags (UAM_NET_OPT_*), then optionally u64 iter_insns (the per-input
+ *           instruction budget from now on; 0 or absent: unchanged); more fields may
+ *           follow, to be ignored
  * SPARSE:   u64 id (0: the INIT map), u8 kind, u64 insns (instructions the iteration ran),
  *           u32 map_size, u32 n, then n x (u32 index, u8 count), indices ascending. A map
  *           with too many set buckets for the list to be smaller goes as COVERAGE instead.
@@ -263,18 +272,23 @@ enum uam_fuzz_net_frame {
  * HAVOC:    u64 first_id (the batch's inputs are first_id .. first_id + n - 1), u32 entry,
  *           u32 n, u64 seed, u32 flags (UAM_NET_HAVOC_*)
  * FIND:     u64 id, u8 reason (0: new coverage; else enum uam_fuzz_net_reason), u32 status,
- *           u64 insns, u64 ops (bit k: operator k was applied), u32 len, u8 data[len],
+ *           u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets,
+ *           u32 new_classes, u64 path (all three 0 unless reason 0), u32 len, u8 data[len],
  *           u32 n, then n x (u32 index, u8 count), indices ascending (n = 0 for a crash)
+ * JUDGE:    u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally:
+ *           buckets and (bucket, class) pairs never seen before, the path's name),
+ *           u8 novel_crash (a crash with a new (reason, status) or in code no crash reached)
+ * PROGRESS: u64 first_id (the batch), u32 execs (runs so far)
  * HAVOC_DONE: u64 first_id, u8 status (UAM_NET_HAVOC_*), u32 execs,
  *           u32 by_reason[7] (index 0: ended normally, else the CRASH reason), u32 finds,
  *           u16 n_ops, then n x (u8 op, u32 used, u32 found (in a coverage FIND)),
  *           u32 n_paths, then n x (u64 path, u32 execs), u32 n_edges, then n x (u32 index,
  *           u32 execs) (only with UAM_NET_HAVOC_EDGES).
  *
- * A path is named by the hash of the iteration's hit list: the FNV-1a 64 of each
- * (index, class) as u32 then u8 little-endian, in ascending index order, then the coverage
- * formula's mix (docs/fuzz-formats.md). A count's class is 1, 2, 4 (counts 1, 2, 3), 8 (4-7),
- * 16 (8-15), 32 (16-31), 64 (32-127) or 128 (128-255). */
+ * A path is named by its set of (index, class) pairs, whatever order they were hit in:
+ * mix(sum of mix((index << 8 | class) + 1)) in 64-bit arithmetic, with the coverage
+ * formula's mix (docs/fuzz-formats.md). A count's class is 1, 2, 4 (counts 1, 2, 3), 8
+ * (4-7), 16 (8-15), 32 (16-31), 64 (32-127) or 128 (128-255). */
 #define UAM_NET_HELLO_FIXED_LEN    10u
 #define UAM_NET_ARCH_MAX           64u
 #define UAM_NET_INPUT_HDR_LEN      12u
@@ -288,7 +302,10 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_MUTATOR_MIN_LEN    20u
 #define UAM_NET_CORPUS_HDR_LEN     8u
 #define UAM_NET_HAVOC_LEN          28u
-#define UAM_NET_FIND_HDR_LEN       33u
+#define UAM_NET_FIND_HDR_LEN       49u
+#define UAM_NET_JUDGE_LEN          25u
+#define UAM_NET_PROGRESS_LEN       12u
+#define UAM_NET_PROGRESS_NS        1000000000u   /* a batch's longest silence */
 #define UAM_NET_HAVOC_BY_REASON    7u
 
 /* HAVOC flags */

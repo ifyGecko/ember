@@ -26,6 +26,7 @@ ended cleanly, 1 otherwise (a worker that ran out of restarts), 2 on a usage err
 import argparse
 import hashlib
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -39,12 +40,20 @@ sys.path.insert(0, HERE)
 from fuzz_queue import SCHEDULES  # noqa: E402
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+def brain_port(log_path, proc, after, timeout=15.0):
+    """The port the brain chose (it listens on port 0 and logs "listening on HOST:PORT"):
+    the first such line past byte `after` of its log. None if it exits or stays silent."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with open(log_path, "rb") as f:
+            f.seek(after)
+            m = re.search(rb"listening on 127\.0\.0\.1:(\d+)", f.read())
+        if m:
+            return int(m.group(1))
+        if proc.poll() is not None:
+            return None
+        time.sleep(0.05)
+    return None
 
 
 def worker_seed(base, name):
@@ -63,10 +72,10 @@ class Worker:
 
     def start(self):
         os.makedirs(self.dir, exist_ok=True)
-        port = free_port()
         a = self.args
-        cmd = [sys.executable, BRAIN, "--listen", "127.0.0.1:%d" % port,
-               "--sync-dir", a.out, "--name", self.name, "--" + self.role,
+        # Port 0: the brain takes a free port and holds it; its log says which.
+        cmd = [sys.executable, BRAIN, "--listen", "127.0.0.1:0",
+               "--sync-dir", a.out, "--name", self.name,
                "--schedule", self.schedule, "--seed-rng", str(self.seed),
                "--sync-interval", str(a.sync_interval),
                "--status-interval", str(a.status_interval)]
@@ -78,11 +87,16 @@ class Worker:
             cmd += ["--dict", d]
         cmd += a.brain_arg
         mode = "ab" if self.restarts else "wb"
-        self.blog = open(os.path.join(self.dir, "brain.log"), mode)
+        blog_path = os.path.join(self.dir, "brain.log")
+        self.blog = open(blog_path, mode)
         self.elog = open(os.path.join(self.dir, "ember.log"), mode)
+        after = os.path.getsize(blog_path)
         self.brain = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self.blog,
                                       stderr=subprocess.STDOUT, start_new_session=True)
-        time.sleep(0.2)                      # let it listen; ember retries for a few seconds
+        port = brain_port(blog_path, self.brain, after)
+        if port is None:
+            log("%s: the brain did not start listening; see %s" % (self.name, blog_path))
+            port = 1                         # nothing listens there: ember fails, the worker restarts
         self.ember = subprocess.Popen(self.ember_cmd + ["--fuzz-net", "127.0.0.1:%d" % port],
                                       stdin=subprocess.DEVNULL, stdout=self.elog,
                                       stderr=subprocess.STDOUT, start_new_session=True)

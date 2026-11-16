@@ -184,7 +184,9 @@ fuzz/             harness.c frontend_replay.c (the harness and the replay fronte
                   list, boundary file, coverage region and fuzz protocol; docs/fuzz-formats.md),
                   cov_scheme.c (the bucket formula) site_list.c (site-list and boundary readers,
                   site check) frontend_net.c (the fuzz protocol, --fuzz-net; it runs the
-                  brain's HAVOC batches) mutate.c (the mutator, uam/fuzz_mutate.h) cov_region.c (the
+                  brain's HAVOC batches) campaign.c (the campaign engine, uam/fuzz_campaign.h: the record
+                  of seen coverage and crashes, judgements, batches) mutate.c (the mutator,
+                  uam/fuzz_mutate.h) cov_region.c (the
                   coverage region, --cov-shm) cov_cli.c (the runner extension for all of them)
                   cov_formats.h
 fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files

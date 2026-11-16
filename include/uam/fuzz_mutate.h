@@ -76,6 +76,7 @@ bool         uam_mutator_is_op(unsigned op);
 
 /* Configuration. Every setter can be called again at any time. */
 uam_status   uam_mutator_set_max_size(uam_mutator *m, size_t max_size);   /* >= 1 */
+size_t       uam_mutator_max_size(const uam_mutator *m);
 uam_status   uam_mutator_set_stack(uam_mutator *m, unsigned lo, unsigned hi); /* 1 <= lo <= hi */
 void         uam_mutator_set_splice(uam_mutator *m, unsigned permille);  /* 0..1000, default 150 */
 uam_status   uam_mutator_set_weight(uam_mutator *m, unsigned op, unsigned weight);
@@ -97,12 +98,13 @@ uam_status     uam_mutator_corpus_put(uam_mutator *m, uint32_t id, const uint8_t
 const uint8_t *uam_mutator_corpus_get(const uam_mutator *m, uint32_t id, size_t *len);
 size_t         uam_mutator_corpus_size(const uam_mutator *m);
 
-/* One mutation of src[0..len): the result is in a buffer of the mutator's, valid until
- * the next call or reconfiguration, and *out_len <= max_size. *ops (optional) gets bit
+/* One mutation of src[0..len): the result is in a buffer of the mutator's (max_size
+ * bytes, which the caller may write: a fix-up), valid until the next call or
+ * reconfiguration, and *out_len <= max_size. *ops (optional) gets bit
  * k set for every operator k that was applied (and UAM_MUT_SPLICE for a splice). NULL
  * when no operator is enabled (every weight 0, or only dictionary operators and no
  * tokens). */
-const uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
+uint8_t       *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
                                   size_t *out_len, uint64_t *ops);
 
 #endif /* UAM_FUZZ_MUTATE_H */

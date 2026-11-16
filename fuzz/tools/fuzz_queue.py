@@ -4,10 +4,8 @@
 Kept apart from the protocol and the main loop so that it can be tested on its own
 (tests/fuzz/brain_unit.py). Stdlib-only. docs/fuzz-ideas.md is the design.
 
-  Coverage       folds an iteration's hit list ((index, count) pairs) into the campaign's
-                 coverage, with AFL-style hit-count classes: an input is interesting when
-                 it sets a bucket never hit, or reaches a count class that bucket never had.
-                 O(buckets hit), never O(map size).
+  CLASS          the hit-count classes. ember keeps the record of what has been seen and
+                 judges each run against it (uam/fuzz_campaign.h): the brain has none.
   path_id        a hash of a hit list (indices and count classes): "the same path";
                  ember computes the same one for the inputs it mutates itself.
   Entry          one queue entry and its statistics.
@@ -54,55 +52,25 @@ def hits_from_map(bitmap: bytes) -> List[Tuple[int, int]]:
     return [(i, b) for i, b in enumerate(bitmap) if b]
 
 
-_FNV_BASIS, _FNV_PRIME, _M64 = 0xcbf29ce484222325, 0x100000001b3, (1 << 64) - 1
+_M64 = (1 << 64) - 1
+
+
+def _mix(v: int) -> int:
+    v ^= v >> 33
+    v = (v * 0xff51afd7ed558ccd) & _M64
+    return v ^ (v >> 33)
 
 
 def path_hash(hits: Hits) -> int:
-    """ember's name for a path (fuzz/formats.h): FNV-1a 64 over each (index as u32 LE,
-    class as u8), ascending indices, then the coverage formula's mix. ember's HAVOC_DONE
-    counts executions per path under the same name."""
-    h = _FNV_BASIS
-    for i, c in hits:
-        for b in struct.pack("<IB", i, CLASS[c]):
-            h = ((h ^ b) * _FNV_PRIME) & _M64
-    h ^= h >> 33
-    h = (h * 0xff51afd7ed558ccd) & _M64
-    h ^= h >> 33
-    return h
+    """ember's name for a path (uam/fuzz_campaign.h): mix(sum of mix((index << 8 | class)
+    + 1)), the same whatever order the buckets were hit in. ember computes it for every run
+    (JUDGE, FIND, HAVOC_DONE); this one is for checking it."""
+    return _mix(sum(_mix(((i << 8) | CLASS[c]) + 1) for i, c in hits) & _M64)
 
 
 def path_id(hits: Hits) -> bytes:
     """8 bytes naming the path: the hit buckets and their count classes (path_hash)."""
     return path_hash(hits).to_bytes(8, "big")
-
-
-class Coverage:
-    """The campaign's coverage: for each bucket, the count classes seen so far."""
-
-    def __init__(self, map_size: int):
-        self.map_size = map_size
-        self.virgin = bytearray(map_size)      # OR of the classes seen per bucket
-        self.edges = 0                         # buckets ever hit
-
-    def fold(self, hits: Hits) -> Tuple[int, int]:
-        """Merge an iteration: (new buckets, new bucket/class pairs). Interesting if the
-        second is non-zero (a new bucket is also a new class)."""
-        new_b = new_c = 0
-        v = self.virgin
-        for i, c in hits:
-            cl = CLASS[c]
-            old = v[i]
-            if not old:
-                new_b += 1
-            if not old & cl:
-                v[i] = old | cl
-                new_c += 1
-        self.edges += new_b
-        return new_b, new_c
-
-    def would_be_new(self, hits: Hits) -> bool:
-        v = self.virgin
-        return any(not v[i] & CLASS[c] for i, c in hits)
 
 
 # ---- queue entries -----------------------------------------------------------------

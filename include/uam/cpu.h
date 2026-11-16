@@ -88,9 +88,13 @@ typedef struct uam_cov_touched {
 /*
  * Block coverage's contexts (uam_exec_set_block_coverage_ex, exec.h). An interrupt
  * taken while a covered block is the next to run saves the history here and starts
- * the handler with an empty one; the first COV back at `resume_pc` restores it, so
- * where an interrupt happened to land does not leak into the interrupted code's
- * buckets, nor the interrupted code into the handler's.
+ * the handler with an empty one. An exception return (a COV with UAM_COV_ERET, which
+ * the pass puts before every EXIT of kind EXC_RETURN) lets the next COV restore the
+ * newest context saved at its pc, so where an interrupt happened to land does not leak
+ * into the interrupted code's buckets, nor the interrupted code into the handler's.
+ * Only an exception return restores: code that merely reaches a saved pc later (the
+ * handler switched tasks and never returned) keeps its own history, and a task that an
+ * interrupt suspended gets its own back when a later exception return resumes it.
  */
 #define UAM_COV_IRQ_MAX 8u
 
@@ -114,9 +118,10 @@ typedef struct uam_cov_state {
     bool      skip_repeat;
     uint64_t  last_pc;                /* with skip_repeat: the site that counted last */
     /* Block coverage's contexts (see uam_cov_irq_ctx). `pending` is nonzero while
-     * skip_pc or an interrupt context is set: the next COV then goes through
-     * uam_cov_count_slow (exec.h), every other one through uam_cov_count. */
+     * skip_pc or eret is set: the next COV then goes through uam_cov_count_slow
+     * (exec.h), every other one through uam_cov_count. */
     uint8_t   pending;
+    uint8_t   eret;                   /* an exception return ran since the last COV */
     bool      contexts;               /* resumes and interrupts are handled */
     uint8_t   n_irq;
     uint64_t  skip_pc;                /* the next COV, if at this pc, does not count */
@@ -146,6 +151,7 @@ static inline void uam_cov_reset_prev(uam_cov_state *s)
     for (unsigned j = 0; j < UAM_COV_HIST_MAX; j++)
         s->hist[j] = 0;
     s->pending = 0;
+    s->eret = 0;
     s->n_irq = 0;
     s->skip_pc = UAM_COV_NO_PC;
 }

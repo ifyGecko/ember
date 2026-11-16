@@ -25,6 +25,10 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
     session going on after it;
   - CRASH GUARD (the pc of the access) for a read of a --guard range;
   - --fuzz-net-timeout giving up on a brain that goes silent;
+  - JUDGE (OPTIONS bit 2): before each INPUT's reply, what the run added (new buckets and
+    classes, zero the second time), its path (Python's path_hash of the reply) and whether a
+    crash is novel; CMPS comes before it;
+  - OPTIONS' budget: a batch of long timeouts sends PROGRESS while it is silent;
   - mutation in ember: HELLO announces it; HAVOC before an accepted MUTATOR, for an unknown
     corpus entry or of 0 mutations gets HAVOC_DONE with that status and nothing runs; a bad
     MUTATOR gets MUTATOR_INFO refusing it, with the operator table (INSERT_BLOCK and RESIZE
@@ -45,6 +49,8 @@ import time
 
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
+JUDGE, PROGRESS = 16, 17
+OPT_JUDGE = 4
 FLAG_BIG_ENDIAN = 1 << 15
 FLAG_CMP = 1 << 14
 FLAG_HAVOC = 1 << 13
@@ -155,12 +161,23 @@ def mutator_info(p):
 
 
 def find(p):
-    """(id, reason, status, insns, ops, data, hits, exact layout)."""
-    fid, reason, status, insns, ops, dlen = struct.unpack(">QBIQQI", p[:33])
-    data = p[33:33 + dlen]
-    (n,) = struct.unpack(">I", p[33 + dlen:37 + dlen])
-    hits = list(struct.iter_unpack(">IB", p[37 + dlen:37 + dlen + 5 * n]))
-    return fid, reason, status, insns, ops, data, hits, len(p) == 37 + dlen + 5 * n
+    """(id, reason, status, insns, ops, data, hits, exact layout, (new_buckets, new_classes, path))."""
+    fid, reason, status, insns, ops, nb, nc, path, dlen = struct.unpack(">QBIQQIIQI", p[:49])
+    data = p[49:49 + dlen]
+    (n,) = struct.unpack(">I", p[49 + dlen:53 + dlen])
+    hits = list(struct.iter_unpack(">IB", p[53 + dlen:53 + dlen + 5 * n]))
+    return fid, reason, status, insns, ops, data, hits, len(p) == 53 + dlen + 5 * n, (nb, nc, path)
+
+
+def judged(c):
+    """The JUDGE frame and the reply that follows it: ((new_buckets, new_classes, path,
+    novel_crash), reply type, reply payload)."""
+    t, p = recv_frame(c)
+    if t != JUDGE or len(p) != 25:
+        raise RuntimeError("expected JUDGE (25 bytes), got type %d, %d bytes" % (t, len(p)))
+    jid, nb, nc, path, novel = struct.unpack(">QIIQB", p)
+    t, p = recv_frame(c)
+    return (jid, nb, nc, path, novel), t, p
 
 
 def havoc_done(p):
@@ -183,13 +200,18 @@ def havoc_done(p):
     return first, st, ex, by, nf, ops, paths, edges, q == len(p)
 
 
+progress_seen = []
+
+
 def run_havoc(c, first, entry, n, seed, flags=0):
-    """Send HAVOC; return (finds, done) once HAVOC_DONE arrives."""
+    """Send HAVOC; return (finds, done) once HAVOC_DONE arrives (PROGRESS frames noted)."""
     send_frame(c, HAVOC, struct.pack(">QIIQI", first, entry, n, seed, flags))
     finds = []
     while True:
         t, p = recv_frame(c)
-        if t == FIND:
+        if t == PROGRESS:
+            progress_seen.append(struct.unpack(">QI", p))
+        elif t == FIND:
             finds.append(find(p))
         elif t == HAVOC_DONE:
             return finds, havoc_done(p)
@@ -231,8 +253,33 @@ def session(run, board, fw, extra, script):
     return proc.returncode, err
 
 
-def havoc_checks(c, tag, msize):
+def havoc_checks(c, tag, msize, slow):
     """Mutation in ember (MUTATOR, CORPUS, HAVOC, FIND, HAVOC_DONE). SPARSE is on."""
+    # JUDGE: ember's judgement of an INPUT's run, before its reply.
+    send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG | OPT_JUDGE))
+    fresh = b"zzzz novel input for judge"
+    send_input(c, 40, fresh)
+    j, t, p = judged(c)
+    hits = None
+    if check(t == SPARSE and j[0] == 40, f"{tag}: JUDGE then SPARSE (type {t}, id {j[0]})"):
+        _, _, _, m, _, idx, _ = sparse(p)
+        hits = [(i, m[i]) for i in idx]
+        check(j[1] <= j[2] and j[4] == 0 and j[3] == path_hash(hits),
+              f"{tag}: JUDGE's path is path_hash of the reply ({j})")
+    send_input(c, 41, fresh)
+    j2, t, p = judged(c)
+    check(t == SPARSE and j2[1] == 0 and j2[2] == 0 and j2[3] == j[3],
+          f"{tag}: the same input again: nothing new, the same path ({j2})")
+    send_input(c, 42, b"FUZ!")
+    j3, t, p = judged(c)
+    check(t == CRASH and j3[1] == 0 and j3[2] == 0 and j3[4] == 0,
+          f"{tag}: a crash seen before is not novel ({j3}, type {t})")
+    send_frame(c, CMP_INPUT, struct.pack(">QI", 43, len(NEAR_IN)) + NEAR_IN)
+    t, p = recv_frame(c)
+    check(t == CMPS, f"{tag}: CMPS comes before JUDGE (type {t})")
+    j4, t, p = judged(c)
+    check(t == SPARSE and j4[0] == 43, f"{tag}: CMP_INPUT: CMPS, JUDGE, reply (type {t})")
+    send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG))
     # Refusals: nothing runs, the batch is answered at once.
     _, done = run_havoc(c, 100, 5, 4, 1)
     check(done[0] == 100 and done[1] == 1 and done[2] == 0 and done[8],
@@ -283,6 +330,17 @@ def havoc_checks(c, tag, msize):
     check(done[1] == 0 and done[3][5] == 3 and len(finds) == 1 and finds[0][1] == TIMEOUT
           and finds[0][5] == loop and finds[0][7], f"{tag}: 3 timeouts, 1 FIND (cap 1): "
           f"{done[3]}, {[f[1] for f in finds]}")
+    if slow:
+        # OPTIONS sets the budget: runs long enough that the batch must say PROGRESS.
+        send_frame(c, OPTIONS, struct.pack(">IQ", OPT_SPARSE | OPT_CMP_LOG, 150000000))
+        del progress_seen[:]
+        t0 = time.monotonic()
+        finds, done = run_havoc(c, 400, 6, 3, 1)
+        took = time.monotonic() - t0
+        check(done[3][5] == 3 and not finds, f"{tag}: 3 long timeouts past the hang cap ({done[3]})")
+        check(took > 1.2 and progress_seen and all(f == 400 and 0 < n < 3 for f, n in progress_seen),
+              f"{tag}: a silent batch of {took:.1f} s sends PROGRESS ({progress_seen})")
+        send_frame(c, OPTIONS, struct.pack(">IQ", OPT_SPARSE | OPT_CMP_LOG, 200000))
     # Default weights, a token: well-formed FINDs; FUZ! crashes, known from INPUTs, only count.
     send_frame(c, MUTATOR, mutator(max_size=200, stack=(2, 128), splice=150,
                                    tokens=struct.pack(">IBH", 1, 0, 4) + b"FUZ!"))
@@ -293,10 +351,15 @@ def havoc_checks(c, tag, msize):
     finds, done = run_havoc(c, 1000, 7, 3000, 12345)
     check(done[1] == 0 and done[2] == 3000 and sum(done[3]) == 3000 and done[4] == len(finds),
           f"{tag}: a 3000-mutation batch's totals ({done[:5]})")
-    check(done[3][FAULT] > 0 and not any(f[1] == FAULT for f in finds),
-          f"{tag}: the known FAULT counted ({done[3][FAULT]}), not reported again")
+    faults = [f for f in finds if f[1] == FAULT]
+    check(done[3][FAULT] > len(faults) and len(faults) < 8,
+          f"{tag}: the known FAULT counted ({done[3][FAULT]}), reported again only when it ran "
+          f"code no crash had ({len(faults)})")
     good = all(f[7] and 1000 <= f[0] < 4000 and len(f[5]) <= 200 and f[4] for f in finds)
     good &= all(f[1] or (f[3] > 0 and f[6] == sorted(f[6]) and f[6]) for f in finds)
+    good &= all(f[1] or (0 < f[8][1] and f[8][0] <= f[8][1] and f[8][2] == path_hash(f[6]))
+                for f in finds)
+    good &= all(not f[1] or f[8] == (0, 0, 0) for f in finds)
     check(good, f"{tag}: FINDs well formed ({len(finds)})")
     used = sum(u for u, _ in done[5].values())
     check(used > 3000 and all(o in everything or o == 25 for o in done[5]),
@@ -438,7 +501,7 @@ def main():
             check(t == CRASH and len(p) == 13 and struct.unpack(">QBI", p)[:2] == (15, FAULT),
                   f"{tag}: the magic value: CRASH FAULT (type {t})")
 
-            havoc_checks(c, tag, msize)
+            havoc_checks(c, tag, msize, slow=mode == "blocks" and not st.get("eof"))
 
             if st.get("eof"):
                 return                                            # close without BYE

@@ -257,14 +257,20 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
         const uam_insn *prev = v->idx ? &v->blk->insn[v->idx - 1] : NULL;
         if (W != 32)
             return fail(v, "cov width must be 32");
-        if (in->flags & ~UAM_COV_SPLIT)
-            return fail(v, "unknown cov flags");
-        if (in->flags & UAM_COV_SPLIT) {
-            uint32_t k = v->idx + 1;   /* only fences, then the final exit */
-            while (k < v->blk->n_insn && v->blk->insn[k].op == UAM_OP_FENCE)
+        if ((in->flags & ~(UAM_COV_SPLIT | UAM_COV_ERET))
+            || in->flags == (UAM_COV_SPLIT | UAM_COV_ERET))
+            return fail(v, "bad cov flags");
+        if (in->flags) {
+            uint32_t k = v->idx + 1;   /* only fences and such markers, then an exit */
+            while (k < v->blk->n_insn && (v->blk->insn[k].op == UAM_OP_FENCE
+                                          || (v->blk->insn[k].op == UAM_OP_COV && v->blk->insn[k].flags)))
                 k++;
-            if (k + 1 != v->blk->n_insn || v->blk->insn[k].op != UAM_OP_EXIT)
-                return fail(v, "a split cov must precede the block's final exit (fences between)");
+            if (k >= v->blk->n_insn || v->blk->insn[k].op != UAM_OP_EXIT)
+                return fail(v, "a split or eret cov must precede an exit (fences between)");
+            if ((in->flags & UAM_COV_SPLIT) && k + 1 != v->blk->n_insn)
+                return fail(v, "a split cov must precede the block's final exit");
+            if ((in->flags & UAM_COV_ERET) && v->blk->insn[k].aux != UAM_EXIT_EXC_RETURN)
+                return fail(v, "an eret cov must precede an exception-return exit");
         } else if (!prev || prev->op != UAM_OP_IMARK || (prev->flags & UAM_IMARK_CONT)) {
             return fail(v, "cov must directly follow a non-continuation imark");
         }

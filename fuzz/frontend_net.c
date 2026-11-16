@@ -32,11 +32,13 @@
  *
  * A brain that sends MUTATOR, CORPUS and HAVOC (HELLO says UAM_NET_HELLO_HAVOC) has ember
  * mutate: a HAVOC batch hands the harness n mutations of a corpus entry, one after
- * another with no frame in between, through this frontend's next_input, so that the
- * observers and traces see each one as they see an INPUT. Each is judged here: a
- * bucket/count class ember has not seen (the virgin map, which every INPUT that ends
- * normally also updates), a crash with a new (reason, status), or a hang up to MUTATOR's
- * cap is sent as a FIND; HAVOC_DONE closes the batch with its totals.
+ * another with no frame from the brain in between, through this frontend's next_input, so
+ * that the observers and traces see each one as they see an INPUT. The campaign engine
+ * (uam/fuzz_campaign.h) owns the mutator and the record of what runs have shown, and
+ * judges every run, INPUTs included; this file only turns its judgements into frames:
+ * FIND for a batch's run worth keeping, PROGRESS when a batch has sent nothing for a
+ * second, HAVOC_DONE with the totals, and, when OPTIONS asks (UAM_NET_OPT_JUDGE), a JUDGE
+ * frame before each INPUT's reply, so that the brain keeps no record of its own.
  *
  * A dead peer is noticed by TCP keepalive (a brain host that vanished without closing the
  * connection would otherwise leave ember waiting forever); a live brain that stops
@@ -55,7 +57,7 @@
 
 #include "formats.h"
 #include "cov_formats.h"
-#include "uam/fuzz_mutate.h"
+#include "uam/fuzz_campaign.h"
 
 _Static_assert(UAM_NET_CMP_EQ == UAM_CMP_EQ && UAM_NET_CMP_ORDER == UAM_CMP_ORDER
                && UAM_NET_CMP_SIGNED == UAM_CMP_SIGNED && UAM_NET_CMP_IMM == UAM_CMP_IMM,
@@ -66,31 +68,6 @@ _Static_assert(UAM_NET_CMP_EQ == UAM_CMP_EQ && UAM_NET_CMP_ORDER == UAM_CMP_ORDE
 #define KEEPALIVE_IDLE_S  60            /* probe after a minute of silence ... */
 #define KEEPALIVE_INTVL_S 10            /* ... every 10 s ... */
 #define KEEPALIVE_CNT     6             /* ... and give up after 6 unanswered: ~2 min */
-
-/* An open-addressing table of 64-bit keys and counts (paths, buckets), emptied per batch. */
-typedef struct counts {
-    uint64_t *key;
-    uint32_t *n;           /* 0: the slot is free */
-    size_t    cap, used;
-} counts;
-
-/* The HAVOC batch in progress. */
-typedef struct havoc_batch {
-    bool           active;
-    uint64_t       first_id, next_id;
-    uint32_t       left, flags;
-    const uint8_t *parent;
-    size_t         parent_len;
-    const uint8_t *data;   /* the mutation being run (the mutator's buffer) */
-    size_t         len;
-    uint64_t       ops;
-    uint32_t       execs, finds;
-    uint32_t       by_reason[UAM_NET_HAVOC_BY_REASON];
-    uint32_t       used[UAM_MUT_OP_LIMIT], found[UAM_MUT_OP_LIMIT];
-    counts         paths, edges;
-} havoc_batch;
-
-static void counts_free(counts *c);
 
 struct cf_net {
     int       fd;
@@ -108,15 +85,14 @@ struct cf_net {
     size_t    out_cap;
     char      peer[300];
 
-    /* mutation in ember (MUTATOR, CORPUS, HAVOC) */
-    uam_mutator *mut;
+    /* the campaign (fuzz_campaign.h): the record of what runs showed, the mutator and
+     * its batches. This frontend only puts its judgements into frames. */
+    uam_fuzz_campaign *camp;
     bool      mut_ok;      /* the last MUTATOR was accepted */
-    uint32_t  max_hang_finds, hang_finds;
-    uint8_t  *virgin;      /* map_size: the count classes seen per bucket */
-    size_t    map_size;
-    uint64_t *crash_sigs;  /* (reason << 32 | status) of every crash seen */
-    size_t    n_sigs, cap_sigs;
-    havoc_batch h;
+    bool      judge;       /* OPTIONS asked for a JUDGE frame before each INPUT's reply */
+    bool      batch;       /* a HAVOC batch is running */
+    uint64_t  first_id, next_id;
+    uint64_t  last_ns;     /* when the last frame of the batch went out (PROGRESS) */
 };
 
 /* ---- big-endian fields ---------------------------------------------------- */
@@ -312,143 +288,17 @@ void cf_net_close(cf_net *z)
         close(z->fd);
     free(z->in);
     free(z->out);
-    uam_mutator_destroy(z->mut);
-    free(z->virgin);
-    free(z->crash_sigs);
-    counts_free(&z->h.paths);
-    counts_free(&z->h.edges);
+    uam_fuzz_campaign_destroy(z->camp);
     free(z);
 }
 
 /* ---- mutation in ember ------------------------------------------------- */
 
-/* A hit count's class (AFL's buckets): what makes a count new. */
-static uint8_t count_class(uint8_t c)
+static uint64_t now_ns(void)
 {
-    if (c <= 2)   return c;
-    if (c == 3)   return 4;
-    if (c <= 7)   return 8;
-    if (c <= 15)  return 16;
-    if (c <= 31)  return 32;
-    if (c <= 127) return 64;
-    return 128;
-}
-
-static uint64_t mix64(uint64_t v)
-{
-    v ^= v >> 33;
-    v *= 0xff51afd7ed558ccdull;
-    v ^= v >> 33;
-    return v;
-}
-
-#define FNV_BASIS 0xcbf29ce484222325ull
-#define FNV_PRIME 0x100000001b3ull
-
-static uint64_t fnv_byte(uint64_t h, uint8_t b) { return (h ^ b) * FNV_PRIME; }
-
-/* The path's name: FNV-1a 64 over each (index as u32 LE, class as u8), then mix64. */
-static uint64_t path_hash(const uint32_t *hits, size_t n, const uint8_t *map)
-{
-    uint64_t h = FNV_BASIS;
-    for (size_t i = 0; i < n; i++) {
-        uint32_t ix = hits[i];
-        for (int k = 0; k < 4; k++)
-            h = fnv_byte(h, (uint8_t)(ix >> (8 * k)));
-        h = fnv_byte(h, count_class(map[ix]));
-    }
-    return mix64(h);
-}
-
-static void counts_free(counts *c)
-{
-    free(c->key);
-    free(c->n);
-    *c = (counts){ 0 };
-}
-
-static void counts_clear(counts *c)
-{
-    if (c->used)
-        memset(c->n, 0, c->cap * sizeof(*c->n));
-    c->used = 0;
-}
-
-static bool counts_grow(counts *c)
-{
-    size_t cap = c->cap ? 2 * c->cap : 1024;
-    uint64_t *k = calloc(cap, sizeof(*k));
-    uint32_t *n = calloc(cap, sizeof(*n));
-    if (!k || !n) {
-        free(k);
-        free(n);
-        return false;
-    }
-    for (size_t i = 0; i < c->cap; i++) {
-        if (!c->n[i])
-            continue;
-        size_t j = (size_t)mix64(c->key[i]) & (cap - 1);
-        while (n[j])
-            j = (j + 1) & (cap - 1);
-        k[j] = c->key[i];
-        n[j] = c->n[i];
-    }
-    free(c->key);
-    free(c->n);
-    c->key = k;
-    c->n = n;
-    c->cap = cap;
-    return true;
-}
-
-static bool counts_add(counts *c, uint64_t key)
-{
-    if (2 * (c->used + 1) > c->cap && !counts_grow(c))
-        return false;
-    size_t j = (size_t)mix64(key) & (c->cap - 1);
-    while (c->n[j] && c->key[j] != key)
-        j = (j + 1) & (c->cap - 1);
-    if (!c->n[j]) {
-        c->key[j] = key;
-        c->used++;
-    }
-    if (c->n[j] < UINT32_MAX)
-        c->n[j]++;
-    return true;
-}
-
-/* Fold an iteration that ended normally into the virgin map: true if it set a bucket/count
- * class not seen before. */
-static bool virgin_fold(cf_net *z, const uint32_t *hits, size_t n, const uint8_t *map)
-{
-    bool fresh = false;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t cl = count_class(map[hits[i]]);
-        if (!(z->virgin[hits[i]] & cl)) {
-            z->virgin[hits[i]] |= cl;
-            fresh = true;
-        }
-    }
-    return fresh;
-}
-
-/* Note a crash's (reason, status): true the first time. */
-static bool crash_sig_new(cf_net *z, uint8_t reason, uint32_t status)
-{
-    uint64_t sig = (uint64_t)reason << 32 | status;
-    for (size_t i = 0; i < z->n_sigs; i++)
-        if (z->crash_sigs[i] == sig)
-            return false;
-    if (z->n_sigs == z->cap_sigs) {
-        size_t cap = z->cap_sigs ? 2 * z->cap_sigs : 64;
-        uint64_t *p = realloc(z->crash_sigs, cap * sizeof(*p));
-        if (!p)
-            return true;          /* report it; the set stays as it is */
-        z->crash_sigs = p;
-        z->cap_sigs = cap;
-    }
-    z->crash_sigs[z->n_sigs++] = sig;
-    return true;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
 /* The protocol's crash reason (0: ended normally) and status of a verdict. */
@@ -467,26 +317,9 @@ static uint8_t verdict_reason(uam_fuzz_verdict v, uint64_t detail, uint32_t *sta
     }
 }
 
-/* The map's set buckets, ascending (the harness's list, which also makes the next clear
- * cheap). NULL only when out of memory. */
-static const uint32_t *all_hits(cf_net *z, size_t *n)
-{
-    return uam_fuzz_map_hits(z->fuzz, z->map_size, n);
-}
-
-static bool need_virgin(cf_net *z)
-{
-    if (z->virgin)
-        return true;
-    size_t size;
-    uam_fuzz_map(z->fuzz, &size);
-    z->map_size = size;
-    z->virgin = calloc(size ? size : 1, 1);
-    return z->virgin != NULL;
-}
-
 static bool send_mutator_info(cf_net *z, bool ok, const char *msg)
 {
+    uam_mutator *mut = z->camp ? uam_fuzz_campaign_mutator(z->camp) : NULL;
     size_t mlen = msg ? strlen(msg) : 0;
     if (mlen > 1024)
         mlen = 1024;
@@ -510,8 +343,7 @@ static bool send_mutator_info(cf_net *z, bool ok, const char *msg)
         size_t nl = strlen(name);
         *p++ = (uint8_t)op;
         p = put16(p, (uint16_t)uam_mutator_default_weight(op));
-        p = put16(p, (uint16_t)(z->mut ? uam_mutator_weight(z->mut, op)
-                                       : uam_mutator_default_weight(op)));
+        p = put16(p, (uint16_t)(mut ? uam_mutator_weight(mut, op) : uam_mutator_default_weight(op)));
         *p++ = (uint8_t)nl;
         memcpy(p, name, nl);
         p += nl;
@@ -524,19 +356,19 @@ static bool send_mutator_info(cf_net *z, bool ok, const char *msg)
 /* MUTATOR: replace the mutator's settings and dictionary. NULL when accepted, else why. */
 static const char *apply_mutator(cf_net *z, const uint8_t *b, size_t len)
 {
+    if (!z->camp)
+        return "this frontend runs without a campaign";
     if (len < UAM_NET_MUTATOR_MIN_LEN)
         return "MUTATOR is shorter than its fixed fields";
-    if (!z->mut && !(z->mut = uam_mutator_create()))
-        return "out of memory";
-    uam_mutator *m = z->mut;
+    uam_mutator *m = uam_fuzz_campaign_mutator(z->camp);
     const uint8_t *p = b, *end = b + len;
     uint32_t max_size = get32(p);
     unsigned lo = get16(p + 4), hi = get16(p + 6), splice = get16(p + 8);
     uint32_t max_hangs = get32(p + 10);
     unsigned nw = get16(p + 14);
     p += 16;
-    if (!max_size || max_size > UAM_FUZZ_NET_FRAME_MAX)
-        return "max_size must be 1 .. 64 MiB";
+    if (!max_size || max_size > UAM_FUZZ_NET_FRAME_MAX / 2)
+        return "max_size must be 1 .. 32 MiB";
     if (uam_mutator_set_max_size(m, max_size) != UAM_OK)
         return "cannot allocate max_size bytes";
     if (uam_mutator_set_stack(m, lo, hi) != UAM_OK)
@@ -581,165 +413,169 @@ static const char *apply_mutator(cf_net *z, const uint8_t *b, size_t len)
     static const uint8_t probe_in[1] = { 0 };
     if (!uam_mutator_mutate(m, probe_in, 1, &ol, NULL))
         return "no operator is enabled (every weight 0, or only dictionary ones and no tokens)";
-    z->max_hang_finds = max_hangs;
+    uam_fuzz_campaign_set_hang_cap(z->camp, max_hangs);
     return NULL;
 }
 
-static bool send_havoc_done(cf_net *z, uint8_t status)
+/* by_reason of HAVOC_DONE from the batch's count per verdict. */
+static uint32_t runs_of_reason(const uam_fuzz_batch *b, uint8_t reason)
 {
-    havoc_batch *h = &z->h;
-    size_t n_ops = 0;
+    static const uam_fuzz_verdict of[UAM_NET_HAVOC_BY_REASON] = {
+        [0] = UAM_FUZZ_OK, [UAM_NET_FAULT] = UAM_FUZZ_CRASH_FAULT, [UAM_NET_GUARD] = UAM_FUZZ_CRASH_GUARD,
+        [UAM_NET_ORACLE] = UAM_FUZZ_CRASH_ORACLE, [UAM_NET_HANG] = UAM_FUZZ_HANG,
+        [UAM_NET_TIMEOUT] = UAM_FUZZ_TIMEOUT, [UAM_NET_REJECTED] = UAM_FUZZ_REJECTED,
+    };
+    return b->by_verdict[of[reason]];
+}
+
+/* HAVOC_DONE; with a status other than OK nothing ran and the totals are zero. */
+static bool send_havoc_done(cf_net *z, uint64_t first_id, uint8_t status)
+{
+    static const uam_fuzz_batch none;
+    const uam_fuzz_batch *b = status == UAM_NET_HAVOC_OK ? uam_fuzz_campaign_batch(z->camp) : &none;
+    size_t n_paths = 0, n_edges = 0, n_ops = 0;
+    const uam_fuzz_count *paths = NULL, *edges = NULL;
+    if (status == UAM_NET_HAVOC_OK) {
+        paths = uam_fuzz_campaign_batch_paths(z->camp, &n_paths);
+        edges = uam_fuzz_campaign_batch_edges(z->camp, &n_edges);
+    }
     for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++)
-        n_ops += h->used[op] != 0;
+        n_ops += b->op_used[op] != 0;
     size_t need = 5 + 8 + 1 + 4 + 4 * UAM_NET_HAVOC_BY_REASON + 4 + 2 + n_ops * 9
-                + 4 + h->paths.used * 12 + 4 + h->edges.used * 8;
+                + 4 + n_paths * 12 + 4 + n_edges * 8;
+    z->batch = false;
     if (!reserve(&z->out, &z->out_cap, need)) {
         z->broken = true;
         return false;
     }
-    uint8_t *p = put64(z->out + 5, h->first_id);
+    uint8_t *p = put64(z->out + 5, first_id);
     *p++ = status;
-    p = put32(p, h->execs);
-    for (unsigned i = 0; i < UAM_NET_HAVOC_BY_REASON; i++)
-        p = put32(p, h->by_reason[i]);
-    p = put32(p, h->finds);
+    p = put32(p, b->execs);
+    for (uint8_t r = 0; r < UAM_NET_HAVOC_BY_REASON; r++)
+        p = put32(p, runs_of_reason(b, r));
+    p = put32(p, b->reports);
     p = put16(p, (uint16_t)n_ops);
     for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++) {
-        if (!h->used[op])
+        if (!b->op_used[op])
             continue;
         *p++ = (uint8_t)op;
-        p = put32(p, h->used[op]);
-        p = put32(p, h->found[op]);
+        p = put32(p, b->op_used[op]);
+        p = put32(p, b->op_found[op]);
     }
-    p = put32(p, (uint32_t)h->paths.used);
-    for (size_t i = 0; i < h->paths.cap; i++) {
-        if (h->paths.n[i]) {
-            p = put64(p, h->paths.key[i]);
-            p = put32(p, h->paths.n[i]);
-        }
+    p = put32(p, (uint32_t)n_paths);
+    for (size_t i = 0; i < n_paths; i++) {
+        p = put64(p, paths[i].key);
+        p = put32(p, paths[i].n);
     }
-    p = put32(p, (uint32_t)h->edges.used);
-    for (size_t i = 0; i < h->edges.cap; i++) {
-        if (h->edges.n[i]) {
-            p = put32(p, (uint32_t)h->edges.key[i]);
-            p = put32(p, h->edges.n[i]);
-        }
+    p = put32(p, (uint32_t)n_edges);
+    for (size_t i = 0; i < n_edges; i++) {
+        p = put32(p, (uint32_t)edges[i].key);
+        p = put32(p, edges[i].n);
     }
-    h->active = false;
     return send_frame(z, UAM_NET_HAVOC_DONE, (size_t)(p - (z->out + 5)));
 }
 
 /* HAVOC: start a batch. false: answered at once (nothing to run) or the stream broke. */
 static bool start_havoc(cf_net *z, const uint8_t *b)
 {
-    havoc_batch *h = &z->h;
-    uint64_t first = get64(b), seed = get64(b + 16);
-    uint32_t entry = get32(b + 8), n = get32(b + 12), flags = get32(b + 24);
-    counts paths = h->paths, edges = h->edges;
-    counts_clear(&paths);
-    counts_clear(&edges);
-    *h = (havoc_batch){ .first_id = first, .next_id = first, .left = n, .flags = flags,
-                        .paths = paths, .edges = edges };
+    const uint64_t first = get64(b), seed = get64(b + 16);
+    const uint32_t entry = get32(b + 8), n = get32(b + 12), flags = get32(b + 24);
     uint8_t status = UAM_NET_HAVOC_OK;
-    if (!z->mut || !z->mut_ok)
+    size_t elen;
+    if (!z->camp || !z->mut_ok)
         status = UAM_NET_HAVOC_NO_MUTATOR;
-    else if (!(h->parent = uam_mutator_corpus_get(z->mut, entry, &h->parent_len)))
+    else if (!uam_mutator_corpus_get(uam_fuzz_campaign_mutator(z->camp), entry, &elen))
         status = UAM_NET_HAVOC_NO_ENTRY;
-    else if (!n || n > UAM_NET_HAVOC_MAX || !first)
+    else if (!n || n > UAM_NET_HAVOC_MAX || !first
+             || uam_fuzz_campaign_batch_begin(z->camp, entry, n, seed,
+                                              flags & UAM_NET_HAVOC_EDGES ? UAM_FUZZ_BATCH_EDGES : 0)
+                != UAM_OK)
         status = UAM_NET_HAVOC_BAD;
-    else if (!need_virgin(z)) {
-        z->broken = true;
-        return false;
-    }
     if (status != UAM_NET_HAVOC_OK) {
         uam_log(UAM_LOG_WARN, "fuzz-net", "HAVOC for entry %u refused (status %u)", entry, status);
-        send_havoc_done(z, status);
+        send_havoc_done(z, first, status);
         return false;
     }
-    uam_mutator_seed(z->mut, seed);
-    h->active = true;
+    z->batch = true;
+    z->first_id = z->next_id = first;
+    z->last_ns = now_ns();
     return true;
 }
 
-/* The next mutation of the batch. */
-static void next_mutation(cf_net *z, uint8_t **data, size_t *len, uint64_t *id)
+/* A batch's input worth keeping, with the campaign's judgement of it. */
+static bool send_find(cf_net *z, uint64_t id, const uam_fuzz_judgement *j)
 {
-    havoc_batch *h = &z->h;
-    h->data = uam_mutator_mutate(z->mut, h->parent, h->parent_len, &h->len, &h->ops);
-    *data = (uint8_t *)h->data;   /* the harness only reads it */
-    *len = h->len;
-    *id = h->next_id++;
-    h->left--;
-}
-
-static bool send_find(cf_net *z, uint64_t id, uint8_t reason, uint32_t status, uint64_t insns,
-                      const uint32_t *hits, size_t n, const uint8_t *map)
-{
-    havoc_batch *h = &z->h;
-    if (!reserve(&z->out, &z->out_cap, 5 + UAM_NET_FIND_HDR_LEN + h->len + 4 + n * 5)) {
+    const uam_fuzz_batch *b = uam_fuzz_campaign_batch(z->camp);
+    uint32_t status;
+    const uint8_t reason = verdict_reason(j->verdict, j->detail, &status);
+    size_t n = 0, map_size;
+    const uint32_t *hits = NULL;
+    const uint8_t *map = uam_fuzz_map(z->fuzz, &map_size);
+    if (!reason && !(hits = uam_fuzz_map_hits(z->fuzz, map_size, &n))) {   /* ascending */
         z->broken = true;
         return false;
     }
+    if (!reserve(&z->out, &z->out_cap, 5 + UAM_NET_FIND_HDR_LEN + b->len + 4 + n * 5)) {
+        z->broken = true;
+        return false;
+    }
+    const uam_fuzz_result *r = uam_fuzz_last_result(z->fuzz);
     uint8_t *p = put64(z->out + 5, id);
     *p++ = reason;
     p = put32(p, status);
-    p = put64(p, insns);
-    p = put64(p, h->ops);
-    p = put32(p, (uint32_t)h->len);
-    memcpy(p, h->data, h->len);
-    p += h->len;
+    p = put64(p, !reason && r ? r->insns : 0);
+    p = put64(p, b->ops);
+    p = put32(p, j->new_buckets);
+    p = put32(p, j->new_classes);
+    p = put64(p, j->path);
+    p = put32(p, (uint32_t)b->len);
+    memcpy(p, b->data, b->len);
+    p += b->len;
     p = put32(p, (uint32_t)n);
     for (size_t i = 0; i < n; i++) {
         p = put32(p, hits[i]);
         *p++ = map[hits[i]];
     }
-    h->finds++;
     return send_frame(z, UAM_NET_FIND, (size_t)(p - (z->out + 5)));
 }
 
-/* One mutation of the batch ran: judge it, and close the batch after the last. */
+/* One mutation of the batch ran: judge it, report it if it is worth it, say that the
+ * batch is alive when nothing went out for a second, and close the batch after the last. */
 static bool havoc_report(cf_net *z, uint64_t id, uam_fuzz_verdict v, uint64_t detail)
 {
-    havoc_batch *h = &z->h;
-    uint32_t status;
-    uint8_t reason = verdict_reason(v, detail, &status);
-    h->execs++;
-    h->by_reason[reason]++;
-    bool fresh = false, ok = true;
-    if (reason == 0) {
-        size_t n;
-        const uint32_t *hits = all_hits(z, &n);
-        if (!hits) {
-            z->broken = true;
-            return false;
-        }
-        const uint8_t *map = uam_fuzz_map(z->fuzz, NULL);
-        fresh = virgin_fold(z, hits, n, map);
-        counts_add(&h->paths, path_hash(hits, n, map));
-        if (h->flags & UAM_NET_HAVOC_EDGES)
-            for (size_t i = 0; i < n; i++)
-                counts_add(&h->edges, hits[i]);
-        if (fresh) {
-            const uam_fuzz_result *r = uam_fuzz_last_result(z->fuzz);
-            ok = send_find(z, id, 0, 0, r ? r->insns : 0, hits, n, map);
-        }
-    } else if (reason == UAM_NET_HANG || reason == UAM_NET_TIMEOUT) {
-        if (z->hang_finds < z->max_hang_finds) {
-            z->hang_finds++;
-            ok = send_find(z, id, reason, status, 0, NULL, 0, NULL);
-        }
-    } else if (reason != UAM_NET_REJECTED && crash_sig_new(z, reason, status)) {
-        ok = send_find(z, id, reason, status, 0, NULL, 0, NULL);
+    uam_fuzz_judgement j;
+    if (uam_fuzz_campaign_batch_judge(z->camp, v, detail, &j) != UAM_OK) {
+        z->broken = true;
+        return false;
     }
-    for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++) {
-        if (h->ops >> op & 1) {
-            h->used[op]++;
-            h->found[op] += fresh;
+    const uam_fuzz_batch *b = uam_fuzz_campaign_batch(z->camp);
+    bool ok = true;
+    if (j.report) {
+        ok = send_find(z, id, &j);
+        z->last_ns = now_ns();
+    } else if (b->left) {
+        const uint64_t now = now_ns();
+        if (now - z->last_ns >= UAM_NET_PROGRESS_NS) {
+            uint8_t *p = put64(z->out + 5, z->first_id);
+            put32(p, b->execs);
+            ok = send_frame(z, UAM_NET_PROGRESS, UAM_NET_PROGRESS_LEN);
+            z->last_ns = now;
         }
     }
-    if (ok && !h->left)
-        ok = send_havoc_done(z, UAM_NET_HAVOC_OK);
+    if (ok && !b->left)
+        ok = send_havoc_done(z, z->first_id, UAM_NET_HAVOC_OK);
     return ok;
+}
+
+/* JUDGE: the campaign's judgement of an INPUT's run, right before its reply. */
+static bool send_judge(cf_net *z, uint64_t id, const uam_fuzz_judgement *j)
+{
+    uint8_t *p = put64(z->out + 5, id);
+    p = put32(p, j->new_buckets);
+    p = put32(p, j->new_classes);
+    p = put64(p, j->path);
+    *p = j->novel_crash;
+    return send_frame(z, UAM_NET_JUDGE, UAM_NET_JUDGE_LEN);
 }
 
 /* ---- the frontend --------------------------------------------------- */
@@ -767,7 +603,8 @@ static uam_status net_hello(void *ctx, const uam_fuzz_info *info)
         return UAM_ERR_INVALID;
     uint8_t *p = put16(z->out + 5, UAM_FUZZ_NET_VERSION);
     p = put16(p, (uint16_t)(z->flags | (z->big_endian ? UAM_NET_HELLO_BIG_ENDIAN : 0)
-                            | (z->fuzz ? UAM_NET_HELLO_CMP | UAM_NET_HELLO_HAVOC : 0)));
+                            | (z->fuzz ? UAM_NET_HELLO_CMP : 0)
+                            | (z->camp ? UAM_NET_HELLO_HAVOC : 0)));
     p = put32(p, info->map_size);
     p = put16(p, (uint16_t)alen);
     memcpy(p, info->arch, alen);
@@ -780,9 +617,14 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     for (;;) {
         if (z->broken)
             return -1;
-        if (z->h.active && z->h.left) {   /* a HAVOC batch runs on, with no frame between */
-            next_mutation(z, data, len, id);
-            return 1;
+        if (z->batch) {   /* a HAVOC batch runs on, with no frame from the brain between */
+            const uint8_t *d;
+            if (uam_fuzz_campaign_batch_next(z->camp, &d, len)) {
+                *data = (uint8_t *)d;   /* the harness only reads it */
+                *id = z->next_id++;
+                return 1;
+            }
+            z->batch = false;           /* cannot happen: the last report closed it */
         }
         uint8_t hdr[5];
         int rc = read_all(z, hdr, sizeof(hdr), true);
@@ -813,6 +655,9 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             if (plen >= UAM_NET_OPTIONS_MIN_LEN && z->fuzz) {
                 const uint32_t o = get32(z->in);
                 z->sparse = o & UAM_NET_OPT_SPARSE;
+                z->judge = (o & UAM_NET_OPT_JUDGE) && z->camp;
+                if (plen >= UAM_NET_OPTIONS_MIN_LEN + 8 && get64(z->in + 4))
+                    uam_fuzz_set_iter_insns(z->fuzz, get64(z->in + 4));
                 unsigned modes = uam_fuzz_cmp_modes(z->fuzz) & ~UAM_FUZZ_CMP_LOG;
                 if (o & UAM_NET_OPT_CMP_LOG)
                     modes |= UAM_FUZZ_CMP_LOG;
@@ -843,8 +688,7 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             return 1;
         }
         case UAM_NET_MUTATOR: {
-            const char *why = z->fuzz ? apply_mutator(z, z->in, plen)
-                                      : "this frontend runs without a harness";
+            const char *why = apply_mutator(z, z->in, plen);
             z->mut_ok = !why;
             if (why)
                 uam_log(UAM_LOG_ERROR, "fuzz-net", "MUTATOR refused: %s", why);
@@ -860,9 +704,9 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
                 z->broken = true;
                 return -1;
             }
-            if ((!z->mut && !(z->mut = uam_mutator_create()))
-                || uam_mutator_corpus_put(z->mut, get32(z->in), z->in + UAM_NET_CORPUS_HDR_LEN,
-                                          clen) != UAM_OK) {
+            if (!z->camp
+                || uam_mutator_corpus_put(uam_fuzz_campaign_mutator(z->camp), get32(z->in),
+                                          z->in + UAM_NET_CORPUS_HDR_LEN, clen) != UAM_OK) {
                 uam_log(UAM_LOG_ERROR, "fuzz-net", "out of memory for the corpus");
                 z->broken = true;
                 return -1;
@@ -876,11 +720,9 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
                 z->broken = true;
                 return -1;
             }
-            if (start_havoc(z, z->in)) {
-                next_mutation(z, data, len, id);
-                return 1;
-            }
-            continue;   /* answered at once (or broken: the loop's top says so) */
+            start_havoc(z, z->in);
+            continue;   /* the loop's top hands out the batch's first mutation (or the
+                         * batch was answered at once, or the stream broke) */
         default:
             continue;   /* any other frame type is ignored */
         }
@@ -942,29 +784,23 @@ static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
 {
     cf_net *z = ctx;
     bool ok;
-    if (kind == UAM_FUZZ_KIND_ITER && z->h.active)
+    if (kind == UAM_FUZZ_KIND_ITER && z->batch)
         return havoc_report(z, id, v, detail) ? UAM_OK : UAM_ERR_INVALID;
-    /* What an INPUT showed counts for the batches too: its classes are not new to them,
-     * and a crash it found is not reported again. */
-    if (kind == UAM_FUZZ_KIND_ITER && z->fuzz && v == UAM_FUZZ_OK) {
-        size_t n;
-        const uint32_t *hits = need_virgin(z) ? all_hits(z, &n) : NULL;
-        if (!hits) {
-            uam_log(UAM_LOG_ERROR, "fuzz-net", "out of memory for the virgin map");
-            return UAM_ERR_NOMEM;
-        }
-        virgin_fold(z, hits, n, map);
-    } else if (kind == UAM_FUZZ_KIND_ITER && v != UAM_FUZZ_HANG && v != UAM_FUZZ_TIMEOUT
-               && v != UAM_FUZZ_REJECTED) {
-        uint32_t st;
-        uint8_t reason = verdict_reason(v, detail, &st);
-        crash_sig_new(z, reason, st);
+    /* Every run is judged, so that the campaign's record is whole: what an INPUT showed
+     * is not new to the batches either. */
+    uam_fuzz_judgement j = { 0 };
+    if (kind == UAM_FUZZ_KIND_ITER && z->camp
+        && uam_fuzz_campaign_judge(z->camp, v, detail, &j) != UAM_OK) {
+        uam_log(UAM_LOG_ERROR, "fuzz-net", "out of memory judging a run");
+        return UAM_ERR_NOMEM;
     }
     if (kind == UAM_FUZZ_KIND_ITER && z->cmp_pending) {
         z->cmp_pending = false;
         if (!send_cmps(z, id))
             return UAM_ERR_INVALID;
     }
+    if (kind == UAM_FUZZ_KIND_ITER && z->judge && !send_judge(z, id, &j))
+        return UAM_ERR_INVALID;
     if ((kind == UAM_FUZZ_KIND_INIT || v == UAM_FUZZ_OK) && z->sparse
         && send_sparse(z, kind == UAM_FUZZ_KIND_INIT ? 0 : id, kind, map_size, &ok)) {
         /* sent (or failed) as SPARSE */
@@ -1002,6 +838,7 @@ void cf_net_attach(cf_net *z, uam_fuzz *f, bool big_endian)
 {
     z->fuzz = f;
     z->big_endian = big_endian;
+    z->camp = uam_fuzz_campaign_create(f);   /* NULL: HELLO does not offer HAVOC */
 }
 
 const uam_fuzz_frontend cf_net_frontend = {

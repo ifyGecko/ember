@@ -15,6 +15,7 @@ struct uam_cov_pass {
     bool          blocks;  /* block mode: instrument each block's first instruction */
     uint32_t      mask;    /* block mode with options: the map's mask (0: plain) */
     bool          splits;  /* block mode: mark blocks cut by a limit (UAM_COV_SPLIT) */
+    bool          erets;   /* block mode: mark exception returns (UAM_COV_ERET) */
     uam_cov_range *range;  /* block mode: only blocks starting in these (sorted by lo) */
     size_t        n_range;
     uam_cov_site *site;    /* sorted by pc */
@@ -100,33 +101,69 @@ static bool split_end(const uam_block *blk, uint64_t *next)
     return true;
 }
 
+/* Where a marker for the EXIT at index e goes: before it and the fences that must
+ * directly precede it. */
+static uint32_t before_exit(const uam_block *blk, uint32_t e)
+{
+    while (e > 1 && blk->insn[e - 1].op == UAM_OP_FENCE)
+        e--;
+    return e;
+}
+
 static uam_status run_blocks(const uam_cov_pass *cp, uam_block *blk)
 {
-    uam_insn ops[2];
-    uint32_t at[2], n = 0;
+    uint32_t n_eret = 0;
+    for (uint32_t i = 0; cp->erets && i < blk->n_insn; i++)
+        n_eret += blk->insn[i].op == UAM_OP_EXIT && blk->insn[i].aux == UAM_EXIT_EXC_RETURN;
+    uam_insn small_ops[4], *ops = small_ops;
+    uint32_t small_at[4], *at = small_at, n = 0;
+    if (n_eret > 2) {
+        ops = malloc(sizeof(*ops) * (n_eret + 2));
+        at = malloc(sizeof(*at) * (n_eret + 2));
+        if (!ops || !at) {
+            free(ops);
+            free(at);
+            return UAM_ERR_NOMEM;
+        }
+    }
+    uam_status st = UAM_OK;
     if (uam_cov_pass_covers(cp, blk->guest_pc)) {
         uint32_t h = uam_cov_block_hash(blk->guest_pc);
         if (cp->mask)
             h &= cp->mask;
         ops[n] = cov_op(blk, h, h >> 1);
         if (uam_ref_is_none(ops[n].a) || uam_ref_is_none(ops[n].b))
-            return UAM_ERR_NOMEM;
+            st = UAM_ERR_NOMEM;
         at[n++] = 1;   /* right after the block's first IMARK */
     }
+    /* An exception return, wherever it leads: the next COV may restore a context. */
+    for (uint32_t i = 0; n_eret && st == UAM_OK && i < blk->n_insn; i++) {
+        if (blk->insn[i].op != UAM_OP_EXIT || blk->insn[i].aux != UAM_EXIT_EXC_RETURN)
+            continue;
+        ops[n] = cov_op(blk, 0, 0);
+        ops[n].flags = UAM_COV_ERET;
+        if (uam_ref_is_none(ops[n].a))
+            st = UAM_ERR_NOMEM;
+        uint32_t k = before_exit(blk, i);
+        at[n] = n && k < at[n - 1] ? at[n - 1] : k;   /* never before the block's own COV */
+        n++;
+    }
     uint64_t next;
-    if (cp->splits && split_end(blk, &next) && uam_cov_pass_covers(cp, next)) {
+    if (st == UAM_OK && cp->splits && split_end(blk, &next) && uam_cov_pass_covers(cp, next)) {
         ops[n] = cov_op(blk, 0, 0);
         ops[n].a = uam_block_imm(blk, next);
         ops[n].flags = UAM_COV_SPLIT;
         if (uam_ref_is_none(ops[n].a) || uam_ref_is_none(ops[n].b))
-            return UAM_ERR_NOMEM;
-        /* right before the final EXIT, and before the fences that must precede it */
-        uint32_t k = blk->n_insn - 1;
-        while (k > 1 && blk->insn[k - 1].op == UAM_OP_FENCE)
-            k--;
-        at[n++] = k;
+            st = UAM_ERR_NOMEM;
+        at[n++] = before_exit(blk, blk->n_insn - 1);
     }
-    return uam_block_insert(blk, at, ops, n);
+    if (st == UAM_OK)
+        st = uam_block_insert(blk, at, ops, n);
+    if (ops != small_ops) {
+        free(ops);
+        free(at);
+    }
+    return st;
 }
 
 static uam_status run_sites(const uam_cov_pass *cp, uam_block *blk)
@@ -255,6 +292,7 @@ uam_status uam_cov_pass_create_blocks_ex(const uam_cov_block_opts *o, uam_cov_pa
     cp->blocks = true;
     cp->mask = o->mask;
     cp->splits = o->splits;
+    cp->erets = o->contexts;
     if (o->n_ranges) {
         /* sorted, overlaps merged: covers() then needs one binary search */
         uam_cov_range *r = malloc(sizeof(*r) * o->n_ranges);

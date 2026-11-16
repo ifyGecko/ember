@@ -1371,6 +1371,14 @@ static void test_blocks_ex(const prog *p)
 }
 
 /* The contexts' semantics on a state alone (uam_cov_count_slow, cpu.h's uam_cov_irq_ctx). */
+static void cov_at(uam_cov_state *s, uint64_t pc, uint32_t a, uint32_t b)
+{
+    if (s->pending)
+        uam_cov_count_slow(s, pc, a, b);
+    else
+        uam_cov_count(s, pc, a, b);
+}
+
 static void test_contexts(void)
 {
     static uint8_t map[MAP_SIZE], ref[MAP_SIZE];
@@ -1379,14 +1387,18 @@ static void test_contexts(void)
     uam_cov_state_init(&s, map, MAP_SIZE, &h);
     uam_cov_state_init(&r, ref, MAP_SIZE, &h);
     s.contexts = true;
-    /* A, B, [interrupt before C: handler H1 H2], C: C counts with A,B's history, H with none. */
-    uam_cov_count(&s, 0x10, 1, 11);
-    uam_cov_count(&s, 0x20, 2, 22);
+    /* A, B, [interrupt before C: handler H1 H2, exception return], C: C counts with A,B's
+     * history, H with none. The handler runs on the fast path (nothing pending). */
+    cov_at(&s, 0x10, 1, 11);
+    cov_at(&s, 0x20, 2, 22);
     uam_cov_irq_enter(&s, 0x30);
-    CHECK(s.pending && s.hist[0] == 0 && s.hist[1] == 0, "irq enter: an empty history, pending");
-    uam_cov_count_slow(&s, 0x900, 9, 99);
-    uam_cov_count_slow(&s, 0x910, 8, 88);
-    uam_cov_count_slow(&s, 0x30, 3, 33);
+    CHECK(!s.pending && s.hist[0] == 0 && s.hist[1] == 0 && s.n_irq == 1,
+          "irq enter: an empty history, nothing pending");
+    cov_at(&s, 0x900, 9, 99);
+    cov_at(&s, 0x910, 8, 88);
+    uam_cov_eret(&s);
+    CHECK(s.pending, "an exception return is pending for the next COV");
+    cov_at(&s, 0x30, 3, 33);
     CHECK(!s.pending && s.n_irq == 0, "back at the resume pc: the context is gone");
     /* the same without the interrupt, plus the handler alone */
     uam_cov_count(&r, 0x10, 1, 11);
@@ -1397,30 +1409,70 @@ static void test_contexts(void)
     uam_cov_count(&r, 0x910, 8, 88);
     CHECK(!memcmp(map, ref, MAP_SIZE), "an interrupt neither adds to nor changes the "
           "interrupted code's buckets");
+
+    /* Only an exception return restores: reaching the saved pc another way (the handler
+     * switched tasks) leaves the context alone, and an exception return to another pc too. */
+    memset(map, 0, sizeof(map));
+    uam_cov_reset_prev(&s);
+    cov_at(&s, 0x10, 1, 11);
+    uam_cov_irq_enter(&s, 0x30);
+    cov_at(&s, 0x900, 9, 99);
+    uint32_t h0 = s.hist[0];
+    cov_at(&s, 0x30, 3, 33);
+    CHECK(s.n_irq == 1 && h0 == 99, "no exception return: the context stays saved");
+    uam_cov_eret(&s);
+    cov_at(&s, 0x50, 5, 55);
+    CHECK(s.n_irq == 1 && !s.pending && s.hist[1] == 33, "a return elsewhere restores nothing");
+    uam_cov_eret(&s);
+    cov_at(&s, 0x30, 3, 33);
+    CHECK(s.n_irq == 0 && s.hist[1] == 11, "a later exception return to the saved pc restores "
+          "the suspended code's history");
+
+    /* Interrupted again right after the return, before the code ran a block. */
+    memset(map, 0, sizeof(map));
+    memset(ref, 0, sizeof(ref));
+    uam_cov_reset_prev(&s);
+    uam_cov_reset_prev(&r);
+    cov_at(&s, 0x10, 1, 11);
+    cov_at(&s, 0x20, 2, 22);
+    uam_cov_irq_enter(&s, 0x30);
+    uam_cov_eret(&s);
+    uam_cov_irq_enter(&s, 0x30);
+    CHECK(s.n_irq == 1 && s.irq[0].hist[0] == 22, "re-interrupted: the code's own history is saved again");
+    uam_cov_eret(&s);
+    cov_at(&s, 0x30, 3, 33);
+    uam_cov_count(&r, 0x10, 1, 11);
+    uam_cov_count(&r, 0x20, 2, 22);
+    uam_cov_count(&r, 0x30, 3, 33);
+    CHECK(!memcmp(map, ref, MAP_SIZE) && s.n_irq == 0, "two interrupts at one pc change nothing");
+
     /* A resume skipped; a skip abandoned when the hart goes elsewhere. */
     memset(map, 0, sizeof(map));
     uam_cov_reset_prev(&s);
     uam_cov_skip_at(&s, 0x40);
-    uam_cov_count_slow(&s, 0x40, 4, 44);
+    cov_at(&s, 0x40, 4, 44);
     CHECK(map_nonzero(map) == 0 && !s.pending, "the resumed block does not count");
     uam_cov_skip_at(&s, 0x50);
-    uam_cov_count_slow(&s, 0x60, 6, 66);
+    cov_at(&s, 0x60, 6, 66);
     CHECK(map_nonzero(map) == 1 && !s.pending && s.skip_pc == UAM_COV_NO_PC,
           "a skip for another pc is dropped, and that block counts");
     /* A resume interrupted before it ran: the skip comes back with the context. */
     memset(map, 0, sizeof(map));
     uam_cov_skip_at(&s, 0x70);
     uam_cov_irq_enter(&s, 0x70);
-    uam_cov_count_slow(&s, 0x900, 9, 99);
-    uam_cov_count_slow(&s, 0x70, 7, 77);
+    cov_at(&s, 0x900, 9, 99);
+    uam_cov_eret(&s);
+    cov_at(&s, 0x70, 7, 77);
     CHECK(map_nonzero(map) == 1 && !s.pending, "an interrupted resume still does not count");
-    /* More contexts than room: the oldest go, the newest restore. */
+    /* More contexts than room: the oldest go. */
     uam_cov_reset_prev(&s);
     for (unsigned i = 0; i < UAM_COV_IRQ_MAX + 3; i++)
         uam_cov_irq_enter(&s, 0x1000 + i);
     CHECK(s.n_irq == UAM_COV_IRQ_MAX && s.irq[0].resume_pc == 0x1003, "the oldest contexts dropped");
+    uam_cov_eret(&s);
     uam_cov_reset_prev(&s);
-    CHECK(!s.n_irq && !s.pending && s.skip_pc == UAM_COV_NO_PC, "reset_prev clears the contexts");
+    CHECK(!s.n_irq && !s.pending && !s.eret && s.skip_pc == UAM_COV_NO_PC,
+          "reset_prev clears the contexts");
 }
 
 int main(void)

@@ -213,6 +213,11 @@ if ((st = uam_machine_add_input(m, "uart0", uart_input, uart)) != UAM_OK)
   through the device's own receive path, so the interrupt and status bits are right.
 - Delivery happens between runs, right after the snapshot restore: the feed must leave the
   device exactly as a real arrival would (interrupt line raised, status bits set).
+- When the firmware drops inputs whose checksum, length field or framing is wrong, give the
+  input a fix-up: `uam_machine_set_input_fixup(m, "nic0", fix, ctx)` with
+  `size_t fix(void *ctx, uint8_t *data, size_t len, size_t cap)` repairs each mutation in
+  place before it runs (it must be idempotent). ember's mutator then spends its runs past
+  the check, and what the brain saves is the repaired input, which replays as it is.
 
 ## Oracles
 
@@ -414,7 +419,9 @@ and its range. A route's redzones are named `mem-before`, `mem-after` and `mem-a
 without `--cov-sites`): N-gram edges (`--cov-ngram N`, default 2, `--cov-rotate`), with a
 block ember split counting once, a block resumed mid-way (a timer came due) not at all, and
 interrupt handlers counting with a history of their own (`--cov-irq isolate`; `follow`
-gives the plain behaviour). The maps depend only on the code's path: the same at
+gives the plain behaviour; the interrupted code, or the task an RTOS resumes, gets its own
+history back at the exception return). Blocks count every execution (`--cov-mode every`,
+their default), so loop counts show in the hit-count classes. The maps depend only on the code's path: the same at
 `--block-insns 32` and 1, and wherever a timer interrupt lands. `--cov-range` (repeatable:
 `LO-HI`, `LO+LEN`, `SYM`, `SYM-SYM2`, `SYM+LEN`) counts only blocks starting in a range, to keep
 an RTOS's scheduler and other tasks out. The map is 64 KiB up to N=2 and 4x per N above

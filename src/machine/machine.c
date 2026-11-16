@@ -135,6 +135,7 @@ void uam_machine_fini(uam_machine *m)
     }
     free(m->aps);
     free(m->ap_execs);
+    free(m->snap_devs);
     free(m->all_execs);
     free(m->ap_cov);
     m->ap_cov = NULL;
@@ -193,6 +194,19 @@ uam_status uam_machine_add_input(uam_machine *m, const char *name, uam_input_fn 
         return UAM_ERR_NOMEM;
     m->inputs[m->n_inputs++] = (uam_machine_input){ .name = nm, .fn = fn, .ctx = ctx };
     return UAM_OK;
+}
+
+uam_status uam_machine_set_input_fixup(uam_machine *m, const char *name, uam_input_fixup_fn fn,
+                                       void *ctx)
+{
+    for (uint32_t i = 0; i < m->n_inputs; i++) {
+        if (!strcmp(m->inputs[i].name, name)) {
+            m->inputs[i].fixup = fn;
+            m->inputs[i].fixup_ctx = ctx;
+            return UAM_OK;
+        }
+    }
+    return UAM_ERR_INVALID;
 }
 
 const uam_machine_input *uam_machine_find_input(const uam_machine *m, const char *name)

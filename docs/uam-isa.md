@@ -351,19 +351,23 @@ index whose byte goes from 0 to 1 (`idx[n++] = idx` while `n < cap`, else `overf
 so that a fuzzer reads and clears the map in time proportional to what an iteration set.
 
 **Block contexts.** Block coverage with contexts (`uam_exec_set_block_coverage_ex`) adds
-two rare cases, behind one byte, `pending`: when it is set, `COV` runs
-`uam_cov_count_slow` instead of the rule above. A block that resumes mid-way (the hart
-stopped inside a block: a timer came due, a hook) sets `skip_pc` to its pc, and that
-`COV` does not count. An interrupt taken where a covered block is next saves the history
-(`uam_cov_irq_ctx`) and starts the handler with an empty one; the first `COV` back at the
-interrupted pc restores it (and does not count if that block was itself a resume). So
-where an interrupt lands changes neither the interrupted code's buckets nor the
-handler's. `COV` with the flag `UAM_COV_SPLIT` counts nothing: its `A` is the pc of the
-next instruction, which it puts in `skip_pc`. The block-coverage pass puts one at the end
-of a block that ends only because ember cut it (its length, a page end, an unfetchable next
-instruction), so that the block after it does not count: a basic block counts once
-however ember had to split it. A split `COV` stands right before the block's final `EXIT`,
-or before the fences that must directly precede it.
+rare cases, behind one byte, `pending`: when it is set, `COV` runs `uam_cov_count_slow`
+instead of the rule above. A block that resumes mid-way (the hart stopped inside a block: a
+timer came due, a hook) sets `skip_pc` to its pc, and that `COV` does not count. An
+interrupt taken where a covered block is next saves the history (`uam_cov_irq_ctx`) and
+starts the handler with an empty one. `COV` with the flag `UAM_COV_ERET`, which the pass
+puts before every `EXIT` of kind `EXC_RETURN`, counts nothing and sets `eret`: the next
+`COV` then restores the newest context saved at its pc, if there is one (and does not
+count if that block was itself a resume). Only an exception return restores, so where an
+interrupt lands changes neither the interrupted code's buckets nor the handler's, a
+suspended task gets its history back when it is resumed, and code that merely reaches a
+saved pc is left alone. `COV` with the flag `UAM_COV_SPLIT` counts nothing: its `A` is the
+pc of the next instruction, which it puts in `skip_pc`. The block-coverage pass puts one
+at the end of a block that ends only because ember cut it (its length, a page end, an
+unfetchable next instruction), so that the block after it does not count: a basic block
+counts once however ember had to split it. A split or eret `COV` stands right before its
+`EXIT`, or before the fences that must directly precede it; a split one before the block's
+final `EXIT`.
 
 ### 7.6 Compare records
 
@@ -406,8 +410,8 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
    `--block-insns`), which bounds interrupt latency.
 8. **Coverage op.** `COV` has width 32, two immediate operands and no guard, and comes
    directly after an `IMARK` that is not a continuation (`UAM_IMARK_CONT`); with
-   `UAM_COV_SPLIT` (its only flag) it comes instead right before the final `EXIT`, only
-   fences between.
+   `UAM_COV_SPLIT` or `UAM_COV_ERET` (one of them) it comes instead right before an `EXIT`
+   (the final one for a split, one of kind `EXC_RETURN` for an eret), only fences between.
 9. **`IMARK` shape.** Its pc is an immediate of address width, its length is non-zero, its only
    flags are `CONT` and `BREAK`, and a `CONT` mark cannot start a block. `n_guest` equals the
    number of `IMARK`s.

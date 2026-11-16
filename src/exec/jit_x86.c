@@ -707,14 +707,19 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
         patch(j, rep);
 }
 
-/* COV with UAM_COV_SPLIT: cs->skip_pc = next, cs->pending = 1 (uam_cov_skip_at). */
-static void emit_cov_split(uam_jit *j, uint64_t next)
+/* COV with UAM_COV_SPLIT: cs->skip_pc = next, cs->pending = 1 (uam_cov_skip_at); with
+ * UAM_COV_ERET (eret): cs->eret = 1, cs->pending = 1 (uam_cov_eret). */
+static void emit_cov_mark(uam_jit *j, bool eret, uint64_t next)
 {
     ld_mem(j, RCX, R14, CPU(cov));                         /* rcx = cpu->cov */
     rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RCX, RCX); /* test rcx, rcx */
     size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
-    mov_imm(j, RAX, next);
-    st_mem(j, RAX, RCX, COV(skip_pc));
+    if (eret) {
+        g8(j, 0xC6); modrm_mem(j, 0, RCX, COV(eret)); g8(j, 1);
+    } else {
+        mov_imm(j, RAX, next);
+        st_mem(j, RAX, RCX, COV(skip_pc));
+    }
     g8(j, 0xC6); modrm_mem(j, 0, RCX, COV(pending)); g8(j, 1);
     patch(j, off);
 }
@@ -1661,8 +1666,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             epi[n_epi++] = jmp_fwd(j);
             break;
         case UAM_OP_COV:
-            if (in->flags & UAM_COV_SPLIT)
-                emit_cov_split(j, blk->imm[uam_ref_index(in->a)]);
+            if (in->flags)
+                emit_cov_mark(j, in->flags & UAM_COV_ERET, blk->imm[uam_ref_index(in->a)]);
             else
                 emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                          (uint32_t)blk->imm[uam_ref_index(in->b)]);

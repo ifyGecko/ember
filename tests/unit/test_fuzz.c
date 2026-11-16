@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "uam/fuzz.h"
+#include "uam/fuzz_campaign.h"
 #include "uam/isa/arm.h"
 #include "uam/isa/mips32.h"
 #include "uam/isa/ppc.h"
@@ -1390,6 +1391,146 @@ static void test_internal_error(const target *t)
     uam_machine_fini(&m);
 }
 
+/* ---- the campaign engine (uam/fuzz_campaign.h) ---------------------------- */
+
+typedef struct fix_log {
+    unsigned calls;
+    uint8_t  first;     /* the byte every input is made to start with */
+} fix_log;
+
+static size_t force_first(void *ctx, uint8_t *data, size_t len, size_t cap)
+{
+    fix_log *l = ctx;
+    l->calls++;
+    if (!len && cap)
+        len = 1;
+    if (len)
+        data[0] = l->first;
+    return len;
+}
+
+static void run_batch(uam_fuzz *f, uam_fuzz_campaign *c, uint32_t n, uint64_t seed, unsigned flags,
+                      uint32_t *reports)
+{
+    CHECK(uam_fuzz_campaign_batch_begin(c, 1, n, seed, flags) == UAM_OK, "batch begin");
+    const uint8_t *d;
+    size_t len;
+    while (uam_fuzz_campaign_batch_next(c, &d, &len)) {
+        uam_fuzz_result r;
+        uam_fuzz_judgement j;
+        CHECK(uam_fuzz_run_one(f, d, len, &r) == UAM_OK, "batch run");
+        CHECK(uam_fuzz_campaign_batch_judge(c, r.verdict, r.detail, &j) == UAM_OK, "batch judge");
+    }
+    *reports = uam_fuzz_campaign_batch(c)->reports;
+}
+
+static void test_campaign(const target *t, backend bk)
+{
+    uam_machine m;
+    machine_for(&m, t, bk);
+    uam_fuzz *f = harness_for(&m, t, NULL, 0, UAM_FUZZ_EXC_DEFAULT);
+    uam_fuzz_campaign *c = uam_fuzz_campaign_create(f);
+    CHECK(c != NULL, "campaign");
+    uam_fuzz_result r;
+    uam_fuzz_boot(f, &r);
+
+    /* Single runs: what is new once is not new twice; the path is the run's name. */
+    uam_fuzz_judgement j1, j2;
+    uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j1);
+    CHECK(r.verdict == UAM_FUZZ_OK && j1.new_buckets > 0 && j1.new_classes >= j1.new_buckets
+          && uam_fuzz_campaign_edges(c) == j1.new_buckets, "%s %s: a first run is all new",
+          t->name, bk_name[bk]);
+    uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j2);
+    CHECK(j2.new_buckets == 0 && j2.new_classes == 0 && j2.path == j1.path,
+          "%s %s: the same run again: nothing new, the same path", t->name, bk_name[bk]);
+    /* the path's name from the sorted list equals the one from the unsorted record */
+    size_t n;
+    const uint32_t *hits = uam_fuzz_map_hits(f, MAP_SIZE, &n);
+    const uint8_t *map = uam_fuzz_map(f, NULL);
+    uint64_t sum = 0;
+    for (size_t i = 0; hits && i < n; i++)
+        sum += uam_fuzz_path_term(hits[i], map[hits[i]]);
+    CHECK(hits && uam_fuzz_path_end(sum) == j1.path, "%s: the path name is order-independent", t->name);
+    uam_fuzz_run_one(f, (const uint8_t *)"B", 1, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j1);
+    uam_fuzz_run_one(f, (const uint8_t *)"B", 1, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j2);
+    CHECK(r.verdict == UAM_FUZZ_CRASH_FAULT && j1.novel_crash && !j2.novel_crash
+          && j1.new_classes == 0, "%s %s: a crash is novel once", t->name, bk_name[bk]);
+    uam_fuzz_run_one(f, (const uint8_t *)"O", 1, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j1);
+    CHECK(j1.novel_crash, "%s: another crash is novel", t->name);
+    uam_fuzz_run_one(f, (const uint8_t *)"H", 1, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j1);
+    CHECK(r.verdict == UAM_FUZZ_TIMEOUT && !j1.novel_crash && !j1.new_classes, "a timeout adds nothing");
+
+    /* Batches: counted, reproducible, fixed up. */
+    uam_mutator *mut = uam_fuzz_campaign_mutator(c);
+    uam_mutator_set_max_size(mut, 64);
+    CHECK(uam_mutator_corpus_put(mut, 1, (const uint8_t *)"AAAA", 4) == UAM_OK, "corpus");
+    CHECK(uam_fuzz_campaign_batch_begin(c, 9, 10, 1, 0) == UAM_ERR_INVALID
+          && uam_fuzz_campaign_batch_begin(c, 1, 0, 1, 0) == UAM_ERR_INVALID, "bad batches refused");
+    fix_log fx = { .first = 'A' };
+    uam_fuzz_set_fixup(f, force_first, &fx);
+    uint32_t rep1;
+    run_batch(f, c, 200, 7, UAM_FUZZ_BATCH_EDGES, &rep1);
+    const uam_fuzz_batch *b = uam_fuzz_campaign_batch(c);
+    uint32_t total = 0, used = 0;
+    for (unsigned v = 0; v < UAM_FUZZ_N_VERDICTS; v++)
+        total += b->by_verdict[v];
+    for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++)
+        used += b->op_used[op];
+    CHECK(b->execs == 200 && total == 200 && b->left == 0 && fx.calls == 200 && used >= 200,
+          "%s %s: a batch of 200 is counted (execs %u, fix-ups %u)", t->name, bk_name[bk],
+          b->execs, fx.calls);
+    CHECK(b->by_verdict[UAM_FUZZ_OK] == 200,
+          "%s: the fix-up made every mutation start with 'A' (%u ok)", t->name, b->by_verdict[UAM_FUZZ_OK]);
+    size_t np, ne;
+    const uam_fuzz_count *paths = uam_fuzz_campaign_batch_paths(c, &np);
+    uint32_t runs = 0;
+    for (size_t i = 0; i < np; i++)
+        runs += paths[i].n;
+    const uam_fuzz_count *edges = uam_fuzz_campaign_batch_edges(c, &ne);
+    CHECK(np >= 1 && runs == 200 && ne >= 1 && edges[0].n >= 1 && edges[0].key < MAP_SIZE,
+          "%s: runs per path (%zu paths) and per bucket (%zu)", t->name, np, ne);
+    /* Every mutation an oracle crash: counted each time, reported only while novel. */
+    fx.first = 'O';
+    uint32_t rep2;
+    run_batch(f, c, 100, 7, 0, &rep2);
+    b = uam_fuzz_campaign_batch(c);
+    CHECK(b->by_verdict[UAM_FUZZ_CRASH_ORACLE] == 100 && rep2 == 0,
+          "%s: a crash seen before is counted (%u), not reported (%u)", t->name,
+          b->by_verdict[UAM_FUZZ_CRASH_ORACLE], rep2);
+    /* Timeouts: reported up to the cap. */
+    fx.first = 'H';
+    uam_fuzz_campaign_set_hang_cap(c, 3);
+    run_batch(f, c, 10, 7, 0, &rep2);
+    CHECK(uam_fuzz_campaign_batch(c)->by_verdict[UAM_FUZZ_TIMEOUT] == 10 && rep2 == 3,
+          "%s: 10 timeouts, 3 reported (%u)", t->name, rep2);
+    uam_fuzz_campaign_destroy(c);
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+
+    /* The same seed in a fresh campaign: the same batch. */
+    uint32_t again[2];
+    for (int k = 0; k < 2; k++) {
+        machine_for(&m, t, bk);
+        f = harness_for(&m, t, NULL, 0, UAM_FUZZ_EXC_DEFAULT);
+        c = uam_fuzz_campaign_create(f);
+        uam_fuzz_boot(f, &r);
+        uam_mutator_set_max_size(uam_fuzz_campaign_mutator(c), 64);
+        uam_mutator_corpus_put(uam_fuzz_campaign_mutator(c), 1, (const uint8_t *)"AAAA", 4);
+        run_batch(f, c, 200, 99, 0, &again[k]);
+        uam_fuzz_campaign_destroy(c);
+        uam_fuzz_destroy(f);
+        uam_machine_fini(&m);
+    }
+    CHECK(again[0] == again[1] && again[0] > 0, "%s %s: a batch is reproducible (%u, %u reports)",
+          t->name, bk_name[bk], again[0], again[1]);
+}
+
 int main(void)
 {
     test_misc();
@@ -1409,6 +1550,9 @@ int main(void)
         for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++)
             test_redzones(&ts[i], (backend)bk);
     }
+    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++)
+        for (int bk = BK_INTERP; bk <= BK_JIT; bk++)
+            test_campaign(&ts[i], (backend)bk);
     test_internal_error(&ts[1]);
     test_replay_sidecars();
     for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {

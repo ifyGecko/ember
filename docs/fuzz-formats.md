@@ -172,7 +172,7 @@ Every integer is big-endian, and maps are raw u8 counters.
 | 3 COVERAGE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u32 map_size, map |
 | 4 CRASH | ember → brain | u64 id, u8 reason, u32 status |
 | 5 BYE | either way | none |
-| 6 OPTIONS | brain → ember, optional, after HELLO (normally once, before the first INPUT; each one replaces the last) | u32 flags: bit 0 SPARSE (reply with SPARSE instead of COVERAGE), bit 1 CMP_LOG (instrument the target's compares, for CMP_INPUT); later fields, if any, are ignored |
+| 6 OPTIONS | brain → ember, optional, after HELLO (normally once, before the first INPUT; each one replaces the last) | u32 flags: bit 0 SPARSE (reply with SPARSE instead of COVERAGE), bit 1 CMP_LOG (instrument the target's compares, for CMP_INPUT), bit 2 JUDGE (a JUDGE frame before each reply; needs HELLO bit 13); then optionally u64 iter_insns (the per-input instruction budget from now on; 0 or absent: unchanged); later fields, if any, are ignored |
 | 7 SPARSE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u64 insns (instructions the iteration ran; 0 for INIT), u32 map_size, u32 n, then n × (u32 index, u8 count), indices ascending |
 | 8 CMP_INPUT | brain → ember | as INPUT; the run also logs what its compares saw |
 | 9 CMPS | ember → brain, right before a CMP_INPUT's reply | u64 id, u32 n, u32 dropped, then n × (u32 site, u8 width (bits), u8 kind, u64 a, u64 b) |
@@ -180,13 +180,16 @@ Every integer is big-endian, and maps are raw u8 counters.
 | 11 MUTATOR_INFO | ember → brain, the reply to each MUTATOR | u8 status (0 accepted, 1 refused), u16 msg_len, msg (why, when refused), u16 n, then n × (u8 op, u16 default weight, u16 weight, u8 name_len, name) |
 | 12 CORPUS | brain → ember | u32 entry, u32 len, data |
 | 13 HAVOC | brain → ember | u64 first_id, u32 entry, u32 n, u64 seed, u32 flags (bit 0 EDGES) |
-| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
+| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (the three 0 unless reason 0), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
 | 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n is 0 or over 2^20), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges, then n × (u32 index, u32 execs) (EDGES only) |
+| 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0), u8 novel_crash |
+| 17 PROGRESS | ember → brain, in a batch silent for 1 s | u64 first_id, u32 execs (runs so far) |
 
 **Lockstep.** After HELLO, ember sends the boot's map once, unsolicited, as COVERAGE id 0,
 kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE (or SPARSE) kind
 ITER if the input ended normally, CRASH otherwise. Every MUTATOR gets one MUTATOR_INFO, every
-HAVOC any number of FINDs and then one HAVOC_DONE; CORPUS and OPTIONS get none. Unknown frame types are ignored.
+HAVOC any number of FIND and PROGRESS frames and then one HAVOC_DONE; CORPUS and OPTIONS
+get none. Unknown frame types are ignored.
 
 **SPARSE.** A brain that sends OPTIONS with bit 0 gets every later map as the list of its
 set buckets instead of the whole map: a typical iteration sets a few hundred to a few
@@ -221,17 +224,26 @@ carries ember's operator table; a refused one (a bad field, or no operator left 
 leaves the mutator unusable until a good one. CORPUS adds or replaces an entry: the
 parents and the splice donors. HAVOC runs n mutations of one entry, seeded with `seed`
 (the same seed, settings, corpus and earlier history give the same batch); they have ids
-first_id .. first_id + n − 1 and run back to back with no frame in between. ember compares
-each run that ends normally with the bucket/count classes it has seen (every INPUT that
-ended normally counts too) and sends FIND for a new one; for a crash it has not seen with
-that (reason, status), from a batch or an INPUT; and for a hang or timeout while the
-session's count is under MUTATOR's cap. REJECTED runs are only counted. HAVOC_DONE then
-gives the batch's totals: per operator, the runs it took part in and those of them that
-were coverage FINDs (id 25 marks a splice); per path, the runs; per bucket, with EDGES, the
-runs that hit it. A path is named by the FNV-1a 64 hash of the run's hit list, each
-`(index as u32, class as u8)` little-endian in ascending index order, put through the
-coverage formula's `mix`; the class of a count is 1, 2 or 4 for 1, 2 or 3, then 8 (4-7),
-16 (8-15), 32 (16-31), 64 (32-127) and 128 (128-255). A HAVOC that cannot run is answered
+first_id .. first_id + n − 1 and run back to back with no frame from the brain in between.
+
+**One record of what has been seen.** ember's campaign engine (`uam/fuzz_campaign.h`)
+judges every run, of a batch or of an INPUT, against one record, and the brain keeps none.
+A run that ended normally is new when it sets a bucket never hit or a count class a bucket
+never had (the class of a count is 1, 2 or 4 for 1, 2 or 3, then 8 (4-7), 16 (8-15), 32
+(16-31), 64 (32-127) and 128 (128-255)). A crash is novel when its (reason, status) is new
+or when it ran code no earlier crash ran (a bucket no crash had hit), which tells two bugs
+at one pc apart. A path is named by its set of (index, class) pairs, whatever order they
+were hit in: `mix(sum of mix((index << 8 | class) + 1))` in 64-bit arithmetic, with the
+coverage formula's `mix`. With OPTIONS bit 2 (JUDGE), every INPUT and CMP_INPUT reply is
+preceded by a JUDGE frame (after CMPS, if there is one) with what the run added.
+
+In a batch, ember sends FIND for a run with new coverage, for a novel crash, and for a hang
+or timeout while the session's count is under MUTATOR's cap; REJECTED runs are only
+counted. When a batch has sent nothing for a second it sends PROGRESS (a batch of long
+timeouts is alive, not stuck: a brain's reply timeout starts anew). HAVOC_DONE then gives
+the batch's totals: per operator, the runs it took part in and those of them that were
+coverage FINDs (id 25 marks a splice); per path, the runs; per bucket, with EDGES, the
+runs that hit it. A HAVOC that cannot run is answered
 at once with HAVOC_DONE and its status. INPUT and CMP_INPUT keep working as before between
 batches.
 

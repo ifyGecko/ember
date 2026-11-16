@@ -40,6 +40,7 @@ typedef struct cli {
     size_t          n_mod;
     cf_scheme       scheme;
     bool            every;      /* --cov-mode every: count every execution */
+    bool            mode_given; /* --cov-mode (else: leapfrog for site lists, every for blocks) */
     bool            strict;
     bool            scheme_given;   /* --cov-scheme (not for block coverage) */
     bool            irq_follow;     /* --cov-irq follow */
@@ -145,6 +146,7 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
     case O_MODE:
         /* leapfrog: a site counts again only after another one did, so a tight loop
          * counts once per entry (docs/fuzz-formats.md "Which executions count"). */
+        c->mode_given = true;
         if (!strcmp(arg, "leapfrog"))
             c->every = false;
         else if (!strcmp(arg, "every"))
@@ -291,7 +293,9 @@ static uam_status setup_blocks(cli *c, uam_runner_setup *s, char *err, size_t er
     s->scheme = cf_scheme_name(&c->scheme);
     s->map_size = c->scheme.map_size;
     cf_cov_history(&c->scheme, &s->history);
-    s->skip_repeats = !c->every;
+    /* Blocks count every execution unless asked otherwise: a loop that is one block then
+     * shows how often it turned (the hit-count classes), which leapfrog would hide. */
+    s->skip_repeats = c->mode_given && !c->every;
     s->ranges = c->ranges;
     s->n_ranges = c->n_ranges;
     s->contexts = !c->irq_follow;
@@ -481,8 +485,9 @@ const uam_runner_ext uam_fuzz_lists_runner_ext = {
         "      --cov-scheme M      site (default: buckets from site ids) or pc (hashed pcs)\n"
         "      --cov-ngram N       N-gram length 1..8 (default 2), for site lists and --cov-blocks\n"
         "      --cov-rotate        rotate each history slot, so the order of sites counts\n"
-        "      --cov-mode M        leapfrog (default: a site counts again only after another\n"
-        "                          one) or every (each execution counts)\n"
+        "      --cov-mode M        leapfrog (a site counts again only after another one: the\n"
+        "                          default for site lists) or every (each execution counts:\n"
+        "                          the default for block coverage)\n"
         "      --cov-range R       --cov-blocks: only blocks starting in R (repeatable): LO-HI,\n"
         "                          LO+LEN, SYM (its size), SYM-SYM2, SYM+LEN (ELF symbols)\n"
         "      --cov-irq M         --cov-blocks: isolate (default: an interrupt handler counts\n"

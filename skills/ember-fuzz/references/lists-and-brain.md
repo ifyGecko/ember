@@ -132,7 +132,8 @@ cores with `fuzz_launch.py`, which runs N brain + ember pairs that share their q
 one directory, each with its own seed and the next of `--schedules` (round robin), and
 restarts a worker that dies. The firmware boots once: the first worker saves the begin
 snapshot (`--fuzz-snapshot DIR/begin.snap`) and the others, and every restart, start from it
-(`--no-shared-boot` boots each worker; a snapshot from an earlier launch is removed first):
+(`--no-shared-boot` boots each worker; a snapshot made from another firmware or command
+line is detected by its `.key` fingerprint and replaced):
 
 ```bash
 IMAGE=fw.bin python3 $EMBER/fuzz/tools/fuzz_launch.py -n 8 --out fuzz/camp \
@@ -188,7 +189,9 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   `REJECTED`, which the brain counts (`rejected` in its status) and does not save.
 - Verdicts become CRASH frames: `FAULT` 1, `GUARD` 2 (a redzone or `--guard`, with the pc of
   the access), `ORACLE` 3, `HANG` 4, `TIMEOUT` 5. The brain saves one input per distinct
-  `(reason, status)` of a session under `--out/crashes/`, minimized, as
+  `(reason, status)` of a session under `--out/crashes/`, minimized (and up to
+  `--crashes-per-sig` (4) more, as found, when a crash at that pc ran code no earlier crash
+  ran: look at those too, they may be other bugs), as
   `crash_r<reason>_s<status>_<sha1>` plus an `.info` note (`reason=`, `reason_name=`,
   `status=`, `status_hex=`, `len=`, `sig=`, `hex=`). Hangs and timeouts go under `hangs/`:
   every distinct input, up to `--max-hangs` (64), not minimized unless

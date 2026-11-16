@@ -659,8 +659,10 @@ static bool splice(uam_mutator *m, mbuf *x)
     return true;
 }
 
-const uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
-                                  size_t *out_len, uint64_t *ops)
+size_t uam_mutator_max_size(const uam_mutator *m) { return m->max_size; }
+
+uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
+                            size_t *out_len, uint64_t *ops)
 {
     if (m->dirty)
         rebuild(m);

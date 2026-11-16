@@ -79,6 +79,8 @@ struct uam_fuzz {
     size_t         n_routes;
     uam_fuzz_deliver_fn deliver;
     void          *deliver_ctx;
+    uam_input_fixup_fn fixup;
+    void          *fixup_ctx;
     mem_route      mem;
 
     uam_snapshot  *snap;
@@ -810,6 +812,8 @@ uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_
 {
     if (err && errlen)
         err[0] = '\0';
+    f->fixup = NULL;
+    f->fixup_ctx = NULL;
     if (!strncmp(spec, "mem:", 4)) {
         mem_route r;
         if (!parse_mem(&r, spec + 4)) {
@@ -837,6 +841,8 @@ uam_status uam_fuzz_select_route(uam_fuzz *f, const char *spec, char *err, size_
     if (in) {
         f->deliver = in->fn;
         f->deliver_ctx = in->ctx;
+        f->fixup = in->fixup;
+        f->fixup_ctx = in->fixup_ctx;
         return UAM_OK;
     }
     if (err && errlen) {
@@ -1245,6 +1251,33 @@ const uint32_t *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n)
     f->hits_valid = true;
     *n = k;
     return f->hits;
+}
+
+const uint32_t *uam_fuzz_map_touched(const uam_fuzz *f, size_t *n)
+{
+    if (f->touched.overflow)
+        return NULL;
+    *n = f->touched.n;
+    return f->touched.idx;
+}
+
+void uam_fuzz_set_iter_insns(uam_fuzz *f, uint64_t insns)
+{
+    f->cfg.iter_insns = insns ? insns : UAM_FUZZ_DEFAULT_ITER_INSNS;
+}
+
+void uam_fuzz_set_fixup(uam_fuzz *f, uam_input_fixup_fn fn, void *ctx)
+{
+    f->fixup = fn;
+    f->fixup_ctx = ctx;
+}
+
+size_t uam_fuzz_fixup(uam_fuzz *f, uint8_t *data, size_t len, size_t cap)
+{
+    if (!f->fixup)
+        return len;
+    size_t n = f->fixup(f->fixup_ctx, data, len, cap);
+    return n > cap ? cap : n;
 }
 
 const uint8_t *uam_fuzz_map(const uam_fuzz *f, size_t *size)

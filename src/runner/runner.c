@@ -119,6 +119,85 @@ static bool resolve_syms(const sym_refs *refs, const char *image)
     return true;
 }
 
+/* ---- --fuzz-snapshot: what a begin snapshot was made from ------------------ */
+
+static uint64_t fp_bytes(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * UINT64_C(0x100000001b3);
+    return h;
+}
+
+static uint64_t fp_file(uint64_t h, const char *path)
+{
+    uint8_t *d;
+    size_t len;
+    if (!path || uam_load_file(path, &d, &len) != UAM_OK)
+        return fp_bytes(h, "?", 1);
+    h = fp_bytes(h, d, len);
+    free(d);
+    return h;
+}
+
+/*
+ * A fingerprint of everything a begin snapshot depends on: the image files' contents,
+ * this library's ABI and the command line, less the options that only say where one
+ * run's inputs and outputs are. A snapshot saved under another fingerprint (the firmware
+ * was rebuilt, an option changed) is not used.
+ */
+static uint64_t fuzz_fingerprint(int argc, char **argv, const char *image,
+                                 const uam_board_image *images, uint32_t n_images)
+{
+    static const char *const skip[] = { "--fuzz-net", "--fuzz-net-timeout", "--fuzz-replay",
+                                        "--fuzz-snapshot", "--cov-out", "--cov-shm",
+                                        "--cov-shm-ring", "--trace-file" };
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    const uint32_t abi = UAM_ABI_VERSION;
+    h = fp_bytes(h, &abi, sizeof(abi));
+    for (int i = 1; i < argc; i++) {
+        bool skipped = false;
+        for (size_t k = 0; k < UAM_ARRAY_LEN(skip) && !skipped; k++) {
+            size_t n = strlen(skip[k]);
+            if (!strncmp(argv[i], skip[k], n) && (!argv[i][n] || argv[i][n] == '=')) {
+                skipped = true;
+                if (!argv[i][n])
+                    i++;   /* its value is the next argument */
+            }
+        }
+        if (!skipped && i < argc)
+            h = fp_bytes(h, argv[i], strlen(argv[i]) + 1);
+    }
+    h = fp_file(h, image);
+    for (uint32_t i = 0; i < n_images; i++)
+        h = fp_file(h, images[i].path);
+    return h;
+}
+
+static uint64_t read_key(const char *path)
+{
+    char buf[32] = "";
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return strtoull(buf, NULL, 16);
+}
+
+static bool write_key(const char *path, uint64_t key)
+{
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp%ld", path, (long)getpid());
+    FILE *fp = fopen(tmp, "w");
+    if (!fp)
+        return false;
+    bool ok = fprintf(fp, "%016llx\n", (unsigned long long)key) > 0;
+    ok = fclose(fp) == 0 && ok;
+    return ok && rename(tmp, path) == 0;
+}
+
 static bool pc_list_add(pc_list *l, uint64_t pc)
 {
     if (l->n == l->cap) {
@@ -1354,11 +1433,32 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: --fuzz-snapshot and --load-snapshot are both given\n");
         return 2;
     }
-    if (fuzz_snapshot && access(fuzz_snapshot, F_OK) == 0) {
-        load_snap = fuzz_snapshot;
-        fprintf(stderr, "uam-run: fuzz: starting from the begin snapshot %s (no boot)\n", fuzz_snapshot);
-    } else if (fuzz_snapshot) {
-        fz.save_snapshot = fuzz_snapshot;
+    if (fuzz_snapshot) {
+        /* FILE.key holds the fingerprint FILE was made under, written before FILE is. */
+        char keypath[4096];
+        if (snprintf(keypath, sizeof(keypath), "%s.key", fuzz_snapshot) >= (int)sizeof(keypath)) {
+            fprintf(stderr, "uam-run: --fuzz-snapshot: the path is too long\n");
+            return 2;
+        }
+        const uint64_t fp = fuzz_fingerprint(argc, argv, image, images, cfg.n_images);
+        const bool have = access(fuzz_snapshot, F_OK) == 0;
+        if (have && read_key(keypath) == fp) {
+            load_snap = fuzz_snapshot;
+            fz.begin_skip = 0;   /* the snapshot was taken after the skipped passes */
+            fprintf(stderr, "uam-run: fuzz: starting from the begin snapshot %s (no boot)\n",
+                    fuzz_snapshot);
+        } else {
+            if (have) {
+                fprintf(stderr, "uam-run: fuzz: %s was made from another firmware or command "
+                        "line: booting and replacing it\n", fuzz_snapshot);
+                unlink(fuzz_snapshot);
+            }
+            if (!write_key(keypath, fp)) {
+                fprintf(stderr, "uam-run: --fuzz-snapshot: cannot write %s\n", keypath);
+                return 2;
+            }
+            fz.save_snapshot = fuzz_snapshot;
+        }
     }
     /* Fuzzing counts ember's blocks unless a site list is given: no list is needed. */
     if (fuzzing && !(provides & UAM_RUNNER_EXT_SITES))

@@ -155,6 +155,12 @@ typedef struct uam_fuzz_frontend {
 
 typedef struct uam_fuzz uam_fuzz;
 
+/* A fix-up for mutated inputs (uam_input_fixup_fn, machine.h). Selecting a machine input
+ * as the route takes that input's fix-up; this sets or clears it directly (after
+ * uam_fuzz_select_route). uam_fuzz_fixup applies it: the new length, or len with none. */
+void       uam_fuzz_set_fixup(uam_fuzz *f, uam_input_fixup_fn fn, void *ctx);
+size_t     uam_fuzz_fixup(uam_fuzz *f, uint8_t *data, size_t len, size_t cap);
+
 /* Delivers an input to the guest; the same type as a machine input (machine.h).
  * UAM_ERR_REJECTED: this input cannot be delivered (too long for the buffer, not in the
  * shape the route needs): the iteration's verdict is UAM_FUZZ_REJECTED and the campaign
@@ -236,6 +242,12 @@ const uint8_t         *uam_fuzz_map(const uam_fuzz *f, size_t *size);
  * size), unless an iteration sets more than the record holds (65536); then the map is
  * read. Asking for it also lets that iteration clear only those buckets. */
 const uint32_t        *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n);
+/* The same buckets in the order first set, without the sort: what a campaign folds after
+ * every run. NULL when the record overflowed (use uam_fuzz_map_hits). Valid until the next
+ * iteration starts. */
+const uint32_t        *uam_fuzz_map_touched(const uam_fuzz *f, size_t *n);
+/* The per-iteration instruction budget, from now on (0: the default). */
+void                   uam_fuzz_set_iter_insns(uam_fuzz *f, uint64_t insns);
 const uam_fuzz_result *uam_fuzz_last_result(const uam_fuzz *f);
 
 /*

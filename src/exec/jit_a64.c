@@ -715,15 +715,19 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
         patch(j, rep);
 }
 
-/* COV with UAM_COV_SPLIT, as on x86-64. */
-static void emit_cov_split(uam_jit *j, uint64_t next)
+/* COV with UAM_COV_SPLIT or UAM_COV_ERET, as on x86-64. */
+static void emit_cov_mark(uam_jit *j, bool eret, uint64_t next)
 {
     ld64(j, X1, CPUR, CPU(cov));
     size_t off = j->n;
     g32(j, 0xB4000000u | X1);                              /* cbz x1, skip */
-    mov_imm(j, X0, next);
-    st64(j, X0, X1, COV(skip_pc));
     mov_imm(j, X16, 1);
+    if (eret) {
+        mem(j, 0, false, X16, X1, COV(eret));
+    } else {
+        mov_imm(j, X0, next);
+        st64(j, X0, X1, COV(skip_pc));
+    }
     mem(j, 0, false, X16, X1, COV(pending));
     patch(j, off);
 }
@@ -1585,8 +1589,8 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             epi[n_epi++] = b_fwd(j);
             break;
         case UAM_OP_COV:
-            if (in->flags & UAM_COV_SPLIT)
-                emit_cov_split(j, blk->imm[uam_ref_index(in->a)]);
+            if (in->flags)
+                emit_cov_mark(j, in->flags & UAM_COV_ERET, blk->imm[uam_ref_index(in->a)]);
             else
                 emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                          (uint32_t)blk->imm[uam_ref_index(in->b)]);

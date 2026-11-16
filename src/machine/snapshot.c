@@ -45,14 +45,6 @@ typedef struct dev_entry dev_entry;
 
 struct uam_snapshot {
     uint64_t     id;       /* unique per process; names the machine's baseline */
-    /* The last restore's device table, kept for the next restore into the same machine
-     * (a fuzz harness restores one snapshot every iteration): valid while that machine's
-     * device list is the same (its head and length). */
-    const uam_machine *dev_m;
-    const uam_device  *dev_head;
-    uint32_t           dev_count;
-    dev_entry         *dev_e;
-    uint32_t           dev_n;
     char        *board, *isa;
     uint64_t     pc, icount, now;
     uint8_t     *state;
@@ -129,7 +121,6 @@ void uam_snapshot_free(uam_snapshot *s)
 {
     if (!s)
         return;
-    free(s->dev_e);
     free(s->board);
     free(s->isa);
     free(s->state);
@@ -681,23 +672,22 @@ static uint32_t device_count(const uam_machine *m)
     return n;
 }
 
-uam_status uam_snapshot_restore(uam_machine *m, const uam_snapshot *cs)
+uam_status uam_snapshot_restore(uam_machine *m, const uam_snapshot *s)
 {
     /* The device table and the compatibility check are the same for every restore of
-     * one snapshot into one unchanged machine: done once, then reused (the cache is
-     * not part of the snapshot's value, hence the cast). */
-    uam_snapshot *s = (uam_snapshot *)cs;
+     * one snapshot into one unchanged machine (a fuzz harness restores one snapshot
+     * every iteration): done once, kept in the machine, then reused. */
     const uint32_t ndev = device_count(m);
-    const bool cached = s->dev_e && s->dev_m == m && s->dev_head == m->devices
-                     && s->dev_count == ndev;
+    const bool cached = m->snap_devs && m->snap_devs_id == s->id
+                     && m->snap_devs_head == m->devices && m->snap_devs_count == ndev;
     dev_table devs;
     if (cached) {
-        devs = (dev_table){ .e = s->dev_e, .n = s->dev_n };
+        devs = (dev_table){ .e = m->snap_devs, .n = m->snap_devs_n };
     } else {
         if (!dev_table_build(m, &devs))
             return UAM_ERR_NOMEM;
-        free(s->dev_e);
-        s->dev_e = NULL;
+        free(m->snap_devs);
+        m->snap_devs = NULL;
     }
     /* This machine's baseline is this snapshot: it was taken or restored here, so it
      * fits (the device list is the cached one). */
@@ -707,11 +697,11 @@ uam_status uam_snapshot_restore(uam_machine *m, const uam_snapshot *cs)
         return UAM_ERR_INVALID;
     }
     if (!cached) {
-        s->dev_m = m;
-        s->dev_head = m->devices;
-        s->dev_count = ndev;
-        s->dev_e = devs.e;
-        s->dev_n = devs.n;
+        m->snap_devs = devs.e;
+        m->snap_devs_id = s->id;
+        m->snap_devs_head = m->devices;
+        m->snap_devs_count = ndev;
+        m->snap_devs_n = devs.n;
     }
     /* Memory first, so that device and extra-state restore callbacks see the
      * restored memory (to resync a flash file, re-read descriptors, ...). */

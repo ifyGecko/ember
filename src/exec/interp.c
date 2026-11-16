@@ -209,6 +209,8 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
                 break;
             if (in->flags & UAM_COV_SPLIT)
                 uam_cov_skip_at(cs, blk->imm[uam_ref_index(in->a)]);
+            else if (in->flags & UAM_COV_ERET)
+                uam_cov_eret(cs);
             else if (cs->pending)
                 uam_cov_count_slow(cs, pos.pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                                    (uint32_t)blk->imm[uam_ref_index(in->b)]);

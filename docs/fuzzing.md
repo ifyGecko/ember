@@ -65,7 +65,9 @@ interpreter +4%.
 A fuzz run counts the blocks ember runs unless `--cov-sites` gives a site list
 (`--cov-blocks` says so explicitly, and asks for it on a plain run, with `--cov-out`), with
 the same N-gram counting as site lists:
-`--cov-ngram N` (default 2), `--cov-rotate` and `--cov-mode` apply. Each block start is a site
+`--cov-ngram N` (default 2), `--cov-rotate` and `--cov-mode` apply (blocks count `every`
+execution by default, so a loop that is one block shows how often it turned; site lists
+default to `leapfrog`). Each block start is a site
 with `A = mix(pc) & mask`, `B = A >> 1` (the block model, `fuzz-formats.md`), and three
 things make an ember block stand for a basic block, so that the map depends only on the
 code's path:
@@ -76,8 +78,11 @@ code's path:
 - **Resumes.** A block entered mid-way, because the hart stopped inside it (a timer came
   due, a hook), does not count.
 - **Interrupts** (`--cov-irq isolate`, the default). An interrupt handler counts with a
-  history of its own, and the interrupted code resumes with its own: where an interrupt
-  lands changes neither. In `tests/firmware/irqtarget.c`, a timer interrupting a parser at
+  history of its own, and the interrupted code gets its own back when an exception return
+  resumes it: where an interrupt lands changes neither. Only an exception return restores
+  a saved history (the IR marks them, exit kind EXC_RETURN), so a task that an interrupt
+  suspended resumes with its own history whenever a later return goes back to it, and code
+  that merely reaches the same pc keeps its own. In `tests/firmware/irqtarget.c`, a timer interrupting a parser at
   six different periods gives one set of buckets with `isolate` and six with `follow` (the
   handler continues the interrupted code's history, as plain edges would).
 
@@ -135,9 +140,10 @@ interrupt contexts (`--cov-irq`).
    passes included, is INIT.
 2. **Snapshot** there. With `--fuzz-snapshot FILE` (`uam_fuzz_config.save_snapshot`) the
    snapshot is also saved to FILE, and a later run given the same FILE starts from it with
-   no boot (the INIT map is then empty): parallel workers boot once. A stale FILE (another
-   build of the firmware with the same memory layout) would be used as is, so remove it when
-   the firmware changes (`fuzz_launch.py` does).
+   no boot (the INIT map is then empty, and `--fuzz-begin-skip` is not applied again):
+   parallel workers boot once. `FILE.key` holds a fingerprint of what the snapshot was made
+   from (the image files' contents and the command line, less the options that only name a
+   run's inputs and outputs); a FILE made from anything else is replaced by a fresh boot.
 3. **Each input**: restore the snapshot (only the memory lines the last input changed, and
    the components; repeat restores reuse the device table and skip the compatibility
    check), clear the map and `prev`, deliver the input, run
@@ -387,10 +393,11 @@ CMP_INPUT and CMPS ([`fuzz-formats.md`](fuzz-formats.md)).
   between processors are not counted.
 - Interrupts are reported only when taken, and only as a crash (`--fuzz-crash-irq`); an
   interrupt line that is raised but masked is invisible to the harness.
-- Block coverage's interrupt contexts follow interrupts, not task switches: a handler that
-  switches to another task leaves its context unclaimed until the hart returns to the
-  interrupted pc (the eight newest are kept). A synchronous exception's handler continues
-  the history. With ranges, an interrupt taken outside them keeps no context.
+- Block coverage's interrupt contexts are restored by exception returns: the eight newest
+  suspended contexts are kept (an RTOS with more tasks than that suspended by interrupts
+  loses the oldest, whose tasks then resume with the handler's history). A task that gave
+  up the processor itself, and a synchronous exception's handler, continue the history.
+  With ranges, an interrupt taken outside them keeps no context.
 - Compare logging sees compares in the IR, so a string compare done in a byte loop
   (`strcmp`, `memcmp`) logs one byte per iteration, and a compared value the code computed
   from the input in other ways than a constant offset (a parsed number, a checksum) is not
@@ -422,7 +429,7 @@ build/uam-run -b mips-ref --cov-sites fw.uams --cov-boundary fw.uamb --cov-stric
 | `--cov-sites FILE` | coverage sites from a site list; record *i* is site id *i* |
 | `--cov-module NAME=BASE` | a module's load base (repeatable). Otherwise the list's module base table, then, for module 0, the image's link base (lowest ELF `PT_LOAD` vaddr, or `--raw-base`) |
 | `--cov-scheme site\|pc`, `--cov-ngram N`, `--cov-rotate` | the bucket model (site ids, or hashed pcs), N-gram length (1..8) and rotation (the order of sites counts); default site, N=2, no rotation. The brain suggests N=3 with rotation for fuzzing |
-| `--cov-mode leapfrog\|every` | which executions count. `leapfrog` (the default): a site counts again only after another site did, so loops count visits and no self-edge appears. `every`: each execution counts |
+| `--cov-mode leapfrog\|every` | which executions count. `leapfrog` (the default for site lists): a site counts again only after another site did, so loops count visits and no self-edge appears. `every` (the default for block coverage): each execution counts |
 | `--cov-map-size N` | overrides the default map size (site model: from the site count and N; hashed-pc: 64 KiB) |
 | `--cov-strict` | each site's bytes in memory must equal the list's `orig[]`, checked at the first begin when fuzzing, else at the end of the run. Without it the check is only reported. A wrong base or byte order shows up here |
 | `--cov-boundary FILE` | iteration boundaries instead of `--fuzz-begin`/`--fuzz-end`: any number of BEGIN markers (the snapshot is at the first one the boot reaches) and of END markers, all with the same depth filter. Depth-zero markers keep nested BEGIN/END arrivals (recursion) inside one iteration; with "any depth" the first END reached ends the iteration |
@@ -527,10 +534,15 @@ inputs up to it from seeds of any size; `--seed-rng` fixes the campaign's random
 each session, every `--status-interval` seconds) and `--quiet` drops the log lines. The
 brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 
-**The campaign.** The brain asks ember for SPARSE replies (`fuzz-formats.md`): each
-iteration's set buckets and its instruction count, folded in time proportional to the
-buckets hit. An input is interesting when it sets a bucket never hit or reaches a hit-count
-class (1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+) that bucket never had. The queue is walked
+**The campaign.** ember keeps the one record of what has been seen (the campaign engine,
+`uam/fuzz_campaign.h`) and tells the brain what each run added (JUDGE and FIND frames,
+`fuzz-formats.md`); the brain keeps none. An input is interesting when it sets a bucket
+never hit or reaches a hit-count class (1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+) that bucket
+never had. A crash is saved when its `(reason, status)` is new (minimized), and up to
+`--crashes-per-sig` (4) times when it ran code no earlier crash ran (as found: another way
+into that pc, or another bug there); a different crash met while minimizing is saved too.
+`--iter-insns N|auto` sets ember's per-input budget (`auto`: 5× the slowest queue entry
+after the baseline). The queue is walked
 in cycles:
 
 - **Favored entries:** for every bucket, the entry that hits it with the smallest
@@ -594,11 +606,13 @@ Chunk lengths are drawn the way AFL's havoc draws them: a third of the time 1-32
 third 32-128, a third 128-1500 (now and then 1500-32768), within what fits. So a seed of a
 few bytes grows: about a third of one seed's mutations are longer than it, about one in
 eight passes 256 bytes and one in 25 passes 2000 (`--max-size 9000`), while most stay
-cheap. ember judges each mutation itself against the bucket/count classes it has seen (from
-every INPUT and every batch) and sends a FIND only for new coverage, a crash with a new
-`(reason, status)`, or a hang (up to `--max-hangs`); a batch ends with its totals
-(executions per verdict, per operator, per path). The brain checks each FIND against its
-own coverage before it queues it. ember tells the brain its operators and their default
+cheap. ember judges each mutation itself against its record (every INPUT and every batch
+counts) and sends a FIND only for new coverage, a novel crash, or a hang (up to
+`--max-hangs`); a batch ends with its totals (executions per verdict, per operator, per
+path), and says PROGRESS when it has been silent for a second, so a batch of slow inputs
+does not look like a dead ember. A board can repair mutated inputs before they run
+(`uam_machine_set_input_fixup` on its named input, or `uam_fuzz_set_fixup`: a checksum, a
+length field), and what ember reports and the brain saves is the repaired input. ember tells the brain its operators and their default
 weights (MUTATOR_INFO), so the two never disagree. Seeds, trimming, input-to-state,
 calibration, crash minimization and imports from other workers still go as single INPUTs.
 `build/test_mutate` checks the mutator, including the growth figures above.

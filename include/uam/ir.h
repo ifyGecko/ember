@@ -175,8 +175,14 @@ typedef enum uam_exit_kind {
  * pc of the next instruction (any width), and the COV that comes next, if at that pc,
  * does not count (uam_cov_skip_at, exec.h). It stands right before the block's final
  * EXIT, or before the fences that must directly precede it. b is 0.
+ *
+ * UAM_COV_ERET marks no count either, but an exception return: it stands before an EXIT
+ * of kind EXC_RETURN (fences between), and the COV that comes next may restore an
+ * interrupt context (uam_cov_eret, exec.h). a and b are 0. The two flags exclude each
+ * other.
  */
 #define UAM_COV_SPLIT 0x1u
+#define UAM_COV_ERET  0x2u
 
 /*
  * UAM_IMARK_BREAK asks the executor to stop *before* this instruction, as if

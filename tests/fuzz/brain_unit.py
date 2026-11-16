@@ -2,7 +2,7 @@
 """brain_unit.py - unit tests of the fuzz brain's campaign logic (fuzz/tools/fuzz_queue.py),
 on synthetic data: no ember, no sockets.
 
-  - hit-count classes and the coverage fold (new buckets, new classes, O(hits));
+  - hit-count classes (ember keeps the coverage record: tests/fuzz/fake_brain.py);
   - path ids (same hits, same path; a count class change, a new path);
   - the favored set (the cheapest entry per bucket, greedy cover) and AFL's skip rule;
   - every schedule's factor and energy behaving as specified;
@@ -36,13 +36,6 @@ def entry(eid, buckets, insns=100, data=b"x", path=None, chosen=0, depth=0, foun
 def test_classes_and_fold():
     check([fq.CLASS[c] for c in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 127, 128, 255)] ==
           [0, 1, 2, 4, 8, 8, 16, 16, 32, 32, 64, 64, 128, 128], "count classes")
-    cov = fq.Coverage(1 << 16)
-    check(cov.fold([(5, 1), (9, 1)]) == (2, 2), "two new buckets")
-    check(cov.fold([(5, 1), (9, 1)]) == (0, 0), "nothing new the second time")
-    check(cov.fold([(5, 3)]) == (0, 1), "a new count class of a known bucket")
-    check(cov.fold([(5, 2), (70000 % (1 << 16), 200)]) == (1, 2), "class 2 and a new bucket")
-    check(cov.edges == 3, "edges counts buckets ever hit")
-    check(not cov.would_be_new([(5, 1), (9, 1)]) and cov.would_be_new([(9, 5)]), "would_be_new")
     check(fq.hits_from_map(b"\0\x02\0\x01") == [(1, 2), (3, 1)], "a whole map as hits")
 
 
@@ -52,8 +45,9 @@ def test_path_id():
     check(a != fq.path_id([(1, 1), (2, 9)]), "another class: another path")
     check(a != fq.path_id([(1, 1)]), "fewer buckets: another path")
     # ember names paths the same way (fuzz/formats.h; fake_brain.py checks it against ember)
-    check(fq.path_hash([(1, 1), (2, 5)]) == 0x85fb26cfe833dcbb and fq.path_hash([]) == 0xecba3df2c3383c52,
-          "path_hash: FNV-1a 64 of (index u32 LE, class u8), then mix")
+    check(fq.path_hash([(1, 1), (2, 5)]) == 0xb59d16a3494e612a and fq.path_hash([]) == 0x0
+          and fq.path_hash([(2, 5), (1, 1)]) == fq.path_hash([(1, 1), (2, 5)]),
+          "path_hash: mix of the sum of mixed (index, class) terms, order-independent")
     check(a == fq.path_hash([(1, 1), (2, 5)]).to_bytes(8, "big"), "path_id is path_hash, big-endian")
 
 

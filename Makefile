@@ -133,7 +133,7 @@ BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_6
                boards/stock.c boards/mmio_rules.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
                fuzz/cov_scheme.c fuzz/site_list.c fuzz/cov_cli.c fuzz/frontend_net.c fuzz/cov_region.c \
-               fuzz/mutate.c
+               fuzz/mutate.c fuzz/campaign.c
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/blockdev_file.c \
                src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c src/runner/trace.c

@@ -95,10 +95,21 @@ typedef struct uam_state_part {
  * delivered (e.g. too long).
  */
 typedef uam_status (*uam_input_fn)(void *ctx, uam_machine *m, const uint8_t *data, size_t len);
+/*
+ * Optional, for an input a fuzzer mutates (uam_machine_set_input_fixup): make a mutated
+ * input well formed before it runs - recompute a checksum, a length field, a frame. The
+ * input is data[0..len) in a buffer of `cap` bytes; returns its new length (at most cap).
+ * It must be idempotent (a fixed input fixed again is unchanged): what a fuzzer saves and
+ * replays is the fixed input.
+ */
+typedef size_t (*uam_input_fixup_fn)(void *ctx, uint8_t *data, size_t len, size_t cap);
+
 typedef struct uam_machine_input {
     char        *name;
     uam_input_fn fn;
     void        *ctx;
+    uam_input_fixup_fn fixup;      /* or NULL */
+    void              *fixup_ctx;
 } uam_machine_input;
 
 struct uam_machine {
@@ -118,6 +129,13 @@ struct uam_machine {
     uam_state_part *state_parts;         /* registered with uam_machine_add_state */
     uint32_t        n_state_parts, cap_state_parts;
     uint64_t        snap_base;           /* snapshot the bus's dirty pages are relative to */
+    /* uam_snapshot_restore's device table for snapshot snap_devs_id, reused by repeat
+     * restores while the device list (its head and length) is the same. The machine's,
+     * so that several machines can restore one snapshot. */
+    void           *snap_devs;
+    const uam_device *snap_devs_head;
+    uint32_t        snap_devs_n, snap_devs_count;
+    uint64_t        snap_devs_id;
     /* Named inputs (uam_machine_add_input). */
     uam_machine_input *inputs;
     uint32_t           n_inputs, cap_inputs;
@@ -244,6 +262,9 @@ uam_status uam_machine_add_state(uam_machine *m, const char *name, uam_state_sav
                                  uam_state_restore_fn restore, void *ctx);
 /* Publish a named input (see uam_input_fn); `name` must be unique. */
 uam_status uam_machine_add_input(uam_machine *m, const char *name, uam_input_fn fn, void *ctx);
+/* Give the input `name` a fix-up for mutated inputs (uam_input_fixup_fn; NULL: none). */
+uam_status uam_machine_set_input_fixup(uam_machine *m, const char *name, uam_input_fixup_fn fn,
+                                       void *ctx);
 /* The input called `name`, or NULL. */
 const uam_machine_input *uam_machine_find_input(const uam_machine *m, const char *name);
 /* The device called `name` that the board added, or NULL. A board built on

@@ -56,8 +56,8 @@ typedef struct uam_cov_range {
  * ends only because of a limit (its length, a page end, an unfetchable next
  * instruction) ends with a COV marked UAM_COV_SPLIT, which makes the COV of the block
  * at its next instruction not count: an ember block then stands for the whole basic
- * block, wherever ember had to cut it. contexts: see uam_exec_set_block_coverage_ex
- * (exec.h).
+ * block, wherever ember had to cut it. contexts: every EXIT of kind EXC_RETURN is
+ * preceded by a COV marked UAM_COV_ERET; see uam_exec_set_block_coverage_ex (exec.h).
  */
 typedef struct uam_cov_block_opts {
     uint32_t             mask;

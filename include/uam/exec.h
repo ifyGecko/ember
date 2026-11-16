@@ -413,8 +413,10 @@ uam_status      uam_exec_set_block_coverage(uam_exec *x, uam_cov_state *state);
 uam_status      uam_exec_set_block_coverage_ex(uam_exec *x, uam_cov_state *state,
                                                const uam_cov_block_opts *o);
 
+/* An exception return ran (COV with UAM_COV_ERET): the next COV may restore a context. */
+void            uam_cov_eret(uam_cov_state *s);
 /* COV with state->pending set (uam_cov_count otherwise): a resume or a split skipped,
- * an interrupt context restored, then the count. */
+ * an interrupt context restored after an exception return, then the count. */
 void            uam_cov_count_slow(uam_cov_state *s, uint64_t pc, uint32_t a, uint32_t b);
 /* The next COV, if at `pc`, does not count (a block entered mid-way). */
 void            uam_cov_skip_at(uam_cov_state *s, uint64_t pc);
