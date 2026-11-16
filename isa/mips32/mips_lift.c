@@ -344,7 +344,8 @@ static lift_result end_after(ml *L)
  * Emit the delay slot then the branch exits. `cond` is NONE for an
  * unconditional transfer; `likely` annuls the slot when not taken.
  */
-static lift_result finish_branch(ml *L, uam_ref cond, uam_ref target, bool likely)
+static lift_result finish_branch_k(ml *L, uam_ref cond, uam_ref target, bool likely,
+                                   uam_exit_kind kind)
 {
     uint32_t dpc = L->pc + 4;
     uint64_t raw = 0;
@@ -370,15 +371,20 @@ static lift_result finish_branch(ml *L, uam_ref cond, uam_ref target, bool likel
         if (lift_insn(&slot, (uint32_t)raw) == LIFT_DONE)
             return LIFT_DONE;                                     /* the slot always traps */
         if (likely && !uam_ref_is_none(cond))
-            uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);          /* taken */
+            uam_exit(L->b, NONE, target, kind);                   /* taken */
         else if (uam_ref_is_none(cond))
-            uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);          /* unconditional */
+            uam_exit(L->b, NONE, target, kind);                   /* unconditional */
         else {
-            uam_exit(L->b, cond, target, UAM_EXIT_JUMP);
+            uam_exit(L->b, cond, target, kind);
             uam_exit(L->b, NONE, imm(L, L->pc + 8), UAM_EXIT_JUMP);
         }
     }
     return LIFT_DONE;
+}
+
+static lift_result finish_branch(ml *L, uam_ref cond, uam_ref target, bool likely)
+{
+    return finish_branch_k(L, cond, target, likely, UAM_EXIT_JUMP);
 }
 
 /* The condition of BPOSGE32: DSPControl.pos >= 32. */
@@ -406,12 +412,12 @@ static lift_result lift_control(ml *L, uint32_t i)
         if (op == 3)
             reg_w(L, 31, imm(L, L->pc + 8));
         uint32_t tgt = ((L->pc + 4) & 0xF0000000u) | ((i & 0x03FFFFFFu) << 2);
-        return finish_branch(L, NONE, imm(L, tgt), false);
+        return finish_branch_k(L, NONE, imm(L, tgt), false, op == 3 ? UAM_EXIT_CALL : UAM_EXIT_JUMP);
     }
     if (op == 0x1D) { /* JALX: to the compressed ISA */
         reg_w(L, 31, imm(L, L->pc + 8));
         uint32_t tgt = ((L->pc + 4) & 0xF0000000u) | ((i & 0x03FFFFFFu) << 2) | 1u;
-        return finish_branch(L, NONE, imm(L, tgt), false);
+        return finish_branch_k(L, NONE, imm(L, tgt), false, UAM_EXIT_CALL);
     }
     if (op == 0x11) { /* BC1F / BC1T / BC1FL / BC1TL */
         if (!(L->priv & MIPS_PRIV_CU1)) {
@@ -424,7 +430,10 @@ static lift_result lift_control(ml *L, uint32_t i)
         uam_ref t = rs_r(L, i);
         if (FUNCT(i) == 0x09)
             reg_w(L, RD(i) ? RD(i) : 31, imm(L, L->pc + 8));
-        return finish_branch(L, NONE, t, false);
+        /* Hints for analysis: a linking jump is a call, `jr ra` a return. */
+        return finish_branch_k(L, NONE, t, false,
+                               FUNCT(i) == 0x09 ? UAM_EXIT_CALL
+                               : RS(i) == 31 ? UAM_EXIT_RET : UAM_EXIT_JUMP);
     }
     if (op == 1 && RT(i) == 0x1C) { /* BPOSGE32 */
         if (!dsp_enabled(L))
@@ -438,7 +447,7 @@ static lift_result lift_control(ml *L, uint32_t i)
                         ge ? imm(L, 0) : rs_r(L, i), ge ? rs_r(L, i) : imm(L, 0));
         if (link)
             reg_w(L, 31, imm(L, L->pc + 8));
-        return finish_branch(L, c, imm(L, btgt), likely);
+        return finish_branch_k(L, c, imm(L, btgt), likely, link ? UAM_EXIT_CALL : UAM_EXIT_JUMP);
     }
 
     /* BEQ / BNE / BLEZ / BGTZ and their likely forms. */

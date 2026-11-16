@@ -337,7 +337,7 @@ static bool has_slot(const m16_insn *d)
 }
 
 /* The delay slot at `spc` (even), then the jump to `target`. */
-static lift_result jump_with_slot(ml *L, uint32_t spc, uam_ref target)
+static lift_result jump_with_slot(ml *L, uint32_t spc, uam_ref target, uam_exit_kind kind)
 {
     uint64_t raw = 0;
     uint32_t jpc = L->pc;
@@ -359,7 +359,7 @@ static lift_result jump_with_slot(ml *L, uint32_t spc, uam_ref target)
     slot.in_slot = true;
     if (lift_simple(&slot, &s, jpc & ~1u) == LIFT_DONE)
         return LIFT_DONE;
-    uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);
+    uam_exit(L->b, NONE, target, kind);
     return LIFT_DONE;
 }
 
@@ -380,18 +380,19 @@ static lift_result lift_control(ml *L, const m16_insn *d)
     }
     case M16_JAL:   /* 4 bytes + a 2-byte slot */
         mips_reg_w(L, RA, mips_imm(L, (pcb + 6) | 1u));
-        return jump_with_slot(L, pcb + 4, mips_imm(L, d->target));
+        return jump_with_slot(L, pcb + 4, mips_imm(L, d->target), UAM_EXIT_CALL);
     case M16_JR: {
         uam_ref t = mips_reg_r(L, d->rx);
+        const uam_exit_kind k = d->link ? UAM_EXIT_CALL : d->rx == RA ? UAM_EXIT_RET : UAM_EXIT_JUMP;
         if (d->compact) {
             if (d->link)
                 mips_reg_w(L, RA, mips_imm(L, (pcb + 2) | 1u));
-            uam_exit(L->b, NONE, t, UAM_EXIT_JUMP);
+            uam_exit(L->b, NONE, t, k);
             return LIFT_DONE;
         }
         if (d->link)
             mips_reg_w(L, RA, mips_imm(L, (pcb + 4) | 1u));
-        return jump_with_slot(L, pcb + 2, t);
+        return jump_with_slot(L, pcb + 2, t, k);
     }
     default:
         mips_ri(L);

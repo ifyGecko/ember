@@ -699,16 +699,20 @@ static lift_result lift_control(ml *L, const um_insn *d)
                    : d->kind == UM_JRADDIUSP ? mips_reg_r(L, RA)
                    : mips_imm(L, d->target);
 
+    /* Hints for analysis: a linking transfer is a call, a jump through ra a return. */
+    const uam_exit_kind k = d->link ? UAM_EXIT_CALL
+                          : d->kind == UM_JRADDIUSP || (d->kind == UM_JR && d->rs == RA) ? UAM_EXIT_RET
+                          : UAM_EXIT_JUMP;
     if (d->kind == UM_JRADDIUSP) {
         mips_reg_w(L, SP, mips_bin(L, UAM_OP_ADD, mips_reg_r(L, SP), mips_imm(L, d->imm)));
-        uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);
+        uam_exit(L->b, NONE, target, k);
         return LIFT_DONE;
     }
     if (d->compact) {   /* BEQZC / BNEZC / JRC */
         if (uam_ref_is_none(c)) {
-            uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);
+            uam_exit(L->b, NONE, target, k);
         } else {
-            uam_exit(L->b, c, target, UAM_EXIT_JUMP);
+            uam_exit(L->b, c, target, k);
             uam_exit(L->b, NONE, mips_imm(L, after | 1u), UAM_EXIT_JUMP);
         }
         return LIFT_DONE;
@@ -742,9 +746,9 @@ static lift_result lift_control(ml *L, const um_insn *d)
     if (lift_simple(&slot, &sd, pcb) == LIFT_DONE)
         return LIFT_DONE;
     if (uam_ref_is_none(c)) {
-        uam_exit(L->b, NONE, target, UAM_EXIT_JUMP);
+        uam_exit(L->b, NONE, target, k);
     } else {
-        uam_exit(L->b, c, target, UAM_EXIT_JUMP);
+        uam_exit(L->b, c, target, k);
         uam_exit(L->b, NONE, mips_imm(L, link), UAM_EXIT_JUMP);
     }
     return LIFT_DONE;

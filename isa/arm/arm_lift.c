@@ -221,9 +221,13 @@ arm_lift_result arm_bx(arm_lift *L, uam_ref addr, uam_exit_kind kind)
 /* Write the pc from a data-processing result: ARM interworks, Thumb stays Thumb. */
 static arm_lift_result alu_write_pc(arm_lift *L, uam_ref v)
 {
+    /* Hints for analysis: `mov pc, lr` returns; a pc write after `mov lr, pc` calls. */
+    const bool mov_lr = L->thumb ? L->len == 2 && (L->raw & 0xFFFFu) == 0x46F7u
+                                 : (L->raw & 0x0FFFFFFFu) == 0x01A0F00Eu;
+    const uam_exit_kind k = mov_lr ? UAM_EXIT_RET : L->linked ? UAM_EXIT_CALL : UAM_EXIT_JUMP;
     if (L->thumb)
-        return arm_branch(L, or_(L, v, imm(L, 1)), UAM_EXIT_JUMP);
-    return arm_bx(L, v, UAM_EXIT_JUMP);
+        return arm_branch(L, or_(L, v, imm(L, 1)), k);
+    return arm_bx(L, v, k);
 }
 
 /* Exception return: CPSR = psr (or SPSR), continue at pc. */
@@ -416,8 +420,9 @@ arm_lift_result arm_ldr(arm_lift *L, unsigned rt, uam_ref addr, unsigned size, b
         v = uam_unop(L->b, sign ? UAM_OP_SEXT : UAM_OP_ZEXT, 32, v);
     if (wb_rn >= 0)
         arm_put(L, (unsigned)wb_rn, wb_val);
-    if (rt == ARM_PC)
-        return arm_bx(L, v, UAM_EXIT_JUMP);   /* LoadWritePC */
+    if (rt == ARM_PC)   /* LoadWritePC; popping the pc is a return (a hint for analysis) */
+        return arm_bx(L, v, wb_rn == (int)ARM_SP ? UAM_EXIT_RET
+                            : L->linked ? UAM_EXIT_CALL : UAM_EXIT_JUMP);
     arm_put(L, rt, v);
     return ARM_SEQ;
 }
@@ -1184,7 +1189,8 @@ static arm_lift_result a32_misc(arm_lift *L, uint32_t i)
         return arm_msr(L, arm_reg(L, rm), BITS(i, 19, 16), BIT(i, 22));
     case 1:
         if (op == 1)
-            return arm_bx(L, arm_reg(L, rm), rm == ARM_LR ? UAM_EXIT_RET : UAM_EXIT_JUMP);
+            return arm_bx(L, arm_reg(L, rm), rm == ARM_LR ? UAM_EXIT_RET
+                                             : L->linked ? UAM_EXIT_CALL : UAM_EXIT_JUMP);
         if (op == 3) {
             arm_put(L, rd, uam_unop(L->b, UAM_OP_CLZ, 32, arm_reg(L, rm)));
             return ARM_SEQ;
@@ -1580,6 +1586,7 @@ uam_status arm_lift_block(uam_lift_ctx *lc)
             fall_through(&L, arm_next_pc(&L), L.it_next);
             return UAM_OK;
         }
+        L.linked = !L.thumb && i == 0xE1A0E00Fu;   /* mov lr, pc */
         it = L.it_next;
         pc += len;
     }

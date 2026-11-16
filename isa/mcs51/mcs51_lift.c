@@ -441,7 +441,12 @@ static lift_result lift_insn(m51_lifter *L)
         uam_ref t = pop_pc(L);
         if (op == 0x32)
             uam_helper(L->b, &uam_isa_mcs51.helpers, MCS51_HELPER_RETI, NONE, NONE, NONE, NONE);
-        uam_exit(L->b, NONE, t, op == 0x32 ? UAM_EXIT_EXC_RETURN : UAM_EXIT_RET);
+        /* A hint for analysis: `push; push; ret` is a computed jump, not a return (the
+         * two bytes before decide; a misreading takes a return for a jump). */
+        uint64_t before = 0;
+        const bool pushed = op == 0x22 && L->lc->fetch(L->lc, (uint16_t)(L->pc - 2), 1, &before) == UAM_OK
+                         && before == 0xC0;
+        uam_exit(L->b, NONE, t, op == 0x32 ? UAM_EXIT_EXC_RETURN : pushed ? UAM_EXIT_JUMP : UAM_EXIT_RET);
         return LIFT_END;
     }
     case 0x03: case 0x13: case 0x23: case 0x33: {                          /* RR RRC RL RLC */

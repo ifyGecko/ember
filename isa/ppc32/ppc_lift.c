@@ -570,8 +570,8 @@ static lift_result lift_bcreg(pl *L, uint32_t i, bool to_lr)
     uam_ref c = branch_cond(L, RD(i), RA(i), to_lr);
     if (i & 1)
         uam_put(L->b, 32, PPC_LR_OFF, imm(L, L->pc + 4), NONE);
-    uam_exit_kind kind = (i & 1) ? UAM_EXIT_CALL : (to_lr && (RD(i) & 0x14) == 0x14) ? UAM_EXIT_RET
-                                                                                   : UAM_EXIT_JUMP;
+    /* Hints for analysis: a branch to LR that does not link is a return, taken or not. */
+    uam_exit_kind kind = (i & 1) ? UAM_EXIT_CALL : to_lr ? UAM_EXIT_RET : UAM_EXIT_JUMP;
     return finish_branch(L, c, tgt, kind);
 }
 

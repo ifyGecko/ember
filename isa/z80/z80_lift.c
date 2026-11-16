@@ -603,7 +603,12 @@ static lift_result lift_main(z80_lifter *L)
         case 0: {                                                       /* RET */
             uam_ref t = pop16_g(L, NONE);
             qput(L, 16, Z80_WZ, t);
-            return jump(L, t, UAM_EXIT_RET);
+            /* A hint for analysis: `push rr; ret` is a computed jump, not a return (the
+             * byte before decides; a misreading takes a return for a jump). */
+            uint64_t before = 0;
+            const bool pushed = L->lc->fetch(L->lc, (uint16_t)(L->pc - 1), 1, &before) == UAM_OK
+                             && (before & 0xCF) == 0xC5;
+            return jump(L, t, pushed ? UAM_EXIT_JUMP : UAM_EXIT_RET);
         }
         case 1: {                                                       /* EXX */
             static const uint32_t a[3] = { Z80_BC, Z80_DE, Z80_HL }, b[3] = { Z80_BC2, Z80_DE2, Z80_HL2 };

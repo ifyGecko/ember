@@ -566,7 +566,12 @@ static lift_result lift_insn(m65_lifter *L)
         uam_ref lo = pull(L, &s), hi = pull(L, &s);
         put8(L, M6502_S, s);
         uam_ref t = bin(L, UAM_OP_ADD, 16, word(L, lo, hi), imm(L, 1));
-        uam_exit(L->b, NONE, zext(L, 32, t), UAM_EXIT_RET);
+        /* A hint for analysis: `pha; rts` (the jump-table idiom) is a jump, not a return
+         * (the byte before decides; a misreading takes a return for a jump). */
+        uint64_t before = 0;
+        const bool pushed = L->lc->fetch(L->lc, (uint16_t)(L->pc - 1), 1, &before) == UAM_OK
+                         && before == 0x48;
+        uam_exit(L->b, NONE, zext(L, 32, t), pushed ? UAM_EXIT_JUMP : UAM_EXIT_RET);
         return LIFT_END;
     }
     case O_RTI: {

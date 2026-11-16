@@ -177,6 +177,7 @@ typedef struct arm_lift {
     uint8_t       it;      /* IT state of the instruction being lifted (Thumb) */
     uint8_t       it_next; /* IT state after it */
     bool          end;     /* end the block after this instruction */
+    bool          linked;  /* the instruction before was `mov lr, pc`: a pc write is a call */
 } arm_lift;
 
 /* arm_lift.c: the ARM decoder and the emitters both decoders share. */

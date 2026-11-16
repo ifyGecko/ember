@@ -653,7 +653,14 @@ static lift_result lift_1001_01_misc(avr_lifter *L)
         if (reti)   /* the interrupt controller (or SREG.I) first: it may let one in */
             uam_helper(L->b, &uam_isa_avr.helpers, AVR_HELPER_RETI, NONE, NONE, NONE, NONE);
         sp_put(L, nsp);
-        uam_exit(L->b, NONE, t, reti ? UAM_EXIT_EXC_RETURN : UAM_EXIT_RET);
+        /* A hint for analysis: `push; push; ret` is how avr-gcc jumps through a table on
+         * the reduced core, not a return. The word before decides (if it is the second
+         * word of a longer instruction that looks like a push, a return is taken for a
+         * jump: the harmless way round). */
+        uint64_t before = 0;
+        const bool pushed = !reti && L->lc->fetch(L->lc, (L->pc - 2) & L->pcmask, 2, &before) == UAM_OK
+                         && (before & 0xFE0F) == 0x920F;
+        uam_exit(L->b, NONE, t, reti ? UAM_EXIT_EXC_RETURN : pushed ? UAM_EXIT_JUMP : UAM_EXIT_RET);
         return LIFT_END;
     }
     case 0x9588:                                                    /* SLEEP */

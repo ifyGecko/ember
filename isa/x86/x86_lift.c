@@ -358,7 +358,9 @@ static lr far_call(xl *x, uam_ref sel, uam_ref off)
     uam_ref a = x_bin(x, UAM_OP_OR, 64, x_zext(x, 64, 16, sel), x_imm(x, (uint64_t)x->in.osz << 16));
     uam_ref pc = x_helper(x, X86_H_FAR_CALL, a, x_zext(x, 64, 64, off),
                           x_zext(x, 64, 64, ret_ip(x, 64)));
-    x_jump(x, pc, UAM_EXIT_CALL);
+    /* A jump to the analysis, like the far return: firmware uses the pair far more to
+     * switch segments, modes and privilege than to call. */
+    x_jump(x, pc, UAM_EXIT_JUMP);
     return LR_END;
 }
 
@@ -901,7 +903,7 @@ static lr lift_c0(xl *x)
     case 0xCA: case 0xCB: {
         uam_ref pc = x_helper(x, X86_H_RETF, x_imm(x, w),
                               x_imm(x, op == 0xCA ? (x->in.imm & 0xFFFF) : 0), NONE);
-        x_jump(x, pc, UAM_EXIT_RET);
+        x_jump(x, pc, UAM_EXIT_JUMP);   /* push cs; push ip; retf is a jump (see far_call) */
         return LR_END;
     }
     case 0xCC: return soft_int(x, X86_EXC_BP, false);
