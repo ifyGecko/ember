@@ -951,7 +951,7 @@ uam_status xt_lift(uam_lift_ctx *lc)
                     uam_ref d = bin(&L, UAM_OP_SUB, 32, get(&L, XT_LENDA), imm(&L, (uint32_t)start + 1));
                     uam_ref bad = bin(&L, UAM_OP_ULT, 32, d, imm(&L, range));
                     uam_syswr(L.b, 32, XT_SYS_STEP, imm(&L, 1), bad);
-                    uam_exit(L.b, bad, imm(&L, (uint32_t)start), UAM_EXIT_JUMP);
+                    uam_exit(L.b, bad, imm(&L, (uint32_t)start), UAM_EXIT_RETRY);
                 }
             }
         }

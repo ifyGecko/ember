@@ -3,6 +3,10 @@
  * and the fuzz network frontend (uam/runner.h; formats in docs/fuzz-formats.md).
  *
  *   --cov-sites FILE        coverage sites from a site list (fuzz/tools/gen_sites.py)
+ *   (or the runner's --cov-blocks: ember's blocks, no list; N, rotation and mode apply)
+ *   --cov-range R           block coverage only in R: LO-HI, LO+LEN, SYM, SYM-SYM, SYM+LEN
+ *   --cov-irq isolate|follow  block coverage: an interrupt handler's own history (default)
+ *                           or the interrupted code's
  *   --cov-module NAME=BASE  a module's load base (repeatable; before the list's base table)
  *   --cov-scheme site|pc    coverage model (default site)
  *   --cov-ngram N           N-gram length 1..8 (default 2)
@@ -24,6 +28,7 @@
 #include "uam/runner.h"
 
 #define MAX_MODULE_OPTS 32
+#define MAX_RANGES      64
 
 typedef struct cli {
     const char     *sites_path, *boundary_path, *net_addr, *shm_path;
@@ -35,6 +40,13 @@ typedef struct cli {
     cf_scheme       scheme;
     bool            every;      /* --cov-mode every: count every execution */
     bool            strict;
+    bool            scheme_given;   /* --cov-scheme (not for block coverage) */
+    bool            irq_follow;     /* --cov-irq follow */
+    bool            irq_given;
+    const char     *range_text[MAX_RANGES];
+    size_t          n_ranges;
+    uam_cov_range   ranges[MAX_RANGES];
+    bool            blocks;         /* after setup: the block scheme is on */
     /* after setup */
     cf_sites        pl;
     uam_cov_site   *sites;
@@ -50,9 +62,10 @@ static const uam_runner_opt opts[] = {
     { "cov-ngram", true }, { "cov-strict", false }, { "cov-boundary", true },
     { "cov-rotate", false }, { "fuzz-net", true }, { "cov-mode", true },
     { "cov-shm", true }, { "cov-shm-ring", true }, { "fuzz-net-timeout", true },
+    { "cov-range", true }, { "cov-irq", true },
 };
 enum { O_SITES, O_MODULE, O_SCHEME, O_NGRAM, O_STRICT, O_BOUNDARY, O_ROTATE, O_NET, O_MODE,
-       O_SHM, O_SHM_RING, O_NET_TIMEOUT };
+       O_SHM, O_SHM_RING, O_NET_TIMEOUT, O_RANGE, O_IRQ };
 
 static void *cli_create(void)
 {
@@ -109,6 +122,24 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
         return true;
     }
     case O_STRICT:   c->strict = true; return true;
+    case O_RANGE:
+        if (c->n_ranges == MAX_RANGES) {
+            snprintf(err, errlen, "at most %d ranges", MAX_RANGES);
+            return false;
+        }
+        c->range_text[c->n_ranges++] = arg;
+        return true;
+    case O_IRQ:
+        if (!strcmp(arg, "isolate"))
+            c->irq_follow = false;
+        else if (!strcmp(arg, "follow"))
+            c->irq_follow = true;
+        else {
+            snprintf(err, errlen, "expected isolate or follow");
+            return false;
+        }
+        c->irq_given = true;
+        return true;
     case O_ROTATE:   c->scheme.rotate = true; return true;
     case O_MODE:
         /* leapfrog: a site counts again only after another one did, so a tight loop
@@ -123,6 +154,7 @@ static bool cli_option(void *st, size_t i, const char *arg, char *err, size_t er
         }
         return true;
     case O_SCHEME:
+        c->scheme_given = true;
         if (!strcmp(arg, "site"))
             c->scheme.model = CF_MODEL_SITE;
         else if (!strcmp(arg, "pc"))
@@ -172,13 +204,108 @@ static unsigned cli_provides(void *st)
          | (c->net_addr ? UAM_RUNNER_EXT_FRONTEND : 0) | (c->shm_path ? UAM_RUNNER_EXT_OBSERVER : 0);
 }
 
+/* The scheme bits for HELLO and the coverage region: 0 without a scheme. */
+static uint32_t scheme_flags(const cli *c)
+{
+    return c->loaded || c->blocks ? cf_scheme_flags(&c->scheme) : 0;
+}
+
+/* One end of a range: a number or SYM (whose size, if any, goes to *size). */
+static bool range_end(const char *t, size_t n, const char *image, uint64_t *v, uint64_t *size,
+                      char *err, size_t errlen)
+{
+    char buf[256];
+    if (!n || n >= sizeof(buf)) {
+        snprintf(err, errlen, "bad range end");
+        return false;
+    }
+    memcpy(buf, t, n);
+    buf[n] = '\0';
+    *size = 0;
+    if (buf[0] >= '0' && buf[0] <= '9') {
+        char *end;
+        *v = strtoull(buf, &end, 0);
+        if (*end) {
+            snprintf(err, errlen, "bad number '%s'", buf);
+            return false;
+        }
+        return true;
+    }
+    const char *why = "no image";
+    if (!image || uam_elf_symbol(image, buf, v, size, &why) != UAM_OK) {
+        snprintf(err, errlen, "symbol '%s': %s", buf, why ? why : "not found");
+        return false;
+    }
+    return true;
+}
+
+/* --cov-range: LO-HI, LO+LEN, SYM (its size), SYM-SYM2, SYM+LEN. */
+static bool parse_range(const char *t, const char *image, uam_cov_range *r, char *err,
+                        size_t errlen)
+{
+    size_t k = strcspn(t + 1, "-+") + 1;   /* a separator after the first character */
+    uint64_t lo, hi, size;
+    if (!range_end(t, k, image, &lo, &size, err, errlen))
+        return false;
+    if (!t[k]) {
+        if (!size) {
+            snprintf(err, errlen, "'%s' has no size: give an end (SYM-SYM2, SYM+LEN)", t);
+            return false;
+        }
+        hi = lo + size;
+    } else {
+        uint64_t x, xs;
+        if (!range_end(t + k + 1, strlen(t + k + 1), image, &x, &xs, err, errlen))
+            return false;
+        hi = t[k] == '+' ? lo + x : x;
+    }
+    if (hi <= lo) {
+        snprintf(err, errlen, "empty range");
+        return false;
+    }
+    *r = (uam_cov_range){ .lo = lo, .hi = hi };
+    return true;
+}
+
+/* --cov-blocks with this extension: N, rotation and mode as for site lists, the block
+ * model's buckets (fuzz-formats.md), and ranges. */
+static uam_status setup_blocks(cli *c, uam_runner_setup *s, char *err, size_t errlen)
+{
+    if (c->scheme_given) {
+        snprintf(err, errlen, "--cov-scheme is for site lists; block coverage has its own model");
+        return UAM_ERR_INVALID;
+    }
+    for (size_t i = 0; i < c->n_ranges; i++) {
+        char e[300];
+        if (!parse_range(c->range_text[i], s->image_path, &c->ranges[i], e, sizeof(e))) {
+            snprintf(err, errlen, "--cov-range %s: %s", c->range_text[i], e);
+            return UAM_ERR_INVALID;
+        }
+    }
+    c->blocks = true;
+    c->scheme.model = CF_MODEL_BLOCK;
+    c->scheme.map_size = s->map_size_option ? s->map_size_option
+                                            : cf_block_map_size(c->scheme.ngram);
+    s->block_scheme = true;
+    s->scheme = cf_scheme_name(&c->scheme);
+    s->map_size = c->scheme.map_size;
+    cf_cov_history(&c->scheme, &s->history);
+    s->skip_repeats = !c->every;
+    s->ranges = c->ranges;
+    s->n_ranges = c->n_ranges;
+    s->contexts = !c->irq_follow;
+    uam_log(UAM_LOG_INFO, "cov", "block coverage, scheme %s, map %u bytes, %zu ranges%s",
+            s->scheme, s->map_size, c->n_ranges, c->irq_follow ? ", interrupts follow" : "");
+    return UAM_OK;
+}
+
 /* Last in setup: the brain hears HELLO with the scheme the sites were built for. */
 static uam_status connect_brain(cli *c, uam_runner_setup *s, char *err, size_t errlen)
 {
     if (!c->net_addr)
         return UAM_OK;
     char e[256];
-    c->net = cf_net_connect(c->net_addr, c->loaded ? (uint16_t)cf_scheme_flags(&c->scheme) : 0,
+    c->net = cf_net_connect(c->net_addr, (uint16_t)scheme_flags(c),
                             c->net_timeout, e, sizeof(e));
     if (!c->net) {
         snprintf(err, errlen, "--fuzz-net: %s", e);
@@ -201,6 +328,15 @@ static uam_status cli_setup(void *st, uam_runner_setup *s, char *err, size_t err
     if (c->net_timeout && !c->net_addr) {
         snprintf(err, errlen, "--fuzz-net-timeout needs --fuzz-net");
         return UAM_ERR_INVALID;
+    }
+    if ((c->n_ranges || c->irq_given) && !s->cov_blocks) {
+        snprintf(err, errlen, "--cov-range and --cov-irq are for block coverage (--cov-blocks)");
+        return UAM_ERR_INVALID;
+    }
+    if (s->cov_blocks) {
+        uam_status bs = setup_blocks(c, s, err, errlen);
+        if (bs != UAM_OK)
+            return bs;
     }
     if (!c->sites_path && !c->boundary_path) {
         if (c->n_mod || c->strict) {
@@ -310,7 +446,7 @@ static uam_status cli_attach(void *st, uam_machine *m, uam_fuzz *f)
         uam_fuzz_map(f, &map_size);
         char e[300];
         c->shm = cf_region_create(c->shm_path, (uint32_t)map_size, c->shm_ring,
-                                  c->loaded ? cf_scheme_flags(&c->scheme) : 0, e, sizeof(e));
+                                  scheme_flags(c), e, sizeof(e));
         if (!c->shm) {
             uam_log(UAM_LOG_ERROR, "cov-region", "--cov-shm: %s", e);
             return UAM_ERR_INVALID;
@@ -341,10 +477,15 @@ const uam_runner_ext uam_fuzz_lists_runner_ext = {
         "      --cov-module NAME=BASE  load base of the site-list module NAME (repeatable; default:\n"
         "                          the list's base table, then the image's link base for module 0)\n"
         "      --cov-scheme M      site (default: buckets from site ids) or pc (hashed pcs)\n"
-        "      --cov-ngram N       N-gram length 1..8 (default 2)\n"
+        "      --cov-ngram N       N-gram length 1..8 (default 2), for site lists and --cov-blocks\n"
         "      --cov-rotate        rotate each history slot, so the order of sites counts\n"
         "      --cov-mode M        leapfrog (default: a site counts again only after another\n"
         "                          one) or every (each execution counts)\n"
+        "      --cov-range R       --cov-blocks: only blocks starting in R (repeatable): LO-HI,\n"
+        "                          LO+LEN, SYM (its size), SYM-SYM2, SYM+LEN (ELF symbols)\n"
+        "      --cov-irq M         --cov-blocks: isolate (default: an interrupt handler counts\n"
+        "                          with a history of its own, the interrupted code resumes with\n"
+        "                          its own) or follow (the handler continues the history)\n"
         "      --cov-strict        fail if a site's bytes in memory differ from the list\n"
         "      --cov-boundary FILE iteration begin/end from a boundary file (gen_boundaries.py;\n"
         "                          any number of BEGIN and END markers)\n"

@@ -210,7 +210,7 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
             && define(v, in->dst, W);
 
     case UAM_OP_EXIT:
-        if (in->aux > UAM_EXIT_EXC_RETURN)
+        if (in->aux > UAM_EXIT_RETRY)
             return fail(v, "bad exit kind");
         return use(v, in->a, aw, "target") && none(v, in->b, "b") && none(v, in->c, "c")
             && define(v, in->dst, 0);
@@ -257,8 +257,17 @@ static bool check_insn(vstate *v, const uam_insn *in, unsigned aw)
         const uam_insn *prev = v->idx ? &v->blk->insn[v->idx - 1] : NULL;
         if (W != 32)
             return fail(v, "cov width must be 32");
-        if (!prev || prev->op != UAM_OP_IMARK || (prev->flags & UAM_IMARK_CONT))
+        if (in->flags & ~UAM_COV_SPLIT)
+            return fail(v, "unknown cov flags");
+        if (in->flags & UAM_COV_SPLIT) {
+            uint32_t k = v->idx + 1;   /* only fences, then the final exit */
+            while (k < v->blk->n_insn && v->blk->insn[k].op == UAM_OP_FENCE)
+                k++;
+            if (k + 1 != v->blk->n_insn || v->blk->insn[k].op != UAM_OP_EXIT)
+                return fail(v, "a split cov must precede the block's final exit (fences between)");
+        } else if (!prev || prev->op != UAM_OP_IMARK || (prev->flags & UAM_IMARK_CONT)) {
             return fail(v, "cov must directly follow a non-continuation imark");
+        }
         if (!uam_ref_is_imm(in->a) || !uam_ref_is_imm(in->b))
             return fail(v, "cov operands must be immediates");
         return use(v, in->a, 32, "a") && use(v, in->b, 32, "b") && none(v, in->c, "c")

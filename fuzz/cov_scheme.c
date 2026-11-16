@@ -46,6 +46,14 @@ uint32_t cf_map_size_for(uint64_t n_sites, unsigned ngram)
     return size > (UINT64_C(1) << 31) ? UINT32_C(1) << 31 : (uint32_t)size;
 }
 
+uint32_t cf_block_map_size(unsigned ngram)
+{
+    unsigned extra = ngram > 2 ? 2 * (ngram - 2) : 0;
+    if (extra > 6)
+        extra = 6;
+    return UINT32_C(1) << (16 + extra);
+}
+
 void cf_site_ab(const cf_scheme *s, uint32_t site_id, uint64_t offset, uint8_t module_idx,
                 uint32_t *a, uint32_t *b)
 {
@@ -82,19 +90,24 @@ void cf_cov_history(const cf_scheme *s, uam_cov_history *h)
 uint32_t cf_scheme_flags(const cf_scheme *s)
 {
     return UAM_COV_SCHEME | (s->model == CF_MODEL_PC ? UAM_COV_SCHEME_PC : 0)
+         | (s->model == CF_MODEL_BLOCK ? UAM_COV_SCHEME_BLOCK : 0)
          | (s->rotate ? UAM_COV_SCHEME_ROTATE : 0) | (s->ngram << UAM_COV_NGRAM_SHIFT);
 }
 
 const char *cf_scheme_name(const cf_scheme *s)
 {
-    static const char *const names[2][CF_NGRAM_MAX][2] = {
+    static const char *const names[3][CF_NGRAM_MAX][2] = {
         { { "site-n1", "site-n1-rot" }, { "site-n2", "site-n2-rot" }, { "site-n3", "site-n3-rot" },
           { "site-n4", "site-n4-rot" }, { "site-n5", "site-n5-rot" }, { "site-n6", "site-n6-rot" },
           { "site-n7", "site-n7-rot" }, { "site-n8", "site-n8-rot" } },
         { { "pc-n1", "pc-n1-rot" }, { "pc-n2", "pc-n2-rot" }, { "pc-n3", "pc-n3-rot" },
           { "pc-n4", "pc-n4-rot" }, { "pc-n5", "pc-n5-rot" }, { "pc-n6", "pc-n6-rot" },
           { "pc-n7", "pc-n7-rot" }, { "pc-n8", "pc-n8-rot" } },
+        { { "block-n1", "block-n1-rot" }, { "block-n2", "block-n2-rot" },
+          { "block-n3", "block-n3-rot" }, { "block-n4", "block-n4-rot" },
+          { "block-n5", "block-n5-rot" }, { "block-n6", "block-n6-rot" },
+          { "block-n7", "block-n7-rot" }, { "block-n8", "block-n8-rot" } },
     };
     unsigned n = s->ngram < 1 ? 1 : s->ngram > CF_NGRAM_MAX ? CF_NGRAM_MAX : s->ngram;
-    return names[s->model == CF_MODEL_PC][n - 1][s->rotate ? 1 : 0];
+    return names[s->model][n - 1][s->rotate ? 1 : 0];
 }

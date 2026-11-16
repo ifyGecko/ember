@@ -403,6 +403,23 @@ uam_status      uam_exec_set_coverage(uam_exec *x, const uam_cov_site *sites, si
 /* Block mode (uam_cov_pass_create_blocks): a site at every block start. NULL turns
  * coverage off. */
 uam_status      uam_exec_set_block_coverage(uam_exec *x, uam_cov_state *state);
+/*
+ * Block mode with options (uam_cov_pass_create_blocks_ex, cov.h): the map's mask in the
+ * site operands, pc ranges, and splits. With o->contexts, state->contexts is set: a block
+ * that resumes mid-way (the hart stopped inside it: a timer came due, a hook) does not
+ * count, and an interrupt taken where a covered block is next keeps the interrupted
+ * code's history apart from the handler's (uam_cov_irq_ctx, cpu.h).
+ */
+uam_status      uam_exec_set_block_coverage_ex(uam_exec *x, uam_cov_state *state,
+                                               const uam_cov_block_opts *o);
+
+/* COV with state->pending set (uam_cov_count otherwise): a resume or a split skipped,
+ * an interrupt context restored, then the count. */
+void            uam_cov_count_slow(uam_cov_state *s, uint64_t pc, uint32_t a, uint32_t b);
+/* The next COV, if at `pc`, does not count (a block entered mid-way). */
+void            uam_cov_skip_at(uam_cov_state *s, uint64_t pc);
+/* An interrupt was taken with `from_pc` next: save the history, start the handler's. */
+void            uam_cov_irq_enter(uam_cov_state *s, uint64_t from_pc);
 
 /*
  * Compare instrumentation (cmp.h): the compare pass on every block translated from now on,

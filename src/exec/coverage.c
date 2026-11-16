@@ -85,3 +85,81 @@ uam_status uam_exec_set_block_coverage(uam_exec *x, uam_cov_state *state)
         return st;
     return coverage_on(x, cp, state);
 }
+
+uam_status uam_exec_set_block_coverage_ex(uam_exec *x, uam_cov_state *state,
+                                          const uam_cov_block_opts *o)
+{
+    coverage_off(x);
+    if (!state)
+        return UAM_OK;
+    if (state_problem(state) || (o->mask && o->mask != state->mask))
+        return UAM_ERR_INVALID;
+    uam_cov_pass *cp;
+    uam_status st = uam_cov_pass_create_blocks_ex(o, &cp);
+    if (st != UAM_OK)
+        return st;
+    state->contexts = o->contexts;
+    uam_cov_reset_prev(state);
+    return coverage_on(x, cp, state);
+}
+
+/* ---- block contexts (cpu.h, uam_cov_irq_ctx) --------------------------------- */
+
+static void update_pending(uam_cov_state *s)
+{
+    s->pending = s->skip_pc != UAM_COV_NO_PC || s->n_irq;
+}
+
+void uam_cov_skip_at(uam_cov_state *s, uint64_t pc)
+{
+    s->skip_pc = pc;
+    s->pending = 1;
+}
+
+void uam_cov_irq_enter(uam_cov_state *s, uint64_t from_pc)
+{
+    if (s->n_irq == UAM_COV_IRQ_MAX) {
+        /* Contexts never returned to (a task switch from the handler): drop the oldest. */
+        for (unsigned i = 1; i < UAM_COV_IRQ_MAX; i++)
+            s->irq[i - 1] = s->irq[i];
+        s->n_irq--;
+    }
+    uam_cov_irq_ctx *c = &s->irq[s->n_irq++];
+    c->resume_pc = from_pc;
+    c->last_pc = s->last_pc;
+    c->skip_pc = s->skip_pc;
+    for (unsigned j = 0; j < UAM_COV_HIST_MAX; j++) {
+        c->hist[j] = s->hist[j];
+        s->hist[j] = 0;
+    }
+    s->last_pc = UAM_COV_NO_PC;
+    s->skip_pc = UAM_COV_NO_PC;
+    s->pending = 1;
+}
+
+void uam_cov_count_slow(uam_cov_state *s, uint64_t pc, uint32_t a, uint32_t b)
+{
+    bool skip = false, back = false;
+    for (unsigned i = s->n_irq; i-- > 0;) {
+        if (s->irq[i].resume_pc != pc)
+            continue;
+        /* Back where an interrupt was taken: the interrupted code's history again, and
+         * its block counts unless it was itself entered mid-way. */
+        const uam_cov_irq_ctx *c = &s->irq[i];
+        for (unsigned j = 0; j < UAM_COV_HIST_MAX; j++)
+            s->hist[j] = c->hist[j];
+        s->last_pc = c->last_pc;
+        skip = c->skip_pc == pc;
+        for (unsigned k = i + 1; k < s->n_irq; k++)
+            s->irq[k - 1] = s->irq[k];
+        s->n_irq--;
+        back = true;
+        break;
+    }
+    if (!back)
+        skip = s->skip_pc == pc;
+    s->skip_pc = UAM_COV_NO_PC;   /* consumed, or the hart went elsewhere */
+    update_pending(s);
+    if (!skip)
+        uam_cov_count(s, pc, a, b);
+}

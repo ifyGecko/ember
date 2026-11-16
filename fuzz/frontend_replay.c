@@ -24,6 +24,9 @@ struct uam_fuzz_replay {
     int       rank;          /* of the verdict behind exit_status (verdict_rank) */
     uint8_t  *last_map;
     size_t    map_size;
+    uint32_t *prev;          /* the buckets last_map has set (prev_valid), to update it */
+    size_t    n_prev, cap_prev;
+    bool      prev_valid;
 };
 
 static int path_cmp(const void *a, const void *b)
@@ -145,6 +148,7 @@ void uam_fuzz_replay_destroy(uam_fuzz_replay *r)
     free(r->paths);
     free(r->data);
     free(r->last_map);
+    free(r->prev);
     free(r);
 }
 
@@ -239,18 +243,44 @@ static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint
     if (!r->last_map || r->map_size != map_size) {
         free(r->last_map);
         r->map_size = 0;
+        r->prev_valid = false;
         if (!(r->last_map = malloc(map_size)))
             return UAM_ERR_NOMEM;
         r->map_size = map_size;
     }
-    memcpy(r->last_map, map, map_size);
+    /* The copy follows the buckets set (the harness's list), not the map size: a big
+     * block-coverage map costs a replayed input no more than a small one. */
+    size_t hit = 0;
+    const uint32_t *hits = uam_fuzz_map_hits(r->f, map_size, &hit);
+    if (hits && r->prev_valid) {
+        for (size_t i = 0; i < r->n_prev; i++)
+            r->last_map[r->prev[i]] = 0;
+        for (size_t i = 0; i < hit; i++)
+            r->last_map[hits[i]] = map[hits[i]];
+    } else {
+        memcpy(r->last_map, map, map_size);
+    }
+    r->prev_valid = false;
+    if (hits && hit > r->cap_prev) {
+        uint32_t *np = realloc(r->prev, sizeof(*np) * hit);
+        if (np) {
+            r->prev = np;
+            r->cap_prev = hit;
+        }
+    }
+    if (hits && hit <= r->cap_prev) {
+        memcpy(r->prev, hits, sizeof(*r->prev) * hit);
+        r->n_prev = hit;
+        r->prev_valid = true;
+    } else if (!hits) {
+        hit = 0;
+        for (size_t i = 0; i < map_size; i++)
+            hit += map[i] != 0;
+    }
     if (kind != UAM_FUZZ_KIND_ITER)
         return UAM_OK;
 
     const uam_fuzz_result *res = uam_fuzz_last_result(r->f);
-    size_t hit = 0;
-    for (size_t i = 0; i < map_size; i++)
-        hit += map[i] != 0;
     fprintf(r->out, "replay: %s: %s", r->paths[id - 1], uam_fuzz_verdict_str(v));
     switch (v) {
     case UAM_FUZZ_CRASH_FAULT:

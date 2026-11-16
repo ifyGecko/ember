@@ -219,6 +219,9 @@ bool       uam_machine_remove_pass(uam_machine *m, const uam_pass *p);
 uam_status uam_machine_set_coverage(uam_machine *m, const uam_cov_site *sites, size_t n,
                                     uam_cov_state *state, char *err, size_t errlen);
 uam_status uam_machine_set_block_coverage(uam_machine *m, uam_cov_state *state);
+/* Block coverage with options (uam_exec_set_block_coverage_ex, exec.h) on every processor. */
+uam_status uam_machine_set_block_coverage_ex(uam_machine *m, uam_cov_state *state,
+                                             const uam_cov_block_opts *o);
 uam_cov_state *uam_machine_cov_state(uam_machine *m, unsigned i);
 /* Compare instrumentation on every processor (uam_exec_set_cmp), all reporting to `s`
  * (processors run one at a time, so they can share it); NULL turns it off.

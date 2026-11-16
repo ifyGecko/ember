@@ -219,6 +219,8 @@ tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmwa
                   compare logging)
                   parallel-check.sh  (a parallel campaign through fuzz_launch.py)
                   brain_unit.py  (the brain's campaign logic on synthetic data)
+                  cov_blocks_check.py  (block coverage: block-size and interrupt-timing
+                  independence with tests/firmware/irqtarget.c, ranges, symbols)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
 tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dump-mem,
                   --trace-after, traces with --jit, --guard/--watch)

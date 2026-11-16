@@ -33,11 +33,8 @@ last; see the ISA document).
 | hashed-pc model, N=1 | `hash_pc(offset, module)` | `0` |
 | hashed-pc model, N=2 | `hash_pc(offset, module)` | `A >> 1` |
 
-Without a site table, block mode (`--cov-blocks`, `uam_exec_set_block_coverage`) puts a site
-at every translated block's start with `A = hash(pc)`, `B = A >> 1`. It is approximate: ember
-blocks are not basic blocks (they end at a size limit, at hooks and page ends, and an
-interrupted block resumes mid-way), so the edges depend on how code was split, though never
-on the backend.
+Without a site table, block mode (`--cov-blocks`) puts a site at every translated block's
+start, so no site list (and no rizin or Ghidra) is needed; see "Block coverage" below.
 
 Properties:
 
@@ -56,6 +53,46 @@ Properties:
 
 Overhead, synthetic worst case (a MIPS loop of 2-7 instruction blocks): JIT +31%,
 interpreter +4%.
+
+### Block coverage (`--cov-blocks`)
+
+`--cov-blocks` counts the blocks ember runs, with the same N-gram counting as site lists:
+`--cov-ngram N` (default 2), `--cov-rotate` and `--cov-mode` apply. Each block start is a site
+with `A = mix(pc) & mask`, `B = A >> 1` (the block model, `fuzz-formats.md`), and three
+things make an ember block stand for a basic block, so that the map depends only on the
+code's path:
+
+- **Splits.** A block ember had to cut (its length, `--block-insns`; a page end; an
+  unfetchable next instruction) marks its continuation, which does not count: the map is
+  the same whether blocks hold 32 instructions or 1 (`tests/fuzz/cov_blocks_check.py`).
+- **Resumes.** A block entered mid-way, because the hart stopped inside it (a timer came
+  due, a hook), does not count.
+- **Interrupts** (`--cov-irq isolate`, the default). An interrupt handler counts with a
+  history of its own, and the interrupted code resumes with its own: where an interrupt
+  lands changes neither. In `tests/firmware/irqtarget.c`, a timer interrupting a parser at
+  six different periods gives one set of buckets with `isolate` and six with `follow` (the
+  handler continues the interrupted code's history, as plain edges would).
+
+`--cov-range R` (repeatable) counts only blocks that start in R: `LO-HI`, `LO+LEN`, an ELF
+symbol `SYM` (its size), `SYM-SYM2` or `SYM+LEN`. Code outside every range neither counts nor
+enters the history, so the parser under test, not the scheduler, the idle task or a C
+library, makes the buckets. The map is 64 KiB for N <= 2 and four times larger for each N
+above (at most 4 MiB; `--cov-map-size`). Begin, end and crash pcs can be ELF symbols too, so
+an image with symbols needs no other tool:
+
+```
+uam-run -b rv32-ref --cov-blocks --cov-ngram 3 --cov-rotate --cov-range net_rx-net_rx_end \
+    --fuzz-begin net_rx --fuzz-end net_rx_done --fuzz-crash-pc panic \
+    --fuzz-input mem:0x80100000,max=1514 --fuzz-net 127.0.0.1:7000 fw.elf
+```
+
+Without the stock extensions (an out-of-tree runner), `--cov-blocks` is plain edges between
+ember's blocks (`uam_exec_set_block_coverage`). In a program:
+`uam_fuzz_set_block_coverage_ex` (`uam_cov_block_opts`: mask, ranges, splits, contexts).
+
+Every coverage op also records each bucket it sets first (`uam_cov_touched`), so the
+harness lists and clears an iteration's buckets in time proportional to what it set, not to
+the map size: a 4 MiB map costs a fuzz iteration no more than a 64 KiB one.
 
 ## The harness (`uam/fuzz.h`)
 
@@ -314,6 +351,10 @@ CMP_INPUT and CMPS ([`fuzz-formats.md`](fuzz-formats.md)).
   between processors are not counted.
 - Interrupts are reported only when taken, and only as a crash (`--fuzz-crash-irq`); an
   interrupt line that is raised but masked is invisible to the harness.
+- Block coverage's interrupt contexts follow interrupts, not task switches: a handler that
+  switches to another task leaves its context unclaimed until the hart returns to the
+  interrupted pc (the eight newest are kept). A synchronous exception's handler continues
+  the history. With ranges, an interrupt taken outside them keeps no context.
 - Compare logging sees compares in the IR, so a string compare done in a byte loop
   (`strcmp`, `memcmp`) logs one byte per iteration, and a compared value the code computed
   from the input in other ways than a constant offset (a parsed number, a checksum) is not
@@ -562,8 +603,8 @@ frame. It needs fuzzing
 boundaries (`--fuzz-begin` or `--cov-boundary`) and replaces `--fuzz-replay`. ember connects
 first, boots to the begin pc, and only then sends HELLO and the INIT map, so a long firmware
 boot is not spent between HELLO and the first reply; the brain waits for HELLO up to its
-`--hello-timeout` (600 s). Any coverage source works: with `--cov-sites`, HELLO describes the
-scheme (site or hashed-pc, N, rotation); with `--cov-blocks` it describes none. HELLO's arch
+`--hello-timeout` (600 s). Any coverage source works: HELLO describes the scheme (site,
+hashed-pc or block model, N, rotation); plain block edges (no stock extensions) describe none. HELLO's arch
 is the ISA's name (`rv32imac`, `mips32be`, `armv7`, ...).
 
 | Verdict | Reply | `status` |
@@ -625,7 +666,8 @@ generations go away as the run publishes more.
   iterations are not published.
 - The live bitmap is the union (saturating sums) of everything published, so
   `cov_region.py stats` shows the campaign's coverage so far.
-- The header carries the scheme flags (with `--cov-sites`; none for `--cov-blocks`) and
+- The header carries the scheme flags (site lists and block coverage; none for plain block
+  edges) and
   ember's pid and start time as the owner. A region another live process owns is refused,
   decided under an exclusive `flock`, so two ember processes starting at once cannot both
   take it, with an owner alive only if its pid still has the recorded start time (a reused

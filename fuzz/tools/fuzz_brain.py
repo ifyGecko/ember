@@ -109,7 +109,7 @@ CMPLOG_TOKENS_MAX = 256                  # dictionary tokens taken from compare 
 KIND_INIT, KIND_ITER = 1, 2
 
 # HELLO flags: the coverage scheme (the coverage region's flags, same bits).
-SCHEME, SCHEME_PC, SCHEME_ROTATE = 1 << 0, 1 << 1, 1 << 2
+SCHEME, SCHEME_PC, SCHEME_ROTATE, SCHEME_BLOCK = 1 << 0, 1 << 1, 1 << 2, 1 << 3
 NGRAM_SHIFT, NGRAM_MASK = 8, 0xf << 8
 
 FAULT, GUARD, ORACLE, HANG, TIMEOUT, REJECTED, MALFORMED = 1, 2, 3, 4, 5, 6, 7
@@ -138,7 +138,7 @@ def scheme_str(flags):
         return "blocks"
     return "n=%d model=%s rotate=%d" % (
         (flags & NGRAM_MASK) >> NGRAM_SHIFT,
-        "pc" if flags & SCHEME_PC else "site",
+        "block" if flags & SCHEME_BLOCK else "pc" if flags & SCHEME_PC else "site",
         1 if flags & SCHEME_ROTATE else 0)
 
 

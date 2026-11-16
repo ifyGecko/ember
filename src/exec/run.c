@@ -871,6 +871,9 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         if (isa->irq_take(cpu)) {
             x->stats.interrupts++;
             cpu->waiting = false;
+            /* Block coverage: the handler gets a history of its own (cpu.h). */
+            if (cpu->cov && cpu->cov->contexts && uam_cov_pass_covers(x->cov_pass, from_pc))
+                uam_cov_irq_enter(cpu->cov, from_pc);
             if (x->hist || (cpu->obs && cpu->obs->interrupt)) {
                 const uint64_t lines = isa->irq_lines ? isa->irq_lines(cpu) : 0;
                 if (x->hist)
@@ -1030,8 +1033,12 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         x->stats.blocks_executed++;
 
         switch (r.kind) {
-        case UAM_BR_NEXT:
         case UAM_BR_INTERRUPTED:
+            /* Block coverage: the block that resumes here is no new block. */
+            if (cpu->cov && cpu->cov->contexts)
+                uam_cov_skip_at(cpu->cov, r.pc);
+            /* fall through */
+        case UAM_BR_NEXT:
             cpu->pc = r.pc;
             if (x->fault_stop)
                 return fault_stopped(x, NULL);

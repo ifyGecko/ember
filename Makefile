@@ -850,6 +850,7 @@ endif
 # files reproduce on their own.
 fuzz-test: $(RUN) firmware firmware-mips firmware-arm firmware-ppc firmware-avr firmware-avr32 firmware-pic firmware-mcs51 \
            firmware-pic32 firmware-6502 firmware-z80 firmware-xtensa
+	python3 tests/fuzz/cov_blocks_check.py $(RUN) $(BUILD)
 	sh tests/fuzz/fuzz-check.sh $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf
 	sh tests/fuzz/fuzz-check.sh $(RUN) mips-ref $(BUILD)/firmware-mips/fuzztarget-be.elf \
 	    $(BUILD)/firmware-mips/fuzztarget-be.bin

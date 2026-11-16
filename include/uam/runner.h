@@ -43,6 +43,8 @@ typedef struct uam_runner_setup {
     bool                  have_raw_base;
     uint64_t              raw_base;
     uint32_t              map_size_option; /* --cov-map-size if given, else 0 */
+    const char           *image_path;      /* the image file, if any (symbols) */
+    bool                  cov_blocks;      /* --cov-blocks: coverage without a site list */
     /* out: coverage sites (owned by the extension, valid until it is destroyed) */
     const uam_cov_site   *sites;
     size_t                n_sites;
@@ -52,6 +54,13 @@ typedef struct uam_runner_setup {
     bool                  skip_repeats;    /* uam_cov_state.skip_repeat */
     uam_cov_namer_fn      namer;           /* optional, see uam_cov_pass_set_namer */
     void                 *namer_ctx;
+    /* out: block coverage's scheme (with cov_blocks): scheme, map_size, history and
+     * skip_repeats as above, plus pc ranges (owned by the extension) and contexts
+     * (uam_cov_block_opts). Without it, --cov-blocks is plain block edges. */
+    bool                  block_scheme;
+    const uam_cov_range  *ranges;
+    size_t                n_ranges;
+    bool                  contexts;
     /* out: iteration boundaries (turn on the fuzz harness) */
     bool                  have_begin;
     uint64_t              begin_pc;

@@ -631,6 +631,11 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
     ld64(j, X1, CPUR, CPU(cov));                           /* x1 = cpu->cov */
     size_t off = j->n;
     g32(j, 0xB4000000u | X1);                              /* cbz x1, skip */
+    size_t slow = 0;
+    if (cs && cs->contexts) {                              /* as on x86-64 */
+        mem(j, 0, true, X16, X1, COV(pending));
+        slow = cbz_fwd(j, true, X16);                      /* cbnz w16, slow */
+    }
     size_t rep = 0;
     if (cs && cs->skip_repeat) {
         mov_imm(j, X0, pc);
@@ -665,15 +670,62 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
     cmp_imm(j, false, X16, 255);
     csel(j, false, true, false, X16, X16, X16, CC_EQ);     /* cinc w16, w16, ne: saturate */
     mem_rr(j, 0, false, X16, X2, X0, false);
+    if (cs && cs->touched) {                               /* a new bucket: append it */
+        cmp_imm(j, false, X16, 1);
+        size_t t1 = bcond_fwd(j, CC_NE);
+        ld64(j, X2, X1, COV(touched));
+        size_t t2 = j->n;
+        g32(j, 0xB4000000u | X2);                          /* cbz x2 */
+        mem(j, 2, true, X16, X2, TOUCH(n));
+        mem(j, 2, true, X17, X2, TOUCH(cap));
+        addsub_reg(j, true, false, true, XZR, X16, X17, 0);  /* cmp w16, w17 */
+        size_t t3 = bcond_fwd(j, CC_HS);                   /* full */
+        addsub_imm(j, false, false, false, X17, X16, 1, false);
+        mem(j, 2, false, X17, X2, TOUCH(n));               /* n++ */
+        ld64(j, X2, X2, TOUCH(idx));
+        mem_rr(j, 2, false, X0, X2, X16, true);            /* idx[w16] = w0 */
+        size_t t4 = b_fwd(j);
+        patch(j, t3);
+        mov_imm(j, X17, 1);
+        mem(j, 0, false, X17, X2, TOUCH(overflow));        /* overflow = 1 */
+        patch(j, t1);
+        patch(j, t2);
+        patch(j, t4);
+    }
     for (uint32_t k = d - 1; k > 0; k--) {                 /* hist[k] = hist[k-1] */
         mem(j, 2, true, X16, X1, COV(hist) + 4 * (int32_t)(k - 1));
         mem(j, 2, false, X16, X1, COV(hist) + 4 * (int32_t)k);
     }
     mov_imm(j, X16, b);
     mem(j, 2, false, X16, X1, COV(prev));                  /* hist[0] = B */
+    if (slow) {
+        size_t done = b_fwd(j);
+        patch(j, slow);                                    /* slow: uam_cov_count_slow */
+        jit_ra_save(j, false);
+        ld64(j, X0, CPUR, CPU(cov));
+        mov_imm(j, X1, pc);
+        mov_imm(j, X2, a);
+        mov_imm(j, X3, b);
+        call_bridge(j, uam_cov_count_slow);
+        jit_ra_save(j, true);
+        patch(j, done);
+    }
     patch(j, off);
     if (rep)
         patch(j, rep);
+}
+
+/* COV with UAM_COV_SPLIT, as on x86-64. */
+static void emit_cov_split(uam_jit *j, uint64_t next)
+{
+    ld64(j, X1, CPUR, CPU(cov));
+    size_t off = j->n;
+    g32(j, 0xB4000000u | X1);                              /* cbz x1, skip */
+    mov_imm(j, X0, next);
+    st64(j, X0, X1, COV(skip_pc));
+    mov_imm(j, X16, 1);
+    mem(j, 0, false, X16, X1, COV(pending));
+    patch(j, off);
 }
 
 /*
@@ -1533,8 +1585,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             epi[n_epi++] = b_fwd(j);
             break;
         case UAM_OP_COV:
-            emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
-                     (uint32_t)blk->imm[uam_ref_index(in->b)]);
+            if (in->flags & UAM_COV_SPLIT)
+                emit_cov_split(j, blk->imm[uam_ref_index(in->a)]);
+            else
+                emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
+                         (uint32_t)blk->imm[uam_ref_index(in->b)]);
             break;
         case UAM_OP_CMPLOG:
             emit_cmplog(j, blk, in);

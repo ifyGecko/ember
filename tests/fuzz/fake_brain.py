@@ -3,8 +3,8 @@
 
 FIRMWARE is a build of tests/fuzz/fuzztarget.h. The brain listens on a free port, starts
 uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz protocol"):
-  - the magic and HELLO (version 1, the arch, map size, scheme flags: none with
-    --cov-blocks, the site-id N=2 scheme with SITES/BOUNDARY from mk_lists.py);
+  - the magic and HELLO (version 1, the arch, map size, scheme flags: the block model N=2
+    with --cov-blocks, the site-id N=2 scheme with SITES/BOUNDARY from mk_lists.py);
   - the unsolicited INIT snapshot (id 0, kind INIT) before any reply;
   - COVERAGE kind ITER for a good input, and the same map for the same input;
   - CRASH FAULT (the store's pc), ORACLE (fuzz_panic), TIMEOUT (status 0) for the
@@ -61,6 +61,7 @@ FAULT, GUARD, ORACLE, HANG, TIMEOUT, REJECTED, MALFORMED = 1, 2, 3, 4, 5, 6, 7
 SCRATCH_OF = {"arm-ref": 0x03f00000, "armeb-ref": 0x03f00000, "ppc-ref": 0x03f00000}
 SCRATCH_DEFAULT = 0x81f00000
 FLAG_SCHEME = 0x1
+FLAG_BLOCK = 0x8
 
 failures = []
 
@@ -308,7 +309,9 @@ def main():
     panic = sym(fw, "fuzz_panic")
     arch = {"rv32-ref": "rv32imac", "mips-ref": "mips32be", "mipsel-ref": "mips32le",
             "arm-ref": "armv7", "armeb-ref": "armv7be", "ppc-ref": "ppc32"}[board]
-    modes = [("blocks", ["--cov-blocks", "--fuzz-begin", hex(sym(fw, "fuzz_iteration"))], 0)]
+    # --cov-blocks with the stock extensions: the block model, N=2 (HELLO says so)
+    modes = [("blocks", ["--cov-blocks", "--fuzz-begin", hex(sym(fw, "fuzz_iteration"))],
+              FLAG_SCHEME | FLAG_BLOCK | (2 << 8))]
     if sites:
         modes.append(("sites", ["--cov-sites", sites[0], "--cov-boundary", sites[1]],
                       FLAG_SCHEME | (2 << 8)))

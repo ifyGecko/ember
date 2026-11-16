@@ -66,7 +66,8 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
    a wrapper plus `uam_machine_add_input` in the board (`references/harness.md`,
    "Publishing an input"). Rebuild.
 4. **Configure the boundaries and oracles**: `--fuzz-begin` at the handler entry (before the
-   input is read), optional `--fuzz-end`, `--fuzz-crash-pc` at the fatal-error reporter,
+   input is read), optional `--fuzz-end`, `--fuzz-crash-pc` at the fatal-error reporter
+   (each an address or, for an ELF with symbols, a name: `--fuzz-begin net_rx`),
    `--fuzz-crash-exc` for the firmware's normal exceptions, `--fuzz-iter-insns` from a
    measured ok run. Put them in a `fuzz.sh` next to `run.sh` that wraps it, sends the
    guest console to a file, away from the replay lines, and sets `UNKNOWN_MMIO=fault`:
@@ -93,6 +94,12 @@ is the same, the board only wires, one device per file, `scripts/rebuild.sh` aft
 6. **Check coverage moves**: `--cov-blocks --cov-out` for two different inputs must give
    different maps; identical maps mean the input never reaches the handler (begin pc after
    the read, wrong route, input dropped by a full FIFO).
+   **Coverage without a site list**: `--cov-blocks --cov-ngram 3 --cov-rotate` is N-gram
+   coverage of ember's blocks, a split block counting once, and an interrupt handler with a
+   history of its own (`--cov-irq isolate`, the default), so timer interrupts add no noise.
+   Add `--cov-range` (`SYM`, `SYM-SYM2`, `LO-HI`) around the code under test so an RTOS's
+   scheduler and other tasks stay out of the map. That needs no rizin or Ghidra pass; site
+   lists remain the choice for instrumenting chosen points only, with names in errors.
 7. **Run the campaign**: the brain (`references/lists-and-brain.md`) or a program on
    `uam/fuzz.h`. The brain logs each queue entry's compares once and writes the values
    they expected into the input (compare logging, on by default), which finds magic values

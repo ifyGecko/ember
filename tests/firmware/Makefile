@@ -11,7 +11,8 @@ FW_CFLAGS     := $(ARCH_FLAGS) -O2 -g -std=gnu11 -Wall -Wextra -ffreestanding -f
               -fno-pic -fno-stack-protector -nostdlib -nostartfiles
 FW_LDFLAGS    := -static -T link.ld -Wl,--build-id=none
 
-all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf $(OUT)/smptest.elf $(OUT)/consoletest.elf
+all: $(OUT)/selftest.elf $(OUT)/nettest.elf $(OUT)/fuzztarget.elf $(OUT)/smptest.elf $(OUT)/consoletest.elf \
+     $(OUT)/irqtarget.elf
 
 $(OUT)/selftest.elf: start.S selftest.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
@@ -28,6 +29,11 @@ $(OUT)/fuzztarget.elf: start.S fuzztarget.c ../fuzz/fuzztarget.h link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
 	@mkdir -p $(OUT)
 	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S fuzztarget.c -o $@
+
+$(OUT)/irqtarget.elf: start.S irqtarget.c link.ld
+	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }
+	@mkdir -p $(OUT)
+	$(CROSS)gcc $(FW_CFLAGS) $(FW_LDFLAGS) start.S irqtarget.c -o $@
 
 $(OUT)/consoletest.elf: start.S consoletest.c link.ld
 	@test -n "$(CROSS)" || { echo "no RISC-V cross compiler found"; exit 1; }

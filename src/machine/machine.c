@@ -438,6 +438,21 @@ uam_status uam_machine_set_block_coverage(uam_machine *m, uam_cov_state *state)
     return st;
 }
 
+uam_status uam_machine_set_block_coverage_ex(uam_machine *m, uam_cov_state *state,
+                                            const uam_cov_block_opts *o)
+{
+    if (state)
+        state->contexts = o->contexts;   /* before the processors' copies are made */
+    uam_status st = cov_prepare(m, state);
+    if (st == UAM_OK)
+        st = uam_exec_set_block_coverage_ex(&m->exec, state, o);
+    for (uint32_t i = 0; st == UAM_OK && i < m->n_aps && state; i++)
+        st = uam_exec_set_block_coverage_ex(m->ap_execs[i], &m->ap_cov[i], o);
+    if (st != UAM_OK)
+        cov_prepare(m, NULL);
+    return st;
+}
+
 uam_status uam_machine_set_cmp(uam_machine *m, uam_cmp_state *s)
 {
     uam_status st = UAM_OK;

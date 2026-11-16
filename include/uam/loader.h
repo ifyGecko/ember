@@ -38,4 +38,13 @@ uam_status uam_load_image(uam_bus *bus, uam_cpu *cpu, const char *path, uint64_t
  * place images themselves, e.g. into a flash device). */
 uam_status uam_load_file(const char *path, uint8_t **data, size_t *len);
 
+/*
+ * A symbol of an ELF file's symbol table (.symtab, else .dynsym): its value (the
+ * address, as the image links it; an ARM Thumb function's has bit 0 set, as ember's pcs
+ * do) and size. The first defined symbol of that name wins. UAM_ERR_INVALID: not an ELF
+ * file, no symbol table, or no such symbol (*why says which, if given).
+ */
+uam_status uam_elf_symbol(const char *path, const char *name, uint64_t *value, uint64_t *size,
+                          const char **why);
+
 #endif /* UAM_LOADER_H */

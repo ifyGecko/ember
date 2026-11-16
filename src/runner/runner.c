@@ -41,6 +41,83 @@ typedef struct pc_list {
     unsigned  n, cap;
 } pc_list;
 
+/*
+ * A pc option's value: a number, or SYM[+OFF] (an ELF symbol of the image, resolved once
+ * it is loaded; resolve_syms). The value goes to *dst, or to list->pc[idx] when the
+ * option fills a growing list.
+ */
+typedef struct sym_ref {
+    const char *opt, *text;
+    uint64_t   *dst;
+    struct pc_list *list;
+    unsigned    idx;
+} sym_ref;
+
+typedef struct sym_refs {
+    sym_ref *r;
+    unsigned n, cap;
+} sym_refs;
+
+/* A number (the whole of arg) in *out, or a symbol reference noted in refs. false: neither. */
+static bool pc_arg(sym_refs *refs, const char *opt, const char *arg, uint64_t *out,
+                   struct pc_list *list, unsigned idx)
+{
+    char *end;
+    if (arg[0] >= '0' && arg[0] <= '9') {
+        *out = strtoull(arg, &end, 0);
+        return !*end;
+    }
+    if (!arg[0] || arg[0] == '+')
+        return false;
+    if (refs->n == refs->cap) {
+        unsigned ncap = refs->cap ? 2 * refs->cap : 16;
+        sym_ref *nr = realloc(refs->r, sizeof(*nr) * ncap);
+        if (!nr)
+            return false;
+        refs->r = nr;
+        refs->cap = ncap;
+    }
+    refs->r[refs->n++] = (sym_ref){ .opt = opt, .text = arg, .dst = out, .list = list, .idx = idx };
+    *out = 0;
+    return true;
+}
+
+/* Resolve the symbol references against the image. false: reported. */
+static bool resolve_syms(const sym_refs *refs, const char *image)
+{
+    for (unsigned i = 0; i < refs->n; i++) {
+        const sym_ref *r = &refs->r[i];
+        if (!image) {
+            fprintf(stderr, "uam-run: --%s %s: a symbol needs an ELF image\n", r->opt, r->text);
+            return false;
+        }
+        char name[256];
+        const char *plus = strrchr(r->text, '+');
+        size_t nl = plus ? (size_t)(plus - r->text) : strlen(r->text);
+        uint64_t off = 0;
+        char *end = NULL;
+        if (plus)
+            off = strtoull(plus + 1, &end, 0);
+        if (nl >= sizeof(name) || (plus && (!plus[1] || *end))) {
+            fprintf(stderr, "uam-run: --%s %s: expected ADDR or SYMBOL[+OFFSET]\n", r->opt, r->text);
+            return false;
+        }
+        memcpy(name, r->text, nl);
+        name[nl] = '\0';
+        uint64_t value, size;
+        const char *why;
+        if (uam_elf_symbol(image, name, &value, &size, &why) != UAM_OK) {
+            fprintf(stderr, "uam-run: --%s %s: %s\n", r->opt, r->text, why ? why : "not found");
+            return false;
+        }
+        uint64_t *dst = r->list ? &r->list->pc[r->idx] : r->dst;
+        *dst = value + off;
+        uam_log(UAM_LOG_INFO, "uam-run", "--%s %s = 0x%llx", r->opt, r->text,
+                (unsigned long long)*dst);
+    }
+    return true;
+}
+
 static bool pc_list_add(pc_list *l, uint64_t pc)
 {
     if (l->n == l->cap) {
@@ -326,13 +403,16 @@ static void usage(FILE *out)
         "      --jit-opmap FILE    with --jit, append which IR instruction each piece of\n"
         "                          native code came from to FILE, for tools/jitprof.py (env\n"
         "                          UAM_JIT_OPMAP=FILE)\n"
-        "      --cov-blocks        count edges between translated blocks (approximate: blocks\n"
-        "                          are not basic blocks) in a coverage map\n"
+        "      --cov-blocks        coverage without a site list: ember's blocks, a split block\n"
+        "                          counting once; with the stock extensions --cov-ngram,\n"
+        "                          --cov-rotate, --cov-mode, --cov-range and --cov-irq apply\n"
         "      --cov-map-size N    coverage map bytes, a power of two (default 64K; with a\n"
-        "                          site list, from the number of sites)\n"
+        "                          site list, from the number of sites; blocks: 4x per N > 2)\n"
         "      --cov-out FILE      write the raw coverage map to FILE when the run stops\n"
         "                          (fuzzing: the last input's map)\n"
         "      --fuzz-begin PC     fuzz: boot to PC, snapshot there, run each input from it\n"
+        "                          (PC: an address or an ELF symbol, SYM[+OFF]; so for every\n"
+        "                          PC and ADDR option)\n"
         "                          (repeatable: the snapshot is at the first one reached, and\n"
         "                          any of them begins an iteration)\n"
         "      --fuzz-end PC       an iteration ends at PC (repeatable: any of them; default:\n"
@@ -685,7 +765,10 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
     }
     int rc = 2;
     uam_fuzz_replay *r = NULL;
-    if (cov_blocks && uam_fuzz_set_block_coverage(f) != UAM_OK) {
+    const uam_cov_block_opts bo = { .ranges = xs->ranges, .n_ranges = xs->n_ranges,
+                                    .splits = true, .contexts = xs->contexts };
+    if (cov_blocks && (xs->block_scheme ? uam_fuzz_set_block_coverage_ex(f, &bo, xs->scheme)
+                                        : uam_fuzz_set_block_coverage(f)) != UAM_OK) {
         fprintf(stderr, "uam-run: cannot enable coverage\n");
         goto out;
     }
@@ -850,6 +933,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     size_t mmio_input_len = 0;
     uam_mmio_input *mmio_input = NULL;
     uint64_t snap_at_pc = 0;
+    sym_refs syms = { 0 };   /* pc options naming a symbol, resolved after loading */
     bool have_snap_at = false;
     char *uart_input_spec = NULL;
     uint64_t raw_base = 0, entry = 0, max_insns = 0, trace_lo = 0, trace_hi = 0, trace_after = 0;
@@ -1014,8 +1098,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
             trace_after_rel = optarg[0] == '+';
             trace_after = strtoull(optarg + trace_after_rel, NULL, 0);
             break;
-        case OPT_LOG_PC:
-        case OPT_BREAK: {
+        case OPT_BREAK:
+            if (!pc_list_add(&break_pcs, 0)
+                || !pc_arg(&syms, "break", optarg, &break_pcs.pc[break_pcs.n - 1], &break_pcs,
+                           break_pcs.n - 1)) {
+                fprintf(stderr, "uam-run: bad --break '%s' (ADDR or SYMBOL[+OFFSET])\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_LOG_PC: {
             char *end;
             uint64_t pc = strtoull(optarg, &end, 0);
             if (end == optarg || (*end && !(c == OPT_LOG_PC && *end == ',' && end[1]))) {
@@ -1067,7 +1158,13 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_GDB: gdb_port = optarg; break;
         case OPT_LOAD_SNAP: load_snap = optarg; break;
         case OPT_SAVE_SNAP: save_snap = optarg; break;
-        case OPT_SNAP_AT: snap_at_pc = strtoull(optarg, NULL, 0); have_snap_at = true; break;
+        case OPT_SNAP_AT:
+            if (!pc_arg(&syms, "snapshot-at", optarg, &snap_at_pc, NULL, 0)) {
+                fprintf(stderr, "uam-run: bad --snapshot-at '%s' (ADDR or SYMBOL[+OFFSET])\n", optarg);
+                return 2;
+            }
+            have_snap_at = true;
+            break;
         case OPT_MAP: show_map = true; break;
         case OPT_DUMP_MEM:
             if (n_mem_dumps == MAX_LIST || !parse_mem_dump(optarg, &mem_dumps[n_mem_dumps])) {
@@ -1105,22 +1202,26 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_COV_MAP_SIZE: cov_map_size = parse_size(optarg); cov_map_size_given = true; break;
         case OPT_FUZZ_BEGIN:
             /* Repeatable: the first is begin_pc, the others more begins. */
-            if (!have_begin) {
-                fz.begin_pc = strtoull(optarg, NULL, 0);
-                have_begin = true;
-            } else if (n_more_begins == MAX_LIST) {
+            if (have_begin && n_more_begins == MAX_LIST) {
                 fprintf(stderr, "uam-run: at most %d --fuzz-begin options\n", MAX_LIST + 1);
                 return 2;
-            } else {
-                fuzz_more_begins[n_more_begins++] = strtoull(optarg, NULL, 0);
             }
+            if (!pc_arg(&syms, "fuzz-begin", optarg,
+                        have_begin ? &fuzz_more_begins[n_more_begins++] : &fz.begin_pc, NULL, 0)) {
+                fprintf(stderr, "uam-run: bad --fuzz-begin '%s' (ADDR or SYMBOL[+OFFSET])\n", optarg);
+                return 2;
+            }
+            have_begin = true;
             break;
         case OPT_FUZZ_END:
             if (n_fuzz_end == MAX_LIST) {
                 fprintf(stderr, "uam-run: at most %d --fuzz-end options\n", MAX_LIST);
                 return 2;
             }
-            fuzz_end_pcs[n_fuzz_end++] = strtoull(optarg, NULL, 0);
+            if (!pc_arg(&syms, "fuzz-end", optarg, &fuzz_end_pcs[n_fuzz_end++], NULL, 0)) {
+                fprintf(stderr, "uam-run: bad --fuzz-end '%s' (ADDR or SYMBOL[+OFFSET])\n", optarg);
+                return 2;
+            }
             fuzz_opts = true;
             break;
         case OPT_FUZZ_INPUT: fuzz_input = optarg; fuzz_opts = true; break;
@@ -1129,7 +1230,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 fprintf(stderr, "uam-run: at most %d --fuzz-crash-pc options\n", MAX_LIST);
                 return 2;
             }
-            fuzz_crash_pcs[fz.n_crash_pcs++] = strtoull(optarg, NULL, 0);
+            if (!pc_arg(&syms, "fuzz-crash-pc", optarg, &fuzz_crash_pcs[fz.n_crash_pcs++], NULL, 0)) {
+                fprintf(stderr, "uam-run: bad --fuzz-crash-pc '%s' (ADDR or SYMBOL[+OFFSET])\n",
+                        optarg);
+                return 2;
+            }
             fuzz_opts = true;
             break;
         case OPT_FUZZ_CRASH_EXC:
@@ -1345,6 +1450,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
     } else if (have_entry) {
         uam_machine_reset(&m, entry);
     }
+    if (!resolve_syms(&syms, image)) {
+        uam_machine_fini(&m);
+        goto out_host;
+    }
     if (load_snap) {
         uam_snapshot *snap;
         st = uam_snapshot_load(load_snap, &snap);
@@ -1425,6 +1534,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     uam_runner_setup xs = { .m = &m, .have_image = image != NULL, .image = info,
                             .have_raw_base = have_raw_base, .raw_base = raw_base,
+                            .image_path = image, .cov_blocks = cov_blocks,
                             .map_size_option = cov_map_size_given ? (uint32_t)cov_map_size : 0 };
     for (size_t e = 0; e < es->n; e++) {
         if (!es->ext[e]->setup)
@@ -1440,6 +1550,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
             xs.sites = one.sites; xs.n_sites = one.n_sites; xs.scheme = one.scheme;
             xs.history = one.history; xs.skip_repeats = one.skip_repeats;
             xs.map_size = one.map_size; xs.namer = one.namer; xs.namer_ctx = one.namer_ctx;
+        }
+        if (one.block_scheme) {
+            xs.block_scheme = true; xs.scheme = one.scheme; xs.history = one.history;
+            xs.skip_repeats = one.skip_repeats; xs.map_size = one.map_size;
+            xs.ranges = one.ranges; xs.n_ranges = one.n_ranges; xs.contexts = one.contexts;
         }
         if (one.have_begin) {
             xs.have_begin = true; xs.begin_pc = one.begin_pc; xs.end_pcs = one.end_pcs;
@@ -1457,7 +1572,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     if (xs.map_size)
         cov_map_size = xs.map_size;
-    if (xs.sites) {
+    if (xs.sites || xs.block_scheme) {
         fz.history = xs.history;
         fz.skip_repeats = xs.skip_repeats;
     }
@@ -1485,8 +1600,14 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     if (cov_blocks && !fuzzing) {
         cov_map = calloc(1, cov_map_size);
-        uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size, NULL);
-        if (!cov_map || uam_machine_set_block_coverage(&m, &cov_state) != UAM_OK) {
+        uam_cov_state_init(&cov_state, cov_map, (uint32_t)cov_map_size,
+                           xs.block_scheme ? &xs.history : NULL);
+        cov_state.skip_repeat = xs.block_scheme && xs.skip_repeats;
+        const uam_cov_block_opts bo = { .mask = (uint32_t)cov_map_size - 1, .ranges = xs.ranges,
+                                        .n_ranges = xs.n_ranges, .splits = true,
+                                        .contexts = xs.contexts };
+        if (!cov_map || (xs.block_scheme ? uam_machine_set_block_coverage_ex(&m, &cov_state, &bo)
+                                         : uam_machine_set_block_coverage(&m, &cov_state)) != UAM_OK) {
             fprintf(stderr, "uam-run: cannot enable coverage\n");
             uam_machine_fini(&m);
             goto out_host;
@@ -1701,6 +1822,7 @@ out_host:
     free(log_pcs.pc);
     free(log_pc_regs_text);
     free(break_pcs.pc);
+    free(syms.r);
     free(log_hits);   /* after the machine: the log hooks counted into it */
     free(su);         /* after the machine: it was the bus's unmapped device */
     if (trace_fp && fclose(trace_fp) != 0 && rc == 0) {

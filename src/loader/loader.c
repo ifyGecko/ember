@@ -194,6 +194,84 @@ uam_status uam_load_image(uam_bus *bus, uam_cpu *cpu, const char *path, uint64_t
     return uam_load_raw(bus, cpu, path, raw_base, info);
 }
 
+#define SHT_SYMTAB 2
+#define SHT_DYNSYM 11
+
+/* The symbol `name` in the symbol table of type `want`: 1 found, 0 not there, -1 bad file. */
+static int find_symbol(const uint8_t *d, size_t len, bool is64, bool be, uint32_t want,
+                       const char *name, uint64_t *value, uint64_t *size)
+{
+    const uint64_t shoff = is64 ? rd(d + 40, 8, be) : rd(d + 32, 4, be);
+    const unsigned shentsize = (unsigned)rd(d + (is64 ? 58 : 46), 2, be);
+    const unsigned shnum = (unsigned)rd(d + (is64 ? 60 : 48), 2, be);
+    const unsigned need = is64 ? 64 : 40;
+    if (!shnum)
+        return 0;
+    if (shoff > len || shentsize < need || (uint64_t)shnum * shentsize > len - shoff)
+        return -1;
+    const size_t nlen = strlen(name);
+    for (unsigned i = 0; i < shnum; i++) {
+        const uint8_t *sh = d + shoff + (uint64_t)i * shentsize;
+        if ((uint32_t)rd(sh + 4, 4, be) != want)
+            continue;
+        uint64_t off = is64 ? rd(sh + 24, 8, be) : rd(sh + 16, 4, be);
+        uint64_t sz = is64 ? rd(sh + 32, 8, be) : rd(sh + 20, 4, be);
+        uint32_t link = (uint32_t)rd(sh + (is64 ? 40 : 24), 4, be);
+        uint64_t ent = is64 ? rd(sh + 56, 8, be) : rd(sh + 36, 4, be);
+        if (link >= shnum || ent < (is64 ? 24u : 16u) || off > len || sz > len - off)
+            return -1;
+        const uint8_t *st = d + shoff + (uint64_t)link * shentsize;
+        uint64_t stroff = is64 ? rd(st + 24, 8, be) : rd(st + 16, 4, be);
+        uint64_t strsz = is64 ? rd(st + 32, 8, be) : rd(st + 20, 4, be);
+        if (stroff > len || strsz > len - stroff)
+            return -1;
+        for (uint64_t k = 0; k + ent <= sz; k += ent) {
+            const uint8_t *sym = d + off + k;
+            uint32_t nm = (uint32_t)rd(sym, 4, be);
+            uint16_t shndx = (uint16_t)rd(sym + (is64 ? 6 : 14), 2, be);
+            if (!shndx || nm >= strsz || strsz - nm <= nlen)
+                continue;   /* undefined, or the name does not fit */
+            const char *s = (const char *)d + stroff + nm;
+            if (memcmp(s, name, nlen) || s[nlen])
+                continue;
+            *value = is64 ? rd(sym + 8, 8, be) : rd(sym + 4, 4, be);
+            *size = is64 ? rd(sym + 16, 8, be) : rd(sym + 8, 4, be);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+uam_status uam_elf_symbol(const char *path, const char *name, uint64_t *value, uint64_t *size,
+                          const char **why)
+{
+    const char *w = NULL;
+    uint8_t *d;
+    size_t len;
+    uam_status st = read_file(path, &d, &len);
+    if (st != UAM_OK) {
+        if (why)
+            *why = "cannot read the image";
+        return st;
+    }
+    if (len < 64 || memcmp(d, "\177ELF", 4) || (d[4] != 1 && d[4] != 2) || (d[5] != 1 && d[5] != 2)) {
+        w = "the image is no ELF file";
+    } else {
+        const bool is64 = d[4] == 2, be = d[5] == 2;
+        int r = find_symbol(d, len, is64, be, SHT_SYMTAB, name, value, size);
+        if (r == 0)
+            r = find_symbol(d, len, is64, be, SHT_DYNSYM, name, value, size);
+        if (r < 0)
+            w = "the ELF section headers are corrupt";
+        else if (r == 0)
+            w = "no such symbol in the image";
+    }
+    free(d);
+    if (why)
+        *why = w;
+    return w ? UAM_ERR_INVALID : UAM_OK;
+}
+
 uam_status uam_load_file(const char *path, uint8_t **data, size_t *len)
 {
     return read_file(path, data, len);

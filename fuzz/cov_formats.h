@@ -30,7 +30,7 @@
 
 /* ---- coverage scheme ------------------------------------------------------ */
 
-typedef enum { CF_MODEL_SITE, CF_MODEL_PC } cf_model;
+typedef enum { CF_MODEL_SITE, CF_MODEL_PC, CF_MODEL_BLOCK } cf_model;
 
 typedef struct cf_scheme {
     cf_model model;
@@ -47,6 +47,9 @@ uint32_t cf_hash_pc(uint64_t offset, uint8_t module_idx, uint32_t mask);
 /* The default map size for the site-id model with n_sites sites and N-gram length ngram. */
 uint32_t cf_map_size_for(uint64_t n_sites, unsigned ngram);
 #define  CF_PC_MAP_SIZE (1u << 16)
+/* The default map size for block coverage with N-gram length ngram: 64 KiB up to N = 2,
+ * four times as much for each N above, at most 4 MiB. */
+uint32_t cf_block_map_size(unsigned ngram);
 /* The COV operands of one site. `offset` is the site's address minus its module's
  * base, reduced to the target's pointer width. */
 void     cf_site_ab(const cf_scheme *s, uint32_t site_id, uint64_t offset, uint8_t module_idx,
@@ -56,7 +59,7 @@ void     cf_site_ab(const cf_scheme *s, uint32_t site_id, uint64_t offset, uint8
 void     cf_cov_history(const cf_scheme *s, uam_cov_history *h);
 /* The scheme bits of HELLO flags and of the coverage region's header flags. */
 uint32_t cf_scheme_flags(const cf_scheme *s);
-/* "site" / "pc" + N (+ "-rot"), e.g. "site-n2", "pc-n3-rot". */
+/* "site" / "pc" / "block" + N (+ "-rot"), e.g. "site-n2", "pc-n3-rot", "block-n3". */
 const char *cf_scheme_name(const cf_scheme *s);
 
 /* ---- site list ------------------------------------------------------------ */

@@ -587,7 +587,7 @@ static prog xtensa_prog(int n)
 typedef enum { BK_INTERP, BK_JIT, BK_JIT_NOCHAIN } backend;
 static const char *const bk_name[] = { "interp", "jit", "jit-nochain" };
 
-typedef enum { COV_NONE, COV_OFF, COV_SITES, COV_BLOCKS } cov_mode;
+typedef enum { COV_NONE, COV_OFF, COV_SITES, COV_BLOCKS, COV_BLOCKS_EX } cov_mode;
 
 typedef struct run_cfg {
     cov_mode            mode;
@@ -599,6 +599,11 @@ typedef struct run_cfg {
     bool                illegal_at_s3;  /* replace site 3's instruction by an illegal one */
     bool                skip_repeat;    /* uam_cov_state.skip_repeat */
     unsigned            cmp;            /* compare instrumentation: CMP_* */
+    /* COV_BLOCKS_EX: block options, a history shape, a touched list (cap; 0: none) */
+    uam_cov_block_opts  bo;
+    uam_cov_history     hist;
+    uint32_t            touched_cap;
+    unsigned            block_insns;    /* 0: the default */
 } run_cfg;
 
 enum { CMP_ON = 1, CMP_LOG = 2 };   /* CMP_ON alone: attached, not logging */
@@ -613,6 +618,9 @@ typedef struct run_out {
     uam_cmp_entry   log[LOG_MAX];
     size_t          n_log;
     uint64_t        dropped;
+    uint32_t        touched[MAP_SIZE];
+    uint32_t        n_touched;
+    bool            overflow;
 } run_out;
 
 static uam_hook_action stop_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
@@ -649,6 +657,15 @@ static void run_prog(const prog *p, backend bk, const run_cfg *cfg, run_out *out
 
     uam_cov_state cs = { .map = out->map, .mask = MAP_SIZE - 1, .skip_repeat = cfg->skip_repeat,
                          .last_pc = UAM_COV_NO_PC };
+    uam_cov_touched touched = { .idx = out->touched, .cap = cfg->touched_cap };
+    if (cfg->mode == COV_BLOCKS_EX) {
+        uam_cov_state_init(&cs, out->map, MAP_SIZE, &cfg->hist);
+        cs.skip_repeat = cfg->skip_repeat;
+        if (cfg->touched_cap)
+            cs.touched = &touched;
+    }
+    if (cfg->block_insns)
+        m.exec.max_block_insns = cfg->block_insns;
     char err[128];
     switch (cfg->mode) {
     case COV_NONE:
@@ -664,6 +681,9 @@ static void run_prog(const prog *p, backend bk, const run_cfg *cfg, run_out *out
         break;
     case COV_BLOCKS:
         CHECK(uam_exec_set_block_coverage(&m.exec, &cs) == UAM_OK, "block coverage");
+        break;
+    case COV_BLOCKS_EX:
+        CHECK(uam_exec_set_block_coverage_ex(&m.exec, &cs, &cfg->bo) == UAM_OK, "block coverage ex");
         break;
     }
     if (cfg->pass)
@@ -685,6 +705,8 @@ static void run_prog(const prog *p, backend bk, const run_cfg *cfg, run_out *out
         out->n_log = n;
         memcpy(out->log, e, n * sizeof(*e));
     }
+    out->n_touched = touched.n;
+    out->overflow = touched.overflow;
     out->pc = m.cpu.pc;
     out->icount = m.cpu.icount;
     memcpy(out->regs, m.cpu.regfile, m.cpu.regfile_size < 256 ? m.cpu.regfile_size : 256);
@@ -1287,6 +1309,120 @@ static void test_cmp_on(const prog *p)
     uam_cmp_state_destroy(s);
 }
 
+/* Block coverage with options on every ISA and backend: maps agree; the touched list holds
+ * each set bucket once, in first-hit order, and overflows cleanly; with splits, the map
+ * does not depend on where ember cuts blocks; ranges select blocks. */
+static void test_blocks_ex(const prog *p)
+{
+    run_cfg c = { .mode = COV_BLOCKS_EX, .touched_cap = MAP_SIZE, .skip_repeat = true,
+                  .bo = { .mask = MAP_SIZE - 1, .splits = true, .contexts = true },
+                  .hist = { .depth = 2, .rot = { 1, 3 } } };
+    static run_out out[3], one, small;
+    for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++)
+        run_prog(p, (backend)bk, &c, &out[bk]);
+    for (int bk = BK_JIT; bk <= BK_JIT_NOCHAIN; bk++) {
+        CHECK(!memcmp(out[bk].map, out[BK_INTERP].map, MAP_SIZE) && same_state(&out[bk], &out[BK_INTERP]),
+              "%s: block coverage ex: %s agrees with the interpreter", p->name, bk_name[bk]);
+        CHECK(out[bk].n_touched == out[BK_INTERP].n_touched
+              && !memcmp(out[bk].touched, out[BK_INTERP].touched, 4 * out[bk].n_touched),
+              "%s: %s records the same buckets in the same order", p->name, bk_name[bk]);
+    }
+    const run_out *o = &out[BK_INTERP];
+    unsigned nz = map_nonzero(o->map);
+    bool once = !o->overflow && o->n_touched == nz && nz > 0;
+    for (uint32_t i = 0; once && i < o->n_touched; i++) {
+        once &= o->map[o->touched[i]] != 0;
+        for (uint32_t k = 0; once && k < i; k++)
+            once &= o->touched[k] != o->touched[i];
+    }
+    CHECK(once, "%s: the touched list is the set buckets, once each (%u of %u)", p->name,
+          o->n_touched, nz);
+    /* A full list: the first entries, then overflow (inline JIT code included). */
+    run_cfg full = c;
+    full.touched_cap = 2;
+    for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++) {
+        run_prog(p, (backend)bk, &full, &small);
+        CHECK(small.n_touched == (nz < 2 ? nz : 2) && small.overflow == (nz > 2)
+              && !memcmp(small.touched, o->touched, 4 * small.n_touched)
+              && !memcmp(small.map, o->map, MAP_SIZE),
+              "%s: %s: a full touched list overflows (n %u, overflow %d)", p->name, bk_name[bk],
+              small.n_touched, small.overflow);
+    }
+    /* One instruction per block (two where a branch has a delay slot: they cannot be
+     * apart): with splits, the same map. */
+    run_cfg cut = c;
+    cut.block_insns = strstr(p->name, "mips") ? 2 : 1;
+    for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++) {
+        run_prog(p, (backend)bk, &cut, &one);
+        CHECK(!memcmp(one.map, o->map, MAP_SIZE) && same_state(&one, o),
+              "%s: %s: one instruction per block, the same map (%u vs %u buckets)", p->name,
+              bk_name[bk], map_nonzero(one.map), nz);
+    }
+    /* Ranges: none matching, nothing counts; one holding the program, all of it. */
+    uam_cov_range none = { 0x7f000000, 0x7f001000 }, all = { p->base & ~1ull, p->done + 64 };
+    run_cfg r = c;
+    r.bo.ranges = &none;
+    r.bo.n_ranges = 1;
+    run_prog(p, BK_JIT, &r, &one);
+    CHECK(map_nonzero(one.map) == 0 && same_state(&one, o), "%s: a range elsewhere: no count", p->name);
+    r.bo.ranges = &all;
+    run_prog(p, BK_JIT, &r, &one);
+    CHECK(!memcmp(one.map, o->map, MAP_SIZE), "%s: a range around the program: every count", p->name);
+}
+
+/* The contexts' semantics on a state alone (uam_cov_count_slow, cpu.h's uam_cov_irq_ctx). */
+static void test_contexts(void)
+{
+    static uint8_t map[MAP_SIZE], ref[MAP_SIZE];
+    uam_cov_history h = { .depth = 2 };
+    uam_cov_state s, r;
+    uam_cov_state_init(&s, map, MAP_SIZE, &h);
+    uam_cov_state_init(&r, ref, MAP_SIZE, &h);
+    s.contexts = true;
+    /* A, B, [interrupt before C: handler H1 H2], C: C counts with A,B's history, H with none. */
+    uam_cov_count(&s, 0x10, 1, 11);
+    uam_cov_count(&s, 0x20, 2, 22);
+    uam_cov_irq_enter(&s, 0x30);
+    CHECK(s.pending && s.hist[0] == 0 && s.hist[1] == 0, "irq enter: an empty history, pending");
+    uam_cov_count_slow(&s, 0x900, 9, 99);
+    uam_cov_count_slow(&s, 0x910, 8, 88);
+    uam_cov_count_slow(&s, 0x30, 3, 33);
+    CHECK(!s.pending && s.n_irq == 0, "back at the resume pc: the context is gone");
+    /* the same without the interrupt, plus the handler alone */
+    uam_cov_count(&r, 0x10, 1, 11);
+    uam_cov_count(&r, 0x20, 2, 22);
+    uam_cov_count(&r, 0x30, 3, 33);
+    uam_cov_reset_prev(&r);
+    uam_cov_count(&r, 0x900, 9, 99);
+    uam_cov_count(&r, 0x910, 8, 88);
+    CHECK(!memcmp(map, ref, MAP_SIZE), "an interrupt neither adds to nor changes the "
+          "interrupted code's buckets");
+    /* A resume skipped; a skip abandoned when the hart goes elsewhere. */
+    memset(map, 0, sizeof(map));
+    uam_cov_reset_prev(&s);
+    uam_cov_skip_at(&s, 0x40);
+    uam_cov_count_slow(&s, 0x40, 4, 44);
+    CHECK(map_nonzero(map) == 0 && !s.pending, "the resumed block does not count");
+    uam_cov_skip_at(&s, 0x50);
+    uam_cov_count_slow(&s, 0x60, 6, 66);
+    CHECK(map_nonzero(map) == 1 && !s.pending && s.skip_pc == UAM_COV_NO_PC,
+          "a skip for another pc is dropped, and that block counts");
+    /* A resume interrupted before it ran: the skip comes back with the context. */
+    memset(map, 0, sizeof(map));
+    uam_cov_skip_at(&s, 0x70);
+    uam_cov_irq_enter(&s, 0x70);
+    uam_cov_count_slow(&s, 0x900, 9, 99);
+    uam_cov_count_slow(&s, 0x70, 7, 77);
+    CHECK(map_nonzero(map) == 1 && !s.pending, "an interrupted resume still does not count");
+    /* More contexts than room: the oldest go, the newest restore. */
+    uam_cov_reset_prev(&s);
+    for (unsigned i = 0; i < UAM_COV_IRQ_MAX + 3; i++)
+        uam_cov_irq_enter(&s, 0x1000 + i);
+    CHECK(s.n_irq == UAM_COV_IRQ_MAX && s.irq[0].resume_pc == 0x1003, "the oldest contexts dropped");
+    uam_cov_reset_prev(&s);
+    CHECK(!s.n_irq && !s.pending && s.skip_pc == UAM_COV_NO_PC, "reset_prev clears the contexts");
+}
+
 int main(void)
 {
     test_ir_rules();
@@ -1311,7 +1447,9 @@ int main(void)
         test_passes(&progs3[i]);
         test_exc_hook(&progs3[i]);
         test_cmp_on(&progs3[i]);
+        test_blocks_ex(&progs300[i]);
     }
+    test_contexts();
 
     printf("test_cov: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;

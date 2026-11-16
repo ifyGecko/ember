@@ -148,9 +148,11 @@ typedef enum uam_fence_kind {
     UAM_FENCE_ACQ, UAM_FENCE_REL, UAM_FENCE_FULL, UAM_FENCE_INSN,
 } uam_fence_kind;
 
-/* EXIT kinds: analysis hints only (section 7.3). */
+/* EXIT kinds: analysis hints only (section 7.3). RETRY: no guest control transfer, but
+ * the block sending the hart back to run its own code another way (Xtensa's loop-end
+ * check stepping instead); block coverage does not take it for a branch. */
 typedef enum uam_exit_kind {
-    UAM_EXIT_JUMP, UAM_EXIT_CALL, UAM_EXIT_RET, UAM_EXIT_EXC_RETURN,
+    UAM_EXIT_JUMP, UAM_EXIT_CALL, UAM_EXIT_RET, UAM_EXIT_EXC_RETURN, UAM_EXIT_RETRY,
 } uam_exit_kind;
 
 /*
@@ -165,6 +167,16 @@ typedef enum uam_exit_kind {
  * fault precision and still advances icount.
  */
 #define UAM_IMARK_CONT 0x1u
+
+/*
+ * COV flags (the `flags` field on a COV instruction; docs/uam-isa.md section 7.5).
+ *
+ * UAM_COV_SPLIT marks no count but the end of a block cut by a limit: operand a is the
+ * pc of the next instruction (any width), and the COV that comes next, if at that pc,
+ * does not count (uam_cov_skip_at, exec.h). It stands right before the block's final
+ * EXIT, or before the fences that must directly precede it. b is 0.
+ */
+#define UAM_COV_SPLIT 0x1u
 
 /*
  * UAM_IMARK_BREAK asks the executor to stop *before* this instruction, as if

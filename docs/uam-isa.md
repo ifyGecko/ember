@@ -285,7 +285,7 @@ Comparisons and flag ops take W-bit operands and produce a 1-bit result.
 | `HELPER` | `[g] dst = HELPER a,b,c {aux=id}` | Call a native function registered by an ISA module or analysis pass (§7.4). |
 | `TRAP` | `[g] TRAP cause, tval {aux=class}` | Raise a synchronous event. Ends the block. Classes: `EXCEPTION` (guest exception, passed to `isa->take_exception` in a `uam_exception` with an ISA-defined `cause`), `DEBUG` (stop into the emulator's debugger, not the guest), `HALT` (stop emulation, e.g. semihosting exit). |
 | `WAIT` | `WAIT next_pc` | The hart idles until `isa->irq_wakeup` is true (an interrupt pending and enabled, whether or not interrupts are globally on). The scheduler may fast-forward virtual time to the next event, and execution resumes at `next_pc`. Terminator. |
-| `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, a temporary target an *indirect* one; the JIT may chain both. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN` are hints for analysis (call graphs, shadow stacks) and do not change semantics. |
+| `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, a temporary target an *indirect* one; the JIT may chain both. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN`, `RETRY` are hints for analysis (call graphs, shadow stacks) and do not change semantics; `RETRY` marks an exit that sends the hart back to run the block's own code another way (Xtensa's loop-end check), not a guest branch. |
 
 ### 7.4 Helpers
 
@@ -346,6 +346,25 @@ inserts it directly after the `IMARK` of an instrumented instruction (§8 rule 8
 exactly once each time that instruction starts, including when a block is interrupted and
 resumed.
 
+**Touched buckets.** A state with a `touched` list (`uam_cov_touched`) also records each
+index whose byte goes from 0 to 1 (`idx[n++] = idx` while `n < cap`, else `overflow = 1`),
+so that a fuzzer reads and clears the map in time proportional to what an iteration set.
+
+**Block contexts.** Block coverage with contexts (`uam_exec_set_block_coverage_ex`) adds
+two rare cases, behind one byte, `pending`: when it is set, `COV` runs
+`uam_cov_count_slow` instead of the rule above. A block that resumes mid-way (the hart
+stopped inside a block: a timer came due, a hook) sets `skip_pc` to its pc, and that
+`COV` does not count. An interrupt taken where a covered block is next saves the history
+(`uam_cov_irq_ctx`) and starts the handler with an empty one; the first `COV` back at the
+interrupted pc restores it (and does not count if that block was itself a resume). So
+where an interrupt lands changes neither the interrupted code's buckets nor the
+handler's. `COV` with the flag `UAM_COV_SPLIT` counts nothing: its `A` is the pc of the
+next instruction, which it puts in `skip_pc`. The block-coverage pass puts one at the end
+of a block that ends only because ember cut it (its length, a page end, an unfetchable next
+instruction), so that the block after it does not count: a basic block counts once
+however ember had to split it. A split `COV` stands right before the block's final `EXIT`,
+or before the fences that must directly precede it.
+
 ### 7.6 Compare records
 
 `CMPLOG.W a, b` (W = 8, 16, 32 or 64; `aux` = a site id, `flags` = what was compared:
@@ -386,7 +405,9 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
 7. **Length.** At most `max_block_insns` guest instructions per block (default 32,
    `--block-insns`), which bounds interrupt latency.
 8. **Coverage op.** `COV` has width 32, two immediate operands and no guard, and comes
-   directly after an `IMARK` that is not a continuation (`UAM_IMARK_CONT`).
+   directly after an `IMARK` that is not a continuation (`UAM_IMARK_CONT`); with
+   `UAM_COV_SPLIT` (its only flag) it comes instead right before the final `EXIT`, only
+   fences between.
 9. **`IMARK` shape.** Its pc is an immediate of address width, its length is non-zero, its only
    flags are `CONT` and `BREAK`, and a `CONT` mark cannot start a block. `n_guest` equals the
    number of `IMARK`s.

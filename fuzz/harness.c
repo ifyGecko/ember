@@ -62,6 +62,7 @@ struct uam_fuzz {
     size_t         n_begin_pcs;
     uint8_t       *map;
     uint32_t      *hits;           /* uam_fuzz_map_hits: the set buckets of the published map */
+    uam_cov_touched touched;       /* buckets the coverage op set first since the last clear */
     size_t         n_hits, cap_hits;
     bool           hits_valid;     /* hits lists every set bucket: the next clear uses it */
     uam_cov_state  cov;
@@ -113,6 +114,8 @@ struct uam_fuzz {
 };
 
 static void clear_map(uam_fuzz *f);
+
+#define TOUCHED_CAP 65536u   /* buckets recorded per iteration before the map is read */
 
 static void mem_disarm(mem_route *r, uam_machine *m);
 
@@ -382,6 +385,14 @@ uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err,
     f->cfg.n_more_begin_pcs = f->n_begin_pcs - 1;
     uam_cov_state_init(&f->cov, f->map, map_size, &cfg->history);
     f->cov.skip_repeat = cfg->skip_repeats;
+    f->touched.cap = map_size < TOUCHED_CAP ? map_size : TOUCHED_CAP;
+    f->touched.idx = malloc(sizeof(uint32_t) * f->touched.cap);
+    if (!f->touched.idx) {
+        uam_fuzz_destroy(f);
+        set_err(err, errlen, "out of memory");
+        return NULL;
+    }
+    f->cov.touched = &f->touched;
     f->ncpus = uam_machine_ncpus(m);
     f->snap_last_pc = malloc(sizeof(uint64_t) * f->ncpus);
     if (!f->snap_last_pc) {
@@ -452,6 +463,7 @@ void uam_fuzz_destroy(uam_fuzz *f)
     free(f->begin_pcs);
     free(f->marker);
     free(f->hits);
+    free(f->touched.idx);
     free(f->map);
     free(f);
 }
@@ -521,6 +533,20 @@ uam_status uam_fuzz_set_block_coverage(uam_fuzz *f)
     uam_status st = uam_machine_set_block_coverage(f->m, &f->cov);
     f->has_cov = st == UAM_OK;
     name_scheme(f, f->has_cov ? "blocks" : "none");
+    return st;
+}
+
+uam_status uam_fuzz_set_block_coverage_ex(uam_fuzz *f, const uam_cov_block_opts *o,
+                                          const char *scheme)
+{
+    if (f->booted)
+        return UAM_ERR_INVALID;
+    uam_cov_block_opts opts = *o;
+    if (!opts.mask)
+        opts.mask = f->cfg.map_size - 1;
+    uam_status st = uam_machine_set_block_coverage_ex(f->m, &f->cov, &opts);
+    f->has_cov = st == UAM_OK;
+    name_scheme(f, f->has_cov ? (scheme ? scheme : "blocks") : "none");
     return st;
 }
 
@@ -1148,13 +1174,24 @@ uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx)
  * when that list is complete (a sparse map), else all of it. */
 static void clear_map(uam_fuzz *f)
 {
-    if (f->hits_valid) {
+    if (!f->touched.overflow) {
+        for (size_t i = 0; i < f->touched.n; i++)
+            f->map[f->touched.idx[i]] = 0;
+    } else if (f->hits_valid) {
         for (size_t i = 0; i < f->n_hits; i++)
             f->map[f->hits[i]] = 0;
     } else {
         memset(f->map, 0, f->cfg.map_size);
     }
     f->hits_valid = false;
+    f->touched.n = 0;
+    f->touched.overflow = false;
+}
+
+static int u32_cmp(const void *x, const void *y)
+{
+    uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
+    return a < b ? -1 : a > b;
 }
 
 const uint32_t *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n)
@@ -1168,6 +1205,17 @@ const uint32_t *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n)
             return NULL;
         f->hits = nh;
         f->cap_hits = max;
+    }
+    if (!f->touched.overflow) {
+        /* What the coverage op recorded: every bucket set since the clear, once each. */
+        if (f->touched.n > max)
+            return NULL;
+        memcpy(f->hits, f->touched.idx, sizeof(uint32_t) * f->touched.n);
+        qsort(f->hits, f->touched.n, sizeof(uint32_t), u32_cmp);
+        f->n_hits = f->touched.n;
+        f->hits_valid = true;
+        *n = f->n_hits;
+        return f->hits;
     }
     size_t k = 0;
     const size_t size = f->cfg.map_size;   /* a power of two */

@@ -72,6 +72,35 @@ typedef struct uam_cov_history {
  */
 #define UAM_COV_NO_PC UINT64_MAX
 
+/*
+ * Buckets an iteration touched: every index whose map byte went from 0 to 1, in the
+ * order first hit, so that a fuzzer reads and clears the map in O(buckets touched)
+ * instead of O(map size). Shared by the processors of a machine (one map). Past `cap`
+ * entries `overflow` is set and the list stops growing: read the whole map then. The
+ * owner empties it (n = 0, overflow = false) whenever it clears the map.
+ */
+typedef struct uam_cov_touched {
+    uint32_t *idx;
+    uint32_t  n, cap;
+    bool      overflow;
+} uam_cov_touched;
+
+/*
+ * Block coverage's contexts (uam_exec_set_block_coverage_ex, exec.h). An interrupt
+ * taken while a covered block is the next to run saves the history here and starts
+ * the handler with an empty one; the first COV back at `resume_pc` restores it, so
+ * where an interrupt happened to land does not leak into the interrupted code's
+ * buckets, nor the interrupted code into the handler's.
+ */
+#define UAM_COV_IRQ_MAX 8u
+
+typedef struct uam_cov_irq_ctx {
+    uint64_t resume_pc;
+    uint64_t last_pc;
+    uint64_t skip_pc;
+    uint32_t hist[UAM_COV_HIST_MAX];
+} uam_cov_irq_ctx;
+
 typedef struct uam_cov_state {
     uint8_t  *map;
     uint32_t  mask;
@@ -84,6 +113,15 @@ typedef struct uam_cov_state {
     };
     bool      skip_repeat;
     uint64_t  last_pc;                /* with skip_repeat: the site that counted last */
+    /* Block coverage's contexts (see uam_cov_irq_ctx). `pending` is nonzero while
+     * skip_pc or an interrupt context is set: the next COV then goes through
+     * uam_cov_count_slow (exec.h), every other one through uam_cov_count. */
+    uint8_t   pending;
+    bool      contexts;               /* resumes and interrupts are handled */
+    uint8_t   n_irq;
+    uint64_t  skip_pc;                /* the next COV, if at this pc, does not count */
+    uam_cov_irq_ctx irq[UAM_COV_IRQ_MAX];
+    uam_cov_touched *touched;         /* optional */
 } uam_cov_state;
 
 /* A state for a map of `map_size` bytes (a power of two) and the history shape `h`
@@ -91,7 +129,8 @@ typedef struct uam_cov_state {
 static inline void uam_cov_state_init(uam_cov_state *s, uint8_t *map, uint32_t map_size,
                                       const uam_cov_history *h)
 {
-    *s = (uam_cov_state){ .map = map, .mask = map_size - 1, .last_pc = UAM_COV_NO_PC };
+    *s = (uam_cov_state){ .map = map, .mask = map_size - 1, .last_pc = UAM_COV_NO_PC,
+                          .skip_pc = UAM_COV_NO_PC };
     while (s->bits < 32 && (UINT64_C(1) << s->bits) < map_size)
         s->bits++;
     if (h) {
@@ -101,11 +140,22 @@ static inline void uam_cov_state_init(uam_cov_state *s, uint8_t *map, uint32_t m
     }
 }
 
-/* Forget the history, e.g. at the start of a fuzz iteration. */
+/* Forget the history and the block contexts, e.g. at the start of a fuzz iteration. */
 static inline void uam_cov_reset_prev(uam_cov_state *s)
 {
     for (unsigned j = 0; j < UAM_COV_HIST_MAX; j++)
         s->hist[j] = 0;
+    s->pending = 0;
+    s->n_irq = 0;
+    s->skip_pc = UAM_COV_NO_PC;
+}
+
+static inline void uam_cov_touch(uam_cov_touched *t, uint32_t idx)
+{
+    if (t->n < t->cap)
+        t->idx[t->n++] = idx;
+    else
+        t->overflow = true;
 }
 
 /* One UAM_OP_COV A, B at guest pc `pc`: the reference the interpreter runs and the JIT
@@ -124,8 +174,12 @@ static inline void uam_cov_count(uam_cov_state *s, uint64_t pc, uint32_t a, uint
         idx ^= r ? ((v << r) | (v >> (s->bits - r))) & s->mask : v;
     }
     idx &= s->mask;
-    if (s->map[idx] != 0xff)
-        s->map[idx]++;
+    const uint8_t v = s->map[idx];
+    if (v != 0xff) {
+        s->map[idx] = (uint8_t)(v + 1);
+        if (!v && s->touched)
+            uam_cov_touch(s->touched, idx);
+    }
     for (uint32_t j = d - 1; j > 0; j--)
         s->hist[j] = s->hist[j - 1];
     s->hist[0] = b;

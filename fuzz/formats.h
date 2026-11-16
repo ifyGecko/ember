@@ -133,12 +133,13 @@ _Static_assert(sizeof(struct uam_bounds_record) == 16, "boundary record is 16 by
 #define UAM_COV_REGION_VERSION 1u
 
 /* header.flags: the coverage scheme the bucket indices follow. SCHEME says the other
- * bits are valid (clear: block coverage, no scheme); MODEL_PC = hashed-pc model (clear:
- * site ids); ROTATE = N-gram rotation; bits 8..11 = N. The fuzz protocol's HELLO flags
- * are the same bits. */
+ * bits are valid (clear: plain block coverage, no scheme); MODEL_PC = hashed-pc model,
+ * MODEL_BLOCK = ember's blocks, no site list (neither: site ids); ROTATE = N-gram
+ * rotation; bits 8..11 = N. The fuzz protocol's HELLO flags are the same bits. */
 #define UAM_COV_SCHEME          (1u << 0)
 #define UAM_COV_SCHEME_PC       (1u << 1)
 #define UAM_COV_SCHEME_ROTATE   (1u << 2)
+#define UAM_COV_SCHEME_BLOCK    (1u << 3)
 #define UAM_COV_NGRAM_SHIFT     8
 #define UAM_COV_NGRAM_MASK      (0xfu << UAM_COV_NGRAM_SHIFT)
 

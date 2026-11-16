@@ -121,7 +121,7 @@ ring_offset      ring_size slots of slot_stride bytes: slot header (24 bytes) + 
 | 6 | ring_size | u16 | slots, 2..65535 |
 | 8 | map_size | u32 | a power of two |
 | 12 | slot_stride | u32 | 24 + map_size |
-| 16 | flags | u32 | the coverage scheme: bit 0 `SCHEME` (the other bits are valid; clear for block coverage), bit 1 `PC` (hashed-pc model), bit 2 `ROTATE`, bits 8..11 N |
+| 16 | flags | u32 | the coverage scheme: bit 0 `SCHEME` (the other bits are valid; clear for plain block edges, which have no scheme), bit 1 `PC` (hashed-pc model), bit 2 `ROTATE`, bit 3 `BLOCK` (block model), bits 8..11 N |
 | 20 | reserved | u32 | 0 |
 | 24 | gen_current | u64 | atomic: the highest generation assigned |
 | 32 | gen_init | u64 | the INIT snapshot's generation (0: none yet) |
@@ -166,7 +166,7 @@ Every integer is big-endian, and maps are raw u8 counters.
 
 | Type | Direction | Payload |
 |---|---|---|
-| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits; bit 13: mutation in ember is understood (MUTATOR, CORPUS, HAVOC); bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
+| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits, bit 3 the block model; bit 13: mutation in ember is understood (MUTATOR, CORPUS, HAVOC); bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
 | 2 INPUT | brain → ember | u64 id (non-zero), u32 len, data |
 | 3 COVERAGE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u32 map_size, map |
 | 4 CRASH | ember → brain | u64 id, u8 reason, u32 status |
@@ -270,6 +270,9 @@ mix(v):  v ^= v >> 33;  v *= 0xff51afd7ed558ccd;  v ^= v >> 33
 site model, site id s:        cur = s;   win = mix(s) & mask
 pc model, offset off in m:    cur = mix(off ^ (m * 0x9E3779B97F4A7C15)) & mask;   win = cur
                               (off = pc − base[m], reduced to the address width)
+block model, block at pc:     cur = mix(pc) & mask (low 32 bits);   win = cur
+                              (a site at every block start ember counts: fuzzing.md,
+                              "Block coverage"; no list, no modules)
 
 idx = cur
 if N ≥ 2: for j in 0..W−1: idx ^= rotate ? rot(prev[j], j) : prev[j]
@@ -281,7 +284,8 @@ if N ≥ 2: prev[W−1..1] = prev[W−2..0];  prev[0] = site model ? win : win >
 rotates by `r = 1 + j × step` (if `r ≥ bits`, `r = 1 + r mod (bits − 1)`), within the map
 width. So the order of sites changes the bucket.
 
-**Map size.** The pc model uses 64 KiB. The site model sizes the map from the site count *n*:
+**Map size.** The pc model uses 64 KiB, the block model 64 KiB for N ≤ 2 and four times as
+much for each N above (at most 4 MiB). The site model sizes the map from the site count *n*:
 `F = 2` for N = 1, `16 << (N − 2)` otherwise; `size = min(next_pow2(max(n,1) × F), 2^24)`,
 then at least 4 KiB and at least `next_pow2(n)`, so every site id has its own bucket.
 No map is larger than 2 GiB. `--cov-map-size` overrides the rule. HELLO and the region

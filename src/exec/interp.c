@@ -205,7 +205,14 @@ uam_block_result uam_interp_block(uam_cpu *cpu, const uam_block *blk,
         case UAM_OP_COV: {
             /* Edge counter (section 7.5); no effect on guest state or icount. */
             uam_cov_state *cs = cpu->cov;
-            if (cs)
+            if (!cs)
+                break;
+            if (in->flags & UAM_COV_SPLIT)
+                uam_cov_skip_at(cs, blk->imm[uam_ref_index(in->a)]);
+            else if (cs->pending)
+                uam_cov_count_slow(cs, pos.pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
+                                   (uint32_t)blk->imm[uam_ref_index(in->b)]);
+            else
                 uam_cov_count(cs, pos.pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
                               (uint32_t)blk->imm[uam_ref_index(in->b)]);
             break;

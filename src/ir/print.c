@@ -7,7 +7,7 @@ static const char *const amo_names[] = {
     "xchg", "add", "and", "or", "xor", "smin", "smax", "umin", "umax",
 };
 static const char *const fence_names[] = { "acq", "rel", "full", "insn" };
-static const char *const exit_names[]  = { "jump", "call", "ret", "exc_return" };
+static const char *const exit_names[]  = { "jump", "call", "ret", "exc_return", "retry" };
 static const char *const trap_names[]  = { "exception", "debug", "halt" };
 
 static void print_ref(FILE *out, const uam_block *blk, uam_ref r)
@@ -106,7 +106,7 @@ void uam_print_insn(FILE *out, const uam_block *blk, const uam_insn *in, const u
         fprintf(out, " {%s}", in->aux < 4 ? fence_names[in->aux] : "?");
         break;
     case UAM_OP_EXIT:
-        fprintf(out, " {%s}", in->aux < 4 ? exit_names[in->aux] : "?");
+        fprintf(out, " {%s}", in->aux < 5 ? exit_names[in->aux] : "?");
         break;
     case UAM_OP_TRAP:
         fprintf(out, " {%s}", in->aux < 3 ? trap_names[in->aux] : "?");

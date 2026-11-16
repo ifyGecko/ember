@@ -618,6 +618,12 @@ static void emit_site(uam_jit *j)
  * shifts. skip_repeat adds a compare of last_pc with the instruction's pc. Clobbers
  * rax, rcx, rdx, r11 (scratch between ops).
  */
+/*
+ * With block contexts (cs->contexts), a COV first tests cs->pending and, when it is set,
+ * calls uam_cov_count_slow instead (a resume or split to skip, an interrupt context to
+ * restore). With a touched list (cs->touched), a bucket whose byte went from 0 to 1 is
+ * appended to it inline: cmp the byte with 1, then n < cap ? idx[n++] = eax : overflow.
+ */
 static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
 {
     const uam_cov_state *cs = j->x->cpu->cov;
@@ -625,6 +631,11 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
     ld_mem(j, RCX, R14, CPU(cov));                         /* rcx = cpu->cov */
     rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RCX, RCX); /* test rcx, rcx */
     size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    size_t slow = 0;
+    if (cs && cs->contexts) {
+        g8(j, 0x80); modrm_mem(j, 7, RCX, COV(pending)); g8(j, 0); /* cmp byte [pending], 0 */
+        slow = jcc_fwd(j, 0x85);                           /* jne slow */
+    }
     size_t rep = 0;
     if (cs && cs->skip_repeat) {
         mov_imm(j, RAX, pc);                                /* rax = pc */
@@ -655,14 +666,57 @@ static void emit_cov(uam_jit *j, uint64_t pc, uint32_t a, uint32_t b)
     ld_mem(j, RDX, RCX, COV(map));                         /* rdx = map */
     g8(j, 0x80); modrm_sib(j, 0, RDX, RAX, 0, 0); g8(j, 1);  /* add byte [rdx+rax], 1 */
     g8(j, 0x80); modrm_sib(j, 3, RDX, RAX, 0, 0); g8(j, 0);  /* sbb byte [rdx+rax], 0: saturate */
+    if (cs && cs->touched) {
+        g8(j, 0x80); modrm_sib(j, 7, RDX, RAX, 0, 0); g8(j, 1);  /* cmp byte [rdx+rax], 1 */
+        size_t t1 = jcc_fwd(j, 0x85);                      /* jne: not a new bucket */
+        ld_mem(j, RDX, RCX, COV(touched));                 /* rdx = touched */
+        rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RDX, RDX); /* test rdx, rdx */
+        size_t t2 = jcc_fwd(j, 0x84);                      /* jz */
+        rex(j, 0, 1, 0, 0); g8(j, 0x8B); modrm_mem(j, R11, RDX, TOUCH(n));   /* r11d = n */
+        rex(j, 0, 1, 0, 0); g8(j, 0x3B); modrm_mem(j, R11, RDX, TOUCH(cap)); /* cmp r11d, cap */
+        size_t t3 = jcc_fwd(j, 0x83);                      /* jae: full */
+        g8(j, 0xFF); modrm_mem(j, 0, RDX, TOUCH(n));       /* inc dword [n] */
+        ld_mem(j, RDX, RDX, TOUCH(idx));                   /* rdx = idx */
+        rex(j, 0, 0, 1, 0); g8(j, 0x89); modrm_sib(j, RAX, RDX, R11, 2, 0); /* [rdx+r11*4] = eax */
+        size_t t4 = jmp_fwd(j);
+        patch(j, t3);
+        g8(j, 0xC6); modrm_mem(j, 0, RDX, TOUCH(overflow)); g8(j, 1); /* overflow = 1 */
+        patch(j, t1);
+        patch(j, t2);
+        patch(j, t4);
+    }
     for (uint32_t k = d - 1; k > 0; k--) {                 /* hist[k] = hist[k-1] */
         g8(j, 0x8B); modrm_mem(j, RDX, RCX, COV(hist) + 4 * (int32_t)(k - 1));
         g8(j, 0x89); modrm_mem(j, RDX, RCX, COV(hist) + 4 * (int32_t)k);
     }
     g8(j, 0xC7); modrm_mem(j, 0, RCX, COV(prev)); g32(j, b); /* hist[0] = B */
+    if (slow) {
+        size_t done = jmp_fwd(j);
+        patch(j, slow);                                    /* slow: uam_cov_count_slow */
+        jit_ra_save(j, false);
+        ld_mem(j, RDI, R14, CPU(cov));
+        mov_imm(j, RSI, pc);
+        mov_imm(j, RDX, a);
+        mov_imm(j, RCX, b);
+        call_bridge(j, uam_cov_count_slow);
+        jit_ra_save(j, true);
+        patch(j, done);
+    }
     patch(j, off);
     if (rep)
         patch(j, rep);
+}
+
+/* COV with UAM_COV_SPLIT: cs->skip_pc = next, cs->pending = 1 (uam_cov_skip_at). */
+static void emit_cov_split(uam_jit *j, uint64_t next)
+{
+    ld_mem(j, RCX, R14, CPU(cov));                         /* rcx = cpu->cov */
+    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RCX, RCX); /* test rcx, rcx */
+    size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    mov_imm(j, RAX, next);
+    st_mem(j, RAX, RCX, COV(skip_pc));
+    g8(j, 0xC6); modrm_mem(j, 0, RCX, COV(pending)); g8(j, 1);
+    patch(j, off);
 }
 
 /*
@@ -1607,8 +1661,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             epi[n_epi++] = jmp_fwd(j);
             break;
         case UAM_OP_COV:
-            emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
-                     (uint32_t)blk->imm[uam_ref_index(in->b)]);
+            if (in->flags & UAM_COV_SPLIT)
+                emit_cov_split(j, blk->imm[uam_ref_index(in->a)]);
+            else
+                emit_cov(j, imark_pc, (uint32_t)blk->imm[uam_ref_index(in->a)],
+                         (uint32_t)blk->imm[uam_ref_index(in->b)]);
             break;
         case UAM_OP_CMPLOG:
             emit_cmplog(j, blk, in);

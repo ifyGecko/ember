@@ -9,7 +9,7 @@ map file (`--cov-out`) is not a region.
 
   python3 fuzz/tools/cov_region.py header  REGION         every header field
   python3 fuzz/tools/cov_region.py gen     REGION         gen_current
-  python3 fuzz/tools/cov_region.py scheme  REGION         "n=<N> model=site|pc rotate=0|1"
+  python3 fuzz/tools/cov_region.py scheme  REGION         "n=<N> model=site|pc|block rotate=0|1"
                                                           ("blocks": no scheme)
   python3 fuzz/tools/cov_region.py stats   REGION [WHICH] "<nonzero> <sum> <max>"
   python3 fuzz/tools/cov_region.py extract REGION OUT [WHICH]   write a map to OUT
@@ -36,7 +36,7 @@ HEADER_LEN = 64
 SLOT_HDR_LEN = 24
 SLOT_TRIES = 100
 
-SCHEME, SCHEME_PC, SCHEME_ROTATE = 1 << 0, 1 << 1, 1 << 2
+SCHEME, SCHEME_PC, SCHEME_ROTATE, SCHEME_BLOCK = 1 << 0, 1 << 1, 1 << 2, 1 << 3
 NGRAM_SHIFT, NGRAM_MASK = 8, 0xf << 8
 
 # magic, version, ring_size, map_size, slot_stride, flags, reserved0,
@@ -93,7 +93,7 @@ class Region:
             return "blocks"
         return "n=%d model=%s rotate=%d" % (
             (flags & NGRAM_MASK) >> NGRAM_SHIFT,
-            "pc" if flags & SCHEME_PC else "site",
+            "block" if flags & SCHEME_BLOCK else "pc" if flags & SCHEME_PC else "site",
             1 if flags & SCHEME_ROTATE else 0)
 
     def bitmap(self):

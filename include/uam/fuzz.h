@@ -167,6 +167,10 @@ void       uam_fuzz_destroy(uam_fuzz *f);
 uam_status uam_fuzz_set_sites(uam_fuzz *f, const uam_cov_site *sites, size_t n,
                               const char *scheme, char *err, size_t errlen);
 uam_status uam_fuzz_set_block_coverage(uam_fuzz *f);
+/* Block coverage with options (cov.h; o->mask 0: the map's), named `scheme` for
+ * frontends ("blocks" if NULL). The history shape is uam_fuzz_config.history. */
+uam_status uam_fuzz_set_block_coverage_ex(uam_fuzz *f, const uam_cov_block_opts *o,
+                                          const char *scheme);
 
 /*
  * Input routes. Built in, by spec string:
@@ -224,9 +228,10 @@ uam_status uam_fuzz_run(uam_fuzz *f, const uam_fuzz_frontend *fe, void *ctx);
 const uint8_t         *uam_fuzz_map(const uam_fuzz *f, size_t *size);
 /* The buckets the map just published set (non-zero), as ascending indices; NULL when more
  * than max are set (send the whole map then) or on an allocation failure. The list is the
- * harness's, valid until the next iteration starts. Asking for it also lets that iteration
- * clear only those buckets instead of the whole map: for a big, sparse map, the cost of an
- * iteration then follows what it touched, not the map size. */
+ * harness's, valid until the next iteration starts. The coverage op records each bucket
+ * it sets first (uam_cov_touched, cpu.h), so the list costs O(buckets set), not O(map
+ * size), unless an iteration sets more than the record holds (65536); then the map is
+ * read. Asking for it also lets that iteration clear only those buckets. */
 const uint32_t        *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n);
 const uam_fuzz_result *uam_fuzz_last_result(const uam_fuzz *f);
 

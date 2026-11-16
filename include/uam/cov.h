@@ -43,6 +43,35 @@ uam_status uam_cov_pass_create(const uam_cov_site *sites, size_t n, uam_cov_pass
  */
 uam_status uam_cov_pass_create_blocks(uam_cov_pass **out);
 
+/* A guest pc range [lo, hi). */
+typedef struct uam_cov_range {
+    uint64_t lo, hi;
+} uam_cov_range;
+
+/*
+ * Block mode with options. mask (the map's size - 1; 0: the plain block mode above):
+ * A = uam_cov_block_hash(pc) & mask, B = A >> 1. ranges (copied; none: everywhere): only
+ * blocks that start inside one get a COV, so code outside them (other tasks, a C
+ * library, the scheduler) neither counts nor enters the history. splits: a block that
+ * ends only because of a limit (its length, a page end, an unfetchable next
+ * instruction) ends with a COV marked UAM_COV_SPLIT, which makes the COV of the block
+ * at its next instruction not count: an ember block then stands for the whole basic
+ * block, wherever ember had to cut it. contexts: see uam_exec_set_block_coverage_ex
+ * (exec.h).
+ */
+typedef struct uam_cov_block_opts {
+    uint32_t             mask;
+    const uam_cov_range *ranges;
+    size_t               n_ranges;
+    bool                 splits;
+    bool                 contexts;
+} uam_cov_block_opts;
+
+uam_status uam_cov_pass_create_blocks_ex(const uam_cov_block_opts *o, uam_cov_pass **out);
+
+/* Whether a block starting at pc gets a COV (always, with sites or without ranges). */
+bool       uam_cov_pass_covers(const uam_cov_pass *cp, uint64_t pc);
+
 /* Optional: describes a site in error messages (e.g. "record 12 of module fw"), so a
  * site that cannot be instrumented is reported in its source's terms. */
 typedef void (*uam_cov_namer_fn)(void *ctx, uint64_t pc, char *buf, size_t len);
