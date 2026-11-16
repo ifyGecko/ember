@@ -614,8 +614,10 @@ static bool restore_components(uam_machine *m, const uam_snapshot *s, dev_table 
     return ok;
 }
 
-/* Bring backed memory to the snapshot's contents. Pages that already match
- * are left alone (their translated code stays valid). */
+#define RESTORE_LINE 64   /* the bus tracks code in lines of this size */
+
+/* Bring backed memory to the snapshot's contents. Pages and lines that already
+ * match are left alone (their translated code stays valid). */
 static void restore_memory(uam_machine *m, const uam_snapshot *s)
 {
     const bool incremental = m->snap_base == s->id && m->bus.track_dirty;
@@ -634,8 +636,26 @@ static void restore_memory(uam_machine *m, const uam_snapshot *s)
             }
             uint64_t off = p << UAM_PAGE_SHIFT;
             size_t n = (size_t)(r->size - off < UAM_PAGE_SIZE ? r->size - off : UAM_PAGE_SIZE);
-            if (memcmp(r->host + off, sr->data + off, n))
-                uam_bus_region_store(&m->bus, r, off, sr->data + off, n);
+            if (!memcmp(r->host + off, sr->data + off, n))
+                continue;
+            /* Store only the runs of 64-byte lines that differ: code sharing the page with
+             * the data an iteration wrote keeps its translations. */
+            for (size_t l = 0; l < n;) {
+                size_t ln = n - l < RESTORE_LINE ? n - l : RESTORE_LINE;
+                if (!memcmp(r->host + off + l, sr->data + off + l, ln)) {
+                    l += ln;
+                    continue;
+                }
+                size_t end = l + ln;
+                while (end < n) {
+                    size_t en = n - end < RESTORE_LINE ? n - end : RESTORE_LINE;
+                    if (!memcmp(r->host + off + end, sr->data + off + end, en))
+                        break;
+                    end += en;
+                }
+                uam_bus_region_store(&m->bus, r, off + l, sr->data + off + l, end - l);
+                l = end;
+            }
         }
         if (r->kind == UAM_REGION_ROMD)
             uam_bus_romd_set_mode(&m->bus, r, sr->rom_mode);

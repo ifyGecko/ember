@@ -879,12 +879,13 @@ void uam_bus_region_move(uam_bus *bus, uam_region *r, uint64_t base)
 
 /* ---- ROMD -------------------------------------------------------------- */
 
+/* Bytes [off, off+len) of r's backing store were replaced from outside the guest: like a
+ * guest store, a page loses its translated code only when a written line holds code
+ * (data sharing a page with code, restored by a snapshot, keeps the code translated). */
 static void drop_code_pages(uam_bus *bus, uam_region *r, uint64_t off, uint64_t len)
 {
-    if (!len)
-        return;
-    for (uint64_t p = off >> UAM_PAGE_SHIFT; p <= (off + len - 1) >> UAM_PAGE_SHIFT; p++)
-        note_code_change(bus, r, p << UAM_PAGE_SHIFT);
+    if (len)
+        note_write(bus, r, off, len);
 }
 
 void uam_bus_romd_set_mode(uam_bus *bus, uam_region *r, bool rom)

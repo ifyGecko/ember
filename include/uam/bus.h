@@ -278,7 +278,8 @@ static inline bool uam_region_page_dirty(const uam_region *r, uint64_t page_inde
 /* Report a direct write to the backing store at physical [addr, addr+len). */
 void       uam_bus_mark_dirty(uam_bus *bus, uint64_t addr, uint64_t len);
 /* Copy `len` bytes into r's backing store at `off` (RAM, ROM or ROMD; ROM
- * protection does not apply), dropping code translated from those pages. */
+ * protection does not apply), dropping code translated from those pages when
+ * a written 64-byte line holds code (as a guest store would). */
 void       uam_bus_region_store(uam_bus *bus, uam_region *r, uint64_t off, const void *src,
                                 uint64_t len);
 
