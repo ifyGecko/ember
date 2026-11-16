@@ -499,7 +499,7 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	UAM_JIT_REGS=1 $(TEST_JITDIFF) 1000 3
 	$(TEST_F80)
 	$(TEST_COV_FORMATS) tests/unit/cov_golden.txt
-	python3 fuzz/tools/mutate.py --selftest
+	python3 fuzz/tools/fuzz_dict.py --selftest
 	python3 fuzz/tools/status_tui.py --selftest
 	python3 fuzz/tools/cmplog.py --selftest
 	python3 tests/fuzz/brain_unit.py

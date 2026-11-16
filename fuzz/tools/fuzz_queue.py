@@ -8,7 +8,8 @@ Kept apart from the protocol and the main loop so that it can be tested on its o
                  coverage, with AFL-style hit-count classes: an input is interesting when
                  it sets a bucket never hit, or reaches a count class that bucket never had.
                  O(buckets hit), never O(map size).
-  path_id        a hash of a hit list (indices and count classes): "the same path".
+  path_id        a hash of a hit list (indices and count classes): "the same path";
+                 ember computes the same one for the inputs it mutates itself.
   Entry          one queue entry and its statistics.
   Queue          the entries, path and edge frequencies, the favored set (culling), and
                  the power schedules that turn an entry into its energy.
@@ -18,7 +19,6 @@ Kept apart from the protocol and the main loop so that it can be tested on its o
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -54,12 +54,26 @@ def hits_from_map(bitmap: bytes) -> List[Tuple[int, int]]:
     return [(i, b) for i, b in enumerate(bitmap) if b]
 
 
-def path_id(hits: Hits) -> bytes:
-    """8 bytes naming the path: the hit buckets and their count classes."""
-    h = hashlib.blake2b(digest_size=8)
+_FNV_BASIS, _FNV_PRIME, _M64 = 0xcbf29ce484222325, 0x100000001b3, (1 << 64) - 1
+
+
+def path_hash(hits: Hits) -> int:
+    """ember's name for a path (fuzz/formats.h): FNV-1a 64 over each (index as u32 LE,
+    class as u8), ascending indices, then the coverage formula's mix. ember's HAVOC_DONE
+    counts executions per path under the same name."""
+    h = _FNV_BASIS
     for i, c in hits:
-        h.update(struct.pack("<IB", i, CLASS[c]))
-    return h.digest()
+        for b in struct.pack("<IB", i, CLASS[c]):
+            h = ((h ^ b) * _FNV_PRIME) & _M64
+    h ^= h >> 33
+    h = (h * 0xff51afd7ed558ccd) & _M64
+    h ^= h >> 33
+    return h
+
+
+def path_id(hits: Hits) -> bytes:
+    """8 bytes naming the path: the hit buckets and their count classes (path_hash)."""
+    return path_hash(hits).to_bytes(8, "big")
 
 
 class Coverage:
@@ -351,6 +365,12 @@ class OpStats:
     def __init__(self):
         self.used: Dict[int, int] = {}
         self.found: Dict[int, int] = {}
+
+    def add(self, op: int, used: int, found: int):
+        """Totals from one of ember's HAVOC batches."""
+        self.used[op] = self.used.get(op, 0) + used
+        if found:
+            self.found[op] = self.found.get(op, 0) + found
 
     def note(self, ops: Iterable[int], interesting: bool):
         for op in set(int(o) for o in ops):

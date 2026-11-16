@@ -30,6 +30,14 @@
  * ember sends BYE when it stops first (an error, an interrupt). EOF before a BYE is an
  * error. Unknown frame types are ignored.
  *
+ * A brain that sends MUTATOR, CORPUS and HAVOC (HELLO says UAM_NET_HELLO_HAVOC) has ember
+ * mutate: a HAVOC batch hands the harness n mutations of a corpus entry, one after
+ * another with no frame in between, through this frontend's next_input, so that the
+ * observers and traces see each one as they see an INPUT. Each is judged here: a
+ * bucket/count class ember has not seen (the virgin map, which every INPUT that ends
+ * normally also updates), a crash with a new (reason, status), or a hang up to MUTATOR's
+ * cap is sent as a FIND; HAVOC_DONE closes the batch with its totals.
+ *
  * A dead peer is noticed by TCP keepalive (a brain host that vanished without closing the
  * connection would otherwise leave ember waiting forever); a live brain that stops
  * answering, by the optional per-frame timeout (--fuzz-net-timeout).
@@ -47,6 +55,7 @@
 
 #include "formats.h"
 #include "cov_formats.h"
+#include "uam/fuzz_mutate.h"
 
 _Static_assert(UAM_NET_CMP_EQ == UAM_CMP_EQ && UAM_NET_CMP_ORDER == UAM_CMP_ORDER
                && UAM_NET_CMP_SIGNED == UAM_CMP_SIGNED && UAM_NET_CMP_IMM == UAM_CMP_IMM,
@@ -57,6 +66,31 @@ _Static_assert(UAM_NET_CMP_EQ == UAM_CMP_EQ && UAM_NET_CMP_ORDER == UAM_CMP_ORDE
 #define KEEPALIVE_IDLE_S  60            /* probe after a minute of silence ... */
 #define KEEPALIVE_INTVL_S 10            /* ... every 10 s ... */
 #define KEEPALIVE_CNT     6             /* ... and give up after 6 unanswered: ~2 min */
+
+/* An open-addressing table of 64-bit keys and counts (paths, buckets), emptied per batch. */
+typedef struct counts {
+    uint64_t *key;
+    uint32_t *n;           /* 0: the slot is free */
+    size_t    cap, used;
+} counts;
+
+/* The HAVOC batch in progress. */
+typedef struct havoc_batch {
+    bool           active;
+    uint64_t       first_id, next_id;
+    uint32_t       left, flags;
+    const uint8_t *parent;
+    size_t         parent_len;
+    const uint8_t *data;   /* the mutation being run (the mutator's buffer) */
+    size_t         len;
+    uint64_t       ops;
+    uint32_t       execs, finds;
+    uint32_t       by_reason[UAM_NET_HAVOC_BY_REASON];
+    uint32_t       used[UAM_MUT_OP_LIMIT], found[UAM_MUT_OP_LIMIT];
+    counts         paths, edges;
+} havoc_batch;
+
+static void counts_free(counts *c);
 
 struct cf_net {
     int       fd;
@@ -73,6 +107,16 @@ struct cf_net {
     uint8_t  *out;         /* one outgoing frame */
     size_t    out_cap;
     char      peer[300];
+
+    /* mutation in ember (MUTATOR, CORPUS, HAVOC) */
+    uam_mutator *mut;
+    bool      mut_ok;      /* the last MUTATOR was accepted */
+    uint32_t  max_hang_finds, hang_finds;
+    uint8_t  *virgin;      /* map_size: the count classes seen per bucket */
+    size_t    map_size;
+    uint64_t *crash_sigs;  /* (reason << 32 | status) of every crash seen */
+    size_t    n_sigs, cap_sigs;
+    havoc_batch h;
 };
 
 /* ---- big-endian fields ---------------------------------------------------- */
@@ -85,6 +129,7 @@ static uint32_t get32(const uint8_t *p)
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 static uint64_t get64(const uint8_t *p) { return (uint64_t)get32(p) << 32 | get32(p + 4); }
+static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 
 /* ---- I/O ---------------------------------------------------------------- */
 
@@ -267,7 +312,434 @@ void cf_net_close(cf_net *z)
         close(z->fd);
     free(z->in);
     free(z->out);
+    uam_mutator_destroy(z->mut);
+    free(z->virgin);
+    free(z->crash_sigs);
+    counts_free(&z->h.paths);
+    counts_free(&z->h.edges);
     free(z);
+}
+
+/* ---- mutation in ember ------------------------------------------------- */
+
+/* A hit count's class (AFL's buckets): what makes a count new. */
+static uint8_t count_class(uint8_t c)
+{
+    if (c <= 2)   return c;
+    if (c == 3)   return 4;
+    if (c <= 7)   return 8;
+    if (c <= 15)  return 16;
+    if (c <= 31)  return 32;
+    if (c <= 127) return 64;
+    return 128;
+}
+
+static uint64_t mix64(uint64_t v)
+{
+    v ^= v >> 33;
+    v *= 0xff51afd7ed558ccdull;
+    v ^= v >> 33;
+    return v;
+}
+
+#define FNV_BASIS 0xcbf29ce484222325ull
+#define FNV_PRIME 0x100000001b3ull
+
+static uint64_t fnv_byte(uint64_t h, uint8_t b) { return (h ^ b) * FNV_PRIME; }
+
+/* The path's name: FNV-1a 64 over each (index as u32 LE, class as u8), then mix64. */
+static uint64_t path_hash(const uint32_t *hits, size_t n, const uint8_t *map)
+{
+    uint64_t h = FNV_BASIS;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t ix = hits[i];
+        for (int k = 0; k < 4; k++)
+            h = fnv_byte(h, (uint8_t)(ix >> (8 * k)));
+        h = fnv_byte(h, count_class(map[ix]));
+    }
+    return mix64(h);
+}
+
+static void counts_free(counts *c)
+{
+    free(c->key);
+    free(c->n);
+    *c = (counts){ 0 };
+}
+
+static void counts_clear(counts *c)
+{
+    if (c->used)
+        memset(c->n, 0, c->cap * sizeof(*c->n));
+    c->used = 0;
+}
+
+static bool counts_grow(counts *c)
+{
+    size_t cap = c->cap ? 2 * c->cap : 1024;
+    uint64_t *k = calloc(cap, sizeof(*k));
+    uint32_t *n = calloc(cap, sizeof(*n));
+    if (!k || !n) {
+        free(k);
+        free(n);
+        return false;
+    }
+    for (size_t i = 0; i < c->cap; i++) {
+        if (!c->n[i])
+            continue;
+        size_t j = (size_t)mix64(c->key[i]) & (cap - 1);
+        while (n[j])
+            j = (j + 1) & (cap - 1);
+        k[j] = c->key[i];
+        n[j] = c->n[i];
+    }
+    free(c->key);
+    free(c->n);
+    c->key = k;
+    c->n = n;
+    c->cap = cap;
+    return true;
+}
+
+static bool counts_add(counts *c, uint64_t key)
+{
+    if (2 * (c->used + 1) > c->cap && !counts_grow(c))
+        return false;
+    size_t j = (size_t)mix64(key) & (c->cap - 1);
+    while (c->n[j] && c->key[j] != key)
+        j = (j + 1) & (c->cap - 1);
+    if (!c->n[j]) {
+        c->key[j] = key;
+        c->used++;
+    }
+    if (c->n[j] < UINT32_MAX)
+        c->n[j]++;
+    return true;
+}
+
+/* Fold an iteration that ended normally into the virgin map: true if it set a bucket/count
+ * class not seen before. */
+static bool virgin_fold(cf_net *z, const uint32_t *hits, size_t n, const uint8_t *map)
+{
+    bool fresh = false;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t cl = count_class(map[hits[i]]);
+        if (!(z->virgin[hits[i]] & cl)) {
+            z->virgin[hits[i]] |= cl;
+            fresh = true;
+        }
+    }
+    return fresh;
+}
+
+/* Note a crash's (reason, status): true the first time. */
+static bool crash_sig_new(cf_net *z, uint8_t reason, uint32_t status)
+{
+    uint64_t sig = (uint64_t)reason << 32 | status;
+    for (size_t i = 0; i < z->n_sigs; i++)
+        if (z->crash_sigs[i] == sig)
+            return false;
+    if (z->n_sigs == z->cap_sigs) {
+        size_t cap = z->cap_sigs ? 2 * z->cap_sigs : 64;
+        uint64_t *p = realloc(z->crash_sigs, cap * sizeof(*p));
+        if (!p)
+            return true;          /* report it; the set stays as it is */
+        z->crash_sigs = p;
+        z->cap_sigs = cap;
+    }
+    z->crash_sigs[z->n_sigs++] = sig;
+    return true;
+}
+
+/* The protocol's crash reason (0: ended normally) and status of a verdict. */
+static uint8_t verdict_reason(uam_fuzz_verdict v, uint64_t detail, uint32_t *status)
+{
+    *status = (uint32_t)detail;
+    switch (v) {
+    case UAM_FUZZ_OK:           *status = 0; return 0;
+    case UAM_FUZZ_CRASH_FAULT:  return UAM_NET_FAULT;
+    case UAM_FUZZ_CRASH_GUARD:  return UAM_NET_GUARD;
+    case UAM_FUZZ_CRASH_ORACLE: return UAM_NET_ORACLE;
+    case UAM_FUZZ_HANG:         return UAM_NET_HANG;
+    case UAM_FUZZ_REJECTED:     *status = 0; return UAM_NET_REJECTED;
+    case UAM_FUZZ_TIMEOUT:
+    default:                    *status = 0; return UAM_NET_TIMEOUT;
+    }
+}
+
+/* The map's set buckets, ascending (the harness's list, which also makes the next clear
+ * cheap). NULL only when out of memory. */
+static const uint32_t *all_hits(cf_net *z, size_t *n)
+{
+    return uam_fuzz_map_hits(z->fuzz, z->map_size, n);
+}
+
+static bool need_virgin(cf_net *z)
+{
+    if (z->virgin)
+        return true;
+    size_t size;
+    uam_fuzz_map(z->fuzz, &size);
+    z->map_size = size;
+    z->virgin = calloc(size ? size : 1, 1);
+    return z->virgin != NULL;
+}
+
+static bool send_mutator_info(cf_net *z, bool ok, const char *msg)
+{
+    size_t mlen = msg ? strlen(msg) : 0;
+    if (mlen > 1024)
+        mlen = 1024;
+    size_t need = 5 + 1 + 2 + mlen + 2 + UAM_MUT_OP_LIMIT * (1 + 2 + 2 + 1 + 64);
+    if (!reserve(&z->out, &z->out_cap, need)) {
+        z->broken = true;
+        return false;
+    }
+    uint8_t *p = z->out + 5;
+    *p++ = ok ? 0 : 1;
+    p = put16(p, (uint16_t)mlen);
+    memcpy(p, msg ? msg : "", mlen);
+    p += mlen;
+    uint8_t *count = p;
+    p += 2;
+    uint16_t n = 0;
+    for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++) {
+        if (!uam_mutator_is_op(op))
+            continue;
+        const char *name = uam_mutator_op_name(op);
+        size_t nl = strlen(name);
+        *p++ = (uint8_t)op;
+        p = put16(p, (uint16_t)uam_mutator_default_weight(op));
+        p = put16(p, (uint16_t)(z->mut ? uam_mutator_weight(z->mut, op)
+                                       : uam_mutator_default_weight(op)));
+        *p++ = (uint8_t)nl;
+        memcpy(p, name, nl);
+        p += nl;
+        n++;
+    }
+    put16(count, n);
+    return send_frame(z, UAM_NET_MUTATOR_INFO, (size_t)(p - (z->out + 5)));
+}
+
+/* MUTATOR: replace the mutator's settings and dictionary. NULL when accepted, else why. */
+static const char *apply_mutator(cf_net *z, const uint8_t *b, size_t len)
+{
+    if (len < UAM_NET_MUTATOR_MIN_LEN)
+        return "MUTATOR is shorter than its fixed fields";
+    if (!z->mut && !(z->mut = uam_mutator_create()))
+        return "out of memory";
+    uam_mutator *m = z->mut;
+    const uint8_t *p = b, *end = b + len;
+    uint32_t max_size = get32(p);
+    unsigned lo = get16(p + 4), hi = get16(p + 6), splice = get16(p + 8);
+    uint32_t max_hangs = get32(p + 10);
+    unsigned nw = get16(p + 14);
+    p += 16;
+    if (!max_size || max_size > UAM_FUZZ_NET_FRAME_MAX)
+        return "max_size must be 1 .. 64 MiB";
+    if (uam_mutator_set_max_size(m, max_size) != UAM_OK)
+        return "cannot allocate max_size bytes";
+    if (uam_mutator_set_stack(m, lo, hi) != UAM_OK)
+        return "the stack depth range must be 1 <= lo <= hi <= 1024";
+    if (splice > 1000)
+        return "splice is per mille (0 .. 1000)";
+    uam_mutator_set_splice(m, splice);
+    uam_mutator_reset_weights(m);
+    if ((size_t)(end - p) < (size_t)nw * 3 + 4)
+        return "MUTATOR's weight list is cut short";
+    for (unsigned i = 0; i < nw; i++, p += 3)
+        if (uam_mutator_set_weight(m, p[0], get16(p + 1)) != UAM_OK)
+            return "a weight names no havoc operator";
+    uint32_t nt = get32(p);
+    p += 4;
+    uam_mutator_clear_tokens(m);
+    for (uint32_t i = 0; i < nt; i++) {
+        if (p >= end)
+            return "MUTATOR's token list is cut short";
+        uint8_t kind = *p++;
+        if (kind == 0) {
+            if (end - p < 2 || (size_t)(end - p - 2) < get16(p))
+                return "MUTATOR's token list is cut short";
+            size_t tl = get16(p);
+            if (uam_mutator_add_token(m, p + 2, tl) != UAM_OK)
+                return "a byte token must be 1 .. 256 bytes";
+            p += 2 + tl;
+        } else if (kind == 1) {
+            if (end - p < 10)
+                return "MUTATOR's token list is cut short";
+            if (uam_mutator_add_int_token(m, get64(p + 2), p[0], p[1] != 0) != UAM_OK)
+                return "an integer token's width must be 1, 2, 4 or 8";
+            p += 10;
+        } else {
+            return "unknown token kind";
+        }
+    }
+    if (p != end)
+        return "MUTATOR has bytes past its token list";
+    /* A probe: no operator enabled is the brain's mistake, said now rather than per batch. */
+    size_t ol;
+    static const uint8_t probe_in[1] = { 0 };
+    if (!uam_mutator_mutate(m, probe_in, 1, &ol, NULL))
+        return "no operator is enabled (every weight 0, or only dictionary ones and no tokens)";
+    z->max_hang_finds = max_hangs;
+    return NULL;
+}
+
+static bool send_havoc_done(cf_net *z, uint8_t status)
+{
+    havoc_batch *h = &z->h;
+    size_t n_ops = 0;
+    for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++)
+        n_ops += h->used[op] != 0;
+    size_t need = 5 + 8 + 1 + 4 + 4 * UAM_NET_HAVOC_BY_REASON + 4 + 2 + n_ops * 9
+                + 4 + h->paths.used * 12 + 4 + h->edges.used * 8;
+    if (!reserve(&z->out, &z->out_cap, need)) {
+        z->broken = true;
+        return false;
+    }
+    uint8_t *p = put64(z->out + 5, h->first_id);
+    *p++ = status;
+    p = put32(p, h->execs);
+    for (unsigned i = 0; i < UAM_NET_HAVOC_BY_REASON; i++)
+        p = put32(p, h->by_reason[i]);
+    p = put32(p, h->finds);
+    p = put16(p, (uint16_t)n_ops);
+    for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++) {
+        if (!h->used[op])
+            continue;
+        *p++ = (uint8_t)op;
+        p = put32(p, h->used[op]);
+        p = put32(p, h->found[op]);
+    }
+    p = put32(p, (uint32_t)h->paths.used);
+    for (size_t i = 0; i < h->paths.cap; i++) {
+        if (h->paths.n[i]) {
+            p = put64(p, h->paths.key[i]);
+            p = put32(p, h->paths.n[i]);
+        }
+    }
+    p = put32(p, (uint32_t)h->edges.used);
+    for (size_t i = 0; i < h->edges.cap; i++) {
+        if (h->edges.n[i]) {
+            p = put32(p, (uint32_t)h->edges.key[i]);
+            p = put32(p, h->edges.n[i]);
+        }
+    }
+    h->active = false;
+    return send_frame(z, UAM_NET_HAVOC_DONE, (size_t)(p - (z->out + 5)));
+}
+
+/* HAVOC: start a batch. false: answered at once (nothing to run) or the stream broke. */
+static bool start_havoc(cf_net *z, const uint8_t *b)
+{
+    havoc_batch *h = &z->h;
+    uint64_t first = get64(b), seed = get64(b + 16);
+    uint32_t entry = get32(b + 8), n = get32(b + 12), flags = get32(b + 24);
+    counts paths = h->paths, edges = h->edges;
+    counts_clear(&paths);
+    counts_clear(&edges);
+    *h = (havoc_batch){ .first_id = first, .next_id = first, .left = n, .flags = flags,
+                        .paths = paths, .edges = edges };
+    uint8_t status = UAM_NET_HAVOC_OK;
+    if (!z->mut || !z->mut_ok)
+        status = UAM_NET_HAVOC_NO_MUTATOR;
+    else if (!(h->parent = uam_mutator_corpus_get(z->mut, entry, &h->parent_len)))
+        status = UAM_NET_HAVOC_NO_ENTRY;
+    else if (!n || n > UAM_NET_HAVOC_MAX || !first)
+        status = UAM_NET_HAVOC_BAD;
+    else if (!need_virgin(z)) {
+        z->broken = true;
+        return false;
+    }
+    if (status != UAM_NET_HAVOC_OK) {
+        uam_log(UAM_LOG_WARN, "fuzz-net", "HAVOC for entry %u refused (status %u)", entry, status);
+        send_havoc_done(z, status);
+        return false;
+    }
+    uam_mutator_seed(z->mut, seed);
+    h->active = true;
+    return true;
+}
+
+/* The next mutation of the batch. */
+static void next_mutation(cf_net *z, uint8_t **data, size_t *len, uint64_t *id)
+{
+    havoc_batch *h = &z->h;
+    h->data = uam_mutator_mutate(z->mut, h->parent, h->parent_len, &h->len, &h->ops);
+    *data = (uint8_t *)h->data;   /* the harness only reads it */
+    *len = h->len;
+    *id = h->next_id++;
+    h->left--;
+}
+
+static bool send_find(cf_net *z, uint64_t id, uint8_t reason, uint32_t status, uint64_t insns,
+                      const uint32_t *hits, size_t n, const uint8_t *map)
+{
+    havoc_batch *h = &z->h;
+    if (!reserve(&z->out, &z->out_cap, 5 + UAM_NET_FIND_HDR_LEN + h->len + 4 + n * 5)) {
+        z->broken = true;
+        return false;
+    }
+    uint8_t *p = put64(z->out + 5, id);
+    *p++ = reason;
+    p = put32(p, status);
+    p = put64(p, insns);
+    p = put64(p, h->ops);
+    p = put32(p, (uint32_t)h->len);
+    memcpy(p, h->data, h->len);
+    p += h->len;
+    p = put32(p, (uint32_t)n);
+    for (size_t i = 0; i < n; i++) {
+        p = put32(p, hits[i]);
+        *p++ = map[hits[i]];
+    }
+    h->finds++;
+    return send_frame(z, UAM_NET_FIND, (size_t)(p - (z->out + 5)));
+}
+
+/* One mutation of the batch ran: judge it, and close the batch after the last. */
+static bool havoc_report(cf_net *z, uint64_t id, uam_fuzz_verdict v, uint64_t detail)
+{
+    havoc_batch *h = &z->h;
+    uint32_t status;
+    uint8_t reason = verdict_reason(v, detail, &status);
+    h->execs++;
+    h->by_reason[reason]++;
+    bool fresh = false, ok = true;
+    if (reason == 0) {
+        size_t n;
+        const uint32_t *hits = all_hits(z, &n);
+        if (!hits) {
+            z->broken = true;
+            return false;
+        }
+        const uint8_t *map = uam_fuzz_map(z->fuzz, NULL);
+        fresh = virgin_fold(z, hits, n, map);
+        counts_add(&h->paths, path_hash(hits, n, map));
+        if (h->flags & UAM_NET_HAVOC_EDGES)
+            for (size_t i = 0; i < n; i++)
+                counts_add(&h->edges, hits[i]);
+        if (fresh) {
+            const uam_fuzz_result *r = uam_fuzz_last_result(z->fuzz);
+            ok = send_find(z, id, 0, 0, r ? r->insns : 0, hits, n, map);
+        }
+    } else if (reason == UAM_NET_HANG || reason == UAM_NET_TIMEOUT) {
+        if (z->hang_finds < z->max_hang_finds) {
+            z->hang_finds++;
+            ok = send_find(z, id, reason, status, 0, NULL, 0, NULL);
+        }
+    } else if (reason != UAM_NET_REJECTED && crash_sig_new(z, reason, status)) {
+        ok = send_find(z, id, reason, status, 0, NULL, 0, NULL);
+    }
+    for (unsigned op = 0; op < UAM_MUT_OP_LIMIT; op++) {
+        if (h->ops >> op & 1) {
+            h->used[op]++;
+            h->found[op] += fresh;
+        }
+    }
+    if (ok && !h->left)
+        ok = send_havoc_done(z, UAM_NET_HAVOC_OK);
+    return ok;
 }
 
 /* ---- the frontend --------------------------------------------------- */
@@ -295,7 +767,7 @@ static uam_status net_hello(void *ctx, const uam_fuzz_info *info)
         return UAM_ERR_INVALID;
     uint8_t *p = put16(z->out + 5, UAM_FUZZ_NET_VERSION);
     p = put16(p, (uint16_t)(z->flags | (z->big_endian ? UAM_NET_HELLO_BIG_ENDIAN : 0)
-                            | (z->fuzz ? UAM_NET_HELLO_CMP : 0)));
+                            | (z->fuzz ? UAM_NET_HELLO_CMP | UAM_NET_HELLO_HAVOC : 0)));
     p = put32(p, info->map_size);
     p = put16(p, (uint16_t)alen);
     memcpy(p, info->arch, alen);
@@ -308,6 +780,10 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
     for (;;) {
         if (z->broken)
             return -1;
+        if (z->h.active && z->h.left) {   /* a HAVOC batch runs on, with no frame between */
+            next_mutation(z, data, len, id);
+            return 1;
+        }
         uint8_t hdr[5];
         int rc = read_all(z, hdr, sizeof(hdr), true);
         if (rc == RD_EOF) {
@@ -366,6 +842,45 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
                 uam_fuzz_cmp_arm(z->fuzz);   /* false with logging off: an empty CMPS */
             return 1;
         }
+        case UAM_NET_MUTATOR: {
+            const char *why = z->fuzz ? apply_mutator(z, z->in, plen)
+                                      : "this frontend runs without a harness";
+            z->mut_ok = !why;
+            if (why)
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "MUTATOR refused: %s", why);
+            if (!send_mutator_info(z, !why, why))
+                return -1;
+            continue;
+        }
+        case UAM_NET_CORPUS: {
+            uint32_t clen = plen >= UAM_NET_CORPUS_HDR_LEN ? get32(z->in + 4) : 0;
+            if (plen < UAM_NET_CORPUS_HDR_LEN || clen != plen - UAM_NET_CORPUS_HDR_LEN) {
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: malformed CORPUS (%zu payload bytes)",
+                        z->peer, plen);
+                z->broken = true;
+                return -1;
+            }
+            if ((!z->mut && !(z->mut = uam_mutator_create()))
+                || uam_mutator_corpus_put(z->mut, get32(z->in), z->in + UAM_NET_CORPUS_HDR_LEN,
+                                          clen) != UAM_OK) {
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "out of memory for the corpus");
+                z->broken = true;
+                return -1;
+            }
+            continue;
+        }
+        case UAM_NET_HAVOC:
+            if (plen < UAM_NET_HAVOC_LEN) {
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: malformed HAVOC (%zu payload bytes)",
+                        z->peer, plen);
+                z->broken = true;
+                return -1;
+            }
+            if (start_havoc(z, z->in)) {
+                next_mutation(z, data, len, id);
+                return 1;
+            }
+            continue;   /* answered at once (or broken: the loop's top says so) */
         default:
             continue;   /* any other frame type is ignored */
         }
@@ -427,6 +942,24 @@ static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
 {
     cf_net *z = ctx;
     bool ok;
+    if (kind == UAM_FUZZ_KIND_ITER && z->h.active)
+        return havoc_report(z, id, v, detail) ? UAM_OK : UAM_ERR_INVALID;
+    /* What an INPUT showed counts for the batches too: its classes are not new to them,
+     * and a crash it found is not reported again. */
+    if (kind == UAM_FUZZ_KIND_ITER && z->fuzz && v == UAM_FUZZ_OK) {
+        size_t n;
+        const uint32_t *hits = need_virgin(z) ? all_hits(z, &n) : NULL;
+        if (!hits) {
+            uam_log(UAM_LOG_ERROR, "fuzz-net", "out of memory for the virgin map");
+            return UAM_ERR_NOMEM;
+        }
+        virgin_fold(z, hits, n, map);
+    } else if (kind == UAM_FUZZ_KIND_ITER && v != UAM_FUZZ_HANG && v != UAM_FUZZ_TIMEOUT
+               && v != UAM_FUZZ_REJECTED) {
+        uint32_t st;
+        uint8_t reason = verdict_reason(v, detail, &st);
+        crash_sig_new(z, reason, st);
+    }
     if (kind == UAM_FUZZ_KIND_ITER && z->cmp_pending) {
         z->cmp_pending = false;
         if (!send_cmps(z, id))

@@ -171,7 +171,11 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
 - A dictionary (`--dict FILE`, repeatable) in ember's format: `"text"`, `hex:BYTES`,
   `u8:`/`u16:`/`u32:`/`u64:` integers in the target's byte order (from HELLO), `u32be:`
   and the like for a fixed order. Take the tokens from the handler's compares in Ghidra:
-  magic numbers, command words, header bytes; integer tokens are also tried ±1. Set `--max-size` (default
+  magic numbers, command words, header bytes; integer tokens are also tried ±1. ember does
+  the mutating (havoc + splice, `fuzz/mutate.c`) in batches the brain asks for (HAVOC) and
+  reports only new coverage, new crashes and hangs, so the brain is no bottleneck: exec
+  rate follows the target's path length. Inputs grow from tiny seeds up to `--max-size`
+  (`INSERT_BLOCK`, `RESIZE`, AFL-sized chunks), so a one-byte seed is fine. Set `--max-size` (default
   65536) to what the route can deliver: `mem:`'s `max` (default 4096) or the UART's buffer. A
   plain route tests only a longer input's prefix; a `reject` route answers CRASH
   `REJECTED`, which the brain counts (`rejected` in its status) and does not save.

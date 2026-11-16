@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """fuzz_brain.py -- ember's coverage-guided fuzz brain.
 
-ember runs the inputs; this chooses them. Start the brain, then start ember
-with `uam-run --fuzz-net HOST:PORT ...` (within --accept-timeout seconds):
-ember dials in, boots its firmware, says HELLO, and from then on runs each
-INPUT the brain sends and answers it with one COVERAGE (or SPARSE) map or CRASH
-verdict. The protocol (UAMF) is specified in docs/fuzz-formats.md; its constants
+ember runs and mutates the inputs; this chooses what to work on. Start the brain,
+then start ember with `uam-run --fuzz-net HOST:PORT ...` (within --accept-timeout
+seconds): ember dials in, boots its firmware and says HELLO. The brain mirrors its queue
+into ember (CORPUS) and asks for batches of mutations of one entry (HAVOC): ember
+mutates, runs and judges them itself and reports only what is worth keeping (FIND) and
+the batch's totals (HAVOC_DONE). Single inputs (seeds, trimming, input-to-state,
+minimizing, imports) go as INPUT and get one COVERAGE (or SPARSE) map or CRASH verdict. The protocol (UAMF) is specified in docs/fuzz-formats.md; its constants
 are in fuzz/formats.h. The design of the campaign is docs/fuzz-ideas.md; its
 logic lives in fuzz/tools/fuzz_queue.py.
 
@@ -24,9 +26,11 @@ The brain
     **input-to-state** replacements fuzz/tools/cmplog.py derives from them (one
     operand's bytes found in the input, the other written there), and adds the code's
     constants the input lacks to the dictionary;
-  - mutates with fuzz/tools/mutate.py (havoc + splice), an optional ember
-    **dictionary** (--dict; integer tokens in the target's byte order, from
-    HELLO), and operator weights it **adapts** to what finds coverage;
+  - has ember **mutate** (fuzz/mutate.c: havoc + splice, inputs that grow up to
+    --max-size), with an optional ember **dictionary** (--dict, fuzz/tools/fuzz_dict.py;
+    integer tokens in the target's byte order, from HELLO), and operator weights it
+    **adapts** to what finds coverage. An ember without in-ember mutation (HELLO bit 13)
+    is refused: rebuild it;
   - saves each crash as the **full input plus a .info sidecar** (reason name,
     status, size, hex) so it can be replayed (`uam-run --fuzz-replay`), and
     **deduplicates** by (reason, status). HANG and TIMEOUT verdicts go to
@@ -39,7 +43,7 @@ The brain
     their new queue entries that are new to it (fuzz/tools/fuzz_launch.py runs a
     whole parallel campaign).
   * It runs **until you stop it** (Ctrl-C / SIGTERM) or ember says BYE; --iters N
-    caps the mutated executions.
+    caps the mutated executions (in whole batches of at most --batch).
 
 Usage:
   python3 fuzz/tools/fuzz_brain.py --listen 127.0.0.1:7000 --seeds seeds/ \\
@@ -50,6 +54,7 @@ Usage:
   fuzz_brain.py --listen HOST:PORT [--seeds DIR] [--out DIR] [--iters N]
                 [--schedule S] [--dict FILE]... [--no-trim] [--trim-probes N]
                 [--no-calibrate] [--reweight-every N] [--no-cmplog] [--cmplog-max N]
+                [--batch N] [--min-energy N] [--stack LO-HI] [--splice PERMILLE]
                 [--name NAME --sync-dir DIR [--sync-interval S] [--main|--secondary]]
                 [--max-size N] [--no-minimize] [--minimize-timeouts]
                 [--max-hangs N] [--seed-rng N] [--accept-timeout S]
@@ -78,9 +83,9 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cmplog import candidates as i2s_candidates, parse_cmps, tokens as i2s_tokens  # noqa: E402
-from mutate import DEFAULT_OP_WEIGHTS, Dictionary, Engine, IntToken, parse_dict  # noqa: E402
+from fuzz_dict import Dictionary, IntToken, parse_dict  # noqa: E402
 from fuzz_queue import (SCHEDULES, Coverage, Entry, OpStats, Queue, entry_name,  # noqa: E402
-                        hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
+                        hits_from_map, load_queue, new_peer_inputs, path_id, peers, save_entry,
                         save_state, set_synced, synced_upto)
 
 # ---- the fuzz protocol (fuzz/formats.h, docs/fuzz-formats.md) ----------
@@ -88,10 +93,16 @@ NET_MAGIC = b"UAMF"
 NET_VERSION = 1
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
+MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
+FIND_HDR_LEN = 33
+HAVOC_EDGES = 1 << 0                     # HAVOC flags: HAVOC_DONE lists executions per bucket
+HAVOC_STATUS = {1: "no accepted MUTATOR", 2: "no such corpus entry", 3: "a bad batch size"}
+HAVOC_MAX = 1 << 20                      # most mutations in one HAVOC
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
 COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 13, 25
 HELLO_BIG_ENDIAN = 1 << 15               # HELLO flags: the target is big-endian
 HELLO_CMP = 1 << 14                      # HELLO flags: compare logging is understood
+HELLO_HAVOC = 1 << 13                    # HELLO flags: MUTATOR, CORPUS and HAVOC are understood
 OPT_SPARSE = 1 << 0                      # OPTIONS: reply with SPARSE, not COVERAGE
 OPT_CMP_LOG = 1 << 1                     # OPTIONS: instrument compares for CMP_INPUT
 CMPLOG_TOKENS_MAX = 256                  # dictionary tokens taken from compare logs
@@ -178,13 +189,25 @@ def main():
     ap.add_argument("--iters", type=int, default=0,
                     help="stop after N mutated execs (0 = run until stopped)")
     ap.add_argument("--max-size", type=int, default=65536,
-                    help="max mutated input bytes (default 65536; an input "
-                         "budget, not a protocol limit)")
+                    help="max mutated input bytes (default 65536): ember's mutations grow "
+                         "inputs up to it, from seeds of any size")
+    ap.add_argument("--batch", type=int, default=1024,
+                    help="most mutations in one HAVOC batch (default 1024; smaller keeps "
+                         "status, sync and --iters finer-grained)")
+    ap.add_argument("--min-energy", type=int, default=64,
+                    help="fewest mutations of an entry each time it is chosen (default 64; "
+                         "a schedule's zero still skips it): small batches cost round trips")
+    ap.add_argument("--stack", default="2-128",
+                    help="havoc operators stacked per mutation, LO-HI; the depth is drawn "
+                         "log-uniformly from the powers of two in range (default 2-128)")
+    ap.add_argument("--splice", type=int, default=150,
+                    help="per mille of mutations that first splice with another queue entry "
+                         "(default 150)")
     ap.add_argument("--schedule", default="fast", choices=SCHEDULES,
                     help="power schedule: how much energy each queue entry gets "
                          "(default fast; docs/fuzzing.md has the table)")
     ap.add_argument("--dict", action="append", default=[],
-                    help="ember dictionary file (fuzz/tools/mutate.py's format; "
+                    help="ember dictionary file (fuzz/tools/fuzz_dict.py's format; "
                          "integer tokens follow the target's byte order); repeatable")
     ap.add_argument("--no-trim", dest="trim", action="store_false",
                     help="do not trim new queue entries")
@@ -239,6 +262,18 @@ def main():
     ap.add_argument("--quiet", action="store_true",
                     help="no log lines (errors still go to stderr)")
     args = ap.parse_args()
+    m = re.fullmatch(r"(\d+)-(\d+)", args.stack)
+    if not m or not 1 <= int(m.group(1)) <= int(m.group(2)) <= 1024:
+        sys.exit("brain: --stack must be LO-HI with 1 <= LO <= HI <= 1024, got %r" % args.stack)
+    stack_lo, stack_hi = int(m.group(1)), int(m.group(2))
+    if not 0 <= args.splice <= 1000:
+        sys.exit("brain: --splice is per mille, 0..1000")
+    if args.min_energy < 1:
+        sys.exit("brain: --min-energy must be at least 1")
+    if not 1 <= args.batch <= HAVOC_MAX:
+        sys.exit("brain: --batch must be 1..%d" % HAVOC_MAX)
+    if not 1 <= args.max_size <= NET_FRAME_MAX // 2:
+        sys.exit("brain: --max-size must be 1..%d" % (NET_FRAME_MAX // 2))
 
     host, _, port = args.listen.rpartition(":")
     if not port.isdigit():
@@ -344,6 +379,9 @@ def main():
             "path-sensitive for fuzzing (uam-run --cov-ngram 3 --cov-rotate)" % scheme)
     log("HELLO version=%d arch=%s (%s-endian) map_size=%d flags=0x%x scheme=%s"
         % (ver, arch, order, map_size, flags, scheme))
+    if not flags & HELLO_HAVOC:
+        sys.exit("brain: this ember does not mutate inputs itself (HELLO lacks bit 13): "
+                 "rebuild uam-run from a tree that has fuzz/mutate.c")
     # Ask for SPARSE replies: the hit buckets instead of the whole map. An ember that
     # does not know OPTIONS ignores it and keeps sending COVERAGE; both are handled.
     # Compare logging only from an ember that announced it (it answers CMP_INPUT).
@@ -354,9 +392,8 @@ def main():
     elif args.cmplog:
         log("NOTE: this ember does not offer compare logging (an older build)")
 
-    dictionary = None
+    dictionary = Dictionary()
     if args.dict:
-        dictionary = Dictionary()
         for p in args.dict:
             try:
                 dictionary.merge(parse_dict(p, order))
@@ -369,12 +406,9 @@ def main():
     cov = Coverage(map_size)
     queue = Queue(args.schedule)
     opstats = OpStats()
-    default_weights = {int(op): w for op, w in DEFAULT_OP_WEIGHTS.items()}
-
-    def splice_donor():
-        return rng.choice(queue.entries).data if queue.entries else b""
-
-    engine = Engine(rng, dictionary=dictionary, corpus=splice_donor, max_size=args.max_size)
+    default_weights = {}   # op -> ember's default weight (MUTATOR_INFO)
+    op_names = {}          # op -> ember's name for it
+    weights = {}           # op -> the weight in use (adapted by maybe_reweight)
 
     execs = mutated = new_cov = crashes = hangs = rejected = 0
     unstable = imported = trimmed_bytes = 0
@@ -388,6 +422,7 @@ def main():
     next_id = [1]          # protocol input ids
     next_eid = [max([e.id for e in resumed], default=-1) + 1]   # queue entry ids
     sparse_seen = [False]
+    batches = 0
 
     # ---- optional JSON-lines status feed (for fuzz/tools/status_tui.py) --
     start = time.monotonic()
@@ -441,6 +476,143 @@ def main():
         if now - last_status[0] >= args.status_interval:
             emit_status()
             last_status[0] = now
+
+    def next_frame():
+        """The next frame from ember, past its unsolicited INIT map (noted) and BYE (raised)."""
+        while True:
+            ftype, payload = recv_frame(conn)
+            if ftype == BYE:
+                raise EmberBye()
+            if (ftype in (COVERAGE, SPARSE) and len(payload) >= 9
+                    and payload[8] == KIND_INIT and payload[:8] == bytes(8)):
+                if ftype == SPARSE and len(payload) >= SPARSE_HDR_LEN:
+                    init_edges[0] = struct.unpack(">I", payload[21:25])[0]
+                else:
+                    init_edges[0] = len(hits_from_map(payload[COVERAGE_HDR_LEN:]))
+                log("ember sent its INIT map (%d edges); not scored" % init_edges[0])
+                continue
+            return ftype, payload
+
+    def send_mutator():
+        """Configure ember's mutator (MUTATOR) and read its operator table (MUTATOR_INFO).
+        A refusal is a bug on one side or the other: the session stops."""
+        body = struct.pack(">IHHHIH", args.max_size, stack_lo, stack_hi, args.splice,
+                           min(args.max_hangs, 0xFFFFFFFF), len(weights))
+        body += b"".join(struct.pack(">BH", op, w) for op, w in sorted(weights.items()))
+        body += dictionary.wire()
+        send_frame(conn, MUTATOR, body)
+        ftype, payload = next_frame()
+        if ftype != MUTATOR_INFO:
+            raise ProtocolError("expected MUTATOR_INFO after MUTATOR, got frame type %d" % ftype)
+        try:
+            status, mlen = struct.unpack(">BH", payload[:3])
+            msg = payload[3:3 + mlen].decode("utf-8", "replace")
+            p = 3 + mlen
+            (n,) = struct.unpack(">H", payload[p:p + 2])
+            p += 2
+            for _ in range(n):
+                op, dw, _w, nl = struct.unpack(">BHHB", payload[p:p + 6])
+                op_names[op] = payload[p + 6:p + 6 + nl].decode("ascii", "replace")
+                default_weights[op] = dw
+                p += 6 + nl
+        except struct.error:
+            raise ProtocolError("MUTATOR_INFO is cut short (%d bytes)" % len(payload)) from None
+        if status:
+            raise ProtocolError("ember refused the mutator settings: %s" % msg)
+        if not weights:
+            weights.update(default_weights)
+
+    def corpus_put(e):
+        """Mirror a queue entry into ember (a parent and a splice donor)."""
+        send_frame(conn, CORPUS, struct.pack(">II", e.id, len(e.data)) + e.data)
+
+    def havoc(e, n):
+        """One HAVOC batch: n mutations of e, run and judged by ember. Returns its FINDs as
+        (reason, status, insns, ops, data, hits); the totals are accounted here."""
+        nonlocal execs, mutated, crashes, hangs, rejected, batches
+        first = next_id[0]
+        next_id[0] += n
+        flags = HAVOC_EDGES if queue.track_edges else 0
+        send_frame(conn, HAVOC, struct.pack(">QIIQI", first, e.id, n, rng.getrandbits(64), flags))
+        finds = []
+        while True:
+            ftype, payload = next_frame()
+            if ftype == FIND:
+                try:
+                    fid, reason, status, insns, ops, dlen = struct.unpack(">QBIQQI",
+                                                                          payload[:FIND_HDR_LEN])
+                    data = payload[FIND_HDR_LEN:FIND_HDR_LEN + dlen]
+                    p = FIND_HDR_LEN + dlen
+                    (nh,) = struct.unpack(">I", payload[p:p + 4])
+                except struct.error:
+                    raise ProtocolError("FIND is cut short (%d bytes)" % len(payload)) from None
+                if len(data) != dlen or len(payload) != p + 4 + 5 * nh:
+                    raise ProtocolError("FIND's lengths do not add up (%d bytes)" % len(payload))
+                if not first <= fid < first + n:
+                    raise ProtocolError("FIND id=%d is not in the batch %d..%d"
+                                        % (fid, first, first + n - 1))
+                hits = list(struct.iter_unpack(">IB", payload[p + 4:]))
+                finds.append((reason, status, insns, ops, data, hits))
+                continue
+            if ftype != HAVOC_DONE:
+                raise ProtocolError("expected FIND or HAVOC_DONE in a batch, got frame type %d"
+                                    % ftype)
+            break
+        try:
+            done_id, st, ex = struct.unpack(">QBI", payload[:13])
+            by = struct.unpack(">7I", payload[13:41])
+            _nfinds, nops = struct.unpack(">IH", payload[41:47])
+            p = 47
+            op_totals = [struct.unpack(">BII", payload[p + 9 * k:p + 9 * k + 9]) for k in range(nops)]
+            p += 9 * nops
+            (npaths,) = struct.unpack(">I", payload[p:p + 4])
+            p += 4
+            paths = list(struct.iter_unpack(">QI", payload[p:p + 12 * npaths]))
+            p += 12 * npaths
+            (nedges,) = struct.unpack(">I", payload[p:p + 4])
+            p += 4
+            edges = list(struct.iter_unpack(">II", payload[p:p + 8 * nedges]))
+        except struct.error:
+            raise ProtocolError("HAVOC_DONE is cut short (%d bytes)" % len(payload)) from None
+        if done_id != first:
+            raise ProtocolError("HAVOC_DONE for batch %d while batch %d runs" % (done_id, first))
+        if st:
+            raise ProtocolError("ember refused HAVOC for queue entry %s: %s"
+                                % (e.name, HAVOC_STATUS.get(st, "status %d" % st)))
+        batches += 1
+        execs += ex
+        mutated += ex
+        crashes += by[FAULT] + by[GUARD] + by[ORACLE]
+        hangs += by[HANG] + by[TIMEOUT]
+        rejected += by[REJECTED]
+        for op, used, found in op_totals:
+            opstats.add(op, used, found)
+        pf = queue.path_freq
+        for path, cnt in paths:
+            k = path.to_bytes(8, "big")
+            pf[k] = pf.get(k, 0) + cnt
+        if queue.track_edges:
+            ef = queue.edge_freq
+            for i, cnt in edges:
+                ef[i] = ef.get(i, 0) + cnt
+        return finds
+
+    def take_finds(e, finds):
+        """After a batch: keep its new coverage as queue entries, save its crashes."""
+        nonlocal new_cov
+        for reason, status, insns, _ops, data, hits in finds:
+            if reason:
+                save_crash(data, reason, status, counted=True)
+                continue
+            nb, nc = cov.fold(hits)
+            if not nc:
+                continue                  # ember saw it first in an INPUT this brain ran
+            c = add_entry(data, hits, insns, path_id(hits), nb, parent=e, op="havoc")
+            if nb:
+                new_cov += 1
+            log("new coverage +%d buckets, +%d classes (queue=%d, %d bytes) %s"
+                % (nb, nc, len(queue.entries), len(data), c.name))
+            emit_event("find", "queue=%d %s" % (len(queue.entries), c.name), edges=nb)
 
     def probe(data, cmp=False):
         """Send one input and return ember's verdict, with no accounting:
@@ -560,17 +732,18 @@ def main():
             except OSError:
                 pass
 
-    def save_crash(data, reason, status):
+    def save_crash(data, reason, status, counted=False):
+        """counted: a HAVOC batch's totals already counted it."""
         nonlocal crashes, hangs, rejected
         if reason == REJECTED:            # the input route refused it: no bug
-            rejected += 1
+            rejected += 0 if counted else 1
             return
         is_hang = reason in HANG_REASONS
         if is_hang:
-            hangs += 1
+            hangs += 0 if counted else 1
             nth, sigs, where, label, ev = hangs, hang_sigs, hang_dir, "HANG", "hang"
         else:
-            crashes += 1
+            crashes += 0 if counted else 1
             nth, sigs, where, label, ev = crashes, crash_sigs, crash_dir, "CRASH", "crash"
         sig = (reason, status)
         n = sigs.get(sig, 0) + 1
@@ -653,17 +826,25 @@ def main():
         execs += n
 
     def add_entry(data, hits, insns, pid, nb, parent=None, op=None, sync=None, src=None,
-                  orig=None, keep_name=None):
-        e = Entry(id=next_eid[0], data=data, parent=parent.id if parent else src,
+                  orig=None, keep_name=None, resumed=None):
+        """resumed: a saved entry coming back, with its own id, name and state."""
+        e = Entry(id=resumed.id if resumed else next_eid[0], data=data,
+                  parent=parent.id if parent else src,
                   depth=parent.depth + 1 if parent else 0, insns=insns,
                   buckets=[i for i, _ in hits], path=pid, found_at=queue.cycle,
                   new_cov=nb > 0)
-        next_eid[0] += 1
+        if resumed:
+            e.parent, e.depth, e.found_at = resumed.parent, resumed.depth, resumed.found_at
+            e.times_chosen, e.trimmed, e.new_cov = (resumed.times_chosen, resumed.trimmed,
+                                                    resumed.new_cov)
+        else:
+            next_eid[0] += 1
         e.name = keep_name or entry_name(e.id, src=parent.id if parent else src, op=op,
                                           new_cov=nb > 0, sync=sync, orig=orig)
         if not keep_name:
             save_entry(queue_dir, e)
         queue.add(e)
+        corpus_put(e)
         calibrate(e, hits)
         return e
 
@@ -702,6 +883,7 @@ def main():
             e.insns = best_insns
             save_entry(queue_dir, e)
             queue.rescore(e)
+            corpus_put(e)
         else:
             save_state(queue_dir, e)
 
@@ -712,13 +894,11 @@ def main():
         for value, width in toks:
             if cmplog_tokens >= CMPLOG_TOKENS_MAX:
                 break
-            if engine.dictionary is None:
-                engine.dictionary = Dictionary()
-            engine.dictionary.add_int(IntToken(value, width, order))
-            cmplog_tokens += 1
-            added += 1
+            if dictionary.add(IntToken(value % (1 << (8 * width)), width, order)):
+                cmplog_tokens += 1
+                added += 1
         if added:
-            engine.set_op_weights(opstats.weights(default_weights))
+            send_mutator()
 
     def i2s(e):
         """The input-to-state stage: e's compares, logged once, each operand written where
@@ -786,13 +966,36 @@ def main():
                 log("sync: imported %d of %d new entries from %s" % (got, len(todo), p_name))
                 emit_event("info", "imported %d from %s" % (got, p_name))
 
+    last_reweight = [0]
+    state_dirty = {}       # id -> entry whose times_chosen changed since its state was saved
+    last_state = [time.monotonic()]
+
+    def flush_state(force=False):
+        """Save the changed entries' state (resumable campaigns), every few seconds."""
+        if not state_dirty or (not force and time.monotonic() - last_state[0] < 5.0):
+            return
+        for x in state_dirty.values():
+            save_state(queue_dir, x)
+        state_dirty.clear()
+        last_state[0] = time.monotonic()
+
     def maybe_reweight():
-        if args.reweight_every and mutated and mutated % args.reweight_every == 0:
-            engine.set_op_weights(opstats.weights(default_weights))
+        if not args.reweight_every or mutated - last_reweight[0] < args.reweight_every:
+            return
+        last_reweight[0] = mutated
+        new = opstats.weights(default_weights)
+        if new != weights:
+            weights.clear()
+            weights.update(new)
+            send_mutator()
 
     status = 0
     ember_bye = False
     try:
+        # ---- ember's mutator: settings, dictionary, operator table ----
+        send_mutator()
+        log("ember mutates: %d operators, stack %d-%d, splice %d/1000, max size %d, %d tokens"
+            % (len(op_names), stack_lo, stack_hi, args.splice, args.max_size, len(dictionary)))
         # ---- baseline: the resumed queue (as saved) and the seeds ----
         emit_status()
         seen = set()
@@ -811,11 +1014,7 @@ def main():
             if r[0] != "iter":
                 continue
             if isinstance(src, Entry):       # a resumed entry: kept, with its name and state
-                e = add_entry(data, r[1], r[2], r[3], r[4], keep_name=src.name)
-                e.id, e.parent, e.depth = src.id, src.parent, src.depth
-                e.found_at, e.times_chosen, e.trimmed = src.found_at, src.times_chosen, src.trimmed
-                e.new_cov = src.new_cov
-                next_eid[0] -= 1             # add_entry took an id it did not use
+                add_entry(data, r[1], r[2], r[3], r[4], keep_name=src.name, resumed=src)
             elif r[5] or not queue.entries:
                 add_entry(data, r[1], r[2], r[3], r[4], orig=src)
             maybe_status()
@@ -855,29 +1054,22 @@ def main():
                 n = queue.energy(e)
                 if n <= 0:
                     continue
+                n = max(n, args.min_energy)   # a batch worth its round trip
                 stage[0] = "havoc %s (%s, cycle %d)" % (e.name, args.schedule, queue.cycle)
                 pending = e.favored and not e.times_chosen
-                for _ in range(n):
-                    if limit():
-                        break
-                    child = engine.mutate(e.data)
-                    r = run(child)
-                    mutated += 1
-                    interesting = r[0] == "iter" and r[5] > 0
-                    opstats.note(engine.last_ops, interesting)
-                    if interesting:
-                        c = add_entry(child, r[1], r[2], r[3], r[4], parent=e, op="havoc")
-                        if r[4]:
-                            new_cov += 1
-                        log("new coverage +%d buckets, +%d classes (queue=%d) %s"
-                            % (r[4], r[5], len(queue.entries), c.name))
-                        emit_event("find", "queue=%d %s" % (len(queue.entries), c.name),
-                                   edges=r[4])
+                left = n
+                while left > 0 and not limit():
+                    k = min(left, args.batch)
+                    if args.iters:
+                        k = min(k, args.iters - mutated)
+                    take_finds(e, havoc(e, k))
+                    left -= k
                     maybe_status()
                     maybe_reweight()
                     sync()
                 e.times_chosen += 1
-                save_state(queue_dir, e)
+                state_dirty[e.id] = e
+                flush_state()
                 if pending and queue.pending_favored:
                     queue.pending_favored -= 1
             queue.cycle += 1
@@ -895,6 +1087,7 @@ def main():
         log("ember said BYE; ending the session")
         ember_bye = True
 
+    flush_state(force=True)
     if not ember_bye:
         try:
             send_frame(conn, BYE)

@@ -423,9 +423,10 @@ formats end to end with lists written by `tests/fuzz/mk_lists.py`.
 ### The brain (`--fuzz-net HOST:PORT`)
 
 `fuzz/tools/fuzz_brain.py` is a coverage-guided fuzzer that drives ember over TCP. It
-mutates inputs (`fuzz/tools/mutate.py`), keeps the interesting ones in a disk-backed queue
-that a restart resumes, saves crashes and hangs, and runs until stopped (`--iters N` caps
-the mutated executions). Its campaign logic is in `fuzz/tools/fuzz_queue.py`; the design and
+decides what to work on and keeps the interesting inputs in a disk-backed queue that a
+restart resumes; **ember mutates** (see "Mutation in ember" below), runs and judges the
+inputs itself and sends back only what is worth keeping. The brain saves crashes and hangs
+and runs until stopped (`--iters N` caps the mutated executions). Its campaign logic is in `fuzz/tools/fuzz_queue.py`; the design and
 its reasons are in [`fuzz-ideas.md`](fuzz-ideas.md). Under `--out DIR`:
 
 - `queue/id:NNNNNN,...`: the queue. Names record each entry's origin:
@@ -442,8 +443,9 @@ its reasons are in [`fuzz-ideas.md`](fuzz-ideas.md). Under `--out DIR`:
   `--max-hangs` (64), not minimized unless `--minimize-timeouts`.
 
 Start ember within `--accept-timeout` (15 s) of the brain; each reply is waited for up to
-`--io-timeout` (60 s). `--max-size` bounds an input's length, `--seed-rng` fixes the
-mutator's random sequence, `--status-file FILE` writes the feed for the status screen (anew
+`--io-timeout` (60 s). `--max-size` (65536) bounds an input's length, and mutations grow
+inputs up to it from seeds of any size; `--seed-rng` fixes the campaign's random sequence
+(each batch's mutator seed comes from it), `--status-file FILE` writes the feed for the status screen (anew
 each session, every `--status-interval` seconds) and `--quiet` drops the log lines. The
 brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 
@@ -494,12 +496,42 @@ in cycles:
   mutator's operators that produced interesting children get more weight (up to 4× their
   default, at least 1); 0 keeps the defaults.
 
+**Mutation in ember.** The brain mirrors its queue into ember (CORPUS frames) and asks for
+batches (HAVOC: up to `--batch` (1024) mutations of one entry, at least `--min-energy` (64)
+each time an entry is chosen). ember's mutator (`fuzz/mutate.c`, `uam/fuzz_mutate.h`)
+copies the entry, splices it first with another entry `--splice` (150) times in 1000 (AFL's
+crossover between the first and last differing byte), and stacks 2-128 (`--stack`,
+log-uniform) havoc operators:
+
+| Operators | What they do |
+|---|---|
+| `BIT_FLIP`, `BYTE_FLIP`, `BYTE_ARITH`, `WORD_ARITH_LE/BE`, `DWORD_ARITH_LE/BE` | flip bits; add or subtract up to 35 at 8, 16 or 32 bits in either order |
+| `SET_INTERESTING_U8`, `_U16_LE/BE`, `_U32_LE/BE`, `RANDOM_BYTE` | write a boundary value (0, -1, 127, 128, 255, 256, 32767, 65535, 2^31 ...) or a random byte |
+| `DELETE_CHUNK`, `CLONE_CHUNK`, `OVERWRITE_CHUNK`, `SWAP_CHUNKS` | delete, duplicate, overwrite or swap runs of bytes |
+| `INSERT_BLOCK` | insert constant or random bytes |
+| `RESIZE` | set the length anywhere in 1..`--max-size`, log-uniformly (each power-of-two size class alike), padding with constant or random bytes |
+| `DICT_INSERT`, `DICT_OVERWRITE`, `DICT_INT_ADJ` | insert or write a dictionary token; write an integer token ±1 |
+
+Chunk lengths are drawn the way AFL's havoc draws them: a third of the time 1-32 bytes, a
+third 32-128, a third 128-1500 (now and then 1500-32768), within what fits. So a seed of a
+few bytes grows: about a third of one seed's mutations are longer than it, about one in
+eight passes 256 bytes and one in 25 passes 2000 (`--max-size 9000`), while most stay
+cheap. ember judges each mutation itself against the bucket/count classes it has seen (from
+every INPUT and every batch) and sends a FIND only for new coverage, a crash with a new
+`(reason, status)`, or a hang (up to `--max-hangs`); a batch ends with its totals
+(executions per verdict, per operator, per path). The brain checks each FIND against its
+own coverage before it queues it. ember tells the brain its operators and their default
+weights (MUTATOR_INFO), so the two never disagree. Seeds, trimming, input-to-state,
+calibration, crash minimization and imports from other workers still go as single INPUTs.
+`build/test_mutate` checks the mutator, including the growth figures above.
+
 **Dictionaries** (`--dict FILE`, repeatable) are ember's own format, one token per line:
 `"text"` (escapes `\\ \" \t \n \r \xHH`), `hex:BYTES`, and integers `u8:`, `u16:`,
 `u32:`, `u64:` laid out in the target's byte order (HELLO says which), or `u16le:` /
 `u32be:` ... for a fixed one; a line starting with `#` is a comment. Integer tokens are also written ±1 (the
-off-by-one neighbour of a boundary check). `python3 fuzz/tools/mutate.py --selftest` checks
-the parser.
+off-by-one neighbour of a boundary check). A byte token is at most 256 bytes. The brain
+reads the files (`fuzz/tools/fuzz_dict.py`; `--selftest` checks the parser, `--check FILE`
+lists what a file holds) and hands the tokens to ember's mutator.
 
 ```
 # a bootloader's command protocol

@@ -51,6 +51,10 @@ def test_path_id():
     check(a == fq.path_id([(1, 1), (2, 6)]), "counts within one class: the same path")
     check(a != fq.path_id([(1, 1), (2, 9)]), "another class: another path")
     check(a != fq.path_id([(1, 1)]), "fewer buckets: another path")
+    # ember names paths the same way (fuzz/formats.h; fake_brain.py checks it against ember)
+    check(fq.path_hash([(1, 1), (2, 5)]) == 0x85fb26cfe833dcbb and fq.path_hash([]) == 0xecba3df2c3383c52,
+          "path_hash: FNV-1a 64 of (index u32 LE, class u8), then mix")
+    check(a == fq.path_hash([(1, 1), (2, 5)]).to_bytes(8, "big"), "path_id is path_hash, big-endian")
 
 
 def test_favored_and_skip():

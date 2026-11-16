@@ -29,7 +29,7 @@ printf 'hello' > "$tmp/seeds/a"
 printf '"FUZ!"\n"FUZ?"\n' > "$tmp/fuzz.dict"
 
 python3 "$tools/fuzz_launch.py" -n 2 --out "$tmp/camp" --seeds "$tmp/seeds" \
-    --dict "$tmp/fuzz.dict" --schedules fast,rare --iters 30000 --sync-interval 1 \
+    --dict "$tmp/fuzz.dict" --schedules fast,rare --iters 300000 --sync-interval 1 \
     --status-interval 0.5 --seed-rng 11 -- \
     "$run" -b "$board" --cov-blocks --fuzz-begin "$begin" --fuzz-crash-pc "$panic" \
     --fuzz-input uart0 --fuzz-iter-insns 200000 "$fw" > "$tmp/launch.log" 2>&1 &

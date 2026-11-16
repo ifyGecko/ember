@@ -192,7 +192,16 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * UAM_NET_OPT_CMP_LOG (which instruments the target's compares) and then CMP_INPUT, an
  * INPUT whose run also logs the values its compares saw: ember sends them as one CMPS
  * frame (with the input's id) right before the input's usual reply. A brain sends
- * CMP_INPUT only to an ember that announced it. */
+ * CMP_INPUT only to an ember that announced it.
+ *
+ * Mutation in ember: an ember whose HELLO has UAM_NET_HELLO_HAVOC mutates inputs itself.
+ * The brain configures its mutator (uam/fuzz_mutate.h) with MUTATOR, which ember answers
+ * with MUTATOR_INFO; mirrors its queue into ember with CORPUS; and asks for a batch with
+ * HAVOC: n mutations of one corpus entry, run back to back with no frame in between.
+ * ember reports the inputs worth keeping as FIND frames while the batch runs (an input
+ * with a bucket/count class it has not seen, a crash with a new (reason, status), a hang
+ * or timeout up to MUTATOR's cap) and closes the batch with one HAVOC_DONE. Plain INPUTs
+ * keep working alongside (seeds, trimming, input-to-state, minimizing). */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
 #define UAM_FUZZ_NET_VERSION   1u
@@ -208,11 +217,18 @@ enum uam_fuzz_net_frame {
     UAM_NET_SPARSE   = 7,   /* ember -> brain: one map as its set buckets (OPTIONS asked) */
     UAM_NET_CMP_INPUT = 8,  /* brain -> ember: an input whose compares are logged too */
     UAM_NET_CMPS     = 9,   /* ember -> brain: a CMP_INPUT's compares, before its reply */
+    UAM_NET_MUTATOR  = 10,  /* brain -> ember: the mutator's settings and dictionary */
+    UAM_NET_MUTATOR_INFO = 11, /* ember -> brain: MUTATOR's reply, with the operator table */
+    UAM_NET_CORPUS   = 12,  /* brain -> ember: add or replace a corpus entry */
+    UAM_NET_HAVOC    = 13,  /* brain -> ember: run a batch of mutations of one entry */
+    UAM_NET_FIND     = 14,  /* ember -> brain: an input of the batch worth keeping */
+    UAM_NET_HAVOC_DONE = 15, /* ember -> brain: the batch ended; its totals */
 };
 
 /* HELLO flags beyond the UAM_COV_SCHEME* bits */
 #define UAM_NET_HELLO_BIG_ENDIAN  (1u << 15)  /* the target's data byte order is big-endian */
 #define UAM_NET_HELLO_CMP         (1u << 14)  /* OPTIONS CMP_LOG and CMP_INPUT are understood */
+#define UAM_NET_HELLO_HAVOC       (1u << 13)  /* MUTATOR, CORPUS and HAVOC are understood */
 
 /* OPTIONS flags */
 #define UAM_NET_OPT_SPARSE        (1u << 0)   /* reply with SPARSE instead of COVERAGE */
@@ -232,7 +248,32 @@ enum uam_fuzz_net_frame {
  *           then n x (u32 site, u8 width (bits), u8 kind (UAM_NET_CMP_*), u64 a, u64 b),
  *           in the order first seen; each distinct (site, a, b) once, at most 8 per site.
  *           A difference tested for zero counts as EQ; with IMM, b is a constant of the
- *           code. n = 0 when compare logging is off (no OPTIONS CMP_LOG). */
+ *           code. n = 0 when compare logging is off (no OPTIONS CMP_LOG).
+ * MUTATOR:  u32 max_size, u16 stack_lo, u16 stack_hi, u16 splice (per mille),
+ *           u32 max_hang_finds (hangs and timeouts reported as FIND in the session),
+ *           u16 n_weights, then n x (u8 op, u16 weight) (operators not listed: their
+ *           defaults), u32 n_tokens, then n tokens, each u8 kind: 0 (bytes) u16 len,
+ *           u8 bytes[len]; 1 (integer) u8 width (1, 2, 4, 8), u8 big_endian, u64 value.
+ *           Replaces every earlier setting and the whole dictionary.
+ * MUTATOR_INFO: u8 status (0 accepted, 1 refused: the mutator is unusable until a good
+ *           MUTATOR), u16 msg_len, u8 msg[msg_len] (why, when refused), u16 n_ops, then
+ *           n x (u8 op, u16 default_weight, u16 weight, u8 name_len, u8 name[name_len])
+ * CORPUS:   u32 entry, u32 len, u8 data[len]
+ * HAVOC:    u64 first_id (the batch's inputs are first_id .. first_id + n - 1), u32 entry,
+ *           u32 n, u64 seed, u32 flags (UAM_NET_HAVOC_*)
+ * FIND:     u64 id, u8 reason (0: new coverage; else enum uam_fuzz_net_reason), u32 status,
+ *           u64 insns, u64 ops (bit k: operator k was applied), u32 len, u8 data[len],
+ *           u32 n, then n x (u32 index, u8 count), indices ascending (n = 0 for a crash)
+ * HAVOC_DONE: u64 first_id, u8 status (UAM_NET_HAVOC_*), u32 execs,
+ *           u32 by_reason[7] (index 0: ended normally, else the CRASH reason), u32 finds,
+ *           u16 n_ops, then n x (u8 op, u32 used, u32 found (in a coverage FIND)),
+ *           u32 n_paths, then n x (u64 path, u32 execs), u32 n_edges, then n x (u32 index,
+ *           u32 execs) (only with UAM_NET_HAVOC_EDGES).
+ *
+ * A path is named by the hash of the iteration's hit list: the FNV-1a 64 of each
+ * (index, class) as u32 then u8 little-endian, in ascending index order, then the coverage
+ * formula's mix (docs/fuzz-formats.md). A count's class is 1, 2, 4 (counts 1, 2, 3), 8 (4-7),
+ * 16 (8-15), 32 (16-31), 64 (32-127) or 128 (128-255). */
 #define UAM_NET_HELLO_FIXED_LEN    10u
 #define UAM_NET_ARCH_MAX           64u
 #define UAM_NET_INPUT_HDR_LEN      12u
@@ -243,6 +284,23 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_SPARSE_ENTRY_LEN   5u
 #define UAM_NET_CMPS_HDR_LEN       16u
 #define UAM_NET_CMPS_ENTRY_LEN     22u
+#define UAM_NET_MUTATOR_MIN_LEN    20u
+#define UAM_NET_CORPUS_HDR_LEN     8u
+#define UAM_NET_HAVOC_LEN          28u
+#define UAM_NET_FIND_HDR_LEN       33u
+#define UAM_NET_HAVOC_BY_REASON    7u
+
+/* HAVOC flags */
+#define UAM_NET_HAVOC_EDGES        (1u << 0)  /* HAVOC_DONE lists executions per bucket */
+#define UAM_NET_HAVOC_MAX          (1u << 20) /* most mutations in one batch */
+
+/* HAVOC_DONE status */
+enum uam_fuzz_net_havoc_status {
+    UAM_NET_HAVOC_OK        = 0,
+    UAM_NET_HAVOC_NO_MUTATOR = 1,   /* no accepted MUTATOR yet; nothing ran */
+    UAM_NET_HAVOC_NO_ENTRY  = 2,    /* no CORPUS entry with that number; nothing ran */
+    UAM_NET_HAVOC_BAD       = 3,    /* n is 0 or over UAM_NET_HAVOC_MAX; nothing ran */
+};
 
 /* CMPS kinds (the same bits as the IR's UAM_CMP_*) */
 #define UAM_NET_CMP_EQ     0x1u   /* equality */

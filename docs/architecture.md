@@ -183,12 +183,14 @@ fuzz/             harness.c frontend_replay.c (the harness and the replay fronte
                   stock_exts.c (the runner extensions uam_run_main uses), formats.h (the site
                   list, boundary file, coverage region and fuzz protocol; docs/fuzz-formats.md),
                   cov_scheme.c (the bucket formula) site_list.c (site-list and boundary readers,
-                  site check) frontend_net.c (the fuzz protocol, --fuzz-net) cov_region.c (the
+                  site check) frontend_net.c (the fuzz protocol, --fuzz-net; it runs the
+                  brain's HAVOC batches) mutate.c (the mutator, uam/fuzz_mutate.h) cov_region.c (the
                   coverage region, --cov-shm) cov_cli.c (the runner extension for all of them)
                   cov_formats.h
 fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files
                   from rizin's analysis) ghidra/ (the same two from headless Ghidra, Jython)
-                  fuzz_brain.py mutate.py (the coverage-guided brain and its mutator)
+                  fuzz_brain.py fuzz_dict.py (the coverage-guided brain and its dictionaries;
+                  ember mutates: fuzz/mutate.c)
                   fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)
                   cmplog.py (input-to-state candidates from ember's compare logs)
                   fuzz_launch.py (a parallel campaign of brain + ember workers)
@@ -900,7 +902,8 @@ Implemented (`make test`):
   the scheme flags against values worked out by hand, and the map-size rule, and covers the site-list and boundary readers (every rejection of
   their checklists), base resolution, the alternate-state flag, boundaries, site naming, the
   site-byte check and the coverage region's ownership rules. `fuzz/formats.h` compiles on its
-  own with ember's strict flags, and `mutate.py --selftest` and `status_tui.py --selftest`
+  own with ember's strict flags, `test_mutate` checks the mutator (operators, dictionary,
+  splice, growth toward max_size), and `fuzz_dict.py --selftest` and `status_tui.py --selftest`
   run. `tests/fuzz/formats-check.sh`
   runs `--cov-sites`/`--cov-boundary` end to end on RV32, MIPS32 BE/LE, ARM (Thumb-2, LE and
   BE8) and PowerPC, including N=3 and N=8 with rotation, and the coverage region read back by

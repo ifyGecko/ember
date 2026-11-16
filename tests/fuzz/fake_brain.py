@@ -24,7 +24,16 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
   - CRASH REJECTED (status 0) for an input the route refuses (mem:...,reject), the
     session going on after it;
   - CRASH GUARD (the pc of the access) for a read of a --guard range;
-  - --fuzz-net-timeout giving up on a brain that goes silent.
+  - --fuzz-net-timeout giving up on a brain that goes silent;
+  - mutation in ember: HELLO announces it; HAVOC before an accepted MUTATOR, for an unknown
+    corpus entry or of 0 mutations gets HAVOC_DONE with that status and nothing runs; a bad
+    MUTATOR gets MUTATOR_INFO refusing it, with the operator table (INSERT_BLOCK and RESIZE
+    in it, the retired 20 and 21 not); with SWAP_CHUNKS alone on an input of equal bytes
+    (a mutation that changes nothing) a batch reports no FIND (an INPUT showed that path
+    already), its totals are exact, and its one path is the one Python's path_hash names
+    for the INPUT's SPARSE list, with per-bucket counts when asked; a batch of timeouts
+    reports as many FINDs as MUTATOR's hang cap; a batch with default weights reports
+    well-formed FINDs, and a crash already seen as an INPUT only in the totals.
 Exit status 0 when everything holds.
 """
 import os
@@ -35,8 +44,11 @@ import sys
 import time
 
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
+MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
 FLAG_BIG_ENDIAN = 1 << 15
 FLAG_CMP = 1 << 14
+FLAG_HAVOC = 1 << 13
+SWAP_CHUNKS, INSERT_BLOCK, RESIZE = 17, 23, 24
 OPT_SPARSE, OPT_CMP_LOG = 1, 2
 CMP_EQ = 1
 FUZZ_MAGIC = 0x6A3C91E5
@@ -116,6 +128,74 @@ def cmps(p):
     return iid, dropped, ents, len(p) == 16 + 22 * n
 
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fuzz", "tools"))
+from fuzz_queue import path_hash  # noqa: E402
+
+
+def mutator(max_size=64, stack=(1, 1), splice=0, hangs=0, weights=(), tokens=b"\0\0\0\0"):
+    """A MUTATOR payload; weights: (op, weight) pairs; tokens: the encoded token list."""
+    return (struct.pack(">IHHHIH", max_size, stack[0], stack[1], splice, hangs, len(weights))
+            + b"".join(struct.pack(">BH", o, w) for o, w in weights) + tokens)
+
+
+def mutator_info(p):
+    """(status, message, {op: (default, weight, name)})."""
+    st, ml = struct.unpack(">BH", p[:3])
+    msg = p[3:3 + ml].decode()
+    q = 3 + ml
+    (n,) = struct.unpack(">H", p[q:q + 2])
+    q += 2
+    ops = {}
+    for _ in range(n):
+        op, dw, w, nl = struct.unpack(">BHHB", p[q:q + 6])
+        ops[op] = (dw, w, p[q + 6:q + 6 + nl].decode())
+        q += 6 + nl
+    return st, msg, ops, q == len(p)
+
+
+def find(p):
+    """(id, reason, status, insns, ops, data, hits, exact layout)."""
+    fid, reason, status, insns, ops, dlen = struct.unpack(">QBIQQI", p[:33])
+    data = p[33:33 + dlen]
+    (n,) = struct.unpack(">I", p[33 + dlen:37 + dlen])
+    hits = list(struct.iter_unpack(">IB", p[37 + dlen:37 + dlen + 5 * n]))
+    return fid, reason, status, insns, ops, data, hits, len(p) == 37 + dlen + 5 * n
+
+
+def havoc_done(p):
+    """(first_id, status, execs, by_reason, finds, {op: (used, found)}, {path: n}, {idx: n}, exact)."""
+    first, st, ex = struct.unpack(">QBI", p[:13])
+    by = struct.unpack(">7I", p[13:41])
+    nf, nops = struct.unpack(">IH", p[41:47])
+    q = 47
+    ops = {}
+    for _ in range(nops):
+        op, u, f = struct.unpack(">BII", p[q:q + 9])
+        ops[op] = (u, f)
+        q += 9
+    (npaths,) = struct.unpack(">I", p[q:q + 4])
+    paths = dict(struct.iter_unpack(">QI", p[q + 4:q + 4 + 12 * npaths]))
+    q += 4 + 12 * npaths
+    (nedges,) = struct.unpack(">I", p[q:q + 4])
+    edges = dict(struct.iter_unpack(">II", p[q + 4:q + 4 + 8 * nedges]))
+    q += 4 + 8 * nedges
+    return first, st, ex, by, nf, ops, paths, edges, q == len(p)
+
+
+def run_havoc(c, first, entry, n, seed, flags=0):
+    """Send HAVOC; return (finds, done) once HAVOC_DONE arrives."""
+    send_frame(c, HAVOC, struct.pack(">QIIQI", first, entry, n, seed, flags))
+    finds = []
+    while True:
+        t, p = recv_frame(c)
+        if t == FIND:
+            finds.append(find(p))
+        elif t == HAVOC_DONE:
+            return finds, havoc_done(p)
+        else:
+            raise RuntimeError("frame type %d in a HAVOC batch" % t)
+
+
 def session(run, board, fw, extra, script):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -150,6 +230,78 @@ def session(run, board, fw, extra, script):
     return proc.returncode, err
 
 
+def havoc_checks(c, tag, msize):
+    """Mutation in ember (MUTATOR, CORPUS, HAVOC, FIND, HAVOC_DONE). SPARSE is on."""
+    # Refusals: nothing runs, the batch is answered at once.
+    _, done = run_havoc(c, 100, 5, 4, 1)
+    check(done[0] == 100 and done[1] == 1 and done[2] == 0 and done[8],
+          f"{tag}: HAVOC before MUTATOR: status 1, nothing ran ({done[:3]})")
+    send_frame(c, MUTATOR, mutator(stack=(8, 2)))
+    t, p = recv_frame(c)
+    r = mutator_info(p) if t == MUTATOR_INFO else None
+    if check(r is not None, f"{tag}: MUTATOR_INFO (type {t})"):
+        st, msg, ops, exact = r
+        check(st == 1 and "stack" in msg and exact, f"{tag}: a bad MUTATOR is refused ({st}, {msg!r})")
+        check(INSERT_BLOCK in ops and RESIZE in ops and 20 not in ops and 21 not in ops
+              and ops[SWAP_CHUNKS][2] == "SWAP_CHUNKS" and all(v[0] > 0 for v in ops.values()),
+              f"{tag}: the operator table ({sorted(ops)})")
+        everything = sorted(ops)
+    else:
+        everything = []
+    # SWAP_CHUNKS alone on equal bytes: every mutation is the parent itself.
+    send_frame(c, MUTATOR, mutator(weights=[(o, 1 if o == SWAP_CHUNKS else 0) for o in everything],
+                                   hangs=1))
+    t, p = recv_frame(c)
+    check(t == MUTATOR_INFO and mutator_info(p)[0] == 0 and mutator_info(p)[2][SWAP_CHUNKS][1] == 1,
+          f"{tag}: MUTATOR accepted, the weight in use reported")
+    same = b"AAAAAAAAAAAA"
+    send_frame(c, CORPUS, struct.pack(">II", 5, len(same)) + same)
+    send_input(c, 30, same)
+    t, p = recv_frame(c)
+    hits = None
+    if check(t == SPARSE, f"{tag}: INPUT of the corpus entry (type {t})"):
+        _, _, _, m, _, idx, _ = sparse(p)
+        hits = [(i, m[i]) for i in idx]
+    _, done = run_havoc(c, 100, 99, 4, 1)
+    check(done[1] == 2 and done[2] == 0, f"{tag}: HAVOC of an unknown entry: status 2 ({done[1]})")
+    _, done = run_havoc(c, 100, 5, 0, 1)
+    check(done[1] == 3 and done[2] == 0, f"{tag}: HAVOC of 0 mutations: status 3 ({done[1]})")
+    finds, done = run_havoc(c, 200, 5, 3, 7, flags=1)
+    first, st, ex, by, nf, ops, paths, edges, exact = done
+    check(first == 200 and st == 0 and ex == 3 and by[0] == 3 and nf == 0 and not finds and exact,
+          f"{tag}: an identity batch: 3 runs, no FIND ({done[:5]}, {len(finds)} finds)")
+    check(ops == {SWAP_CHUNKS: (3, 0)}, f"{tag}: the batch's operator totals ({ops})")
+    if hits is not None:
+        check(paths == {path_hash(hits): 3},
+              f"{tag}: ember's path name is Python's path_hash ({paths}, {path_hash(hits):#x})")
+        check(edges == {i: 3 for i, _ in hits}, f"{tag}: per-bucket executions with HAVOC_EDGES")
+    # Timeouts: MUTATOR's cap (1) says how many are reported.
+    loop = b"LLLLLLLL"
+    send_frame(c, CORPUS, struct.pack(">II", 6, len(loop)) + loop)
+    finds, done = run_havoc(c, 300, 6, 3, 1)
+    check(done[1] == 0 and done[3][5] == 3 and len(finds) == 1 and finds[0][1] == TIMEOUT
+          and finds[0][5] == loop and finds[0][7], f"{tag}: 3 timeouts, 1 FIND (cap 1): "
+          f"{done[3]}, {[f[1] for f in finds]}")
+    # Default weights, a token: well-formed FINDs; FUZ! crashes, known from INPUTs, only count.
+    send_frame(c, MUTATOR, mutator(max_size=200, stack=(2, 128), splice=150,
+                                   tokens=struct.pack(">IBH", 1, 0, 4) + b"FUZ!"))
+    t, p = recv_frame(c)
+    check(t == MUTATOR_INFO and mutator_info(p)[0] == 0, f"{tag}: default MUTATOR accepted")
+    seed = b"hello world"
+    send_frame(c, CORPUS, struct.pack(">II", 7, len(seed)) + seed)
+    finds, done = run_havoc(c, 1000, 7, 3000, 12345)
+    check(done[1] == 0 and done[2] == 3000 and sum(done[3]) == 3000 and done[4] == len(finds),
+          f"{tag}: a 3000-mutation batch's totals ({done[:5]})")
+    check(done[3][FAULT] > 0 and not any(f[1] == FAULT for f in finds),
+          f"{tag}: the known FAULT counted ({done[3][FAULT]}), not reported again")
+    good = all(f[7] and 1000 <= f[0] < 4000 and len(f[5]) <= 200 and f[4] for f in finds)
+    good &= all(f[1] or (f[3] > 0 and f[6] == sorted(f[6]) and f[6]) for f in finds)
+    check(good, f"{tag}: FINDs well formed ({len(finds)})")
+    used = sum(u for u, _ in done[5].values())
+    check(used > 3000 and all(o in everything or o == 25 for o in done[5]),
+          f"{tag}: operator totals ({used})")
+
+
 def main():
     run, board, fw = sys.argv[1:4]
     sites = sys.argv[4:6] if len(sys.argv) >= 6 else None
@@ -172,7 +324,7 @@ def main():
             ver, flags, msize, alen = struct.unpack(">HHIH", p[:10])
             check(ver == 1 and len(p) == 10 + alen, f"{tag}: HELLO version {ver}, {len(p)} bytes")
             check(p[10:10 + alen].decode() == arch, f"{tag}: HELLO arch {p[10:10 + alen]!r}")
-            want = want_flags | FLAG_CMP | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
+            want = want_flags | FLAG_CMP | FLAG_HAVOC | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
             check(flags == want, f"{tag}: HELLO flags {flags:#x}, expected {want:#x}")
             t, p = recv_frame(c)
             iid, kind, bitmap, size = coverage(p) if t == COVERAGE else (None,) * 4
@@ -282,6 +434,8 @@ def main():
             t, p = recv_frame(c)
             check(t == CRASH and len(p) == 13 and struct.unpack(">QBI", p)[:2] == (15, FAULT),
                   f"{tag}: the magic value: CRASH FAULT (type {t})")
+
+            havoc_checks(c, tag, msize)
 
             if st.get("eof"):
                 return                                            # close without BYE
