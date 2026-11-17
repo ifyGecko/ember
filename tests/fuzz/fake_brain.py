@@ -416,15 +416,26 @@ def havoc_checks(c, tag, msize, slow):
           and finds[0][5] == loop and finds[0][7], f"{tag}: 3 timeouts, 1 FIND (cap 1): "
           f"{done[3]}, {[f[1] for f in finds]}")
     if slow:
-        # OPTIONS sets the budget: runs long enough that the batch must say PROGRESS.
-        send_frame(c, OPTIONS, struct.pack(">IQ", OPT_SPARSE | OPT_CMP_LOG, 150000000))
+        # OPTIONS sets the budget: runs long enough that the batch must say PROGRESS. PROGRESS
+        # goes out between runs only, so each run must take more than its 1 s and much less
+        # than this socket's timeout: one timed run measures the host, and the budget is sized
+        # for about 2 s a run (the same instructions take far longer on a slow or emulated host).
+        probe = 10000000
+        send_frame(c, OPTIONS, struct.pack(">IQ", OPT_SPARSE | OPT_CMP_LOG, probe))
+        t0 = time.monotonic()
+        _, done = run_havoc(c, 350, 6, 1, 1)
+        rate = probe / max(time.monotonic() - t0, 1e-3)
+        check(done[3][5] == 1, f"{tag}: a timed run to the budget ({done[3]})")
+        budget = max(20000000, int(rate * 2.0))
+        send_frame(c, OPTIONS, struct.pack(">IQ", OPT_SPARSE | OPT_CMP_LOG, budget))
         del progress_seen[:]
         t0 = time.monotonic()
         finds, done = run_havoc(c, 400, 6, 3, 1)
         took = time.monotonic() - t0
         check(done[3][5] == 3 and not finds, f"{tag}: 3 long timeouts past the hang cap ({done[3]})")
         check(took > 1.2 and progress_seen and all(f == 400 and 0 < n < 3 for f, n in progress_seen),
-              f"{tag}: a silent batch of {took:.1f} s sends PROGRESS ({progress_seen})")
+              f"{tag}: a silent batch of {took:.1f} s ({budget} instructions a run) sends "
+              f"PROGRESS ({progress_seen})")
         send_frame(c, OPTIONS, struct.pack(">IQ", OPT_SPARSE | OPT_CMP_LOG, 200000))
     # Default weights, a token: well-formed FINDs; FUZ! crashes, known from INPUTs, only count.
     send_frame(c, MUTATOR, mutator(max_size=200, stack=(2, 128), splice=150,
