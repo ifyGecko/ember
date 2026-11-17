@@ -30,6 +30,30 @@
 #define UAM_JIT_HOST 1
 #endif
 
+/*
+ * The host flags as a value. After the host instruction that computed a - b (a subtract
+ * or a compare) or a + b at width w, with all of the result's bits, the flags are those
+ * of that operation, and every compare, carry and overflow op of the IR over the same
+ * operands - and a sign or zero test of the result r - is one condition on them. ARM's
+ * and x86's flag-setting instructions lift to four or five such ops in a row.
+ */
+typedef enum { HF_NONE, HF_SUB, HF_ADD } jit_hf_kind;
+typedef struct jit_hf {
+    uint8_t kind;      /* jit_hf_kind */
+    uint8_t w;
+    uam_ref a, b;      /* the operands, in order */
+    uam_ref r;         /* the result's temp, or NONE if none holds it */
+} jit_hf;
+typedef enum {
+    HC_EQ, HC_NE,                                   /* result zero / not */
+    HC_ULT, HC_UGE, HC_ULE, HC_UGT,                 /* a ? b, unsigned (HF_SUB) */
+    HC_SLT, HC_SGE, HC_SLE, HC_SGT,                 /* a ? b, signed (HF_SUB) */
+    HC_OVF,                                         /* signed overflow */
+    HC_NEG,                                         /* result negative */
+    HC_CARRY,                                       /* carry out (HF_ADD) */
+    HC__N
+} jit_hcond;
+
 /* ---- runtime context ----------------------------------------------------------- */
 
 /* A chaining link, one per EXIT, stored after the block's code. A computed EXIT's slot
@@ -220,6 +244,10 @@ struct uam_jit {
     /* flag fusion: a compare whose only reader is the next guard or select condition
      * leaves its result in the host flags instead of a register */
     bool         fuse;       /* the insn being compiled is such a compare */
+    /* What the host flags hold besides (jit_hf): set by the template that emitted the
+     * flag-setting instruction, kept by templates that leave the flags alone, and gone
+     * with anything else. hf_in is its value on entry to the op being emitted. */
+    jit_hf       hf, hf_in;
     uam_ref      flag_temp;  /* the temp now held in the flags, or NONE */
     uint8_t      flag_cc;    /* its host condition code (true when the cc holds) */
     /* profiling output, from the environment at creation (docs/jit-perf.md) */
@@ -280,6 +308,12 @@ void     jit_ra_save(uam_jit *j, bool restore);
  * the guard or the select condition of the next insn (past a continuation IMARK, whose
  * icount increment must then leave the flags alone). */
 bool     jit_fusable(const uam_jit *j, const uam_block *blk, uint32_t i);
+/* The condition on flags `hf` that is the result of the compare, carry or overflow op
+ * `in`, if they hold one: then the op is a set-on-condition and no compare. */
+bool     jit_hf_cond(const jit_hf *hf, const uam_block *blk, const uam_insn *in, jit_hcond *c);
+/* Does an op that follows the add or subtract at i, with nothing between them that
+ * touches the flags, read a result its flags hold? (Then it is worth setting them.) */
+bool     jit_hf_wanted(const uam_jit *j, const uam_block *blk, uint32_t i);
 /* The current instruction's site record (one per instruction, emitted after the code),
  * and a reference to it at code offset `pos` to patch. Returns false on failure. */
 bool     jit_site_ref(uam_jit *j, size_t pos);

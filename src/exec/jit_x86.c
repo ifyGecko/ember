@@ -588,13 +588,14 @@ static void ic_flush(uam_jit *j)
     st_mem(j, RAX, R14, CPU(icount));
 }
 /* After a bridge, which may have asked the block to stop (uam_cpu_request_exit): take
- * cpu->icount_stop as the new jc->ic_base, r13 following. Clobbers rax. */
+ * cpu->icount_stop as the new jc->ic_base, r13 following. Clobbers rcx, not rax (the
+ * bridge's result). */
 static void ic_rebase(uam_jit *j)
 {
     rex(j, 1, 1, 0, 0); g8(j, 0x03); modrm_mem(j, R13, RBX, OFF(ic_base));   /* add r13, [ic_base] */
-    ld_mem(j, RAX, R14, CPU(icount_stop));
-    st_mem(j, RAX, RBX, OFF(ic_base));
-    rex(j, 1, 0, 0, 1); g8(j, 0x29); modrm_reg(j, RAX, R13);       /* sub r13, rax */
+    ld_mem(j, RCX, R14, CPU(icount_stop));
+    st_mem(j, RCX, RBX, OFF(ic_base));
+    g8(j, 0x49); g8(j, 0x29); g8(j, 0xCD);                         /* sub r13, rcx */
 }
 
 /* Before a bridge call that may fault: jc->site = the current instruction's site
@@ -989,6 +990,23 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
         return;
     }
 
+    /* A compare, carry or overflow whose answer the flags already hold (jit_hf): a
+     * set-on-condition, which leaves them as they are. */
+    static const uint8_t hc_cc[HC__N] = {
+        [HC_EQ] = 0x4, [HC_NE] = 0x5, [HC_ULT] = 0x2, [HC_UGE] = 0x3, [HC_ULE] = 0x6, [HC_UGT] = 0x7,
+        [HC_SLT] = 0xC, [HC_SGE] = 0xD, [HC_SLE] = 0xE, [HC_SGT] = 0xF, [HC_OVF] = 0x0,
+        [HC_NEG] = 0x8, [HC_CARRY] = 0x2,
+    };
+    jit_hcond hc;
+    if (jit_hf_cond(&j->hf_in, blk, in, &hc)) {
+        if (j->fuse)
+            j->flag_cc = hc_cc[hc];
+        else
+            setcc(j, rd, hc_cc[hc]);
+        j->hf = j->hf_in;
+        return;
+    }
+
     /* Natural operand size: 32-bit operations zero-extend their result, so only
      * narrower widths need masking after an add, sub or multiply. AND/OR/XOR of
      * zero-extended values never need it. */
@@ -999,7 +1017,10 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
                                       [UAM_OP_AND] = ALU_AND, [UAM_OP_OR] = ALU_OR,
                                       [UAM_OP_XOR] = ALU_XOR };
         const opnd a = opnd_of(j, blk, in->a, W), b = opnd_of(j, blk, in->b, W);
-        const bool lea = op == UAM_OP_ADD && W >= 32 && a.kind == O_REG;
+        /* an add whose flags a following op reads is an add, not a lea */
+        const bool flags = W >= 32 && (op == UAM_OP_ADD || op == UAM_OP_SUB);
+        const bool lea = op == UAM_OP_ADD && W >= 32 && a.kind == O_REG && !jit_hf_wanted(j, blk, (uint32_t)(in - blk->insn));
+        bool set = true;
         if (a.kind == O_REG && a.reg == rd) {
             alu(j, alu_op[op], os, rd, b);                   /* in place */
         } else if (b.kind == O_REG && b.reg == rd) {
@@ -1012,14 +1033,19 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
             }
         } else if (lea && b.kind == O_REG) {
             lea_index(j, os, rd, a.reg, b.reg);
+            set = false;
         } else if (lea && b.kind == O_IMM && (os == 32 || fits_s32(b.imm))) {
             lea_disp(j, os, rd, a.reg, (int32_t)b.imm);
+            set = false;
         } else {
             load(j, rd, a, W);
             alu(j, alu_op[op], os, rd, b);
         }
         if ((op == UAM_OP_ADD || op == UAM_OP_SUB) && W < 32)
             mask_reg(j, rd, W);
+        if (flags && set)   /* the flags of the W-bit a + b or a - b, and nothing since */
+            j->hf = (jit_hf){ .kind = op == UAM_OP_SUB ? HF_SUB : HF_ADD, .w = (uint8_t)W,
+                              .a = in->a, .b = in->b, .r = in->dst };
         return;
     }
     case UAM_OP_MUL: {
@@ -1050,10 +1076,13 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
             j->flag_cc = cc;                                       /* the reader tests the flags */
         else
             setcc(j, rd, cc);
+        if (W >= 8)
+            j->hf = (jit_hf){ .kind = HF_SUB, .w = (uint8_t)W, .a = in->a, .b = in->b, .r = UAM_REF_NONE };
         return;
     }
     case UAM_OP_ZEXT:   /* the source temp is already zero-extended */
         load_operand(j, rd, blk, in->a, src_w);
+        j->hf = j->hf_in;                                          /* a move */
         return;
     case UAM_OP_TRUNC: {
         const opnd a = opnd_of(j, blk, in->a, src_w);
@@ -1180,6 +1209,8 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
             j->flag_cc = cc;
         else
             setcc(j, rd, cc);                                          /* setc/seto */
+        j->hf = (jit_hf){ .kind = sub ? HF_SUB : HF_ADD, .w = (uint8_t)W, .a = in->a, .b = in->b,
+                          .r = UAM_REF_NONE };
         return;
     }
     case UAM_OP_POPCNT:
@@ -1342,6 +1373,8 @@ static bool emit_replays(uam_jit *j, const uam_block *blk, uint32_t i, unsigned 
     const bool fuse = j->fuse;
     const uam_ref ft = j->flag_temp;
     j->fuse = false;                   /* every result to rax, nothing held in the flags */
+    const jit_hf hf = j->hf, hf_in = j->hf_in;   /* a cold path's flags are its own */
+    j->hf_in.kind = HF_NONE;
     j->flag_temp = UAM_REF_NONE;
     for (uint32_t e = j->clo_start[i]; e < j->clo_start[i + 1]; e++) {
         const uam_insn *c = &blk->insn[j->clo_list[e]];
@@ -1350,6 +1383,8 @@ static bool emit_replays(uam_jit *j, const uam_block *blk, uint32_t i, unsigned 
     }
     j->fuse = fuse;
     j->flag_temp = ft;
+    j->hf = hf;
+    j->hf_in = hf_in;
     for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
         const uam_insn *d = &blk->insn[j->obs_list[e]];
         size_t skip = 0;
@@ -1399,6 +1434,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     }
     unsigned n_epi = 0;
     bool first = true;
+    j->hf.kind = HF_NONE;
     uint64_t imark_pc = blk->guest_pc;   /* the pc of the instruction being emitted */
 
     for (uint32_t i = 0; i < blk->n_insn && !j->overflow; i++) {
@@ -1411,6 +1447,12 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             continue;                          /* replayed on the cold paths, if at all */
         j->fuse = jit_fusable(j, blk, i);
         jit_mark(j, MK_OP, i);
+        /* the flags' value (jit_hf) is gone unless this op's template keeps it; a guard
+         * tested first takes it away */
+        j->hf_in = j->hf;
+        j->hf.kind = HF_NONE;
+        if (!uam_ref_is_none(in->guard) && !uam_ref_is_imm(in->guard))
+            j->hf_in.kind = HF_NONE;
         /* where the result goes: picked now, as it may spill a register */
         int rd = RAX;
         if (has_dst && !j->fuse) {
@@ -1485,9 +1527,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                 else g8(j, 0x8B);                                    /* mov r32 / r64 */
                 modrm_mem(j, rd, R15, (int32_t)in->aux);
             }
+            j->hf = j->hf_in;                                        /* a move */
             break;
         case UAM_OP_PUT:
             emit_put(j, in->aux, W, opnd_of(j, blk, in->a, W));
+            j->hf = j->hf_in;                                        /* moves only */
             break;
         case UAM_OP_LD: {
             unsigned size = W / 8;
@@ -1520,9 +1564,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             mov_imm(j, RDX, in->flags);
             mov_imm(j, RCX, size);
             call_bridge(j, jit_br_load);
-            g8(j, 0x85); modrm_reg(j, RAX, RAX);
-            epi[n_epi++] = jcc_fwd(j, 0x85);            /* jnz epilogue (fault) */
             ic_rebase(j);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+            epi[n_epi++] = jcc_fwd(j, 0x85);            /* jnz epilogue (fault) */
             jit_ra_save(j, true);
             ld_mem(j, rd, RBX, OFF(scratch));
             if (fast)
@@ -1542,10 +1586,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                 mov_imm(j, RCX, in->flags);
                 mov_imm(j, R8, W / 8);
                 call_bridge(j, jit_br_store_x);
-                g8(j, 0x85); modrm_reg(j, RAX, RAX);
-                epi[n_epi++] = jcc_fwd(j, 0x85);
-            ic_rebase(j);
                 ic_rebase(j);
+                g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+                epi[n_epi++] = jcc_fwd(j, 0x85);
                 jit_ra_save(j, true);
                 if (has_dst)
                     ld_mem(j, rd, RBX, OFF(scratch));
@@ -1603,9 +1646,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             mov_imm(j, RCX, in->flags);
             mov_imm(j, R8, size);
             call_bridge(j, jit_br_store);
-            g8(j, 0x85); modrm_reg(j, RAX, RAX);
-            epi[n_epi++] = jcc_fwd(j, 0x85);
             ic_rebase(j);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+            epi[n_epi++] = jcc_fwd(j, 0x85);
             jit_ra_save(j, true);
             if (fast) {
                 patch(j, done);
@@ -1630,9 +1673,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             mov_imm(j, R9, (uint32_t)op | (cas ? 0 : (uint32_t)in->aux << 8) | (uint32_t)W << 16);
             mov_rr(j, RDI, RBX);
             call_bridge(j, jit_br_rmw);
-            g8(j, 0x85); modrm_reg(j, RAX, RAX);
-            epi[n_epi++] = jcc_fwd(j, 0x85);
             ic_rebase(j);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+            epi[n_epi++] = jcc_fwd(j, 0x85);
             jit_ra_save(j, true);
             if (has_dst)
                 ld_mem(j, rd, RBX, OFF(scratch));
@@ -1659,9 +1702,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             mov_rr(j, RDI, RBX);
             mov_imm(j, RSI, in->aux);
             call_bridge(j, jit_br_sysrd);
-            g8(j, 0x85); modrm_reg(j, RAX, RAX);
-            epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
             ic_rebase(j);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+            epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
             jit_ra_save(j, true);
             ld_mem(j, rd, RBX, OFF(scratch));
             mask_reg(j, rd, W);
@@ -1674,9 +1717,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             mov_rr(j, RDI, RBX);
             mov_imm(j, RSI, in->aux);
             call_bridge(j, jit_br_syswr);
-            g8(j, 0x85); modrm_reg(j, RAX, RAX);
-            epi[n_epi++] = jcc_fwd(j, 0x85);
             ic_rebase(j);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+            epi[n_epi++] = jcc_fwd(j, 0x85);
             jit_ra_save(j, true);
             break;
         case UAM_OP_HELPER: {
@@ -1696,9 +1739,9 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             mov_rr(j, RDI, RBX);
             mov_imm(j, RSI, in->aux);
             call_bridge(j, jit_br_helper);
-            g8(j, 0x85); modrm_reg(j, RAX, RAX);
-            epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
             ic_rebase(j);
+            g8(j, 0x85); modrm_reg(j, RAX, RAX);        /* test eax, eax */
+            epi[n_epi++] = jcc_fwd(j, 0x85);          /* jnz epilogue (fault) */
             jit_ra_save(j, true);
             if (has_dst)
                 ld_mem(j, rd, RBX, OFF(scratch));

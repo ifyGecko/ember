@@ -990,6 +990,23 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
         return;
     }
 
+    /* A compare, carry or overflow whose answer the flags already hold (jit_hf): a
+     * conditional set, which leaves them as they are. */
+    static const uint8_t hc_cc[HC__N] = {
+        [HC_EQ] = CC_EQ, [HC_NE] = CC_NE, [HC_ULT] = CC_LO, [HC_UGE] = CC_HS, [HC_ULE] = CC_LS,
+        [HC_UGT] = CC_HI, [HC_SLT] = CC_LT, [HC_SGE] = 10, [HC_SLE] = CC_LE, [HC_SGT] = 12,
+        [HC_OVF] = CC_VS, [HC_NEG] = 4, [HC_CARRY] = CC_HS,
+    };
+    jit_hcond hc;
+    if (jit_hf_cond(&j->hf_in, blk, in, &hc)) {
+        if (j->fuse)
+            j->flag_cc = hc_cc[hc];
+        else
+            cset(j, rd, hc_cc[hc]);
+        j->hf = j->hf_in;
+        return;
+    }
+
     /* Natural operand size: 32-bit operations zero-extend their result, so only
      * narrower widths need masking after an add, sub or multiply. AND/OR/XOR of
      * zero-extended values never need it. */
@@ -999,22 +1016,30 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
         const int ra = src(j, opnd_of(j, blk, in->a, W), X0, W);
         const opnd b = opnd_of(j, blk, in->b, W);
         bool sub = op == UAM_OP_SUB;
+        /* At 32 and 64 bits the flag-setting forms leave the flags of a + b or a - b
+         * (jit_hf): used when an op that follows reads them, unless the immediate is taken
+         * with its sign turned. */
+        bool set = W >= 32 && jit_hf_wanted(j, blk, (uint32_t)(in - blk->insn));
         if (b.kind == O_IMM) {
             const uint64_t m = sf ? ~UINT64_C(0) : 0xFFFFFFFFu;
             const uint64_t nv = (0 - b.imm) & m;
             if (b.imm < 0x1000) {
-                addsub_imm(j, sub, sf, false, rd, ra, (uint32_t)b.imm, false);
+                addsub_imm(j, sub, sf, set, rd, ra, (uint32_t)b.imm, false);
             } else if (nv < 0x1000) {
                 addsub_imm(j, !sub, sf, false, rd, ra, (uint32_t)nv, false);
+                set = false;
             } else {
                 mov_imm(j, X1, b.imm);
-                addsub_reg(j, sub, sf, false, rd, ra, X1, 0);
+                addsub_reg(j, sub, sf, set, rd, ra, X1, 0);
             }
         } else {
-            addsub_reg(j, sub, sf, false, rd, ra, src(j, b, X1, W), 0);
+            addsub_reg(j, sub, sf, set, rd, ra, src(j, b, X1, W), 0);
         }
         if (W < 32)
             mask_reg(j, rd, W);
+        if (set)
+            j->hf = (jit_hf){ .kind = sub ? HF_SUB : HF_ADD, .w = (uint8_t)W, .a = in->a, .b = in->b,
+                              .r = in->dst };
         break;
     }
     case UAM_OP_AND: case UAM_OP_OR: case UAM_OP_XOR: {
@@ -1051,6 +1076,8 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
         }
         const uint8_t cc = op == UAM_OP_EQ ? CC_EQ : op == UAM_OP_NE ? CC_NE : op == UAM_OP_ULT ? CC_LO
                          : op == UAM_OP_ULE ? CC_LS : op == UAM_OP_SLT ? CC_LT : CC_LE;
+        if (W >= 32)   /* the flags of the W-bit a - b */
+            j->hf = (jit_hf){ .kind = HF_SUB, .w = (uint8_t)W, .a = in->a, .b = in->b, .r = UAM_REF_NONE };
         if (j->fuse) {
             j->flag_cc = cc;                                       /* the reader tests the flags */
             break;
@@ -1060,6 +1087,7 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
     }
     case UAM_OP_ZEXT:   /* the source temp is already zero-extended */
         load_operand(j, rd, blk, in->a, src_w);
+        j->hf = j->hf_in;                                          /* a move */
         break;
     case UAM_OP_TRUNC:
         zext_rr(j, rd, src(j, opnd_of(j, blk, in->a, src_w), X0, src_w), W);
@@ -1149,6 +1177,9 @@ static void emit_pure(uam_jit *j, const uam_block *blk, const uam_insn *in, int 
             addsub_reg(j, sub, false, true, XZR, X0, rb, 32 - W);
         }
         const uint8_t cc = op == UAM_OP_CARRY ? CC_HS : CC_VS;   /* c / v */
+        if (W >= 32)
+            j->hf = (jit_hf){ .kind = sub ? HF_SUB : HF_ADD, .w = (uint8_t)W, .a = in->a, .b = in->b,
+                              .r = UAM_REF_NONE };
         if (j->fuse) {
             j->flag_cc = cc;
             break;
@@ -1300,6 +1331,8 @@ static bool emit_replays(uam_jit *j, const uam_block *blk, uint32_t i, unsigned 
     const bool fuse = j->fuse;
     const uam_ref ft = j->flag_temp;
     j->fuse = false;                   /* every result to x0, nothing held in the flags */
+    const jit_hf hf = j->hf, hf_in = j->hf_in;   /* a cold path's flags are its own */
+    j->hf_in.kind = HF_NONE;
     j->flag_temp = UAM_REF_NONE;
     for (uint32_t e = j->clo_start[i]; e < j->clo_start[i + 1]; e++) {
         const uam_insn *c = &blk->insn[j->clo_list[e]];
@@ -1308,6 +1341,8 @@ static bool emit_replays(uam_jit *j, const uam_block *blk, uint32_t i, unsigned 
     }
     j->fuse = fuse;
     j->flag_temp = ft;
+    j->hf = hf;
+    j->hf_in = hf_in;
     for (uint32_t e = j->obs_start[i]; e < j->obs_start[i + 1]; e++) {
         const uam_insn *d = &blk->insn[j->obs_list[e]];
         size_t skip = 0;
@@ -1370,6 +1405,7 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
     }
     unsigned n_epi = 0;
     bool first = true;
+    j->hf.kind = HF_NONE;
     uint64_t imark_pc = blk->guest_pc;   /* the pc of the instruction being emitted */
 
     for (uint32_t i = 0; i < blk->n_insn && !j->overflow; i++) {
@@ -1382,6 +1418,12 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
             continue;                          /* replayed on the cold paths, if at all */
         j->fuse = jit_fusable(j, blk, i);
         jit_mark(j, MK_OP, i);
+        /* the flags' value (jit_hf) is gone unless this op's template keeps it; a guard
+         * tested first takes it away */
+        j->hf_in = j->hf;
+        j->hf.kind = HF_NONE;
+        if (!uam_ref_is_none(in->guard) && !uam_ref_is_imm(in->guard))
+            j->hf_in.kind = HF_NONE;
         /* where the result goes: picked now, as it may spill a register; an operand's
          * own register, if it is free for it, keeps a ZEXT from moving anything */
         int rd = X0;
@@ -1445,9 +1487,11 @@ bool jit_host_compile(uam_jit *j, const uam_block *blk)
                 mov_imm(j, rd, 0);
             else
                 mem(j, sz_of(W / 8), true, rd, RF, (int32_t)in->aux);
+            j->hf = j->hf_in;                                        /* a move */
             break;
         case UAM_OP_PUT:
             emit_put(j, in->aux, W, opnd_of(j, blk, in->a, W));
+            j->hf = j->hf_in;                                        /* moves only */
             break;
         case UAM_OP_LD: {
             unsigned size = W / 8;

@@ -576,6 +576,103 @@ bool jit_fusable(const uam_jit *j, const uam_block *blk, uint32_t i)
     return c->guard == t || (c->op == UAM_OP_SELECT && c->a == t && c->b != t && c->c != t);
 }
 
+/* ---- the host flags as a value (jit_impl.h, jit_hf) ----------------------------- */
+
+static bool is_zero(const uam_block *blk, uam_ref r, unsigned w)
+{
+    return uam_ref_is_imm(r) && !(blk->imm[uam_ref_index(r)] & uam_mask(w));
+}
+
+/* UAM_JIT_NOFLAGS=1: every compare is its own (to tell this from another fault). */
+static int hf_off = -1;
+
+bool jit_hf_cond(const jit_hf *hf, const uam_block *blk, const uam_insn *in, jit_hcond *c)
+{
+    if (hf_off < 0) {
+        const char *e = getenv("UAM_JIT_NOFLAGS");
+        hf_off = e && *e && *e != '0';
+    }
+    if (hf_off || hf->kind == HF_NONE || in->width != hf->w)
+        return false;
+    const uam_ref a = in->a, b = in->b;
+    const bool same = a == hf->a && b == hf->b, swapped = a == hf->b && b == hf->a;
+    const bool has_r = !uam_ref_is_none(hf->r);
+    const bool r_zero = has_r && ((a == hf->r && is_zero(blk, b, hf->w))
+                                  || (b == hf->r && is_zero(blk, a, hf->w)));
+    switch (in->op) {
+    case UAM_OP_EQ: case UAM_OP_NE:
+        /* a == b is "a - b is zero"; of a sum only the result's own test is */
+        if (!(r_zero || (hf->kind == HF_SUB && (same || swapped))))
+            return false;
+        *c = in->op == UAM_OP_EQ ? HC_EQ : HC_NE;
+        return true;
+    case UAM_OP_SLT:
+        if (has_r && a == hf->r && is_zero(blk, b, hf->w)) {
+            *c = HC_NEG;   /* r < 0 */
+            return true;
+        }
+        /* fall through */
+    case UAM_OP_SLE: case UAM_OP_ULE:
+        if (hf->kind != HF_SUB || !(same || swapped))
+            return false;
+        *c = in->op == UAM_OP_SLT ? (same ? HC_SLT : HC_SGT)
+           : in->op == UAM_OP_SLE ? (same ? HC_SLE : HC_SGE) : (same ? HC_ULE : HC_UGE);
+        return true;
+    case UAM_OP_ULT:
+        if (hf->kind == HF_SUB && (same || swapped)) {
+            *c = same ? HC_ULT : HC_UGT;
+            return true;
+        }
+        /* a sum is below one of its operands exactly when it carried */
+        if (hf->kind == HF_ADD && has_r && a == hf->r && (b == hf->a || b == hf->b)) {
+            *c = HC_CARRY;
+            return true;
+        }
+        return false;
+    case UAM_OP_CARRY:
+        if (hf->kind != HF_ADD || !(same || swapped))
+            return false;
+        *c = HC_CARRY;
+        return true;
+    case UAM_OP_SCARRY:
+        if (hf->kind != HF_ADD || !(same || swapped))
+            return false;
+        *c = HC_OVF;
+        return true;
+    case UAM_OP_SBORROW:
+        if (hf->kind != HF_SUB || !same)
+            return false;
+        *c = HC_OVF;
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool jit_hf_wanted(const uam_jit *j, const uam_block *blk, uint32_t i)
+{
+    const uam_insn *p = &blk->insn[i];
+    const jit_hf hf = { .kind = p->op == UAM_OP_SUB ? HF_SUB : HF_ADD, .w = p->width,
+                        .a = p->a, .b = p->b, .r = p->dst };
+    for (uint32_t k = i + 1; k < blk->n_insn; k++) {
+        const uam_insn *in = &blk->insn[k];
+        jit_hcond c;
+        if (j->dfr[k] || j->cold[k])
+            continue;   /* not emitted here: it neither reads nor disturbs the flags */
+        if (jit_hf_cond(&hf, blk, in, &c))
+            return true;
+        switch (in->op) {   /* what leaves the flags alone, unguarded */
+        case UAM_OP_ZEXT: case UAM_OP_GET: case UAM_OP_PUT:
+            if (uam_ref_is_none(in->guard))
+                continue;
+            return false;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
 /* ---- deferred register writes (docs/jit-dead-puts-design.md) ----------------------
  *
  * A PUT that a later unguarded PUT of the same block overwrites before anything reads
