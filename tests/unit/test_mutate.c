@@ -5,12 +5,17 @@
  * dictionary tokens (bytes and integers in either byte order, and their off-by-one
  * neighbours), splice, the corpus, and growth: from a seed of one byte and a max_size of
  * thousands, inputs must reach every size class up to max_size, not hover near the seed.
+ *
+ * Input-to-state (uam/fuzz_i2s.h): the candidates and dictionary tokens derived from a
+ * compare log.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "uam/fuzz_i2s.h"
 #include "uam/fuzz_mutate.h"
+#include "uam/ir.h"
 
 static int n_checks, n_failed;
 
@@ -310,6 +315,127 @@ static void test_growth(void)
     uam_mutator_destroy(m);
 }
 
+/* ---- input-to-state --------------------------------------------------------- */
+
+#define I2S_MAX 256
+
+static uam_i2s_patch i2s_out[I2S_MAX];
+
+/* The candidates of data for one record, at most max. */
+static size_t i2s(const void *data, size_t len, unsigned width, unsigned kind, uint64_t a,
+                  uint64_t b, size_t max)
+{
+    const uam_cmp_entry e = { .site = 1, .width = (uint8_t)width, .kind = (uint8_t)kind, .a = a, .b = b };
+    return uam_i2s_candidates(data, len, &e, 1, i2s_out, max);
+}
+
+/* Patch k applied to data gives want[0..len). */
+static bool gives(const void *data, size_t len, size_t k, const void *want)
+{
+    uint8_t buf[256];
+    memcpy(buf, data, len);
+    memcpy(buf + i2s_out[k].pos, i2s_out[k].bytes, i2s_out[k].len);
+    return !memcmp(buf, want, len);
+}
+
+static bool any_gives(const void *data, size_t len, size_t n, const void *want)
+{
+    for (size_t k = 0; k < n; k++)
+        if (gives(data, len, k, want))
+            return true;
+    return false;
+}
+
+static void le32(uint8_t *p, uint32_t v)
+{
+    for (int i = 0; i < 4; i++)
+        p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void test_i2s(void)
+{
+    const uint32_t magic = 0x6A3C91E5u, near = magic ^ 0x01000000u;
+    uint8_t data[12], want[12];
+    memcpy(data, "Mabc", 4);
+    le32(data + 4, near);
+    memcpy(data + 8, "tail", 4);
+    memcpy(want, data, 12);
+    le32(want + 4, magic);
+
+    /* a 32-bit equality of the input's little-endian word with a register holding magic */
+    size_t n = i2s(data, 12, 32, UAM_CMP_EQ, near, magic, I2S_MAX);
+    CHECK(any_gives(data, 12, n, want), "the LE word replaced by magic (%zu candidates)", n);
+    bool minimal = n > 0;
+    for (size_t k = 0; k < n; k++)
+        minimal = minimal && i2s_out[k].len >= 1
+                  && i2s_out[k].bytes[0] != data[i2s_out[k].pos]
+                  && i2s_out[k].bytes[i2s_out[k].len - 1] != data[i2s_out[k].pos + i2s_out[k].len - 1];
+    CHECK(minimal, "a patch differs from the input in its first and last byte");
+    /* the same compare on a big-endian core that loaded the word as is: swapped values */
+    n = i2s(data, 12, 32, UAM_CMP_EQ | UAM_CMP_IMM, __builtin_bswap32(near), __builtin_bswap32(magic),
+            I2S_MAX);
+    CHECK(any_gives(data, 12, n, want), "the big-endian view");
+    /* IMM: only a is searched, b written ('tail' as a big-endian word) */
+    n = i2s(data, 12, 32, UAM_CMP_EQ | UAM_CMP_IMM, 0x7461696Cu, 0x41414141u, I2S_MAX);
+    uint8_t w2[12];
+    memcpy(w2, data, 12);
+    memcpy(w2 + 8, "AAAA", 4);
+    CHECK(n == 1 && gives(data, 12, 0, w2), "IMM: only a is searched, b written (%zu)", n);
+    n = i2s(data, 12, 32, UAM_CMP_EQ | UAM_CMP_IMM, 0x41414141u, 0x7461696Cu, I2S_MAX);
+    CHECK(n == 0, "IMM: the constant is not searched for");
+    /* without IMM both operands are */
+    n = i2s(data, 12, 32, UAM_CMP_EQ, 0x41414141u, 0x7461696Cu, I2S_MAX);
+    CHECK(n == 1 && gives(data, 12, 0, w2), "no IMM: either operand may be the input's");
+    /* a byte compared in a 32-bit register is one byte of input */
+    n = i2s("xax", 3, 32, UAM_CMP_EQ | UAM_CMP_IMM, 'a', 'Z', I2S_MAX);
+    CHECK(n == 1 && gives("xax", 3, 0, "xZx") && i2s_out[0].len == 1, "a byte in a wide compare");
+    /* ordered: y, y + 1, y - 1 */
+    const uint8_t h[2] = { 0x34, 0x12 };
+    n = i2s(h, 2, 16, UAM_CMP_ORDER | UAM_CMP_IMM, 0x1234, 0x2000, I2S_MAX);
+    CHECK(n == 3 && any_gives(h, 2, n, "\x00\x20") && any_gives(h, 2, n, "\x01\x20")
+          && any_gives(h, 2, n, "\xff\x1f"), "ORDER: y and y +- 1 (%zu)", n);
+    /* zero patterns are not searched; equal operands give nothing */
+    CHECK(i2s("\0\0\0\0", 4, 32, UAM_CMP_EQ, 0, 5, I2S_MAX) == 0, "zeros are not searched");
+    CHECK(i2s(data, 12, 32, UAM_CMP_EQ, 9, 9, I2S_MAX) == 0, "equal operands: nothing");
+    /* every occurrence, up to UAM_I2S_OCCURRENCES; the limit */
+    char many[60];
+    for (int k = 0; k < 20; k++)
+        memcpy(many + 3 * k, "ab-", 3);
+    n = i2s(many, 60, 16, UAM_CMP_EQ | UAM_CMP_IMM, 0x6261, 0x7a7a, I2S_MAX);
+    CHECK(n == UAM_I2S_OCCURRENCES, "at most %u positions (%zu)", UAM_I2S_OCCURRENCES, n);
+    CHECK(i2s(many, 60, 16, UAM_CMP_EQ | UAM_CMP_IMM, 0x6261, 0x7a7a, 3) == 3, "the limit");
+    /* distinct: two records that give the same bytes give one candidate */
+    const uam_cmp_entry two[2] = {
+        { .site = 1, .width = 32, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 'a', .b = 'Z' },
+        { .site = 2, .width = 8, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 'a', .b = 'Z' },
+    };
+    CHECK(uam_i2s_candidates((const uint8_t *)"xax", 3, two, 2, i2s_out, I2S_MAX) == 1, "distinct");
+    /* a 64-bit compare, and a width that is none */
+    uint8_t q[8] = { 1, 2, 3, 4, 5, 6, 7, 8 }, qw[8] = { 8, 7, 6, 5, 4, 3, 2, 1 };
+    n = i2s(q, 8, 64, UAM_CMP_EQ, UINT64_C(0x0807060504030201), UINT64_C(0x0102030405060708), I2S_MAX);
+    CHECK(any_gives(q, 8, n, qw), "a 64-bit operand");
+    CHECK(i2s(q, 8, 12, UAM_CMP_EQ, 1, 2, I2S_MAX) == 0, "a record with no such width is skipped");
+    CHECK(i2s(q, 0, 32, UAM_CMP_EQ, 1, 2, I2S_MAX) == 0 && i2s(q, 1, 32, UAM_CMP_EQ, 0x0201, 5, I2S_MAX) == 0,
+          "inputs shorter than the pattern");
+
+    /* tokens: the constants the input lacks, two or more significant bytes */
+    const uam_cmp_entry recs[] = {
+        { .width = 32, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 1, .b = magic },
+        { .width = 32, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 1, .b = 0x7461 },      /* "at" is in it */
+        { .width = 32, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 1, .b = 0x41 },        /* one byte */
+        { .width = 32, .kind = UAM_CMP_EQ, .a = 1, .b = 0xBEEF },                    /* no constant */
+        { .width = 32, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 2, .b = magic },       /* again */
+        { .width = 32, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 1, .b = 0xBEEF },
+        { .width = 64, .kind = UAM_CMP_EQ | UAM_CMP_IMM, .a = 1, .b = UINT64_C(0x1122334455) },
+    };
+    uam_i2s_token tok[8];
+    n = uam_i2s_tokens(data, 12, recs, 7, tok, 8);
+    CHECK(n == 3 && tok[0].value == magic && tok[0].width == 4 && tok[1].value == 0xBEEF
+          && tok[1].width == 2 && tok[2].value == UINT64_C(0x1122334455) && tok[2].width == 8,
+          "tokens: the missing multi-byte constants, each once, at their narrowest (%zu)", n);
+    CHECK(uam_i2s_tokens(data, 12, recs, 7, tok, 1) == 1, "the token limit");
+}
+
 int main(void)
 {
     test_ops_table();
@@ -319,6 +445,7 @@ int main(void)
     test_dictionary();
     test_splice_and_corpus();
     test_growth();
+    test_i2s();
     printf("test_mutate: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

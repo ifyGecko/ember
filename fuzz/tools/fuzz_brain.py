@@ -6,9 +6,10 @@ then start ember with `uam-run --fuzz-net HOST:PORT ...` (within --accept-timeou
 seconds): ember dials in, boots its firmware and says HELLO. The brain mirrors its queue
 into ember (CORPUS) and asks for batches of mutations of one entry (HAVOC): ember
 mutates, runs and judges them itself and reports only what is worth keeping (FIND) and
-the batch's totals (HAVOC_DONE). Single inputs (seeds, trimming, input-to-state,
-minimizing, imports) go as INPUT and get one COVERAGE (or SPARSE) map or CRASH verdict. The protocol (UAMF) is specified in docs/fuzz-formats.md; its constants
-are in fuzz/formats.h. The design of the campaign is docs/fuzz-ideas.md; its
+the batch's totals (HAVOC_DONE). Trimming and input-to-state are stages ember runs the
+same way (STAGE). Single inputs (seeds, calibration, minimizing, imports) go as INPUT and
+get one COVERAGE (or SPARSE) map or CRASH verdict. The protocol (UAMF) is specified in
+docs/fuzz-formats.md; its constants are in fuzz/formats.h. The design of the campaign is docs/fuzz-ideas.md; its
 logic lives in fuzz/tools/fuzz_queue.py.
 
 The brain
@@ -23,15 +24,15 @@ The brain
     **energy** per entry from a performance score times its **power schedule**
     (--schedule fast, explore, exploit, coe, rare, lin, quad, seek, mmopt);
   - with **compare logging** (ember announces it in HELLO; --no-cmplog turns it off):
-    runs each queue entry once with its compares logged (CMP_INPUT) and tries the
-    **input-to-state** replacements fuzz/tools/cmplog.py derives from them (one
-    operand's bytes found in the input, the other written there), and adds the code's
-    constants the input lacks to the dictionary;
+    has ember run each queue entry once with its compares logged and then the
+    **input-to-state** replacements it derives from them (uam/fuzz_i2s.h: one operand's
+    bytes found in the input, the other written there), and adds the code's constants
+    the input lacks to the dictionary;
   - has ember **mutate** (fuzz/mutate.c: havoc + splice, inputs that grow up to
     --max-size), with an optional ember **dictionary** (--dict, fuzz/tools/fuzz_dict.py;
     integer tokens in the target's byte order, from HELLO), and operator weights it
-    **adapts** to what finds coverage. An ember without in-ember mutation (HELLO bit 13)
-    is refused: rebuild it;
+    **adapts** to what finds coverage. An ember without in-ember mutation and stages
+    (HELLO bits 13 and 12) is refused: rebuild it;
   - saves each crash as the **full input plus a .info sidecar** (reason name,
     status, size, hex) so it can be replayed (`uam-run --fuzz-replay`), and
     **deduplicates** by (reason, status). HANG and TIMEOUT verdicts go to
@@ -84,7 +85,6 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cmplog import candidates as i2s_candidates, parse_cmps, tokens as i2s_tokens  # noqa: E402
 from fuzz_dict import Dictionary, IntToken, parse_dict  # noqa: E402
 from fuzz_queue import (SCHEDULES, Entry, OpStats, Queue, entry_name,  # noqa: E402
                         hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
@@ -96,19 +96,24 @@ NET_VERSION = 1
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
-JUDGE, PROGRESS = 16, 17
+JUDGE, PROGRESS, STAGE, STAGE_RESULT = 16, 17, 18, 19
 FIND_HDR_LEN, JUDGE_LEN = 49, 25
 OPT_JUDGE = 1 << 2                       # OPTIONS: a JUDGE frame before each INPUT's reply
 HAVOC_EDGES = 1 << 0                     # HAVOC flags: HAVOC_DONE lists executions per bucket
-HAVOC_STATUS = {1: "no accepted MUTATOR", 2: "no such corpus entry", 3: "a bad batch size"}
+HAVOC_STATUS = {1: "no accepted MUTATOR", 2: "no such corpus entry", 3: "a bad batch size",
+                4: "compare logging is off"}
 HAVOC_MAX = 1 << 20                      # most mutations in one HAVOC
+STAGE_I2S, STAGE_TRIM = 1, 2             # STAGE kinds
+STAGE_I2S_MAX, STAGE_TRIM_MAX = 4096, 65536   # most candidates / cuts in one STAGE
+STAGE_RESULT_HDR_LEN = 9
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
 COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 13, 25
 HELLO_BIG_ENDIAN = 1 << 15               # HELLO flags: the target is big-endian
 HELLO_CMP = 1 << 14                      # HELLO flags: compare logging is understood
 HELLO_HAVOC = 1 << 13                    # HELLO flags: MUTATOR, CORPUS and HAVOC are understood
+HELLO_STAGES = 1 << 12                   # HELLO flags: STAGE is understood
 OPT_SPARSE = 1 << 0                      # OPTIONS: reply with SPARSE, not COVERAGE
-OPT_CMP_LOG = 1 << 1                     # OPTIONS: instrument compares for CMP_INPUT
+OPT_CMP_LOG = 1 << 1                     # OPTIONS: instrument compares (input-to-state)
 CMPLOG_TOKENS_MAX = 256                  # dictionary tokens taken from compare logs
 KIND_INIT, KIND_ITER = 1, 2
 
@@ -395,9 +400,12 @@ def main():
     if not flags & HELLO_HAVOC:
         sys.exit("brain: this ember does not mutate inputs itself (HELLO lacks bit 13): "
                  "rebuild uam-run from a tree that has fuzz/mutate.c")
+    if not flags & HELLO_STAGES:
+        sys.exit("brain: this ember does not trim or derive input-to-state candidates itself "
+                 "(HELLO lacks bit 12): rebuild uam-run from a tree that has fuzz/i2s.c")
     # Ask for SPARSE replies: the hit buckets instead of the whole map. An ember that
     # does not know OPTIONS ignores it and keeps sending COVERAGE; both are handled.
-    # Compare logging only from an ember that announced it (it answers CMP_INPUT).
+    # Compare logging only from an ember that announced it.
     cmplog_on = bool(args.cmplog and flags & HELLO_CMP)
     opt_flags = OPT_SPARSE | OPT_JUDGE | (OPT_CMP_LOG if cmplog_on else 0)
 
@@ -433,7 +441,6 @@ def main():
     unstable = imported = trimmed_bytes = 0
     cmplog_execs = cmplog_finds = cmplog_tokens = 0
     cmplog_done = set()    # queue entry ids already through the input-to-state stage
-    last_cmps = [None]     # the records of the last CMP_INPUT
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
     saved_per_sig = {}     # (reason, status) -> crashes saved (--crashes-per-sig)
@@ -545,16 +552,15 @@ def main():
         """Mirror a queue entry into ember (a parent and a splice donor)."""
         send_frame(conn, CORPUS, struct.pack(">II", e.id, len(e.data)) + e.data)
 
-    def havoc(e, n):
-        """One HAVOC batch: n mutations of e, run and judged by ember. Returns its FINDs as
-        (reason, status, insns, new_buckets, new_classes, path, data, hits); the totals are
-        accounted here."""
-        nonlocal execs, mutated, crashes, hangs, rejected, batches
-        first = next_id[0]
-        next_id[0] += n
-        flags = HAVOC_EDGES if queue.track_edges else 0
-        send_frame(conn, HAVOC, struct.pack(">QIIQI", first, e.id, n, rng.getrandbits(64), flags))
+    def batch(ftype, body, first, span, e):
+        """One batch (HAVOC or STAGE) to its HAVOC_DONE; its inputs' ids are first ..
+        first + span - 1. Returns (finds, a stage's STAGE_RESULT payload or None, runs):
+        the FINDs as (reason, status, insns, new_buckets, new_classes, path, data, hits).
+        The totals are accounted here, except for `mutated`."""
+        nonlocal execs, crashes, hangs, rejected
+        send_frame(conn, ftype, body)
         finds = []
+        result = None
         while True:
             ftype, payload = next_frame()
             if ftype == FIND:
@@ -568,14 +574,19 @@ def main():
                     raise ProtocolError("FIND is cut short (%d bytes)" % len(payload)) from None
                 if len(data) != dlen or len(payload) != p + 4 + 5 * nh:
                     raise ProtocolError("FIND's lengths do not add up (%d bytes)" % len(payload))
-                if not first <= fid < first + n:
+                if not first <= fid < first + span:
                     raise ProtocolError("FIND id=%d is not in the batch %d..%d"
-                                        % (fid, first, first + n - 1))
+                                        % (fid, first, first + span - 1))
                 hits = list(struct.iter_unpack(">IB", payload[p + 4:]))
                 finds.append((reason, status, insns, nb, nc, path.to_bytes(8, "big"), data, hits))
                 continue
             if ftype == PROGRESS:         # the batch is alive: the reply timeout starts anew
                 maybe_status()
+                continue
+            if ftype == STAGE_RESULT:
+                if len(payload) < STAGE_RESULT_HDR_LEN or struct.unpack(">Q", payload[:8])[0] != first:
+                    raise ProtocolError("STAGE_RESULT does not belong to the stage %d" % first)
+                result = payload[8:]      # from the kind on
                 continue
             if ftype != HAVOC_DONE:
                 raise ProtocolError("expected FIND or HAVOC_DONE in a batch, got frame type %d"
@@ -600,11 +611,9 @@ def main():
         if done_id != first:
             raise ProtocolError("HAVOC_DONE for batch %d while batch %d runs" % (done_id, first))
         if st:
-            raise ProtocolError("ember refused HAVOC for queue entry %s: %s"
+            raise ProtocolError("ember refused a batch for queue entry %s: %s"
                                 % (e.name, HAVOC_STATUS.get(st, "status %d" % st)))
-        batches += 1
         execs += ex
-        mutated += ex
         crashes += by[FAULT] + by[GUARD] + by[ORACLE]
         hangs += by[HANG] + by[TIMEOUT]
         rejected += by[REJECTED]
@@ -618,32 +627,59 @@ def main():
             ef = queue.edge_freq
             for i, cnt in edges:
                 ef[i] = ef.get(i, 0) + cnt
+        return finds, result, ex
+
+    def havoc(e, n):
+        """One HAVOC batch: n mutations of e, run and judged by ember. Returns its FINDs."""
+        nonlocal mutated, batches
+        first = next_id[0]
+        next_id[0] += n
+        flags = HAVOC_EDGES if queue.track_edges else 0
+        finds, _, ex = batch(HAVOC, struct.pack(">QIIQI", first, e.id, n, rng.getrandbits(64), flags),
+                             first, n, e)
+        batches += 1
+        mutated += ex
         return finds
 
-    def take_finds(e, finds):
-        """After a batch: keep its new coverage as queue entries, save its crashes."""
+    def run_stage(kind, e, limit):
+        """One STAGE on e: the entry's own run and at most `limit` inputs ember derives
+        from it. Returns (finds, the STAGE_RESULT payload from its kind on, runs)."""
+        first = next_id[0]
+        next_id[0] += limit + 1
+        flags = HAVOC_EDGES if queue.track_edges else 0
+        finds, result, ex = batch(STAGE, struct.pack(">QIBII", first, e.id, kind, limit, flags),
+                                  first, limit + 1, e)
+        if not result:
+            raise ProtocolError("a stage for queue entry %s ended without a STAGE_RESULT" % e.name)
+        return finds, result, ex
+
+    def take_finds(e, finds, op="havoc"):
+        """After a batch: keep its new coverage as queue entries, save its crashes. Returns
+        how many entries it added."""
         nonlocal new_cov
+        kept = 0
         for reason, status, insns, nb, nc, path, data, hits in finds:
             if reason:
                 save_crash(data, reason, status, counted=True, novel=True)
                 continue
             edges[0] += nb                # ember judged it: its record is the only one
-            c = add_entry(data, hits, insns, path, nb, parent=e, op="havoc")
+            c = add_entry(data, hits, insns, path, nb, parent=e, op=op)
+            kept += 1
             if nb:
                 new_cov += 1
-            log("new coverage +%d buckets, +%d classes (queue=%d, %d bytes) %s"
-                % (nb, nc, len(queue.entries), len(data), c.name))
+            log("%snew coverage +%d buckets, +%d classes (queue=%d, %d bytes) %s"
+                % ("" if op == "havoc" else op + ": ", nb, nc, len(queue.entries), len(data), c.name))
             emit_event("find", "queue=%d %s" % (len(queue.entries), c.name), edges=nb)
+        return kept
 
-    def probe(data, cmp=False):
+    def probe(data):
         """Send one input and return ember's verdict, with no accounting:
         ('crash', reason, status) | ('iter', hits, insns) | ('other', None, None).
-        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map.
-        cmp: as CMP_INPUT; its compare records land in last_cmps[0]."""
+        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map."""
         ident = next_id[0]
         next_id[0] += 1
         last_judge[0] = None
-        send_frame(conn, CMP_INPUT if cmp else INPUT, struct.pack(">QI", ident, len(data)) + data)
+        send_frame(conn, INPUT, struct.pack(">QI", ident, len(data)) + data)
         while True:
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
@@ -657,16 +693,6 @@ def main():
                     raise ProtocolError("JUDGE for id=%d while input id=%d is running"
                                         % (jid, ident))
                 last_judge[0] = (nb, nc, path.to_bytes(8, "big"), bool(novel))
-                continue
-            if ftype == CMPS:
-                try:
-                    cid, _dropped, recs = parse_cmps(payload)
-                except ValueError as e:
-                    raise ProtocolError(str(e)) from None
-                if cid != ident or not cmp:
-                    raise ProtocolError("CMPS for id=%d while input id=%d is a%s"
-                                        % (cid, ident, " CMP_INPUT" if cmp else "n INPUT"))
-                last_cmps[0] = recs
                 continue
             insns = 0
             if ftype == CRASH:
@@ -900,43 +926,32 @@ def main():
         return e
 
     def trim(e):
-        """Remove chunks while the path stays the same (AFL's trim stage): smaller
-        entries mutate faster and splice better. One run per probe: ember is exact."""
+        """Have ember cut chunks out of e while its path stays the same (AFL's trim
+        stage): smaller entries mutate faster and splice better."""
         nonlocal trimmed_bytes
         e.trimmed = True
-        data = e.data
-        if len(data) < 5 or args.trim_probes <= 0:
+        if len(e.data) < 5 or args.trim_probes <= 0:
             save_state(queue_dir, e)
             return
         stage[0] = "trim %s" % e.name
-        lp2 = 1
-        while lp2 < len(data):
-            lp2 <<= 1
-        remove = max(lp2 // 16, 4)
-        floor = max(lp2 // 1024, 4)
-        probes = 0
-        best_insns = e.insns
-        while remove >= floor and probes < args.trim_probes and not stop["flag"]:
-            pos = remove
-            while pos < len(data) and probes < args.trim_probes:
-                cand = data[:pos] + data[pos + remove:]
-                probes += 1
-                r = run(cand)
-                if r[0] == "iter" and r[3] == e.path:
-                    data = cand
-                    best_insns = r[2]
-                else:
-                    pos += remove
-            remove //= 2
-        if len(data) < len(e.data):
+        finds, res, _ = run_stage(STAGE_TRIM, e, min(args.trim_probes, STAGE_TRIM_MAX))
+        try:
+            kind, ran, insns, _path, dlen = struct.unpack(">BBQQI", res[:22])
+        except struct.error:
+            raise ProtocolError("STAGE_RESULT is cut short (%d bytes)" % len(res)) from None
+        data = res[22:]
+        if kind != STAGE_TRIM or len(data) != dlen:
+            raise ProtocolError("STAGE_RESULT is not a trim's (%d bytes)" % len(res))
+        if ran and len(data) < len(e.data):
             trimmed_bytes += len(e.data) - len(data)
             e.data = data
-            e.insns = best_insns
+            e.insns = insns
             save_entry(queue_dir, e)
             queue.rescore(e)
             corpus_put(e)
         else:
             save_state(queue_dir, e)
+        take_finds(e, finds, op="trim")   # a cut that ran new code is an entry of its own
 
     def add_tokens(toks):
         """Constants the target compares with, as dictionary integers (target order)."""
@@ -952,36 +967,31 @@ def main():
             send_mutator()
 
     def i2s(e):
-        """The input-to-state stage: e's compares, logged once, each operand written where
-        the other one is in the input. Its candidates count as mutated execs."""
-        nonlocal mutated, cmplog_execs, cmplog_finds, new_cov
+        """The input-to-state stage: ember runs e with its compares logged and then every
+        input with one operand written where the other one is. The candidates count as
+        mutated execs."""
+        nonlocal mutated, cmplog_execs, cmplog_finds
         cmplog_done.add(e.id)
         stage[0] = "cmplog %s" % e.name
-        last_cmps[0] = None
-        probe(e.data, cmp=True)
-        nonlocal_execs(1)
-        recs = last_cmps[0] or []
-        if not recs:
+        limit = min(args.cmplog_max, STAGE_I2S_MAX)
+        if args.iters:
+            limit = min(limit, args.iters - mutated)
+        if limit <= 0:
             return
-        add_tokens(i2s_tokens(e.data, recs))
-        for cand in i2s_candidates(e.data, recs, args.cmplog_max):
-            if stop["flag"] or (args.iters and mutated >= args.iters):
-                break
-            if len(cand) > args.max_size:
-                continue
-            r = run(cand)
-            mutated += 1
-            cmplog_execs += 1
-            if r[0] == "iter" and r[5] > 0:
-                c = add_entry(cand, r[1], r[2], r[3], r[4], parent=e, op="cmplog")
-                cmplog_finds += 1
-                if r[4]:
-                    new_cov += 1
-                log("cmplog: new coverage +%d buckets, +%d classes (queue=%d) %s"
-                    % (r[4], r[5], len(queue.entries), c.name))
-                emit_event("find", "queue=%d %s" % (len(queue.entries), c.name), edges=r[4])
-            maybe_status()
-            sync()
+        finds, res, ex = run_stage(STAGE_I2S, e, limit)
+        try:
+            kind, _compares, _dropped, _cands, ntok = struct.unpack(">BIIIH", res[:15])
+            toks = [(v, w) for w, v in struct.iter_unpack(">BQ", res[15:15 + 9 * ntok])]
+        except struct.error:
+            raise ProtocolError("STAGE_RESULT is cut short (%d bytes)" % len(res)) from None
+        if kind != STAGE_I2S or len(res) != 15 + 9 * ntok:
+            raise ProtocolError("STAGE_RESULT is not an input-to-state stage's (%d bytes)" % len(res))
+        mutated += max(ex - 1, 0)
+        cmplog_execs += max(ex - 1, 0)
+        cmplog_finds += take_finds(e, finds, op="cmplog")
+        add_tokens(toks)
+        maybe_status()
+        sync()
 
     last_sync = [0.0]
 

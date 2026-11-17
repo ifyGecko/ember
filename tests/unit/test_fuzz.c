@@ -1531,6 +1531,139 @@ static void test_campaign(const target *t, backend bk)
           t->name, bk_name[bk], again[0], again[1]);
 }
 
+/* ---- stages: input-to-state and trimming in the campaign engine -------------- */
+
+/* Run the stage that was begun to its end: its runs, and the inputs worth reporting. */
+static uint32_t run_stage(uam_fuzz *f, uam_fuzz_campaign *c, unsigned *crashes)
+{
+    const uint8_t *d;
+    size_t len;
+    uint32_t runs = 0;
+    *crashes = 0;
+    while (uam_fuzz_campaign_batch_next(c, &d, &len)) {
+        uam_fuzz_result r;
+        uam_fuzz_judgement j;
+        CHECK(uam_fuzz_run_one(f, d, len, &r) == UAM_OK, "stage run");
+        CHECK(uam_fuzz_campaign_batch_judge(c, r.verdict, r.detail, &j) == UAM_OK, "stage judge");
+        *crashes += j.report && j.novel_crash;
+        runs++;
+        if (runs > 100000)
+            break;
+    }
+    return runs;
+}
+
+static size_t cut_tail(void *ctx, uint8_t *data, size_t len, size_t cap)
+{
+    (void)cap;
+    unsigned *calls = ctx;
+    ++*calls;
+    data[len - 1] = '$';   /* a fix-up that marks what it saw */
+    return len;
+}
+
+static void test_stages(const target *t, backend bk)
+{
+    uam_machine m;
+    machine_for(&m, t, bk);
+    uam_fuzz *f = harness_for(&m, t, NULL, 0, UAM_FUZZ_EXC_DEFAULT);
+    uam_fuzz_campaign *c = uam_fuzz_campaign_create(f);
+    uam_fuzz_result r;
+    uam_fuzz_boot(f, &r);
+    uam_mutator *mut = uam_fuzz_campaign_mutator(c);
+    uam_mutator_set_max_size(mut, 64);
+    uam_mutator_corpus_put(mut, 1, (const uint8_t *)"AAAA", 4);
+    uam_mutator_corpus_put(mut, 2, (const uint8_t *)"AAAAAAAAAAAAAAAA", 16);
+    uam_mutator_corpus_put(mut, 3, (const uint8_t *)"AAA", 3);
+    uam_mutator_corpus_put(mut, 4, (const uint8_t *)"B", 1);
+    unsigned crashes;
+
+    /* Input-to-state needs compare logging; bad requests are refused. */
+    CHECK(uam_fuzz_campaign_i2s_begin(c, 1, 64, 0) == UAM_ERR_INVALID
+          && !uam_fuzz_campaign_batch_next(c, &(const uint8_t *){ 0 }, &(size_t){ 0 }),
+          "%s: i2s without compare logging is refused", t->name);
+    CHECK(uam_fuzz_set_cmp(f, UAM_FUZZ_CMP_LOG) == UAM_OK, "compare logging on");
+    CHECK(uam_fuzz_campaign_i2s_begin(c, 9, 64, 0) == UAM_ERR_INVALID
+          && uam_fuzz_campaign_i2s_begin(c, 1, 0, 0) == UAM_ERR_INVALID
+          && uam_fuzz_campaign_i2s_begin(c, 1, UAM_FUZZ_I2S_MAX + 1, 0) == UAM_ERR_INVALID
+          && uam_fuzz_campaign_trim_begin(c, 9, 64, 0) == UAM_ERR_INVALID
+          && uam_fuzz_campaign_trim_begin(c, 1, 0, 0) == UAM_ERR_INVALID, "bad stages refused");
+
+    /* "AAAA": the target compares its first byte with five keys; each key written over
+     * each 'A' is a candidate, and the ones at offset 0 are the planted bugs. */
+    CHECK(uam_fuzz_campaign_i2s_begin(c, 1, 256, 0) == UAM_OK, "i2s begin");
+    uint32_t runs = run_stage(f, c, &crashes);
+    const uam_fuzz_i2s *is = uam_fuzz_campaign_i2s(c);
+    const uam_fuzz_batch *b = uam_fuzz_campaign_batch(c);
+    CHECK(is->compares >= 5 && is->candidates >= 20 && is->candidates <= 60
+          && runs == is->candidates + 1 && b->execs == runs && b->left == 0,
+          "%s %s: i2s: 5 keys at 4 places, and their neighbours where the compare orders "
+          "(%u compares, %u candidates, %u runs)", t->name, bk_name[bk], is->compares,
+          is->candidates, runs);
+    CHECK(b->by_verdict[UAM_FUZZ_CRASH_FAULT] >= 1 && b->by_verdict[UAM_FUZZ_CRASH_ORACLE] == 1
+          && b->by_verdict[UAM_FUZZ_TIMEOUT] >= 1 && crashes >= 2,
+          "%s %s: i2s reaches the planted bugs (%u fault, %u oracle, %u timeout, %u novel)",
+          t->name, bk_name[bk], b->by_verdict[UAM_FUZZ_CRASH_FAULT],
+          b->by_verdict[UAM_FUZZ_CRASH_ORACLE], b->by_verdict[UAM_FUZZ_TIMEOUT], crashes);
+    /* the same stage again: the same runs, nothing novel */
+    CHECK(uam_fuzz_campaign_i2s_begin(c, 1, 256, 0) == UAM_OK, "i2s again");
+    CHECK(run_stage(f, c, &crashes) == runs && crashes == 0, "%s: i2s again: nothing novel", t->name);
+    /* the limit; a stage's inputs go through the fix-up, the entry's own run does not */
+    unsigned calls = 0;
+    uam_fuzz_set_fixup(f, cut_tail, &calls);
+    CHECK(uam_fuzz_campaign_i2s_begin(c, 1, 3, 0) == UAM_OK, "i2s with a limit");
+    CHECK(run_stage(f, c, &crashes) == 4 && calls == 3 && uam_fuzz_campaign_i2s(c)->candidates == 3
+          && uam_fuzz_campaign_batch(c)->data[3] == '$', "%s: the limit, and the fix-up on "
+          "candidates only (%u calls)", t->name, calls);
+    uam_fuzz_set_fixup(f, NULL, NULL);
+    /* an entry that crashes still has its compares */
+    CHECK(uam_fuzz_campaign_i2s_begin(c, 4, 256, 0) == UAM_OK, "i2s of a crashing entry");
+    runs = run_stage(f, c, &crashes);
+    CHECK(runs >= 1 && uam_fuzz_campaign_batch(c)->by_verdict[UAM_FUZZ_CRASH_FAULT] >= 1,
+          "%s: a crashing entry runs (%u runs)", t->name, runs);
+
+    /* Trimming: only the first byte matters to the target, so every 4-byte chunk after
+     * the first goes: 16 -> 4 bytes in three cuts. */
+    CHECK(uam_fuzz_campaign_trim_begin(c, 2, 64, 0) == UAM_OK, "trim begin");
+    runs = run_stage(f, c, &crashes);
+    const uam_fuzz_trim *tr = uam_fuzz_campaign_trim(c);
+    CHECK(tr->ran && tr->len == 4 && tr->removed == 12 && !memcmp(tr->data, "AAAA", 4) && runs == 4
+          && tr->insns > 0, "%s %s: trim: 16 -> 4 bytes in 3 cuts (len %zu, %u runs)", t->name,
+          bk_name[bk], tr->len, runs);
+    uam_fuzz_judgement j;
+    uam_fuzz_run_one(f, tr->data, tr->len, &r);
+    uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j);
+    CHECK(j.path == tr->path && r.insns == tr->insns, "%s: the trimmed entry runs on the entry's "
+          "path, in the instructions said", t->name);
+    CHECK(uam_fuzz_campaign_trim_begin(c, 2, 1, 0) == UAM_OK, "trim with one probe");
+    CHECK(run_stage(f, c, &crashes) == 2 && uam_fuzz_campaign_trim(c)->len == 12,
+          "%s: one probe, one cut", t->name);
+    CHECK(uam_fuzz_campaign_trim_begin(c, 3, 64, 0) == UAM_OK, "trim of a short entry");
+    CHECK(run_stage(f, c, &crashes) == 1 && uam_fuzz_campaign_trim(c)->len == 3
+          && uam_fuzz_campaign_trim(c)->removed == 0, "%s: under 5 bytes nothing is cut", t->name);
+    CHECK(uam_fuzz_campaign_trim_begin(c, 4, 64, 0) == UAM_OK, "trim of a crashing entry");
+    CHECK(run_stage(f, c, &crashes) == 1 && !uam_fuzz_campaign_trim(c)->ran
+          && uam_fuzz_campaign_trim(c)->len == 1, "%s: a crashing entry is not trimmed", t->name);
+    /* a cut that changes the path does not stay: a fix-up that makes cut inputs crash */
+    fix_log fx = { .first = 'O' };
+    uam_fuzz_set_fixup(f, force_first, &fx);
+    CHECK(uam_fuzz_campaign_trim_begin(c, 2, 64, 0) == UAM_OK, "trim against a changing path");
+    runs = run_stage(f, c, &crashes);
+    CHECK(runs == 4 && uam_fuzz_campaign_trim(c)->len == 16 && uam_fuzz_campaign_trim(c)->removed == 0
+          && !memcmp(uam_fuzz_campaign_trim(c)->data, "AAAAAAAAAAAAAAAA", 16),
+          "%s: cuts that change the path are dropped (%u runs, len %zu)", t->name, runs,
+          uam_fuzz_campaign_trim(c)->len);
+    /* a batch of mutations after a stage is a batch of mutations */
+    uam_fuzz_set_fixup(f, NULL, NULL);
+    uint32_t rep;
+    run_batch(f, c, 50, 3, 0, &rep);
+    CHECK(uam_fuzz_campaign_batch(c)->execs == 50, "%s: havoc after a stage", t->name);
+
+    uam_fuzz_campaign_destroy(c);
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+}
+
 /* ---- what a restore keeps of translations ---------------------------------- */
 
 /* A restore before every input keeps the processor's translations (translated code's
@@ -1680,6 +1813,9 @@ int main(void)
     for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++)
         for (int bk = BK_INTERP; bk <= BK_JIT; bk++)
             test_campaign(&ts[i], (backend)bk);
+    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++)
+        for (int bk = BK_INTERP; bk <= BK_JIT; bk++)
+            test_stages(&ts[i], (backend)bk);
     test_internal_error(&ts[1]);
     test_replay_sidecars();
     for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++) {

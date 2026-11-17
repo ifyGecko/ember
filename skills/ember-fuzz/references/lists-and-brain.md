@@ -157,16 +157,17 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   ember lists those from what the coverage op recorded, so a big map costs nothing extra.
 - The campaign (`docs/fuzzing.md`, "The campaign"): a favored set, calibration (each new
   entry runs twice; an `UNSTABLE` line means the harness leaks state between iterations:
-  fix that first, the readiness gate in `SKILL.md`), trimming, and energy from a power
+  fix that first, the readiness gate in `SKILL.md`), trimming (ember cuts and runs; a cut
+  that reaches new code is kept as an `op:trim` entry), and energy from a power
   schedule: `--schedule fast` (default), `explore`, `exploit`, `coe`, `rare`, and the
   variants `lin`, `quad` (gentler `fast`), `seek` (`explore` ignoring cost) and `mmopt`
   (`explore` favoring the newest, deepest entries). After the
   baseline it suggests a `--fuzz-iter-insns` (5x the slowest entry).
 - Compare logging (on when ember offers it in HELLO; `--no-cmplog` turns it off): each
-  queue entry, when first chosen, runs once with its compares logged (CMP_INPUT, a CMPS
-  frame back), and `fuzz/tools/cmplog.py` writes each compare's other operand where one
-  operand's bytes are in the input (both byte orders, also at the narrowest width; ±1 for
-  ordered compares), up to `--cmplog-max` (256) runs per entry. Code constants the input
+  queue entry, when first chosen, goes through an input-to-state stage that ember runs by
+  itself: the entry once with its compares logged, then every input with a compare's other
+  operand written where one operand's bytes are in the entry (both byte orders, also at
+  the narrowest width; ±1 for ordered compares), up to `--cmplog-max` (256) runs per entry. Code constants the input
   lacks join the dictionary. Normal runs pay 1-3% for it. It reaches what havoc cannot
   guess (a 32-bit magic value from an unrelated seed in a few thousand runs), but not
   compares done a byte at a time in a loop (`strcmp`, `memcmp`) or on values computed

@@ -32,6 +32,20 @@ struct uam_fuzz_campaign {
     const uint8_t *parent;
     size_t         parent_len;
     counts         paths, edge_runs;
+    /* a stage: phase 0 is the entry's own run, 1 the inputs derived after it */
+    enum { ST_HAVOC, ST_I2S, ST_TRIM } stage;
+    unsigned       phase;
+    uint8_t       *sbuf;        /* the stage's input being run */
+    size_t         sbuf_cap;
+    uam_i2s_patch *patches;
+    size_t         n_patches, next_patch, cap_patches;
+    uint32_t       limit;       /* candidates or probes at most */
+    uam_i2s_token  tokens[UAM_FUZZ_I2S_TOKENS];
+    uam_fuzz_i2s   i2s;
+    uint8_t       *tdata;       /* the entry as trimmed so far */
+    size_t         tlen, tcap, remove, floor, pos;
+    uint32_t       probes;
+    uam_fuzz_trim  trim;
 };
 
 uint8_t uam_fuzz_count_class(uint8_t c)
@@ -169,6 +183,9 @@ void uam_fuzz_campaign_destroy(uam_fuzz_campaign *c)
     free(c->sigs);
     counts_free(&c->paths);
     counts_free(&c->edge_runs);
+    free(c->sbuf);
+    free(c->patches);
+    free(c->tdata);
     free(c);
 }
 
@@ -261,6 +278,185 @@ uam_status uam_fuzz_campaign_judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uin
     return judge(c, v, detail, j, NULL, NULL);
 }
 
+/* ---- stages ---------------------------------------------------------------- */
+
+static bool grow(uint8_t **buf, size_t *cap, size_t need)
+{
+    if (need <= *cap)
+        return true;
+    uint8_t *p = realloc(*buf, need);
+    if (!p)
+        return false;
+    *buf = p;
+    *cap = need;
+    return true;
+}
+
+static uam_status stage_begin(uam_fuzz_campaign *c, int stage, uint32_t entry, uint32_t limit,
+                              uint32_t max, unsigned flags)
+{
+    c->b = (uam_fuzz_batch){ 0 };
+    counts_clear(&c->paths);
+    counts_clear(&c->edge_runs);
+    c->flags = flags;
+    c->stage = stage;
+    c->phase = 0;
+    c->limit = limit;
+    c->parent = uam_mutator_corpus_get(c->mut, entry, &c->parent_len);
+    if (!c->parent || !limit || limit > max)
+        return UAM_ERR_INVALID;
+    /* room for the entry, and for a fix-up to grow an input up to the mutator's limit */
+    size_t cap = uam_mutator_max_size(c->mut);
+    if (cap < c->parent_len)
+        cap = c->parent_len;
+    if (!grow(&c->sbuf, &c->sbuf_cap, cap ? cap : 1))
+        return UAM_ERR_NOMEM;
+    c->b.left = 1;   /* the entry's own run */
+    return UAM_OK;
+}
+
+uam_status uam_fuzz_campaign_i2s_begin(uam_fuzz_campaign *c, uint32_t entry,
+                                       uint32_t max_candidates, unsigned flags)
+{
+    c->i2s = (uam_fuzz_i2s){ .tokens = c->tokens };
+    uam_status st = stage_begin(c, ST_I2S, entry, max_candidates, UAM_FUZZ_I2S_MAX, flags);
+    if (st != UAM_OK)
+        return st;
+    if (!(uam_fuzz_cmp_modes(c->f) & UAM_FUZZ_CMP_LOG)) {
+        c->b.left = 0;
+        return UAM_ERR_INVALID;
+    }
+    if (max_candidates > c->cap_patches) {
+        uam_i2s_patch *p = realloc(c->patches, sizeof(*p) * max_candidates);
+        if (!p) {
+            c->b.left = 0;
+            return UAM_ERR_NOMEM;
+        }
+        c->patches = p;
+        c->cap_patches = max_candidates;
+    }
+    c->n_patches = c->next_patch = 0;
+    return UAM_OK;
+}
+
+uam_status uam_fuzz_campaign_trim_begin(uam_fuzz_campaign *c, uint32_t entry,
+                                        uint32_t max_probes, unsigned flags)
+{
+    c->trim = (uam_fuzz_trim){ 0 };
+    uam_status st = stage_begin(c, ST_TRIM, entry, max_probes, UAM_FUZZ_TRIM_MAX, flags);
+    if (st != UAM_OK)
+        return st;
+    if (!grow(&c->tdata, &c->tcap, c->sbuf_cap)) {
+        c->b.left = 0;
+        return UAM_ERR_NOMEM;
+    }
+    memcpy(c->tdata, c->parent, c->parent_len);
+    c->tlen = c->parent_len;
+    c->probes = 0;
+    c->trim.data = c->tdata;
+    c->trim.len = c->tlen;
+    return UAM_OK;
+}
+
+const uam_fuzz_i2s  *uam_fuzz_campaign_i2s(const uam_fuzz_campaign *c)  { return &c->i2s; }
+const uam_fuzz_trim *uam_fuzz_campaign_trim(const uam_fuzz_campaign *c) { return &c->trim; }
+
+/* The stage's next input into sbuf. */
+static bool stage_next(uam_fuzz_campaign *c, const uint8_t **data, size_t *len)
+{
+    uint8_t *buf = c->sbuf;
+    size_t n;
+    if (c->phase == 0) {
+        memcpy(buf, c->parent, c->parent_len);
+        n = c->parent_len;
+        if (c->stage == ST_I2S)
+            uam_fuzz_cmp_arm(c->f);
+    } else if (c->stage == ST_I2S) {
+        const uam_i2s_patch *p = &c->patches[c->next_patch++];
+        memcpy(buf, c->parent, c->parent_len);
+        memcpy(buf + p->pos, p->bytes, p->len);
+        n = uam_fuzz_fixup(c->f, buf, c->parent_len, c->sbuf_cap);
+    } else {
+        /* the entry as trimmed so far, without the chunk at pos */
+        const size_t cut = c->tlen - c->pos < c->remove ? c->tlen - c->pos : c->remove;
+        memcpy(buf, c->tdata, c->pos);
+        memcpy(buf + c->pos, c->tdata + c->pos + cut, c->tlen - c->pos - cut);
+        n = uam_fuzz_fixup(c->f, buf, c->tlen - cut, c->sbuf_cap);
+        c->probes++;
+    }
+    c->b.data = buf;
+    c->b.len = n;
+    c->b.ops = 0;
+    c->b.left--;
+    *data = buf;
+    *len = n;
+    return true;
+}
+
+/* Trimming: is there another cut to try? Sets the batch's `left`, and the result when not. */
+static void trim_seek(uam_fuzz_campaign *c)
+{
+    while (c->remove >= c->floor && c->probes < c->limit) {
+        if (c->pos < c->tlen) {
+            c->b.left = 1;
+            return;
+        }
+        c->remove /= 2;
+        c->pos = c->remove;
+    }
+    c->b.left = 0;
+    c->trim.len = c->tlen;
+    c->trim.removed = (uint32_t)(c->parent_len - c->tlen);
+}
+
+/* A stage's run was judged: derive what runs next from it. */
+static uam_status stage_judged(uam_fuzz_campaign *c, uam_fuzz_verdict v, const uam_fuzz_judgement *j)
+{
+    const uam_fuzz_result *r = uam_fuzz_last_result(c->f);
+    if (c->stage == ST_I2S) {
+        if (c->phase == 0) {
+            size_t n = 0;
+            uint64_t dropped = 0;
+            const uam_cmp_entry *log = uam_fuzz_cmp_log(c->f, &n, &dropped);
+            if (!log)
+                n = 0;
+            c->i2s.compares = (uint32_t)n;
+            c->i2s.dropped = dropped;
+            c->n_patches = uam_i2s_candidates(c->parent, c->parent_len, log, n, c->patches, c->limit);
+            c->i2s.n_tokens = uam_i2s_tokens(c->parent, c->parent_len, log, n, c->tokens,
+                                             UAM_FUZZ_I2S_TOKENS);
+            c->i2s.candidates = (uint32_t)c->n_patches;
+            c->b.left = (uint32_t)c->n_patches;
+            c->phase = 1;
+        }
+        return UAM_OK;
+    }
+    if (c->phase == 0) {
+        c->trim.ran = v == UAM_FUZZ_OK;
+        c->trim.path = j->path;
+        c->trim.insns = r ? r->insns : 0;
+        c->phase = 1;
+        if (!c->trim.ran || c->tlen < 5) {
+            c->b.left = 0;
+            return UAM_OK;
+        }
+        size_t lp2 = 1;
+        while (lp2 < c->tlen)
+            lp2 <<= 1;
+        c->remove = lp2 / 16 > 4 ? lp2 / 16 : 4;
+        c->floor = lp2 / 1024 > 4 ? lp2 / 1024 : 4;
+        c->pos = c->remove;
+    } else if (v == UAM_FUZZ_OK && j->path == c->trim.path && c->b.len < c->tlen) {
+        memcpy(c->tdata, c->b.data, c->b.len);   /* the cut stays; the same place again */
+        c->tlen = c->b.len;
+        c->trim.insns = r ? r->insns : 0;
+    } else {
+        c->pos += c->remove;
+    }
+    trim_seek(c);
+    return UAM_OK;
+}
+
 /* ---- batches --------------------------------------------------------------- */
 
 uam_status uam_fuzz_campaign_batch_begin(uam_fuzz_campaign *c, uint32_t entry, uint32_t n,
@@ -270,6 +466,7 @@ uam_status uam_fuzz_campaign_batch_begin(uam_fuzz_campaign *c, uint32_t entry, u
     counts_clear(&c->paths);
     counts_clear(&c->edge_runs);
     c->flags = flags;
+    c->stage = ST_HAVOC;
     c->parent = uam_mutator_corpus_get(c->mut, entry, &c->parent_len);
     if (!c->parent || !n)
         return UAM_ERR_INVALID;
@@ -287,6 +484,8 @@ bool uam_fuzz_campaign_batch_next(uam_fuzz_campaign *c, const uint8_t **data, si
 {
     if (!c->b.left)
         return false;
+    if (c->stage != ST_HAVOC)
+        return stage_next(c, data, len);
     uint8_t *buf = uam_mutator_mutate(c->mut, c->parent, c->parent_len, &c->b.len, &c->b.ops);
     if (!buf) {
         c->b.left = 0;
@@ -333,6 +532,8 @@ uam_status uam_fuzz_campaign_batch_judge(uam_fuzz_campaign *c, uam_fuzz_verdict 
         }
     }
     b->reports += j->report;
+    if (c->stage != ST_HAVOC)
+        return stage_judged(c, v, j);
     return UAM_OK;
 }
 

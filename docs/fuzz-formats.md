@@ -167,7 +167,7 @@ Every integer is big-endian, and maps are raw u8 counters.
 
 | Type | Direction | Payload |
 |---|---|---|
-| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits, bit 3 the block model; bit 13: mutation in ember is understood (MUTATOR, CORPUS, HAVOC); bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
+| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits, bit 3 the block model; bit 12: stages in ember are understood (STAGE); bit 13: mutation in ember is understood (MUTATOR, CORPUS, HAVOC); bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
 | 2 INPUT | brain → ember | u64 id (non-zero), u32 len, data |
 | 3 COVERAGE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u32 map_size, map |
 | 4 CRASH | ember → brain | u64 id, u8 reason, u32 status |
@@ -181,15 +181,17 @@ Every integer is big-endian, and maps are raw u8 counters.
 | 12 CORPUS | brain → ember | u32 entry, u32 len, data |
 | 13 HAVOC | brain → ember | u64 first_id, u32 entry, u32 n, u64 seed, u32 flags (bit 0 EDGES) |
 | 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (the three 0 unless reason 0), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
-| 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n is 0 or over 2^20), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges, then n × (u32 index, u32 execs) (EDGES only) |
+| 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n (a stage's limit) is 0 or over its maximum or the stage's kind is unknown, 4 input-to-state without compare logging), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges, then n × (u32 index, u32 execs) (EDGES only) |
 | 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0), u8 novel_crash |
 | 17 PROGRESS | ember → brain, in a batch silent for 1 s | u64 first_id, u32 execs (runs so far) |
+| 18 STAGE | brain → ember | u64 first_id, u32 entry, u8 kind (1 input-to-state, 2 trimming), u32 limit (inputs derived at most: 1 .. 4096 candidates, 1 .. 65536 cuts), u32 flags (bit 0 EDGES) |
+| 19 STAGE_RESULT | ember → brain, before the HAVOC_DONE of a stage that ran | u64 first_id, u8 kind, then for input-to-state: u32 compares, u32 dropped, u32 candidates, u16 n, then n × (u8 width (bytes: 2, 4 or 8), u64 value); for trimming: u8 ran, u64 insns, u64 path, u32 len, data |
 
 **Lockstep.** After HELLO, ember sends the boot's map once, unsolicited, as COVERAGE id 0,
 kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE (or SPARSE) kind
 ITER if the input ended normally, CRASH otherwise. Every MUTATOR gets one MUTATOR_INFO, every
-HAVOC any number of FIND and PROGRESS frames and then one HAVOC_DONE; CORPUS and OPTIONS
-get none. Unknown frame types are ignored.
+HAVOC any number of FIND and PROGRESS frames and then one HAVOC_DONE, every STAGE the same
+with one STAGE_RESULT before the HAVOC_DONE; CORPUS and OPTIONS get none. Unknown frame types are ignored.
 
 **SPARSE.** A brain that sends OPTIONS with bit 0 gets every later map as the list of its
 set buckets instead of the whole map: a typical iteration sets a few hundred to a few
@@ -246,6 +248,31 @@ coverage FINDs (id 25 marks a splice); per path, the runs; per bucket, with EDGE
 runs that hit it. A HAVOC that cannot run is answered
 at once with HAVOC_DONE and its status. INPUT and CMP_INPUT keep working as before between
 batches.
+
+**Stages in ember.** An ember whose HELLO has bit 12 also derives inputs from a corpus
+entry itself (`uam/fuzz_campaign.h`, "stages"). A STAGE is a batch like a HAVOC's: its
+runs have the ids first_id .. first_id + limit, the entry's own run first; they are judged
+against the same record, reported as FIND (with `ops` 0) on the same terms and counted in
+the HAVOC_DONE that closes the stage. Each derived input goes through the route's fix-up.
+Right before that HAVOC_DONE, a stage that ran sends one STAGE_RESULT.
+
+- *Input-to-state* (kind 1; needs OPTIONS bit 1): the entry runs once with its compares
+  logged, then every candidate derived from the log runs (`uam/fuzz_i2s.h`): for each
+  record, one operand's bytes are looked for in the entry, in either byte order, at the
+  compare's width and at the narrowest of 1, 2 and 4 bytes that holds both values, and the
+  other operand is written there, plus and minus one as well for an ordered compare. A
+  constant of the code (IMM) is never looked for, only written; a pattern of zero bytes is
+  not looked for; the first 8 places of a pattern are tried; candidates are distinct.
+  STAGE_RESULT gives the number of records, of records left out, and of candidates, and
+  the code's constants with two or more significant bytes that the entry holds in neither
+  byte order (at most 64): dictionary material.
+- *Trimming* (kind 2): the entry runs once for its path; then chunks are cut out of it,
+  from a sixteenth of its length (rounded up to a power of two) down to a 1024th, at least
+  4 bytes, never the first chunk, and a cut stays when the run still ends normally on the
+  same path and the input got shorter. Entries under 5 bytes are left alone. STAGE_RESULT
+  gives whether the entry's own run ended normally (otherwise nothing was cut), and the
+  entry as trimmed with its instruction count and path; when nothing went, that is the
+  entry itself.
 
 The session ends with BYE from either side. EOF before a BYE is an error. ember notices a
 vanished brain host through TCP keepalive, and a brain that stops answering through

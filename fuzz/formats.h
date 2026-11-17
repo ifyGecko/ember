@@ -204,8 +204,16 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * MUTATOR's cap), sends PROGRESS when a batch has been silent for a second, and closes the
  * batch with one HAVOC_DONE. ember is the one owner of what has been seen: with
  * UAM_NET_OPT_JUDGE it tells the brain, in a JUDGE frame before each INPUT's reply, what
- * that run added. Plain INPUTs
- * keep working alongside (seeds, trimming, input-to-state, minimizing). */
+ * that run added. Plain INPUTs keep working alongside (seeds, minimizing).
+ *
+ * Stages in ember: an ember whose HELLO has UAM_NET_HELLO_STAGES also derives inputs
+ * itself. STAGE asks for one stage on one corpus entry: input-to-state (the entry's run
+ * with its compares logged, then every candidate uam/fuzz_i2s.h derives from the log; it
+ * needs OPTIONS CMP_LOG) or trimming (cuts of the entry that keep its path). A stage is a
+ * batch like HAVOC's: FIND and PROGRESS frames while it runs, then, when it ran, one
+ * STAGE_RESULT with what the stage itself found (dictionary tokens; the entry as
+ * trimmed), and HAVOC_DONE with the totals. Its inputs take the ids first_id .. first_id
+ * + limit (the entry's own run first). */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
 #define UAM_FUZZ_NET_VERSION   1u
@@ -230,12 +238,15 @@ enum uam_fuzz_net_frame {
     UAM_NET_JUDGE    = 16,  /* ember -> brain: the campaign's judgement of an INPUT's run,
                              * before its reply (OPTIONS asked) */
     UAM_NET_PROGRESS = 17,  /* ember -> brain: a batch is running (no other frame for 1 s) */
+    UAM_NET_STAGE    = 18,  /* brain -> ember: run a stage on one corpus entry */
+    UAM_NET_STAGE_RESULT = 19, /* ember -> brain: what the stage found, before its HAVOC_DONE */
 };
 
 /* HELLO flags beyond the UAM_COV_SCHEME* bits */
 #define UAM_NET_HELLO_BIG_ENDIAN  (1u << 15)  /* the target's data byte order is big-endian */
 #define UAM_NET_HELLO_CMP         (1u << 14)  /* OPTIONS CMP_LOG and CMP_INPUT are understood */
 #define UAM_NET_HELLO_HAVOC       (1u << 13)  /* MUTATOR, CORPUS and HAVOC are understood */
+#define UAM_NET_HELLO_STAGES      (1u << 12)  /* STAGE is understood */
 
 /* OPTIONS flags */
 #define UAM_NET_OPT_SPARSE        (1u << 0)   /* reply with SPARSE instead of COVERAGE */
@@ -284,6 +295,15 @@ enum uam_fuzz_net_frame {
  *           u16 n_ops, then n x (u8 op, u32 used, u32 found (in a coverage FIND)),
  *           u32 n_paths, then n x (u64 path, u32 execs), u32 n_edges, then n x (u32 index,
  *           u32 execs) (only with UAM_NET_HAVOC_EDGES).
+ * STAGE:    u64 first_id, u32 entry, u8 kind (UAM_NET_STAGE_*), u32 limit (candidates or
+ *           cuts run at most: 1 .. UAM_NET_STAGE_I2S_MAX / UAM_NET_STAGE_TRIM_MAX),
+ *           u32 flags (UAM_NET_HAVOC_*)
+ * STAGE_RESULT: u64 first_id, u8 kind, then for input-to-state: u32 compares (records the
+ *           entry's run logged), u32 dropped, u32 candidates, u16 n_tokens, then n x
+ *           (u8 width (bytes: 2, 4, 8), u64 value): constants of the code the entry does
+ *           not hold; for trimming: u8 ran (0: the entry's own run did not end normally,
+ *           nothing was cut), u64 insns, u64 path (of the entry as trimmed), u32 len,
+ *           u8 data[len] (the entry as trimmed: the entry itself when nothing went).
  *
  * A path is named by its set of (index, class) pairs, whatever order they were hit in:
  * mix(sum of mix((index << 8 | class) + 1)) in 64-bit arithmetic, with the coverage
@@ -305,6 +325,11 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_FIND_HDR_LEN       49u
 #define UAM_NET_JUDGE_LEN          25u
 #define UAM_NET_PROGRESS_LEN       12u
+#define UAM_NET_STAGE_LEN          21u
+#define UAM_NET_STAGE_RESULT_HDR_LEN 9u
+#define UAM_NET_STAGE_I2S_FIXED_LEN  14u   /* after the header, before the tokens */
+#define UAM_NET_STAGE_TOKEN_LEN    9u
+#define UAM_NET_STAGE_TRIM_FIXED_LEN 21u   /* after the header, before the data */
 #define UAM_NET_PROGRESS_NS        1000000000u   /* a batch's longest silence */
 #define UAM_NET_HAVOC_BY_REASON    7u
 
@@ -317,8 +342,18 @@ enum uam_fuzz_net_havoc_status {
     UAM_NET_HAVOC_OK        = 0,
     UAM_NET_HAVOC_NO_MUTATOR = 1,   /* no accepted MUTATOR yet; nothing ran */
     UAM_NET_HAVOC_NO_ENTRY  = 2,    /* no CORPUS entry with that number; nothing ran */
-    UAM_NET_HAVOC_BAD       = 3,    /* n is 0 or over UAM_NET_HAVOC_MAX; nothing ran */
+    UAM_NET_HAVOC_BAD       = 3,    /* n (a stage: its limit) is 0 or over the maximum, or
+                                     * the stage's kind is unknown; nothing ran */
+    UAM_NET_HAVOC_NO_CMP    = 4,    /* input-to-state without OPTIONS CMP_LOG; nothing ran */
 };
+
+/* STAGE kinds and limits */
+enum uam_fuzz_net_stage {
+    UAM_NET_STAGE_I2S  = 1,   /* input-to-state */
+    UAM_NET_STAGE_TRIM = 2,   /* trimming */
+};
+#define UAM_NET_STAGE_I2S_MAX      4096u
+#define UAM_NET_STAGE_TRIM_MAX     65536u
 
 /* CMPS kinds (the same bits as the IR's UAM_CMP_*) */
 #define UAM_NET_CMP_EQ     0x1u   /* equality */

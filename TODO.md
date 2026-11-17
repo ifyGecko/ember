@@ -69,20 +69,34 @@ campaign's queue, schedules and files are the Python brain's.
 
 ## Input-to-state inside ember
 
-Compare logging runs in ember, but the candidates are built by `fuzz/tools/cmplog.py` and
-sent back one INPUT at a time (up to 256 round trips per queue entry). Building and running
-them in the campaign engine, like the mutations, would make the stage as fast as havoc.
-Constants in the code's compares could also seed the dictionary when blocks are translated,
-before any input is run.
+The stage runs in the campaign engine (`uam/fuzz_i2s.h`, `uam_fuzz_campaign_i2s_begin`).
+What it leaves open:
+
+- Constants in the code's compares could seed the dictionary when blocks are translated,
+  before any input is run.
+- Compares made a byte at a time in a loop (`strcmp`, `memcmp`) and on values computed from
+  the input give no candidates; routines recognised at their call (the board hooks them, as
+  for the guarded heap) could log both buffers.
+- Colorization: telling which input bytes a compare's operand came from, instead of looking
+  for the operand's bytes anywhere in the input.
 
 ## Mutator
 
 - Operators that know a length or checksum field (found from compare logs, or declared).
 - Per-entry operator statistics (MOpt proper) instead of one set of weights per session.
-- Trimming in ember (today the brain trims with one INPUT per probe).
+- Crash minimization in ember (the brain minimizes with one INPUT per probe; trimming is a
+  stage of the campaign engine already).
 
-## Throughput regression test
+## Throughput
 
-Nothing notices if executions per second halve. A benchmark target with a fixed input set
-and a recorded figure per host (`--fuzz-replay` of N inputs, a HAVOC batch of N), checked
-within a tolerance by `make bench-test`.
+`make fuzz-throughput` checks what an execution costs against recorded figures
+(`tests/fuzz/throughput.py`). What a profile of the RV32 fuzz target still shows between two
+inputs, after restores stopped dropping translations:
+
+- Dirty tracking starts over at every restore, so the first store to each page an input
+  writes takes the slow path again (and the JIT's data cache is refilled for it). Keeping
+  the pages an input wrote marked across restores, and comparing them with the snapshot
+  each time, would save that; it needs a rule for letting the set shrink again.
+- A device's `restore` reads its state field by field (an interrupt controller's arrays one
+  word at a time); a machine with many devices pays for all of them per input.
+- The figures are recorded for x86-64 only.

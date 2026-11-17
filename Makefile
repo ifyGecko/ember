@@ -134,7 +134,7 @@ BOARD_SRC   := boards/rv32_ref.c boards/mips_ref.c boards/arm_ref.c boards/x86_6
                boards/stock.c boards/mmio_rules.c
 FUZZ_SRC    := fuzz/harness.c fuzz/frontend_replay.c fuzz/stock_exts.c \
                fuzz/cov_scheme.c fuzz/site_list.c fuzz/cov_cli.c fuzz/frontend_net.c fuzz/cov_region.c \
-               fuzz/mutate.c fuzz/campaign.c
+               fuzz/mutate.c fuzz/campaign.c fuzz/i2s.c
 HOST_SRC    := src/host/chardev_backends.c src/host/netdev_backends.c src/host/blockdev_file.c \
                src/host/hostloop.c \
                src/debug/gdbstub.c src/runner/runner.c src/runner/trace.c
@@ -222,7 +222,7 @@ EXAMPLE   := $(BUILD)/examples/external-board/ext-run
         firmware-mcs51 mcs51-test firmware-pic32 pic32-test firmware-6502 6502-test firmware-z80 z80-test \
         firmware-xtensa xtensa-test example-test \
         snapshot-test cov-test fuzz-test fuzz-lists-test net-check gdb-test jitdiff-soak \
-        bench-test xbench install \
+        bench-test xbench fuzz-throughput fuzz-throughput-record install \
         clean FORCE
 
 all: $(RUN) lib
@@ -508,7 +508,6 @@ unit-test: $(TEST_IR) $(TEST_CORE) $(TEST_HOST) $(TEST_SNAP) $(TEST_JIT) $(TEST_
 	$(TEST_COV_FORMATS) tests/unit/cov_golden.txt
 	python3 fuzz/tools/fuzz_dict.py --selftest
 	python3 fuzz/tools/status_tui.py --selftest
-	python3 fuzz/tools/cmplog.py --selftest
 	python3 tests/fuzz/brain_unit.py
 
 # The JIT differential test at length: JITDIFF_BLOCKS random blocks per seed, several seeds.
@@ -944,8 +943,23 @@ test: unit-test firmware-test mips-test arm-test x86-test ppc-test avr-test avr3
 # The cross-ISA benchmark (tests/bench): bench-test checks every guest build, with the
 # interpreter and the JIT, against the host build in two rounds; xbench times them
 # (tools/xbench.sh; XBENCH_ARGS="--per-kernel" for each kernel on its own).
-bench-test: $(RUN)
+bench-test: $(RUN) fuzz-throughput
 	AVR32_CROSS=$(AVR32_CROSS) sh tools/xbench.sh --check --run $(RUN) --out $(abspath $(BUILD))/firmware-bench
+
+# Fuzz throughput: what one execution costs (a HAVOC batch, the input-to-state and trim
+# stages), in guest instructions at this host's plain JIT speed, against the figures
+# recorded for the host architecture in tests/fuzz/throughput.ref: a stage that costs over
+# 1.5 times its figure fails. THROUGHPUT_REF= (empty) only reports.
+# fuzz-throughput-record rewrites the figures (on a quiet machine, after a change meant to
+# move them).
+THROUGHPUT_REF ?= tests/fuzz/throughput.ref
+fuzz-throughput: $(RUN) firmware
+	python3 tests/fuzz/throughput.py $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf \
+	    $(if $(THROUGHPUT_REF),--ref $(THROUGHPUT_REF))
+
+fuzz-throughput-record: $(RUN) firmware
+	python3 tests/fuzz/throughput.py $(RUN) rv32-ref $(BUILD)/firmware/fuzztarget.elf \
+	    --ref tests/fuzz/throughput.ref --record --runs 7
 
 xbench: $(RUN)
 	AVR32_CROSS=$(AVR32_CROSS) sh tools/xbench.sh --run $(RUN) --out $(abspath $(BUILD))/firmware-bench $(XBENCH_ARGS)

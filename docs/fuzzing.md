@@ -492,6 +492,15 @@ armed run with the state detached, at a cost of a load and an untaken branch per
 Maps and verdicts are the same with or without it. The fuzz protocol carries it as
 CMP_INPUT and CMPS ([`fuzz-formats.md`](fuzz-formats.md)).
 
+**Stages.** The campaign engine (`uam/fuzz_campaign.h`) also runs two kinds of batch whose
+inputs it derives itself from a corpus entry: `uam_fuzz_campaign_i2s_begin` (the entry with
+its compares logged, then the input-to-state candidates of `uam/fuzz_i2s.h`; compare
+logging must be on) and `uam_fuzz_campaign_trim_begin` (cuts of the entry that keep its
+path). Both are driven like a batch of mutations (`batch_next`, the run, `batch_judge`) and
+judged against the same record; `uam_fuzz_campaign_i2s` and `uam_fuzz_campaign_trim` return
+what the stage found (dictionary tokens; the entry as trimmed). The protocol carries them
+as STAGE.
+
 ## Limitations
 
 - Sites are keyed on the virtual pc. Code reached through both kseg0 and kseg1 needs two
@@ -666,7 +675,9 @@ in cycles:
   After the baseline the brain also suggests a per-input budget (5× the slowest entry).
 - **Trimming:** a new entry, when first chosen, loses chunks for as long as its path (its
   buckets and hit-count classes) stays the same, up to `--trim-probes` runs (64);
-  `--no-trim` keeps entries as found.
+  `--no-trim` keeps entries as found. ember does the cutting and the runs (a STAGE, like a
+  batch of mutations), and a cut that ran new code becomes a queue entry of its own
+  (`op:trim`).
 - **Energy:** each chosen entry gets a number of mutations from a performance score
   (cheaper, wider, later-found and deeper entries score higher; the cost is the exact
   instruction count) times its power schedule's factor (`--schedule`):
@@ -684,12 +695,14 @@ in cycles:
 | `mmopt` | like `explore`, plus ×2 for entries within 3 generations of the deepest and ×1.5 within 5 | the newest discoveries |
 
 - **Compare logging (input-to-state):** when ember offers it (HELLO), each queue entry,
-  when first chosen and after trimming, runs once as CMP_INPUT. For every compare it logged,
-  `fuzz/tools/cmplog.py` finds one operand's bytes in the input (either byte order, at the
+  when first chosen and after trimming, goes through an input-to-state stage in ember (a
+  STAGE; `uam/fuzz_i2s.h`). The entry runs once with its compares logged; for every compare
+  ember finds one operand's bytes in the input (either byte order, at the
   compare's width and at the narrowest width that holds both values) and writes the other
   operand there, plus and minus one for ordered compares: at most `--cmplog-max` (256)
-  candidates per entry, each run and kept if it is new coverage (`op:cmplog` in the
-  queue). Constants of the code that the input lacks become dictionary integers (up to 256).
+  candidates per entry, run back to back like a batch of mutations, each kept if it is new
+  coverage (`op:cmplog` in the queue). Constants of the code that the input lacks become
+  dictionary integers (up to 256).
   This finds what havoc cannot guess: a 32-bit magic value from `hello world!` in a few
   thousand executions on every tested board. `--no-cmplog` turns it off; the candidates
   count as mutated executions for `--iters`, and the status counts `cmplog_execs` and
@@ -725,9 +738,13 @@ path), and says PROGRESS when it has been silent for a second, so a batch of slo
 does not look like a dead ember. A board can repair mutated inputs before they run
 (`uam_machine_set_input_fixup` on its named input, or `uam_fuzz_set_fixup`: a checksum, a
 length field), and what ember reports and the brain saves is the repaired input. ember tells the brain its operators and their default
-weights (MUTATOR_INFO), so the two never disagree. Seeds, trimming, input-to-state,
-calibration, crash minimization and imports from other workers still go as single INPUTs.
-`build/test_mutate` checks the mutator, including the growth figures above.
+weights (MUTATOR_INFO), so the two never disagree. Trimming and input-to-state run in ember
+as well, as stages of the campaign engine (`uam/fuzz_campaign.h`): the brain names the
+entry and a limit, ember derives the inputs, runs them with no frame in between and
+reports as it does for a batch. Seeds, calibration, crash minimization and imports from
+other workers still go as single INPUTs.
+`build/test_mutate` checks the mutator, including the growth figures above, and the
+input-to-state candidates.
 
 **Dictionaries** (`--dict FILE`, repeatable) are ember's own format, one token per line:
 `"text"` (escapes `\\ \" \t \n \r \xHH`), `hex:BYTES`, and integers `u8:`, `u16:`,
@@ -814,9 +831,23 @@ planted crash found from a dictionary alone; the magic value found by compare lo
 not without it) and a parallel campaign
 (`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
 crashes, and survive a killed ember). `make unit-test` runs `tests/fuzz/brain_unit.py` (the
-campaign logic on synthetic data), `fuzz/tools/cmplog.py --selftest` (the input-to-state
-candidates), `test_fuzz`'s checks of the harness's hit lists and compare logging, and
+campaign logic on synthetic data), `test_mutate` (the mutator and the input-to-state
+candidates), `test_fuzz`'s checks of the harness's hit lists, compare logging and the
+campaign engine's batches and stages, and
 `test_cov`'s of the compare pass and `CMPLOG` on every ISA and backend.
+
+**Throughput.** `make fuzz-throughput` (part of `make bench-test`) times a HAVOC batch with
+a fixed seed, input-to-state stages and trims on the RV32 fuzz target
+(`tests/fuzz/throughput.py`) and one long run of plain guest code on the same host, and
+compares what one execution costs, in guest instructions at that plain speed, with the
+figures recorded per host architecture in `tests/fuzz/throughput.ref`: a stage that costs
+over 1.5 times its figure fails, so a change that halves the executions per second is
+noticed. `make fuzz-throughput-record` rewrites the figures (on a quiet machine, after a
+change meant to move them); `THROUGHPUT_REF=` only reports. Between two inputs the harness
+restores its snapshot: only the memory that changed is written back, and translated code
+keeps its links and the JIT's data cache its entries for loads unless the input changed
+the processor's address translation or the firmware translates through page tables in its
+memory ([`uam-isa.md`](uam-isa.md), `uam_xlate.regs_only`).
 
 ### The coverage region (`--cov-shm PATH`)
 

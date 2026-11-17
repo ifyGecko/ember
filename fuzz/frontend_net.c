@@ -40,6 +40,10 @@
  * second, HAVOC_DONE with the totals, and, when OPTIONS asks (UAM_NET_OPT_JUDGE), a JUDGE
  * frame before each INPUT's reply, so that the brain keeps no record of its own.
  *
+ * STAGE (HELLO says UAM_NET_HELLO_STAGES) runs one of the campaign's stages on a corpus
+ * entry the same way: input-to-state or trimming, with a STAGE_RESULT before the batch's
+ * HAVOC_DONE.
+ *
  * A dead peer is noticed by TCP keepalive (a brain host that vanished without closing the
  * connection would otherwise leave ember waiting forever); a live brain that stops
  * answering, by the optional per-frame timeout (--fuzz-net-timeout).
@@ -59,6 +63,8 @@
 #include "cov_formats.h"
 #include "uam/fuzz_campaign.h"
 
+_Static_assert(UAM_NET_STAGE_I2S_MAX == UAM_FUZZ_I2S_MAX && UAM_NET_STAGE_TRIM_MAX == UAM_FUZZ_TRIM_MAX,
+               "STAGE's limits are the campaign's");
 _Static_assert(UAM_NET_CMP_EQ == UAM_CMP_EQ && UAM_NET_CMP_ORDER == UAM_CMP_ORDER
                && UAM_NET_CMP_SIGNED == UAM_CMP_SIGNED && UAM_NET_CMP_IMM == UAM_CMP_IMM,
                "CMPS kinds are the IR's compare kinds");
@@ -90,7 +96,8 @@ struct cf_net {
     uam_fuzz_campaign *camp;
     bool      mut_ok;      /* the last MUTATOR was accepted */
     bool      judge;       /* OPTIONS asked for a JUDGE frame before each INPUT's reply */
-    bool      batch;       /* a HAVOC batch is running */
+    bool      batch;       /* a HAVOC batch or a stage is running */
+    uint8_t   stage;       /* the stage's kind (UAM_NET_STAGE_*); 0: a HAVOC batch */
     uint64_t  first_id, next_id;
     uint64_t  last_ns;     /* when the last frame of the batch went out (PROGRESS) */
 };
@@ -497,9 +504,83 @@ static bool start_havoc(cf_net *z, const uint8_t *b)
         return false;
     }
     z->batch = true;
+    z->stage = 0;
     z->first_id = z->next_id = first;
     z->last_ns = now_ns();
     return true;
+}
+
+/* STAGE: start a stage. false: answered at once (nothing to run) or the stream broke. */
+static bool start_stage(cf_net *z, const uint8_t *b)
+{
+    const uint64_t first = get64(b);
+    const uint32_t entry = get32(b + 8), limit = get32(b + 13), flags = get32(b + 17);
+    const uint8_t kind = b[12];
+    const unsigned bf = flags & UAM_NET_HAVOC_EDGES ? UAM_FUZZ_BATCH_EDGES : 0;
+    uint8_t status = UAM_NET_HAVOC_OK;
+    size_t elen;
+    if (!z->camp || !z->mut_ok)
+        status = UAM_NET_HAVOC_NO_MUTATOR;
+    else if (!uam_mutator_corpus_get(uam_fuzz_campaign_mutator(z->camp), entry, &elen))
+        status = UAM_NET_HAVOC_NO_ENTRY;
+    else if (kind == UAM_NET_STAGE_I2S && !(uam_fuzz_cmp_modes(z->fuzz) & UAM_FUZZ_CMP_LOG))
+        status = UAM_NET_HAVOC_NO_CMP;
+    else if (!first || (kind != UAM_NET_STAGE_I2S && kind != UAM_NET_STAGE_TRIM)
+             || (kind == UAM_NET_STAGE_I2S ? uam_fuzz_campaign_i2s_begin(z->camp, entry, limit, bf)
+                                           : uam_fuzz_campaign_trim_begin(z->camp, entry, limit, bf))
+                != UAM_OK)
+        status = UAM_NET_HAVOC_BAD;
+    if (status != UAM_NET_HAVOC_OK) {
+        uam_log(UAM_LOG_WARN, "fuzz-net", "STAGE %u for entry %u refused (status %u)", kind, entry,
+                status);
+        send_havoc_done(z, first, status);
+        return false;
+    }
+    z->batch = true;
+    z->stage = kind;
+    z->first_id = z->next_id = first;
+    z->last_ns = now_ns();
+    return true;
+}
+
+/* STAGE_RESULT: what the stage that just ended found. */
+static bool send_stage_result(cf_net *z)
+{
+    uint8_t *p;
+    if (z->stage == UAM_NET_STAGE_I2S) {
+        const uam_fuzz_i2s *r = uam_fuzz_campaign_i2s(z->camp);
+        if (!reserve(&z->out, &z->out_cap, 5 + UAM_NET_STAGE_RESULT_HDR_LEN + UAM_NET_STAGE_I2S_FIXED_LEN
+                                           + r->n_tokens * UAM_NET_STAGE_TOKEN_LEN)) {
+            z->broken = true;
+            return false;
+        }
+        p = put64(z->out + 5, z->first_id);
+        *p++ = z->stage;
+        p = put32(p, r->compares);
+        p = put32(p, r->dropped > UINT32_MAX ? UINT32_MAX : (uint32_t)r->dropped);
+        p = put32(p, r->candidates);
+        p = put16(p, (uint16_t)r->n_tokens);
+        for (size_t i = 0; i < r->n_tokens; i++) {
+            *p++ = r->tokens[i].width;
+            p = put64(p, r->tokens[i].value);
+        }
+    } else {
+        const uam_fuzz_trim *r = uam_fuzz_campaign_trim(z->camp);
+        if (!reserve(&z->out, &z->out_cap, 5 + UAM_NET_STAGE_RESULT_HDR_LEN + UAM_NET_STAGE_TRIM_FIXED_LEN
+                                           + r->len)) {
+            z->broken = true;
+            return false;
+        }
+        p = put64(z->out + 5, z->first_id);
+        *p++ = z->stage;
+        *p++ = r->ran;
+        p = put64(p, r->insns);
+        p = put64(p, r->path);
+        p = put32(p, (uint32_t)r->len);
+        memcpy(p, r->data, r->len);
+        p += r->len;
+    }
+    return send_frame(z, UAM_NET_STAGE_RESULT, (size_t)(p - (z->out + 5)));
 }
 
 /* A batch's input worth keeping, with the campaign's judgement of it. */
@@ -562,8 +643,12 @@ static bool havoc_report(cf_net *z, uint64_t id, uam_fuzz_verdict v, uint64_t de
             z->last_ns = now;
         }
     }
-    if (ok && !b->left)
-        ok = send_havoc_done(z, z->first_id, UAM_NET_HAVOC_OK);
+    if (ok && !b->left) {
+        if (z->stage)
+            ok = send_stage_result(z);
+        if (ok)
+            ok = send_havoc_done(z, z->first_id, UAM_NET_HAVOC_OK);
+    }
     return ok;
 }
 
@@ -604,7 +689,7 @@ static uam_status net_hello(void *ctx, const uam_fuzz_info *info)
     uint8_t *p = put16(z->out + 5, UAM_FUZZ_NET_VERSION);
     p = put16(p, (uint16_t)(z->flags | (z->big_endian ? UAM_NET_HELLO_BIG_ENDIAN : 0)
                             | (z->fuzz ? UAM_NET_HELLO_CMP : 0)
-                            | (z->camp ? UAM_NET_HELLO_HAVOC : 0)));
+                            | (z->camp ? UAM_NET_HELLO_HAVOC | UAM_NET_HELLO_STAGES : 0)));
     p = put32(p, info->map_size);
     p = put16(p, (uint16_t)alen);
     memcpy(p, info->arch, alen);
@@ -723,6 +808,15 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             start_havoc(z, z->in);
             continue;   /* the loop's top hands out the batch's first mutation (or the
                          * batch was answered at once, or the stream broke) */
+        case UAM_NET_STAGE:
+            if (plen < UAM_NET_STAGE_LEN) {
+                uam_log(UAM_LOG_ERROR, "fuzz-net", "%s: malformed STAGE (%zu payload bytes)",
+                        z->peer, plen);
+                z->broken = true;
+                return -1;
+            }
+            start_stage(z, z->in);
+            continue;
         default:
             continue;   /* any other frame type is ignored */
         }

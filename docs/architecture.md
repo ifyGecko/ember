@@ -187,9 +187,11 @@ fuzz/             harness.c frontend_replay.c (the harness and the replay fronte
                   list, boundary file, coverage region and fuzz protocol; docs/fuzz-formats.md),
                   cov_scheme.c (the bucket formula) site_list.c (site-list and boundary readers,
                   site check) frontend_net.c (the fuzz protocol, --fuzz-net; it runs the
-                  brain's HAVOC batches) campaign.c (the campaign engine, uam/fuzz_campaign.h: the record
-                  of seen coverage and crashes, judgements, batches) mutate.c (the mutator,
-                  uam/fuzz_mutate.h) cov_region.c (the
+                  brain's HAVOC batches and stages) campaign.c (the campaign engine,
+                  uam/fuzz_campaign.h: the record of seen coverage and crashes, judgements,
+                  batches of mutations, the input-to-state and trim stages) mutate.c (the
+                  mutator, uam/fuzz_mutate.h) i2s.c (input-to-state candidates from a compare
+                  log, uam/fuzz_i2s.h) cov_region.c (the
                   coverage region, --cov-shm) cov_cli.c (the runner extension for all of them)
                   cov_formats.h
 fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files
@@ -198,7 +200,6 @@ fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists an
                   fuzz_brain.py fuzz_dict.py (the coverage-guided brain and its dictionaries;
                   ember mutates: fuzz/mutate.c)
                   fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)
-                  cmplog.py (input-to-state candidates from ember's compare logs)
                   fuzz_launch.py (a parallel campaign of brain + ember workers)
                   status_tui.py (its status screen) cov_region.py (reads a coverage region)
 tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
@@ -931,8 +932,11 @@ Implemented (`make test`):
   through `fuzz_launch.py` (imports, both planted crashes, a killed ember restarted).
   `tests/fuzz/brain_unit.py` checks the brain's campaign logic on synthetic data (hit-count
   classes, path ids, the favored set and skip rule, every schedule, operator weights, queue
-  files, sync bookkeeping), `fuzz/tools/cmplog.py --selftest` the input-to-state candidates,
-  `test_fuzz` the harness's hit lists (`uam_fuzz_map_hits`) and the selective map clear they
+  files, sync bookkeeping), `test_mutate` the mutator and the input-to-state candidates,
+  `tests/fuzz/throughput.py` (`make fuzz-throughput`, in `bench-test`) what a fuzz execution
+  costs against recorded figures,
+  `test_fuzz` the campaign engine's batches and stages, what a snapshot restore keeps of
+  translations (and drops when page tables are in guest memory), the harness's hit lists (`uam_fuzz_map_hits`) and the selective map clear they
   enable, against whole-map clears, and compare logging (only armed iterations log, the same
   maps and verdicts, the same logs on every backend), and `test_cov` the compare pass on
   hand-built IR (flags ISAs' compares, constant offsets, swapped constants, what is left out)

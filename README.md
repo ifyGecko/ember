@@ -281,7 +281,8 @@ brain (`fuzz/tools/fuzz_brain.py`) drive the campaign: a queue with a favored se
 calibration, trimming and nine power schedules, ember dictionaries, adaptive mutation
 operators, compare logging (an input-to-state stage that writes the values the target's
 compares expected into the input) and sparse coverage replies, with ember itself mutating
-(havoc, splice and dictionaries in batches); `fuzz/tools/fuzz_launch.py` runs several brain +
+(havoc, splice and dictionaries in batches), trimming and deriving the input-to-state
+candidates; `fuzz/tools/fuzz_launch.py` runs several brain +
 ember workers that boot the firmware once and share their queues. `--cov-shm PATH` publishes the maps in a
 shared-memory coverage region. The formats are in [`docs/fuzz-formats.md`](docs/fuzz-formats.md).
 

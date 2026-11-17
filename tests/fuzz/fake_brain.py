@@ -37,7 +37,14 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
     already), its totals are exact, and its one path is the one Python's path_hash names
     for the INPUT's SPARSE list, with per-bucket counts when asked; a batch of timeouts
     reports as many FINDs as MUTATOR's hang cap; a batch with default weights reports
-    well-formed FINDs, and a crash already seen as an INPUT only in the totals.
+    well-formed FINDs, and a crash already seen as an INPUT only in the totals;
+  - stages in ember: HELLO announces them; a STAGE of an unknown kind, for an unknown
+    entry or with a limit of 0 gets HAVOC_DONE with that status, input-to-state without
+    compare logging status 4, and nothing runs; an input-to-state stage on the magic-value
+    input one bit off sends STAGE_RESULT (its compares, as many candidates as it then
+    runs, its tokens) before HAVOC_DONE and reaches the planted FAULT; a limit bounds it;
+    a trim returns a shorter entry that starts as the entry did and, sent as an INPUT,
+    runs on the path and in the instructions STAGE_RESULT said.
 Exit status 0 when everything holds.
 """
 import os
@@ -49,11 +56,13 @@ import time
 
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
-JUDGE, PROGRESS = 16, 17
+JUDGE, PROGRESS, STAGE, STAGE_RESULT = 16, 17, 18, 19
+STAGE_I2S, STAGE_TRIM = 1, 2
 OPT_JUDGE = 4
 FLAG_BIG_ENDIAN = 1 << 15
 FLAG_CMP = 1 << 14
 FLAG_HAVOC = 1 << 13
+FLAG_STAGES = 1 << 12
 SWAP_CHUNKS, INSERT_BLOCK, RESIZE = 17, 23, 24
 OPT_SPARSE, OPT_CMP_LOG = 1, 2
 CMP_EQ = 1
@@ -217,6 +226,82 @@ def run_havoc(c, first, entry, n, seed, flags=0):
             return finds, havoc_done(p)
         else:
             raise RuntimeError("frame type %d in a HAVOC batch" % t)
+
+
+def run_stage(c, first, entry, kind, limit, flags=0):
+    """Send STAGE; return (finds, STAGE_RESULT payload or None, done) once HAVOC_DONE arrives."""
+    send_frame(c, STAGE, struct.pack(">QIBII", first, entry, kind, limit, flags))
+    finds, result = [], None
+    while True:
+        t, p = recv_frame(c)
+        if t == PROGRESS:
+            continue
+        if t == FIND:
+            finds.append(find(p))
+        elif t == STAGE_RESULT:
+            result = p
+        elif t == HAVOC_DONE:
+            return finds, result, havoc_done(p)
+        else:
+            raise RuntimeError("frame type %d in a stage" % t)
+
+
+def stage_checks(c, tag):
+    """Stages in ember (STAGE, STAGE_RESULT). SPARSE and compare logging are on, a MUTATOR
+    was accepted."""
+    send_frame(c, CORPUS, struct.pack(">II", 8, len(NEAR_IN)) + NEAR_IN)
+    long_in = b"hello world" + b"x" * 53
+    send_frame(c, CORPUS, struct.pack(">II", 9, len(long_in)) + long_in)
+    # Refusals: nothing runs, no STAGE_RESULT.
+    for what, args, want in (("an unknown kind", (8, 7, 16), 3), ("an unknown entry", (77, STAGE_I2S, 16), 2),
+                             ("a limit of 0", (8, STAGE_TRIM, 0), 3),
+                             ("a limit over the maximum", (8, STAGE_I2S, 4097), 3)):
+        _, res, done = run_stage(c, 5000, *args)
+        check(res is None and done[0] == 5000 and done[1] == want and done[2] == 0,
+              f"{tag}: STAGE with {what}: status {want}, nothing ran ({done[:3]})")
+    send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE))
+    _, res, done = run_stage(c, 5000, 8, STAGE_I2S, 16)
+    check(res is None and done[1] == 4 and done[2] == 0,
+          f"{tag}: input-to-state without compare logging: status 4 ({done[:3]})")
+    send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG))
+    # Input-to-state on the magic value one bit off.
+    finds, res, done = run_stage(c, 6000, 8, STAGE_I2S, 256)
+    if check(res is not None and len(res) >= 23 and done[1] == 0, f"{tag}: an i2s stage ran ({done[:3]})"):
+        first, kind, compares, _dropped, cands, ntok = struct.unpack(">QBIIIH", res[:23])
+        check(first == 6000 and kind == STAGE_I2S and len(res) == 23 + 9 * ntok,
+              f"{tag}: STAGE_RESULT's layout (i2s, {len(res)} bytes, {ntok} tokens)")
+        check(compares >= 1 and cands >= 1 and done[2] == cands + 1 and sum(done[3]) == done[2],
+              f"{tag}: i2s: the entry's run and its {cands} candidates ({compares} compares, {done[2]} runs)")
+        check(done[3][FAULT] >= 1, f"{tag}: i2s reaches the bug behind the magic value ({done[3]})")
+        check(all(w in (2, 4, 8) for w, _ in struct.iter_unpack(">BQ", res[23:])),
+              f"{tag}: i2s tokens are 2, 4 or 8 bytes wide")
+        check(all(f[7] and 6000 <= f[0] <= 6256 and f[4] == 0 for f in finds) and done[4] == len(finds)
+              and not done[5], f"{tag}: a stage's FINDs carry no operators ({len(finds)})")
+    _, res, done = run_stage(c, 6500, 8, STAGE_I2S, 1)
+    check(res is not None and done[2] == 2 and struct.unpack(">I", res[17:21])[0] == 1,
+          f"{tag}: i2s with a limit of 1: two runs ({done[2]})")
+    # Trimming.
+    send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG | OPT_JUDGE))
+    _, res, done = run_stage(c, 7000, 9, STAGE_TRIM, 64, 1)
+    if check(res is not None and len(res) >= 30 and done[1] == 0, f"{tag}: a trim ran ({done[:3]})"):
+        first, kind, ran, insns, path, dlen = struct.unpack(">QBBQQI", res[:30])
+        data = res[30:]
+        check(first == 7000 and kind == STAGE_TRIM and ran == 1 and len(data) == dlen,
+              f"{tag}: STAGE_RESULT's layout (trim, {len(res)} bytes)")
+        check(4 <= dlen < len(long_in) and data[:4] == long_in[:4] and 2 <= done[2] <= 65,
+              f"{tag}: the trim cut the entry ({len(long_in)} -> {dlen} bytes in {done[2]} runs)")
+        check(path in done[6] and done[7], f"{tag}: a stage's paths and per-bucket executions")
+        send_input(c, 7100, data)
+        j, t, p = judged(c)
+        check(t == SPARSE and j[3] == path and sparse(p)[2] == insns,
+              f"{tag}: the trimmed entry runs on the path and in the instructions said")
+    _, res, done = run_stage(c, 7200, 9, STAGE_TRIM, 1)
+    check(res is not None and done[2] == 2, f"{tag}: a trim with one probe: two runs ({done[2]})")
+    send_frame(c, CORPUS, struct.pack(">II", 10, 4) + b"FUZ!")
+    _, res, done = run_stage(c, 7300, 10, STAGE_TRIM, 8)
+    check(res is not None and res[9] == 0 and res[30:] == b"FUZ!" and done[2] == 1,
+          f"{tag}: a crashing entry is not trimmed ({done[2]} runs)")
+    send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG))
 
 
 def session(run, board, fw, extra, script):
@@ -390,7 +475,7 @@ def main():
             ver, flags, msize, alen = struct.unpack(">HHIH", p[:10])
             check(ver == 1 and len(p) == 10 + alen, f"{tag}: HELLO version {ver}, {len(p)} bytes")
             check(p[10:10 + alen].decode() == arch, f"{tag}: HELLO arch {p[10:10 + alen]!r}")
-            want = want_flags | FLAG_CMP | FLAG_HAVOC | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
+            want = want_flags | FLAG_CMP | FLAG_HAVOC | FLAG_STAGES | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
             check(flags == want, f"{tag}: HELLO flags {flags:#x}, expected {want:#x}")
             t, p = recv_frame(c)
             iid, kind, bitmap, size = coverage(p) if t == COVERAGE else (None,) * 4
@@ -502,6 +587,7 @@ def main():
                   f"{tag}: the magic value: CRASH FAULT (type {t})")
 
             havoc_checks(c, tag, msize, slow=mode == "blocks" and not st.get("eof"))
+            stage_checks(c, tag)
 
             if st.get("eof"):
                 return                                            # close without BYE
