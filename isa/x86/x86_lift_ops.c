@@ -151,7 +151,10 @@ void x_flags_add(xl *x, unsigned w, uam_ref a, uam_ref b, uam_ref res, uam_ref c
     if (cin != NONE)
         cf = x_bin(x, UAM_OP_OR, 1, cf,
                    x_bin(x, UAM_OP_AND, 1, cin, x_bin(x, UAM_OP_EQ, w, res, a)));
-    uam_ref of = sign_bit(x, w, x_bin(x, UAM_OP_AND, w, x_bin(x, UAM_OP_XOR, w, a, res),
+    /* a + b overflows as SCARRY says; with a carry in, the sum of three is judged by
+     * its signs */
+    uam_ref of = cin == NONE ? x_bin(x, UAM_OP_SCARRY, w, a, b)
+               : sign_bit(x, w, x_bin(x, UAM_OP_AND, w, x_bin(x, UAM_OP_XOR, w, a, res),
                                       x_bin(x, UAM_OP_XOR, w, b, res)));
     x_setflag(x, X86_F_CF, cf);
     x_setflag(x, X86_F_OF, of);
@@ -165,7 +168,8 @@ void x_flags_sub(xl *x, unsigned w, uam_ref a, uam_ref b, uam_ref res, uam_ref b
     if (bin != NONE)
         cf = x_bin(x, UAM_OP_OR, 1, cf,
                    x_bin(x, UAM_OP_AND, 1, bin, x_bin(x, UAM_OP_EQ, w, a, b)));
-    uam_ref of = sign_bit(x, w, x_bin(x, UAM_OP_AND, w, x_bin(x, UAM_OP_XOR, w, a, b),
+    uam_ref of = bin == NONE ? x_bin(x, UAM_OP_SBORROW, w, a, b)
+               : sign_bit(x, w, x_bin(x, UAM_OP_AND, w, x_bin(x, UAM_OP_XOR, w, a, b),
                                       x_bin(x, UAM_OP_XOR, w, a, res)));
     x_setflag(x, X86_F_CF, cf);
     x_setflag(x, X86_F_OF, of);

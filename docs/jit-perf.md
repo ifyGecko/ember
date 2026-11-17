@@ -424,6 +424,47 @@ MIPS 1.05x, ARM 1.05x, Thumb 1.08x, PPC 1.03x, x86 1.04x. Host instructions per 
 instruction on AArch64, counted as above: RV32 8.0 to 7.2, MIPS 8.3 to 7.5, ARM 11.6 to
 10.7, Thumb 11.7 to 10.7, PPC 10.1 to 9.3, x86 12.6 to 12.0.
 
+### After step 19 (flags read where they already are)
+
+After the host instruction that computed a subtract, a compare or an add, the flags hold
+every compare, carry and overflow result of the IR over the same operands, and the sign
+and zero tests of the result. ARM's and x86's flag-setting instructions lift to four or
+five such ops in a row; each was a compare of its own and is now one set-on-condition
+(`jit_hf` in `jit_impl.h`; `UAM_JIT_NOFLAGS=1` turns it off for bisecting). The x86 lifter
+now states the overflow of an add or subtract without carry-in as `SCARRY`/`SBORROW`
+(one op, and then one `seto`) instead of four ops over the signs.
+
+Full-run time on an x86-64 host over step 18 (best of 7 interleaved runs, one pinned
+core): ARM 1.07x, Thumb 1.06x, x86 1.07x, PPC 1.02x, RV32 and MIPS unchanged. Not timed on
+AArch64, where an add or subtract takes its flag-setting form only when a following op
+reads the flags.
+
+Measured on the way, with a sampling profiler joined to the op map (shares of time,
+RV32 / ARM / x86 guest): memory fast paths 38 / 36 / 28%, the per-instruction count and
+check 26 / 11 / 14% (overstated by sample skid), exit and chaining 21 / 14 / 11%,
+register file reads and writes 8 / 8 / 11%, arithmetic and flags 5 / 28 / 34% (before
+this step). The code is bound by how many micro-ops it is, not by one dependency chain
+alone: on RV32 a block of 5.6 guest instructions takes about 7.5 cycles.
+
+Tried and left out:
+- **The chain budget in a register.** An EXIT that chains counts its hop in
+  `jc->chain_left`, a memory read-modify-write and a second branch per block. Removing
+  both outright (not correct, as a bound) is worth 5% on RV32. Three ways to keep the count
+  were built and measured on x86-64: packed into the icount register's low bits (the
+  16-bit test of it cost what the memory counter did), in r12 with its own branch (about
+  1%), and in r12 negated so that one `test r13, r12` covers stop and budget (about 1%).
+  All need r12, the only temp register that survives a bridge call, and with five
+  call-clobbered temp registers ARM's 64-bit arithmetic kernel ran 12% slower and the
+  list kernel 3 to 5%. Net loss; the budget stays in memory.
+- **Add-with-carry and multiply-high pairs.** A guest's carry is a register value made by
+  one guest instruction and read by another, with an IMARK's count between them, so the
+  host carry flag cannot span them; `mul`/`mulhu` over the same operands are rarely
+  adjacent. Under 2% on one kernel at best.
+- **Slow paths out of line.** The bridge path of a load or store needs the register
+  allocation as it was at that op (what `jit_ra_save` saves, where replays find their
+  operands): emitting it later needs a snapshot of the allocator, as IMARK stubs have for
+  their replays only. A larger change than its 0 to 2% (measured earlier as a bound).
+
 Not done yet:
 - **The x86 gap** (x86 at about 1.35-1.65x RV32's kernel time): writes live at block exits.
   Step 13, stages C1 and C2 in docs/jit-carry-design.md (approved; stage N done).
@@ -434,5 +475,4 @@ Not done yet:
 - **Links that survive a privilege change.** Each one moves the epoch, which unlinks
   every direct jump (step 18) and kills every slot, and flushes the data TLB. The bench
   never changes privilege, so this is unmeasured.
-- **Slow paths out of line**, and one flag-setting instruction shared by the compares of
-  the same operands (ARM and x86 guests' flags).
+- **Slow paths out of line** (with an allocator snapshot; see above).
