@@ -98,7 +98,7 @@ this directory on Ghidra's script path, so the scripts find
 G=<ghidra>/support/analyzeHeadless
 
 # site list for the whole image, then a begin marker checked against it
-$G /tmp/proj fw -import build/firmware-mips/fuzztarget-be.elf \
+$G /tmp/proj fw -import build/tests/firmware-mips/fuzztarget-be.elf \
     -scriptPath fuzz/tools/ghidra \
     -postScript gen_sites.py /tmp/fw.sites --strategy entry \
     -postScript gen_boundaries.py /tmp/fw.bounds fuzz_iteration:begin \
@@ -114,7 +114,7 @@ then
 
 ```bash
 uam-run -b BOARD --cov-sites /tmp/fw.sites --cov-boundary /tmp/fw.bounds \
-    --cov-strict ... build/firmware-mips/fuzztarget-be.elf
+    --cov-strict ... build/tests/firmware-mips/fuzztarget-be.elf
 ```
 
 From the GUI, run them from the Script Manager on the open program, with
@@ -180,7 +180,7 @@ compare with.
 Generated both ways and compared with `cmp` (Ghidra 12.2, rizin 0.9.0):
 
 * The ember test firmware in `build/` (`tests/fuzz/gen-check.sh`, which
-  `make fuzz-lists-test` runs): site lists and boundary files are
+  `meson test -C build --suite fuzz-lists` runs): site lists and boundary files are
   byte-identical for MIPS32 BE and LE, ARM, RV32 and PowerPC with
   `--strategy entry`, and for ARM, RV32 and PowerPC with the default
   terminator strategy.

@@ -8,7 +8,7 @@ analysis (`fuzz/tools/gen_sites.py`, `gen_boundaries.py`): opt in when a target 
 inputs come from its coverage-guided brain (`fuzz/tools/fuzz_brain.py`, over `--fuzz-net`)
 either way. Everything ships in
 ember's tree; the project's pinned ember checkout has the tools at `$EMBER/fuzz/tools/`
-(`$EMBER` = the project's `ember-src`, or the clone `ember.src` names). That checkout's
+(`$EMBER` = the project's `subprojects/ember`, or the clone `ember.src` names). That checkout's
 `docs/fuzzing.md` (section "Site lists, boundary files and the brain") and
 `docs/fuzz-formats.md` are the authority; this page is what matters on a custom board.
 

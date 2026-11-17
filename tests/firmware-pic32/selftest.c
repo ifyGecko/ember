@@ -1,6 +1,6 @@
 /*
  * selftest.c - Bare-metal self-test for the UAM pic32-ref board, built once per
- * model and ISA (Makefile): mx in MIPS16e with MIPS32 handlers, mm in microMIPS,
+ * model and ISA (meson.build): mx in MIPS16e with MIPS32 handlers, mm in microMIPS,
  * mz in MIPS32 and again in microMIPS (bootisa=micromips), both with the FPU and
  * the DSP ASE.
  *

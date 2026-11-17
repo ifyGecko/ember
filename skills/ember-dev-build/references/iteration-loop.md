@@ -273,8 +273,10 @@ sub-steps inside the same device (wake-up bit, then chip revision) belong to the
 iteration.
 
 ## (5) Rebuild, re-run, commit, journal
-- Edited `emulation/` files (new files are picked up automatically): `scripts/rebuild.sh`.
-- Changed ember itself (rare): commit the change in `ember-src` with the message it would
+- Edited `emulation/` files (a new file: add its line to `emulation/meson.build`):
+  `scripts/rebuild.sh`. A milestone reached: add its console line to `tests/boot.expect`,
+  and `meson test -C build` keeps checking it.
+- Changed ember itself (rare): commit the change in `subprojects/ember` with the message it would
   carry upstream (or `scripts/regen-patches.sh -m "..."`), run `scripts/regen-patches.sh`,
   review `patches/`, then `scripts/build-ember.sh` (organization.md, rule 4).
 - ember has moved on: `scripts/repin.sh` to the latest commit, re-run, journal the move.
@@ -292,7 +294,7 @@ ended still blocked, say so and carry the problem forward.
 ```markdown
 # iter-XX — <short title, e.g. "model the UART TX path">
 
-- date / commit: <date> / <emulation-repo short hash>; ember <ember.commit short hash>
+- date / commit: <date> / <emulation-repo short hash>; ember <pinned revision, short hash>
 - milestone targeted: <first serial byte | banner | prompt | network | ...>
 - run: `./run.sh -n <budget> [...]` -> exit <code> after <N> instructions
   (from snapshot <file, pc, icount, commit> if the run started from one)

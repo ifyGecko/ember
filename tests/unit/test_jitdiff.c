@@ -23,7 +23,7 @@
  * Each one runs with every instruction deadline, with an exit already requested, and
  * with the device requesting an exit at its first and second access.
  *
- *   test_jitdiff [blocks [seed]]     (default 3000 blocks, seed 1; make jitdiff-soak
+ *   test_jitdiff [blocks [seed]]     (default 3000 blocks, seed 1; meson compile -C build jitdiff-soak
  *                                     runs many more)
  *
  * A failure prints the seed and a shrunk block (instructions deleted while the

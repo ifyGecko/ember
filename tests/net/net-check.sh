@@ -1,6 +1,6 @@
 #!/bin/sh
 # End-to-end network check: boot tests/firmware/nettest.c on the rv32-test board
-# (tests/boards/; UAM_RUN is build/uam-test-run) with virtio-net port net0 attached to a
+# (tests/boards/; UAM_RUN is build/tests/uam-test-run) with virtio-net port net0 attached to a
 # real Linux tap or tun interface, and let the
 # host kernel's IP stack talk to it (the guest ARPs for and pings 10.0.2.2, then
 # the host pings the guest at 10.0.2.15).

@@ -40,16 +40,24 @@
 #      upstream and drops it once upstream has it; build-ember.sh refuses a dirty working copy
 #
 # Usage: skills/tests/run-tests.sh [EMBER_GIT_SOURCE]   (default: $EMBER_UPSTREAM or ~/ember)
-# Needs: git, cc, python3; mips-linux-gnu-gcc (step 3); gcc with -m32 support (step 4);
-# ember's own `make firmware firmware-mips firmware-arm firmware-x86 firmware-ppc ...` output
-# (one target per ISA, in EMBER_GIT_SOURCE/build) for step 2 (each run skipped when
-# absent); gdb-multiarch and an OVMF install (OVMF_DIR, default
+# The projects pin EMBER_GIT_SOURCE's HEAD commit: commit ember changes before testing them.
+# Needs: git, meson, ninja, cc, python3; mips-linux-gnu-gcc (step 3); gcc with -m32 support
+# (step 4); ember's own test firmware (`meson compile -C build firmware` in
+# EMBER_GIT_SOURCE; another build directory: EMBER_BUILD) for step 2 (each run skipped
+# when absent); gdb-multiarch and an OVMF install (OVMF_DIR, default
 # /usr/share/OVMF: OVMF_CODE_4M.fd + OVMF_VARS_4M.fd) for the optional checks in step 4.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SK="$HERE/../ember-dev-build"
 UP="${1:-${EMBER_UPSTREAM:-$HOME/ember}}"
 UP="$(cd "$UP" && pwd)"
+FW="${EMBER_BUILD:-$UP/build}/tests"   # ember's test firmware: $FW/firmware-<isa>/
+pin_of() { sed -n 's/^revision *= *//p' "$1/subprojects/ember.wrap"; }
+# list every emulation/*.c of a project in its emulation/meson.build
+list_sources() {
+    { echo "board_sources = files("; for f in "$1"/emulation/*.c; do echo "  '$(basename "$f")',"; done; echo ")"; } \
+        > "$1/emulation/meson.build"
+}
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 pass=0; fail=0
 ok()  { echo "PASS  $*"; pass=$((pass+1)); }
@@ -73,13 +81,16 @@ for v in "${NEW_ISAS[@]}"; do
         --ember-upstream "$UP" >/dev/null || bad "$p: scaffold"
 done
 # one hash, even from a local clone (ls-remote HEAD also lists refs/remotes/origin/HEAD)
-[[ "$(cat "$T/pc/ember.commit")" =~ ^[0-9a-f]{40}$ ]] && ok "new-emulation.sh: ember.commit is one hash" \
-    || { bad "new-emulation.sh: ember.commit is one hash"; cat "$T/pc/ember.commit"; }
+[[ "$(pin_of "$T/pc")" =~ ^[0-9a-f]{40}$ ]] && ok "new-emulation.sh: the pin is one hash" \
+    || { bad "new-emulation.sh: the pin is one hash"; cat "$T/pc/subprojects/ember.wrap"; }
 for p in mips rv arm armeb pc ppc ppcbe avr avr32 avr32b pic pic32 mcs51 m6502 z80 xtensa xtensaeb; do
     out="$("$T/$p/scripts/build-ember.sh" 2>&1)" && ok "$p: template builds" || { bad "$p: template builds"; echo "$out" | tail -20; }
     echo "$out" | grep -q "warning:" && bad "$p: template has warnings" || ok "$p: no warnings"
     echo "$out" | grep -q "registered" && ok "$p: board registered" || bad "$p: board registered"
 done
+# the scaffold's own check, through meson
+out="$(meson test -C "$T/rv/build" 2>&1)" && echo "$out" | grep -q "registered  *OK" \
+    && ok "rv: meson test runs the scaffold's registered check" || { bad "rv: meson test"; echo "$out" | tail -8; }
 # every other CPU model: the generated board compiles warning-free
 for v in "ppc booke" "avr e" "avr xm" "avr xt" "avr rc" "pic baseline" "pic mid" "pic enhanced" \
          "pic32 mm" "pic32 mz" "mcs51 8051" "mcs51 cip51" "m6502 2a03" "m6502 65c02" "m6502 r65c02" \
@@ -87,36 +98,36 @@ for v in "ppc booke" "avr e" "avr xm" "avr xt" "avr rc" "pic baseline" "pic mid"
     read -r isa model <<< "$v"; d="$T/models/$isa-$model"
     "$SK/scripts/new-emulation.sh" mt --dir "$d" --isa "$isa" --model "$model" --ember-upstream "$UP" >/dev/null \
         && out="$(cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
-                  -I"$T/mips/ember-src/include" -I"$d/emulation" -c "$d/emulation/mt_board.c" -o /dev/null 2>&1)" \
+                  -I"$T/mips/subprojects/ember/include" -I"$d/emulation" -c "$d/emulation/mt_board.c" -o /dev/null 2>&1)" \
         && [[ -z "$out" ]] && ok "$isa --model $model: board compiles warning-free" \
         || { bad "$isa --model $model: board compiles warning-free"; echo "$out" | head -10; }
 done
 
 # 2. bare boards stall on the console poll
 run_bare() {  # proj image expect-addr-substring [exit code, default 124]
-    [[ -f "$2" ]] || { echo "skip  $1 bare run ($2 missing: make -C $UP firmware-<isa>)"; return; }
+    [[ -f "$2" ]] || { echo "skip  $1 bare run ($2 missing: meson compile -C ${EMBER_BUILD:-$UP/build} firmware)"; return; }
     (cd "$T/$1" && mkdir -p build && IMAGE="$2" timeout -k 5 60 ./run.sh -n 2000000 > build/c.txt 2> build/e.log < /dev/null) || true
     python3 "$T/$1/scripts/log_summary.py" "$T/$1/build/e.log" > "$T/$1/build/s.txt"
     grep -q "exit ${4:-124}" "$T/$1/build/s.txt" && grep -q "$3" "$T/$1/build/s.txt" \
         && ok "$1: bare board stalls on the console UART ($3)" \
         || { bad "$1: bare board stalls on the console UART ($3)"; sed -n '2,3p;/first distinct/,/^$/p' "$T/$1/build/s.txt" | head -12; }
 }
-run_bare mips "$UP/build/firmware-mips/selftest-be.elf" "0x1fd003fd"
-run_bare rv "$UP/build/firmware/selftest.elf" "0x10000005"
-run_bare arm "$UP/build/firmware-arm/selftest-arm.elf" "0x1c000005"
-run_bare armeb "$UP/build/firmware-arm/selftest-arm-be.elf" "0x1c000005"
-run_bare ppc "$UP/build/firmware-ppc/selftest.elf" "0xf0000005"
-run_bare ppcbe "$UP/build/firmware-ppc/selftest-booke.elf" "0xf0000005"
-run_bare avr "$UP/build/firmware-avr/selftest-eplus.elf" "phys 0x8000e5"
-run_bare avr32 "$UP/build/firmware-avr32/selftest-a.elf" "0xffff1405"
-run_bare avr32b "$UP/build/firmware-avr32/selftest-b.elf" "0xffff1405"
-run_bare pic "$UP/build/firmware-pic/selftest-pic18.elf" "phys 0x800f65"
-run_bare pic32 "$UP/build/firmware-pic32/selftest-mx.elf" "0x1f820005"
-run_bare mcs51 "$UP/build/firmware-mcs51/selftest-8052.bin" "phys 0x2000098"
-run_bare m6502 "$UP/build/firmware-6502/selftest-nmos.bin" "0x7f05"
-run_bare z80 "$UP/build/firmware-z80/selftest-nmos.bin" "phys 0x10000)" 125
-run_bare xtensa "$UP/build/firmware-xtensa/selftest-lx6.elf" "0x60000005"
-run_bare xtensaeb "$UP/build/firmware-xtensa/selftest-lx6-be.bin" "0x60000005"
+run_bare mips "$FW/firmware-mips/selftest-be.elf" "0x1fd003fd"
+run_bare rv "$FW/firmware/selftest.elf" "0x10000005"
+run_bare arm "$FW/firmware-arm/selftest-arm.elf" "0x1c000005"
+run_bare armeb "$FW/firmware-arm/selftest-arm-be.elf" "0x1c000005"
+run_bare ppc "$FW/firmware-ppc/selftest.elf" "0xf0000005"
+run_bare ppcbe "$FW/firmware-ppc/selftest-booke.elf" "0xf0000005"
+run_bare avr "$FW/firmware-avr/selftest-eplus.elf" "phys 0x8000e5"
+run_bare avr32 "$FW/firmware-avr32/selftest-a.elf" "0xffff1405"
+run_bare avr32b "$FW/firmware-avr32/selftest-b.elf" "0xffff1405"
+run_bare pic "$FW/firmware-pic/selftest-pic18.elf" "phys 0x800f65"
+run_bare pic32 "$FW/firmware-pic32/selftest-mx.elf" "0x1f820005"
+run_bare mcs51 "$FW/firmware-mcs51/selftest-8052.bin" "phys 0x2000098"
+run_bare m6502 "$FW/firmware-6502/selftest-nmos.bin" "0x7f05"
+run_bare z80 "$FW/firmware-z80/selftest-nmos.bin" "phys 0x10000)" 125
+run_bare xtensa "$FW/firmware-xtensa/selftest-lx6.elf" "0x60000005"
+run_bare xtensaeb "$FW/firmware-xtensa/selftest-lx6-be.bin" "0x60000005"
 # an 8-bit core has no bus error: a store to ROM stops it, and log_summary must say so
 python3 -c "
 import sys
@@ -128,8 +139,8 @@ python3 "$T/m6502/scripts/log_summary.py" "$T/m6502/build/halt.log" | grep -q "c
     || { bad "log_summary: a halted 8-bit core is reported"; tail -5 "$T/m6502/build/halt.log"; }
 # diagnostics through run.sh: UNKNOWN_MMIO=stop halts at the first unmodelled access (exit 131),
 # and log_summary.py reports the access, the --history tail and the exc and mmio summaries
-if [[ -f "$UP/build/firmware/selftest.elf" ]]; then
-    (cd "$T/rv" && IMAGE="$UP/build/firmware/selftest.elf" UNKNOWN_MMIO=stop TRACE=exc,mmio-summary \
+if [[ -f "$FW/firmware/selftest.elf" ]]; then
+    (cd "$T/rv" && IMAGE="$FW/firmware/selftest.elf" UNKNOWN_MMIO=stop TRACE=exc,mmio-summary \
         timeout -k 5 60 ./run.sh -n 2000000 --history 8 > build/c.txt 2> build/stop.log < /dev/null) || true
     python3 "$T/rv/scripts/log_summary.py" "$T/rv/build/stop.log" > "$T/rv/build/stop.txt"
     grep -q "exit 131" "$T/rv/build/stop.txt" \
@@ -155,7 +166,7 @@ for v in "fault 20 crash-fault" "zero 0 ok"; do
 done
 # the PC template runs ember's x86 self-test as a raw stage (real mode at 0); its software
 # SMIs need the stand-in APM port
-X86ST="$UP/build/firmware-x86/selftest.bin"
+X86ST="$FW/firmware-x86/selftest.bin"
 if [[ -f "$X86ST" ]]; then
     for v in "" "--jit"; do
         (cd "$T/pc" && mkdir -p build && IMAGE="$X86ST" timeout -k 5 60 ./run.sh -o apm-smi=1 $v -n 20000000 \
@@ -164,8 +175,8 @@ if [[ -f "$X86ST" ]]; then
             || { bad "pc: template runs the x86 self-test $v"; cat "$T/pc/build/st.txt"; tail -3 "$T/pc/build/st.log"; }
     done
     # the AMD64 SMRAM save state and AMD's SMRAM registers, by board option
-    if [[ -f "$UP/build/firmware-x86/smm-amd.bin" ]]; then
-        (cd "$T/pc" && IMAGE="$UP/build/firmware-x86/smm-amd.bin" timeout -k 5 60 ./run.sh -o apm-smi=1 -o smm-map=amd64 -n 20000000 > build/amd.txt 2> build/amd.log < /dev/null) || true
+    if [[ -f "$FW/firmware-x86/smm-amd.bin" ]]; then
+        (cd "$T/pc" && IMAGE="$FW/firmware-x86/smm-amd.bin" timeout -k 5 60 ./run.sh -o apm-smi=1 -o smm-map=amd64 -n 20000000 > build/amd.txt 2> build/amd.log < /dev/null) || true
         grep -q "io+0x700: .*(last 0x5555)" "$T/pc/build/amd.log" && ok "pc: template runs the AMD64 SMM self-test" \
             || { bad "pc: template runs the AMD64 SMM self-test"; cat "$T/pc/build/amd.txt"; tail -3 "$T/pc/build/amd.log"; }
     fi
@@ -175,13 +186,15 @@ if [[ -f "$X86ST" ]]; then
         && ok "log_summary: a software SMI nothing decodes is reported" \
         || { bad "log_summary: lost software SMI"; grep -i "b2" "$T/pc/build/nosmi.log" | head -3; }
 else
-    echo "skip  pc: x86 self-test ($X86ST missing: make -C $UP firmware-x86)"
+    echo "skip  pc: x86 self-test ($X86ST missing: meson compile -C ${EMBER_BUILD:-$UP/build} firmware)"
 fi
 
 # 3. fixture firmware on the wired board
 P="$T/mips"
 cp "$SK"/references/examples/*.[ch] "$P/emulation/"
 cp "$HERE"/fixture/testbrd_*.[ch] "$P/emulation/"
+if "$P/scripts/rebuild.sh" >/dev/null 2>&1; then bad "a source not in emulation/meson.build is rejected"; else ok "a source not in emulation/meson.build is rejected"; fi
+list_sources "$P"
 check "fixture: rebuild" "$P/scripts/rebuild.sh"
 if command -v mips-linux-gnu-gcc >/dev/null; then
     mkdir -p "$T/fw"
@@ -196,6 +209,15 @@ if command -v mips-linux-gnu-gcc >/dev/null; then
         [[ "$rc" -eq 0 && "$(cat "$P/build/fx.txt")" == "$expect" ]] && ok "fixture run ($v)" \
             || { bad "fixture run ($v): exit $rc"; cat "$P/build/fx.txt"; tail -5 "$P/build/fx.log"; }
     done
+    # the scaffold's boot check: skipped without an image, then the firmware through run.sh
+    out="$(meson test -C "$P/build" 2>&1)" && echo "$out" | grep -q "boot  *SKIP" \
+        && ok "meson test: boot is skipped without an image" || { bad "meson test: boot skipped without an image"; echo "$out" | tail -8; }
+    cp "$T/fw/fw.bin" "$P/firmware/firmware.bin"; printf 'chip reset\nafter reset\nirq ok\n' > "$P/tests/boot.expect"
+    out="$(meson test -C "$P/build" 2>&1)" && echo "$out" | grep -q "boot  *OK" \
+        && ok "meson test: boot runs the firmware to boot.expect" || { bad "meson test: boot"; echo "$out" | tail -8; }
+    printf 'no such line\n' > "$P/tests/boot.expect"
+    if meson test -C "$P/build" >/dev/null 2>&1; then bad "meson test: boot fails on a missing line"; else ok "meson test: boot fails on a missing line"; fi
+    rm -f "$P/firmware/firmware.bin"; : > "$P/tests/boot.expect"
     rc=0; (cd "$P" && IMAGE="$T/fw/fw.bin" ./run.sh -o hle=1 -n 5000000 > build/hx.txt 2> build/hx.log < /dev/null) || rc=$?
     [[ "$rc" -eq 0 && "$(cat "$P/build/hx.txt")" == "00001234803fffe000001234803fffe0" ]] \
         && ok "HLE hook replaces puts_" || bad "HLE hook replaces puts_ (exit $rc)"
@@ -253,10 +275,11 @@ fi
 Q="$T/pc"
 cp "$SK"/references/examples/pc/*.[ch] "$Q/emulation/"
 cp "$HERE"/fixture/pc/pcbrd_board.c "$Q/emulation/"
+list_sources "$Q"
 check "pc fixture: rebuild" "$Q/scripts/rebuild.sh"
 if echo 'int x;' | cc -m32 -c -x c -o /dev/null - 2>/dev/null; then
     F="$T/pcfw"; mkdir -p "$F"
-    make -s -C "$HERE/fixture/pc/fw" OUT="$F" >/dev/null 2>&1 && ok "pc fixture firmware builds" || bad "pc fixture firmware builds"
+    "$HERE/fixture/pc/fw/build.sh" "$F" >/dev/null 2>&1 && ok "pc fixture firmware builds" || bad "pc fixture firmware builds"
     pc_run() {  # out-file flash extra-args...
         local out="$1" fl="$2"; shift 2
         (cd "$Q" && FLASH="$fl" timeout -k 5 120 ./run.sh --ram 64M -n 50000000 "$@" \
@@ -398,13 +421,14 @@ printf '#include "uam/state.h"\n#include "uam/blockdev.h"\nint ok_dev_x;\n' > "$
 check "device may include uam/state.h and uam/blockdev.h" "$P/scripts/check-layering.sh"
 rm -f "$P/emulation/ok_dev.c"
 printf '#include "uam/machine.h"\nint bad_dev_x;\n' > "$P/emulation/bad_dev.c"
+cp "$P/emulation/meson.build" "$T/sources.keep"; list_sources "$P"
 if "$P/scripts/rebuild.sh" >/dev/null 2>&1; then bad "layering violation rejected"; else ok "layering violation rejected"; fi
-rm -f "$P/emulation/bad_dev.c" "$P/build/obj/bad_dev."*
+rm -f "$P/emulation/bad_dev.c"; cp "$T/sources.keep" "$P/emulation/meson.build"
 # Every ember change is a git format-patch file applied to the clone at the pin as a commit.
 export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-skills-test}" GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-skills-test@localhost}"
 export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-skills-test}" GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-skills-test@localhost}"
-PIN="$(head -1 "$P/ember.commit")"
-echo "/* stray */" >> "$P/ember-src/src/core/common.c"
+PIN="$(pin_of "$P")"
+echo "/* stray */" >> "$P/subprojects/ember/src/core/common.c"
 if "$P/scripts/rebuild.sh" >/dev/null 2>&1; then bad "uncaptured ember edit rejected"; else ok "uncaptured ember edit rejected"; fi
 if "$P/scripts/regen-patches.sh" >/dev/null 2>&1; then bad "regen-patches wants a commit message"; else ok "regen-patches wants a commit message"; fi
 check "regen-patches -m commits and exports it" "$P/scripts/regen-patches.sh" -m "core: a test change"
@@ -413,8 +437,8 @@ PF="$(ls "$P"/patches/*.patch 2>/dev/null | head -1)"
     && ok "one format-patch file with the message" || bad "one format-patch file with the message"
 check "rebuild accepts the exported patch" "$P/scripts/rebuild.sh"
 check "full build re-applies the patch" "$P/scripts/build-ember.sh"
-[[ "$(git -C "$P/ember-src" log --format=%s "$PIN..HEAD")" == "core: a test change" && -z "$(git -C "$P/ember-src" status --porcelain -uno)" ]] \
-    && grep -q "stray" "$P/ember-src/src/core/common.c" \
+[[ "$(git -C "$P/subprojects/ember" log --format=%s "$PIN..HEAD")" == "core: a test change" && -z "$(git -C "$P/subprojects/ember" status --porcelain -uno)" ]] \
+    && grep -q "stray" "$P/subprojects/ember/src/core/common.c" \
     && ok "patch applied as a commit on the pin" || bad "patch applied as a commit on the pin"
 git clone -q "$UP" "$T/upx"; git -C "$T/upx" checkout -q -B main "$PIN"
 git -C "$T/upx" am -q "$PF" && [[ "$(git -C "$T/upx" log -1 --format=%s)" == "core: a test change" ]] \
@@ -422,19 +446,19 @@ git -C "$T/upx" am -q "$PF" && [[ "$(git -C "$T/upx" log -1 --format=%s)" == "co
 # Re-pin to a newer upstream: the patch is rebased; once upstream has taken it, it drops out.
 git -C "$T/upx" reset -q --hard "$PIN"; echo "repin test" > "$T/upx/REPIN-TEST"
 git -C "$T/upx" add REPIN-TEST; git -C "$T/upx" commit -q -m "upstream moves on"
-git -C "$P/ember-src" remote set-url origin "$T/upx"
+git -C "$P/subprojects/ember" remote set-url origin "$T/upx"
 check "repin.sh moves to the latest commit" "$P/scripts/repin.sh" --no-build
-[[ "$(head -1 "$P/ember.commit")" == "$(git -C "$T/upx" rev-parse HEAD)" && "$(ls "$P"/patches/*.patch | wc -l)" -eq 1 ]] \
+[[ "$(pin_of "$P")" == "$(git -C "$T/upx" rev-parse HEAD)" && "$(ls "$P"/patches/*.patch | wc -l)" -eq 1 ]] \
     && ok "pin moved, patch carried" || bad "pin moved, patch carried"
 git -C "$T/upx" am -q "$PF"
 check "repin.sh onto an upstream that took the patch" "$P/scripts/repin.sh" --no-build
-[[ "$(head -1 "$P/ember.commit")" == "$(git -C "$T/upx" rev-parse HEAD)" ]] && ! ls "$P"/patches/*.patch >/dev/null 2>&1 \
+[[ "$(pin_of "$P")" == "$(git -C "$T/upx" rev-parse HEAD)" ]] && ! ls "$P"/patches/*.patch >/dev/null 2>&1 \
     && ok "a patch taken upstream drops out" || bad "a patch taken upstream drops out"
-git -C "$P/ember-src" remote set-url origin "$UP"
-git clone -q "$UP" "$T/wc"; echo "/* user work */" >> "$T/wc/Makefile"
+git -C "$P/subprojects/ember" remote set-url origin "$UP"
+git clone -q "$UP" "$T/wc"; echo "# user work" >> "$T/wc/meson.build"
 "$SK/scripts/new-emulation.sh" wc-test --dir "$T/wcp" --ember-src "$T/wc" >/dev/null
 if "$T/wcp/scripts/build-ember.sh" >/dev/null 2>&1; then bad "dirty working copy protected"; else ok "dirty working copy protected"; fi
-grep -q "user work" "$T/wc/Makefile" && ok "working copy untouched" || bad "working copy untouched"
+grep -q "user work" "$T/wc/meson.build" && ok "working copy untouched" || bad "working copy untouched"
 
 echo "== $pass passed, $fail failed =="
 [[ "$fail" -eq 0 ]]

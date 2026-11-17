@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 PROJ="$(resolve_proj "$P")"; SRC="$(resolve_src "$S" "$PROJ")"
 [[ -d "$SRC/.git" ]] || _die "not a git checkout: $SRC"
-COMMIT="$(head -1 "$PROJ/ember.commit")"
+COMMIT="$(pin_of "$PROJ")"
 PIN="$(git -C "$SRC" rev-parse --verify -q "$COMMIT^{commit}")" || _die "pinned commit $COMMIT not in $SRC"
 git -C "$SRC" merge-base --is-ancestor "$PIN" HEAD \
     || _die "$SRC is not on top of the pinned ${COMMIT:0:12} (run build-ember.sh, or repin.sh to move the pin)"

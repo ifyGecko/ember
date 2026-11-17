@@ -1,0 +1,9 @@
+# The ember this project builds against. `revision` is the pin: a full commit hash in a real
+# project (the latest ember commit when the project was created or last moved), so a fresh
+# clone rebuilds the same runner. This in-tree example follows the default branch instead.
+[wrap-git]
+url = https://github.com/ifyGecko/ember.git
+revision = head
+
+[provide]
+uam = uam_dep

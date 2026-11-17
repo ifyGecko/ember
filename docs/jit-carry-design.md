@@ -227,7 +227,7 @@ The comparison covers the register file, RAM, icount and the device log.
 
 **Unit tests and end to end:**
 - test_jit: a hop count that shows carried links happen on a looping guest.
-- `make test` (every firmware self-test on the interpreter and the JIT).
+- `meson test -C build` (every firmware self-test on the interpreter and the JIT).
 - Both end-to-end workloads: identical consoles and identical interpreter-vs-JIT `-d` state, and the UEFI boot check of an external x86 board if one is available, with secure boot after C2 (ember has no such make target).
 
 **Measurement:**

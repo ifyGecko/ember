@@ -1,6 +1,6 @@
 ---
 name: ember-dev-build
-description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC board, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, make a board snapshot-capable, or debug a stalled bring-up (exit 124/125/126/128/129/131, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (pinned out-of-tree library, one file per device, a wiring-only board); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
+description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC board, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, make a board snapshot-capable, or debug a stalled bring-up (exit 124/125/126/128/129/131, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (meson project pinning ember, one file per device, a wiring-only board); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
 ---
 
 # ember-dev-build: iterative firmware bring-up on ember
@@ -26,9 +26,15 @@ is a separate step: the **ember-fuzz** skill.
 
 Script paths are relative to this skill's directory, `skills/ember-dev-build/` in the ember
 repository (`skills/install.sh` links it into the agent's skills directory). Requirements:
-git, a C11 compiler, make, python3; gdb-multiarch (or the target's own gdb) for debugging; a
-cross compiler only for your own test firmware. Ember itself needs libc and libm, for its
-floating-point models (the project Makefile links `-lm`).
+git, a C11 compiler, meson (1.1 or newer) and ninja, python3; gdb-multiarch (or the target's
+own gdb) for debugging; a cross compiler only for your own test firmware. Ember itself
+needs libc and libm, for its floating-point models (the `uam` dependency brings `-lm`).
+
+**The build system is meson.** Ember builds with it, and a board is a meson project that
+takes ember as a pinned subproject: `meson.build` (the runner), `subprojects/ember.wrap`
+(the pin), `emulation/meson.build` (the list of sources). The project's layout is fixed
+and `new-emulation.sh` creates it; `references/organization.md` is the authority on what
+goes where and how it is built. Do not invent another layout or another build.
 
 ## Before you start: tools must work
 If a tool the task depends on is unavailable or misbehaving, **stop and tell the user instead
@@ -70,17 +76,21 @@ scripts/new-emulation.sh <board> --dir <project-dir> --recon RECON.md \
   `pic32`: mx, mm, mz; `mcs51`: 8052, 8051, cip51; `m6502`: nmos, 2a03, 65c02, r65c02; `z80`:
   nmos, cmos; `xtensa*`: lx6, lx106, lx7). The memory map, reset vector, CPU model call and
   interrupt example follow ember's `boards/<isa>_ref.c` (table in `references/board-skeleton.md`).
-- It generates a **minimal board that already builds and runs** (`emulation/<board>_board.c`,
-  `main.c`, `Makefile`, `run.sh`), with the RECON numbers you pass filled in. `--isa x86_64`
+- It generates the whole project in the fixed layout, with a **minimal board that already
+  builds and runs**: `meson.build`, `subprojects/ember.wrap`, `emulation/` (`meson.build`,
+  `main.c`, `<board>_board.c`), `firmware/` (put the image there), `tests/` (`meson test`:
+  the board is registered; the firmware boots to the lines in `boot.expect`), `run.sh`,
+  with the RECON numbers you pass filled in. `--isa x86_64`
   generates a **PC board** instead (`templates/board-pc.c.in`): processors with local APICs,
   8259/8254/RTC/HPET/8042/COM1/POST/port 92h, PCI configuration at 0xCF8, the boot flash
   ending at 4 GiB (`FLASH=bios.bin ./run.sh`, or `CODE=` + `VARS=` for an OVMF split),
   catch-alls over every unmodelled I/O port; the chipset is what you add
   (`references/pc-platform.md`).
 - **Pin and clone (rule):** the project builds against its own local clone of ember
-  (`<project>/ember-src`, from `--ember-upstream`, `$EMBER_UPSTREAM` or `~/ember`), pinned to
-  the **latest ember commit** (upstream's HEAD, the default; `--ember-commit` for anything
-  else, with the reason in the README). `--ember-src` only names another clone dedicated to
+  (`<project>/subprojects/ember`, from `--ember-upstream`, `$EMBER_UPSTREAM` or `~/ember`),
+  pinned to the **latest ember commit** (upstream's HEAD, the default; `--ember-commit` for
+  anything else, with the reason in the README). The pin is the `revision` line of
+  `subprojects/ember.wrap`. `--ember-src` only names another clone dedicated to
   the project, never an ember working copy. When ember moves on, `scripts/repin.sh` moves the
   pin to the new latest commit and carries the patches along.
 - **Every change to ember is a local git patch file (rule):** if the emulation needs ember
@@ -93,11 +103,16 @@ scripts/new-emulation.sh <board> --dir <project-dir> --recon RECON.md \
   this skill.
 
 ```bash
-scripts/build-ember.sh      # full: guard -> clone at the pin -> patches as commits -> libuam (out of tree) -> build/<board>-run
-scripts/rebuild.sh          # fast: after editing emulation/ files (layering checked, new files picked up)
-scripts/regen-patches.sh    # after committing a change to ember in ember-src: export patches/ (rule 4)
+scripts/build-ember.sh      # full: guard -> clone at the pin -> patches as commits -> meson setup build -> meson compile: libuam + build/<board>-run
+scripts/rebuild.sh          # fast: after editing emulation/ files (sources listed, layering checked, meson compile -C build)
+meson test -C build         # the project's checks (tests/): registered; boot, once firmware/ and tests/boot.expect are filled
+scripts/regen-patches.sh    # after committing a change to ember in subprojects/ember: export patches/ (rule 4)
 scripts/repin.sh            # move to the latest ember commit, rebasing patches/ onto it
 ```
+A new device is a new `emulation/<soc>_<block>.c` + `.h`, **its line in
+`emulation/meson.build`**, and one create/map/connect block in the board. As the boot gets
+further, add the console lines it must reach to `tests/boot.expect`: `meson test -C build`
+then guards every milestone already passed.
 Before writing code against a new pin, run the API checklist in `references/board-skeleton.md`
 and, when the pin moved, the skills' end-to-end test against it:
 `skills/tests/run-tests.sh <ember checkout>` (from the ember repository holding this skill).

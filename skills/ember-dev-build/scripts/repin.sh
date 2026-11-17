@@ -2,7 +2,7 @@
 # repin.sh - move the project to the latest ember commit, carrying patches/ along.
 #
 # Fetches the clone's origin (the ember the project was cloned from), rebases the patch
-# commits onto the new commit, writes it to ember.commit, re-exports patches/ and runs a full
+# commits onto the new commit, writes it to subprojects/ember.wrap (revision), re-exports patches/ and runs a full
 # build. A patch that ember has meanwhile taken upstream drops out on its own (git rebase
 # skips a commit whose change is already there). On a conflict it stops in the clone: resolve
 # it there (git -C <clone> rebase --continue) and run `repin.sh --finish`.
@@ -27,12 +27,12 @@ while [[ $# -gt 0 ]]; do
 done
 PROJ="$(resolve_proj "$P")"; SRC="$(resolve_src "$S" "$PROJ")"
 [[ -d "$SRC/.git" ]] || _die "no ember clone at $SRC; run build-ember.sh first"
-OLD="$(head -1 "$PROJ/ember.commit")"
-STATE_FILE="$PROJ/.ember-build/repin-target"
+OLD="$(pin_of "$PROJ")"
+STATE_FILE="$PROJ/.repin-target"
 
 finish() {   # $1 = the new pinned commit
     git -C "$SRC" merge-base --is-ancestor "$1" HEAD || _die "the clone is not on top of ${1:0:12}"
-    echo "$1" > "$PROJ/ember.commit"
+    set_pin "$PROJ" "$1"
     rm -f "$STATE_FILE"
     "$HERE/regen-patches.sh" --proj "$PROJ" --ember-src "$SRC"
     echo "repin: ${OLD:0:12} -> ${1:0:12} ($(git -C "$SRC" log -1 --format='%cs %s' "$1"))"
@@ -48,7 +48,7 @@ if [[ "$FINISH" -eq 1 ]]; then
 fi
 
 [[ "$(clone_state "$SRC" "$PROJ" "$OLD")" == applied ]] \
-    || _die "the clone is not ember.commit + patches/ (uncaptured ember work?); run regen-patches.sh or build-ember.sh first"
+    || _die "the clone is not the pin + patches/ (uncaptured ember work?); run regen-patches.sh or build-ember.sh first"
 echo "--- fetching ember into $SRC ---"
 git -C "$SRC" fetch -q --tags origin
 git -C "$SRC" remote set-head origin -a >/dev/null 2>&1 || true
@@ -56,7 +56,7 @@ NEW="$(git -C "$SRC" rev-parse --verify -q "${TO:-origin/HEAD}^{commit}")" \
     || _die "cannot resolve ${TO:-origin/HEAD} in $SRC"
 OLDC="$(git -C "$SRC" rev-parse "$OLD^{commit}")"
 if [[ "$NEW" == "$OLDC" ]]; then echo "repin: already at ${NEW:0:12}, the latest"; exit 0; fi
-mkdir -p "$PROJ/.ember-build"; echo "$NEW" > "$STATE_FILE"
+echo "$NEW" > "$STATE_FILE"
 n="$(git -C "$SRC" rev-list --count "$OLDC..HEAD")"
 echo "--- rebasing $n patch commit(s) from ${OLDC:0:12} onto ${NEW:0:12} ---"
 id_env=()

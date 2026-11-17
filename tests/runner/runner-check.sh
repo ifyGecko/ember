@@ -1,6 +1,6 @@
 #!/bin/sh
 # runner-check.sh RUNNER X86_SELFTEST_BIN - checks of uam-run's debugging options on
-# x86_64-test (RUNNER is build/uam-test-run) with the raw x86 self-test (loaded at 0,
+# x86_64-test (RUNNER is build/tests/uam-test-run) with the raw x86 self-test (loaded at 0,
 # entered at 0):
 #   bad board options  a setup error (exit 2), not a crash, however early the board refuses
 #   --log-pc     more than 64 addresses all take effect

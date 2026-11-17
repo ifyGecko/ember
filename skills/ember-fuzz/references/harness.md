@@ -529,7 +529,8 @@ for (each input)
 ```
 
 Such a program is analysis code, not part of the board: keep it outside `emulation/` (e.g.
-`fuzz/driver.c` with its own Makefile target), and build the machine through the board's
+`fuzz/driver.c` with its own `executable()` in the project's `meson.build`, linking
+`uam_dep` and the board's sources), and build the machine through the board's
 registered `build` exactly as the runner does. A result that names a guard
 (`r.guard_valid`) carries the hit in `r.guard` (`uam_guard_hit`: name, processor, pc, the
 access's address and the guard's range, so `addr - start` is the offset into it, size,

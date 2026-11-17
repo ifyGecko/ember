@@ -1,0 +1,20 @@
+option('rounds', type: 'integer', value: 0, min: 0,
+  description: 'Rounds per kernel (0: bench.c\'s BENCH_ROUNDS)')
+option('only', type: 'integer', value: -1, min: -1,
+  description: 'Run this kernel only (-1: all)')
+option('riscv_cross', type: 'string', value: '',
+  description: 'RISC-V toolchain prefix (empty: the first of riscv64-unknown-elf-, riscv64-linux-gnu-, riscv32-unknown-elf- found)')
+option('mips_cross', type: 'string', value: 'mips-linux-gnu-')
+option('mipsel_cross', type: 'string', value: 'mipsel-linux-gnu-')
+option('arm_cross', type: 'string', value: 'arm-linux-gnueabi-')
+option('ppc_cross', type: 'string', value: 'powerpc64le-linux-gnu-')
+option('x86_cross', type: 'string', value: 'x86_64-linux-gnu-')
+option('avr_cross', type: 'string', value: 'avr-')
+option('avr32_cross', type: 'string', value: 'avr32-')
+option('xtensa_lx106_cross', type: 'string', value: 'xtensa-lx106-elf-')
+option('xtensa_lx6_cross', type: 'string', value: 'xtensa-esp32-elf-')
+option('xtensa_lx7_cross', type: 'string', value: 'xtensa-esp32s3-elf-')
+option('sdcc', type: 'string', value: 'sdcc')
+option('sdasz80', type: 'string', value: 'sdasz80')
+option('sdcc_libsrc', type: 'string', value: '',
+  description: 'SDCC\'s library sources (empty: ../share/sdcc/lib/src beside sdcc)')

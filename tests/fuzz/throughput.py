@@ -243,7 +243,7 @@ def read_ref(path):
 def write_ref(path, ref):
     with open(path, "w") as f:
         f.write("# What one fuzz execution costs, in guest instructions at the host's plain JIT\n"
-                "# speed (tests/fuzz/throughput.py; `make fuzz-throughput-record` rewrites it).\n"
+                "# speed (tests/fuzz/throughput.py; `meson compile -C build fuzz-throughput-record` rewrites it).\n"
                 "# host-arch board stage cost\n")
         for (arch, board, stage), cost in sorted(ref.items()):
             f.write("%s %s %s %.0f\n" % (arch, board, stage, cost))

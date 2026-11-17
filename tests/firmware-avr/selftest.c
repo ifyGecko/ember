@@ -1,6 +1,6 @@
 /*
  * selftest.c - 8-bit AVR self-test for the avr-ref board, built for each core family
- * (-o model=e|eplus|xm|xt|rc; the Makefile names the part whose memory layout each
+ * (-o model=e|eplus|xm|xt|rc; meson.build names the part whose memory layout each
  * model has).
  *
  * Exercises: every flag the ALU instructions define, against vectors computed from the

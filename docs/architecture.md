@@ -204,12 +204,13 @@ fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists an
                   status_tui.py (its status screen) cov_region.py (reads a coverage region)
 tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
                   docs/jit-perf.md)
-examples/         external-board/ (an out-of-tree board built against `make lib`)
+examples/         external-board/ (an out-of-tree board project in the prescribed layout, built
+                  with ember as its meson subproject)
 skills/           ember-dev-recon/ ember-dev-build/ ember-fuzz/ (agent skills: SKILL.md, scripts,
                   references, templates) install.sh tests/ (run-tests.sh: the skills' tooling
                   against an ember checkout; never part of the library)
 tests/boards/     test_boards.c test_boards.h uam-test-run.c  (x86_64-test and rv32-test: reference boards plus
-                  the components only the tests use; build/uam-test-run) heap_hooks.c (a board's
+                  the components only the tests use; build/tests/uam-test-run) heap_hooks.c (a board's
                   hooks from a firmware's allocator to a guarded heap)
 tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c test_jitdiff.c
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_cov_formats.c
@@ -239,9 +240,9 @@ tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dum
                   interpreter and JIT alike)
 tests/gdb/        gdb-check.py  (the gdb stub over the remote protocol, four processors)
 tests/smp/        smp_test.h  (one multiprocessor self-test for RISC-V, MIPS, ARM, PowerPC)
-tests/bench/      bench.c Makefile x86-start.S x86.ld pic32.ld  (one C benchmark for every guest ISA but
-                  the 8-bit PIC; make
-                  bench-test checks it, tools/xbench.sh times it)
+tests/bench/      bench.c meson.build x86-start.S x86.ld pic32.ld  (one C benchmark for every guest ISA
+                  but the 8-bit PIC, a meson project of its own; `meson test --suite bench`
+                  checks it, tools/xbench.sh times it)
 tests/firmware/       start.S selftest.c nettest.c smpstart.S smptest.c fuzztarget.c consoletest.c
                       consoletest.script link.ld  (RISC-V; the console test: scripted input)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
@@ -352,7 +353,7 @@ devices.
   built out of tree on the library (`examples/external-board/`). Ember's own tests also use
   generic components no reference board wires (the 0xB2 SMI port, storage, VGA, printer,
   virtio-net): `tests/boards/` adds them on top of the reference boards as `x86_64-test` and
-  `rv32-test`, registered only by the test runner `build/uam-test-run`.
+  `rv32-test`, registered only by the test runner `build/tests/uam-test-run`.
 - **Multiprocessor machines** (`-o cpus=N` on `rv32-ref`, `mips-ref`/`mipsel-ref`,
   `arm-ref`/`armeb-ref`, `ppc-ref`, `x86_64-ref` and `xtensa-ref`/`xtensaeb-ref`): processors share the
   bus and the clock and run in deterministic instruction slices (`--quantum`). Every processor
@@ -757,16 +758,16 @@ an ABI handshake. ARMv7-M (the M-profile NVIC exception model) is still planned.
 
 ## 8. Verification
 
-Implemented (`make test`):
+Implemented (`meson test -C build`):
 
 - Unit tests: IR semantics, verifier and printer (`test_ir`); bus, resets, hooks, time and
   livelock bounds, the ABI handshake (`test_core`); host backends, the host loop and console
   holding (`test_host`); state streams and snapshots under both backends (`test_snapshot`).
 - The IR verifier runs on every translated block (on by default; `--no-verify` skips it), before
   and after the optimizer.
-- Also in `make test`: the x86 self-tests (`selftest.asm`, `smm-amd.asm`), the 6502 self-test,
+- Also in `meson test -C build`: the x86 self-tests (`selftest.asm`, `smm-amd.asm`), the 6502 self-test,
   PIC32 with its FPU and DSP vectors, `test_xtensa_fpu`, the console-script test and the MIPS
-  decoder checks. `make net-check` is separate.
+  decoder checks. `meson compile -C build net-check` is separate.
 - Firmware self-tests: bare-metal RV32, MIPS32 (both byte orders), ARMv7 (built as ARM and
   as Thumb-2 code, little-endian and BE8) and 32-bit PowerPC (integer, CR, branches, every
   load/store form, exceptions, problem state, decrementer, the MMU, the FPU and its FPSCR,
@@ -814,9 +815,9 @@ Implemented (`make test`):
   the input and past the buffer, read and write, length fields of either byte order) on every
   fuzz target and backend; `tests/runner/runner-check.sh` checks `--guard`/`--watch` on the x86
   self-test, with the interpreter and the JIT stopping at the same instruction.
-- Runner options: `tests/runner/runner-check.sh` (`make runner-test`) checks `--log-pc`,
+- Runner options: `tests/runner/runner-check.sh` (`meson test -C build --suite runner`) checks `--log-pc`,
   `--break`, `--dump-mem`, `--trace-after` (absolute and `+N`, across a snapshot) and block
-  traces with `--jit`; `tests/runner/trace-check.sh` (part of `make runner-test`) checks the
+  traces with `--jit`; `tests/runner/trace-check.sh` (part of `meson test -C build --suite runner`) checks the
   traces on the RISC-V self-test and on a small polling image: every `exc`, `mmio`,
   `sysreg`, `irq` and `console` line, the summaries and a `--history` identical under the
   interpreter, the JIT and the JIT without chaining; the exc lines' kind names and icounts
@@ -933,7 +934,7 @@ Implemented (`make test`):
   `tests/fuzz/brain_unit.py` checks the brain's campaign logic on synthetic data (hit-count
   classes, path ids, the favored set and skip rule, every schedule, operator weights, queue
   files, sync bookkeeping), `test_mutate` the mutator and the input-to-state candidates,
-  `tests/fuzz/throughput.py` (`make fuzz-throughput`, in `bench-test`) what a fuzz execution
+  `tests/fuzz/throughput.py` (`meson test -C build --suite fuzz-throughput`) what a fuzz execution
   costs against recorded figures,
   `test_fuzz` the campaign engine's batches and stages, what a snapshot restore keeps of
   translations (and drops when page tables are in guest memory), the harness's hit lists (`uam_fuzz_map_hits`) and the selective map clear they
@@ -944,7 +945,7 @@ Implemented (`make test`):
   chaining (identical logs, runs unchanged). `fuzz-check.sh` adds a planted bug behind a
   32-bit magic value to every board's fuzz target.
 - The external-board example is built and run against the library.
-- Cross-ISA benchmark: `make bench-test` builds `tests/bench/bench.c` for every reference
+- Cross-ISA benchmark: `meson test -C build --suite bench` builds `tests/bench/bench.c` for every reference
   board but `pic-ref` (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, AVR32A
   and AVR32B with an AVR32 toolchain, PIC32 MX/MM/MZ, Xtensa LX106/LX6/LX7 with their
   toolchains, the 8051, the 6502 and 65C02, and the Z80) and natively, and
@@ -956,8 +957,8 @@ Implemented (`make test`):
   sysregs, traps) under every deadline and exit request, and fixed shapes the optimizer
   rewrites (overwritten register writes, flags read back, common subexpressions). Each run must agree on the result,
   registers, memory, icount and on the register file seen at every device, sysreg and helper
-  access. `make jitdiff-soak` runs it at length; docs/jit-perf.md has the performance side.
-  It holds whichever code generator the host has: `make test` passes on x86-64 and on
+  access. `meson compile -C build jitdiff-soak` runs it at length; docs/jit-perf.md has the performance side.
+  It holds whichever code generator the host has: `meson test -C build` passes on x86-64 and on
   AArch64.
 - `test_f80` checks the x87's software 80-bit format: on an x86-64 host bit for bit against
   the host's x87 (arithmetic, square root, compares, conversions, FRNDINT and FISTP under

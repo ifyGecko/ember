@@ -1,0 +1,43 @@
+# Options of ember's build: `meson setup build -Dname=value`, later `meson configure build -Dname=value`.
+
+option('tests', type: 'boolean', value: true,
+  description: 'Build and register ember\'s tests and their firmware (never as a subproject)')
+
+# The test firmware is built with each guest's own toolchain. A toolchain that is not found
+# leaves its firmware out, and with it the tests that need it (the configure summary says
+# which). The *_cross options are prefixes: the compiler is <prefix>gcc.
+option('riscv_cross', type: 'string', value: '',
+  description: 'RISC-V toolchain prefix (empty: riscv64-unknown-elf-, riscv64-linux-gnu- or riscv32-unknown-elf-, the first found)')
+option('mips_cross', type: 'string', value: 'mips-linux-gnu-',
+  description: 'Big-endian MIPS toolchain prefix')
+option('mipsel_cross', type: 'string', value: 'mipsel-linux-gnu-',
+  description: 'Little-endian MIPS toolchain prefix (also the PIC32 firmware)')
+option('arm_cross', type: 'string', value: 'arm-linux-gnueabi-',
+  description: 'ARM toolchain prefix')
+option('ppc_cross', type: 'string', value: 'powerpc64le-linux-gnu-',
+  description: 'PowerPC toolchain prefix (any GCC for PowerPC, 32- or 64-bit)')
+option('avr_cross', type: 'string', value: 'avr-',
+  description: '8-bit AVR toolchain prefix')
+option('avr32_cross', type: 'string', value: 'avr32-',
+  description: 'AVR32 toolchain prefix (avr32-gcc 4.x of the AVR32 GNU toolchain)')
+option('xtensa_lx106_cross', type: 'string', value: 'xtensa-lx106-elf-',
+  description: 'Xtensa LX106 toolchain prefix')
+option('xtensa_lx6_cross', type: 'string', value: 'xtensa-esp32-elf-',
+  description: 'Xtensa LX6 toolchain prefix')
+option('xtensa_lx7_cross', type: 'string', value: 'xtensa-esp32s3-elf-',
+  description: 'Xtensa LX7 toolchain prefix')
+option('nasm', type: 'string', value: 'nasm', description: 'NASM (the x86 firmware)')
+option('gpasm', type: 'string', value: 'gpasm', description: 'gpasm of gputils (the 8-bit PIC firmware)')
+option('as31', type: 'string', value: 'as31', description: 'as31 (the 8051 self-tests)')
+option('sdcc', type: 'string', value: 'sdcc', description: 'SDCC (the 8051, 6502 and Z80 fuzz targets)')
+option('sdas6500', type: 'string', value: 'sdas6500', description: 'SDCC\'s 6502 assembler')
+option('sdld', type: 'string', value: 'sdld', description: 'SDCC\'s linker (the 6502 self-tests)')
+option('sdasz80', type: 'string', value: 'sdasz80', description: 'SDCC\'s Z80 assembler')
+option('sdldz80', type: 'string', value: 'sdldz80', description: 'SDCC\'s Z80 linker')
+
+option('throughput_ref', type: 'string', value: 'tests/fuzz/throughput.ref',
+  description: 'Figures the fuzz-throughput test checks against, relative to the source tree (empty: only report)')
+option('jitdiff_blocks', type: 'integer', value: 200000, min: 1,
+  description: 'Random blocks per seed of the jitdiff-soak target')
+option('xbench_args', type: 'string', value: '',
+  description: 'Arguments of the xbench target (tools/xbench.sh), as shell words, e.g. --per-kernel')

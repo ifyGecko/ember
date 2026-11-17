@@ -5,7 +5,7 @@
  * The tests also exercise generic components no reference board wires, so these
  * boards run a reference board's build and add them on top, the way an
  * out-of-tree board can start from a reference board. They are not shipped:
- * only build/uam-test-run (uam-test-run.c) registers them.
+ * only build/tests/uam-test-run (uam-test-run.c) registers them.
  *
  * "x86_64-test": x86_64-ref plus
  *   0xB2 software SMI port (any write raises SMI# on every processor), for the

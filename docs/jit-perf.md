@@ -196,9 +196,9 @@ and natively: CRC-32, heapsort,
 matrix multiply, string search, a switch-dispatch bytecode interpreter, pointer
 chasing, 64-bit arithmetic and number formatting, about 5e8 guest instructions in all.
 Everything it checksums is fixed-width (plain `int` and `unsigned` only for small counters and indices), so every build prints the same checksums.
-- `make bench-test` (part of `make test`) runs two rounds on every guest, under the
+- `meson test -C build --suite bench` (part of `meson test -C build`) runs two rounds on every guest, under the
   interpreter and the JIT, and requires the host build's checksums.
-- `tools/xbench.sh` (`make xbench`) times the full run on every guest. Each does the
+- `tools/xbench.sh` (`meson compile -C build xbench`) times the full run on every guest. Each does the
   same work, so wall time is the number to compare; `vs_best` divides it by the fastest
   guest's. `--times` also prints each kernel's seconds and their geometric mean. `--per-kernel` times each kernel on its own and prints the ratio matrix with
   a geometric mean per guest; `--interp` uses the interpreter.
@@ -222,7 +222,7 @@ on an 8-bit CPU), so its time measures the ISA more than the emulator; per instr
 runs at 843 MIPS. AVR32B is slower than AVR32A here (not profiled); the benchmark runs in the untranslated P1/P2 segments, so its TLB is not consulted. The AVR32 rows
 need an AVR32 toolchain (README, "Build and test"); without one they are skipped.
 
-The 8051 build (SDCC, `bench-mcs51.bin`) is in `make bench-test`'s checksum check but not in
+The 8051 build (SDCC, `bench-mcs51.bin`) is in `meson test -C build --suite bench`'s checksum check but not in
 the timed run: SDCC's reentrant 8051 code needs about 450 million instructions per round,
 some 350 times what RV32 needs, which a 400-round run would take minutes to show
 (`tools/xbench.sh --variants mcs51 --rounds 4` times it). Its rate is near 400 MIPS: the

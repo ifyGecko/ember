@@ -1,0 +1,12 @@
+# The board's checks, run by `meson test -C build`. `registered` needs nothing. `boot`
+# runs the firmware through run.sh and wants every line of tests/boot.expect on the
+# console, in order: put the image in firmware/, name it below, and write the lines the
+# boot must reach into boot.expect as the bring-up gets there. While the image is absent or
+# boot.expect is empty the check reports itself skipped.
+test('registered', find_program('registered.sh'), args: [runner, board])
+
+boot_image = meson.project_source_root() / 'firmware' / 'firmware.bin'   # the image under emulation
+test('boot', find_program('boot.sh'),
+  args: [meson.project_source_root() / 'run.sh', runner, '@IMAGE_VAR@', boot_image,
+         meson.current_source_dir() / 'boot.expect'],
+  timeout: 900)

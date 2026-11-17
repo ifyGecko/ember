@@ -32,9 +32,9 @@ checkout a project pins is the authority on options and APIs; the skills say whe
 | for | needs |
 |---|---|
 | recon | python3 (stdlib only); optional `binwalk`; Ghidra for the analysis pass (headless `analyzeHeadless`, or a Ghidra MCP server for interactive work) |
-| build | git, a C11 compiler, make, python3, an ember git checkout or URL; `gdb-multiarch` for debugging (see ember-dev-build for which ISAs it can drive) |
+| build | git, a C11 compiler, meson (1.1 or newer) and ninja, python3, an ember git checkout or URL; `gdb-multiarch` for debugging (see ember-dev-build for which ISAs it can drive) |
 | fuzz | a working ember-dev-build project. Nothing else by default (ember collects coverage itself). Only for opt-in site lists: one of the two tools ember's list generators run on, rizin with python3's `rzpipe` or headless Ghidra with the Jython extension (the Ghidra recon already uses) |
-| tests | the build requirements; `mips-linux-gnu-gcc` (fixture firmware) and gcc with `-m32` (the PC fixture); ember's own firmware builds (`make firmware firmware-mips ...` in the ember checkout) for the bare-board runs. Optional: gdb-multiarch, OVMF, Ghidra. Parts whose tools are missing are skipped |
+| tests | the build requirements; `mips-linux-gnu-gcc` (fixture firmware) and gcc with `-m32` (the PC fixture); ember's own test firmware (`meson setup build && meson compile -C build firmware` in the ember checkout; `EMBER_BUILD` names another build directory) for the bare-board runs. Optional: gdb-multiarch, OVMF, Ghidra. Parts whose tools are missing are skipped |
 
 ## Install
 
@@ -80,7 +80,8 @@ Re-run it whenever the ember pin moves.
 | `GHIDRA_PROJECTS` | recon | `~/GhidraProjects` |
 | `EMU_ROOT` | build | `~/emu` (default parent of new projects when `--dir` is not given) |
 | `EMBER_UPSTREAM` | build, tests | `~/ember` (clone source for a project's own ember checkout) |
-| `EMBER_SRC` | build | build in this existing checkout (else `ember.src`, else `<project>/ember-src`) |
+| `EMBER_SRC` | build | build in this existing checkout (else `ember.src`, else `<project>/subprojects/ember`) |
+| `EMBER_BUILD` | tests | `<ember checkout>/build` (ember's meson build directory, for its test firmware) |
 | `CLAUDE_SKILLS_DIR`, `QWEN_SKILLS_DIR` (`QWEN_HOME`), `AGENTS_SKILLS_DIR` | install | see Install |
 
 ## Layout
@@ -97,8 +98,9 @@ skills/
   ember-dev-build/  SKILL.md
                     scripts/  new-emulation.sh, build-ember.sh, rebuild.sh, regen-patches.sh, repin.sh,
                               check-layering.sh, _common.sh, log_summary.py, gdb_trace_calls.py
-                    templates/  board.c.in, board-pc.c.in, board.h.in, main.c.in, Makefile.in,
-                                master_abort_log.{c,h}
+                    templates/  meson.build.in, emulation.meson.build.in, tests.meson.build.in,
+                                registered.sh, boot.sh, board.c.in, board-pc.c.in, board.h.in,
+                                main.c.in, master_abort_log.{c,h}
                     references/  organization, iteration-loop, diagnostics, board-skeleton,
                                  device-anatomy, snapshots, pc-platform, examples/ (tested device models;
                                  examples/pc/ a Q35-class chipset)

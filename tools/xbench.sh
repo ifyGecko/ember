@@ -4,7 +4,7 @@
 #   tools/xbench.sh [--runs N] [--interp] [--rounds N] [--only K] [--per-kernel [--times]]
 #                   [--check] [--run UAM_RUN] [--out DIR] [--variants LIST]
 #
-# Builds tests/bench (ROUNDS and ONLY passed through), runs each guest build on its
+# Builds tests/bench (a meson project; rounds and the kernel passed through), runs each guest build on its
 # reference board with --jit (--interp: the interpreter) under tools/jitbench.sh, and
 # checks its console against the host build's. Every guest does the same work, so
 # time_s is the number to compare across ISAs; vs_best is it divided by the fastest
@@ -18,14 +18,16 @@
 # prints each kernel's time_s per guest, and their geometric mean: the table to compare two
 # builds by, as the ratios hide a change that speeds up every guest alike.
 #
-# --check is the quick correctness run of make bench-test: 2 rounds, one run each,
-# with the interpreter and with the JIT.
+# --check is the quick correctness run of `meson test --suite bench`: 2 rounds, one run
+# each, with the interpreter and with the JIT.
 #
 # Builds go to DIR (default build/firmware-bench), DIR-kN per kernel, DIR-check.
 # Variants (default all): rv32 mips mipsel arm thumb thumb-be ppc x86 avr avr32a avr32b
 #   pic32mx pic32mm pic32mz lx106 lx6 lx7
 # (the AVR32 ones only when tests/bench built them: an AVR32 toolchain, AVR32_CROSS; the
-# Xtensa ones likewise: XTENSA_LX106_CROSS, XTENSA_LX6_CROSS, XTENSA_LX7_CROSS), and
+# Xtensa ones likewise: XTENSA_LX106_CROSS, XTENSA_LX6_CROSS, XTENSA_LX7_CROSS; these and
+# RISCV_CROSS, MIPS_CROSS, MIPSEL_CROSS, ARM_CROSS, PPC_CROSS, X86_CROSS, AVR_CROSS, SDCC,
+# SDASZ80 in the environment name the toolchains, as tests/bench/meson_options.txt does), and
 # with --check also mcs51, 6502, 65c02 and z80 (when SDCC built them): the 8051 needs some
 # 450 million instructions a round, the 6502 some 180 million and the Z80 some 137 million
 # (SDCC's 64-bit arithmetic), hundreds of times RV32's, so timing them takes --variants
@@ -61,11 +63,29 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# build_bench DIR [KERNEL]: configure tests/bench in DIR (again, if the work changed) and build it.
+build_bench() {
+    set -- "$1" "-Drounds=${rounds:-0}" "-Donly=${2:--1}"
+    for v in RISCV_CROSS MIPS_CROSS MIPSEL_CROSS ARM_CROSS PPC_CROSS X86_CROSS AVR_CROSS AVR32_CROSS \
+             XTENSA_LX106_CROSS XTENSA_LX6_CROSS XTENSA_LX7_CROSS SDCC SDASZ80; do
+        eval "val=\${$v-}"
+        [ -z "$val" ] || set -- "$@" "-D$(echo $v | tr A-Z a-z)=$val"
+    done
+    if [ -f "$1/build.ninja" ]; then
+        dir=$1; shift
+        meson configure "$dir" "$@" > "$tmp/build.log" 2>&1 || { cat "$tmp/build.log" >&2; exit 1; }
+    else
+        dir=$1
+        meson setup "$@" "$here/tests/bench" > "$tmp/build.log" 2>&1 || { cat "$tmp/build.log" >&2; exit 1; }
+    fi
+    meson compile -C "$dir" > "$tmp/build.log" 2>&1 || { cat "$tmp/build.log" >&2; exit 1; }
+}
+
 # run_all ONLY ROWS [SUFFIX]: build (kernel ONLY, or all when empty) into its own
 # directory and append "board<TAB>jitbench row<TAB>ok" for every variant to ROWS.
 run_all() {
     out=$base${1:+-k$1}${3:-}
-    make -s -C "$here/tests/bench" OUT="$out" ${rounds:+ROUNDS=$rounds} ${1:+ONLY=$1} >&2
+    build_bench "$out" "$1"
     ref=$("$out/bench-host" | sha256sum | cut -c1-12)
     for v in $variants; do
         extra=
@@ -127,7 +147,7 @@ elif [ $per_kernel = 0 ]; then
 else
     k=0
     while :; do
-        make -s -C "$here/tests/bench" OUT="$base-k$k" ONLY=$k ${rounds:+ROUNDS=$rounds} >&2
+        build_bench "$base-k$k" $k
         name=$("$base-k$k/bench-host" | sed -n '1s/^bench: \([^ ]*\) .*/\1/p')
         [ "$name" != total ] || break
         run_all $k "$tmp/k$k"

@@ -344,6 +344,6 @@ These formats are ember's. A change that a current reader would misread gets a n
 number in that format's header, and the readers refuse the old version with a message
 naming the tool that writes the new one. New optional data goes into reserved fields only
 together with a flag bit that says it is there. A change to the bucket formula changes
-`tests/unit/cov_golden.txt` (`build/test_cov_formats --write-golden
+`tests/unit/cov_golden.txt` (`build/tests/test_cov_formats --write-golden
 tests/unit/cov_golden.txt` writes it anew) and makes every saved corpus's coverage
 incomparable, so make one only on purpose.

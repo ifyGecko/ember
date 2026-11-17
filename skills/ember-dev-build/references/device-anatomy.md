@@ -322,4 +322,5 @@ both devices first, then hands each the other's interface pointer.
 - function replacements (PC hooks) → `<board>_hle.c`, never inside a device
 - the board → `<board>_board.c` (wires only)
 
-The Makefile compiles every `emulation/*.c`; there is nothing else to register.
+Each file gets its line in `emulation/meson.build` (`rebuild.sh` refuses one that is not
+listed); there is nothing else to register.

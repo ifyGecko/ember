@@ -231,7 +231,7 @@ over the rv32 fuzz target's input buffer catches `parse` reading it:
 
 ```
 build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
-    --fuzz-input uart0 --guard 0x80000470+256:r,name=g_buf --fuzz-replay in/ build/firmware/fuzztarget.elf
+    --fuzz-input uart0 --guard 0x80000470+256:r,name=g_buf --fuzz-replay in/ build/tests/firmware/fuzztarget.elf
 replay: in/1-hello: crash-guard pc=0x80000262 (read 1 at 0x80000470: +0 into guard g_buf [0x80000470, 0x80000570)) insns=60 buckets=8
 ```
 
@@ -306,11 +306,11 @@ On the x86 self-test (`tests/runner/runner-check.sh` checks the same), a watch l
 and a guard stops at the first:
 
 ```
-build/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --watch p:0x3000+4:w build/firmware-x86/selftest.bin
+build/tests/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --watch p:0x3000+4:w build/tests/firmware-x86/selftest.bin
 guard p:0x3000+4:w (log): cpu 0 pc 0xc8 write 2 at 0x3000 (+0) value 0xa55a icount=144
 guard p:0x3000+4:w (log): cpu 0 pc 0xc8 write 2 at 0x3002 (+2) value 0xa55a icount=145
 
-build/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --guard 0x3000-16+16:w,name=lo build/firmware-x86/selftest.bin
+build/tests/uam-test-run -b x86_64-test --raw-base 0 --entry 0 --guard 0x3000-16+16:w,name=lo build/tests/firmware-x86/selftest.bin
 uam-run: guard lo (stop): cpu 0 pc 0xc8 write 2 at 0x3000 (+16) value 0xa55a
 uam-run: guarded memory access (status 0) at pc=0xc8 after 144 instructions
 ```
@@ -444,7 +444,7 @@ Runs each input once (a directory in name order) and prints one line per input:
 
 ```
 build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
-    --fuzz-input uart0 --fuzz-replay crashes/ build/firmware/fuzztarget.elf
+    --fuzz-input uart0 --fuzz-replay crashes/ build/tests/firmware/fuzztarget.elf
 replay: crashes//2-store: crash-fault pc=0x800002b2 (store-fault cause 0x0 tval 0x40000000) insns=95 buckets=17
 ```
 
@@ -456,7 +456,7 @@ a fuzzer's notes saved beside an input: a runner extension can name their suffix
 file X plus that suffix is then skipped when X is in the directory too. The stock extension
 names `.info`, so the brain's `crashes/` or `hangs/` directory replays its inputs
 and not their `.info` sidecars (`uam_fuzz_replay_create_ex` in a program). `--cov-out FILE` writes the last input's map. `tests/fuzz/fuzztarget.h`
-is a small target with planted bugs used by `make fuzz-test`.
+is a small target with planted bugs used by `meson test -C build --suite fuzz`.
 
 For triage, the traces work in replay too (`-t mmio,exc`, `--trace-file`): the boot's traces
 come first and end with `trace: the boot to the begin pc ends` and its summaries, then each
@@ -758,7 +758,7 @@ as well, as stages of the campaign engine (`uam/fuzz_campaign.h`): the brain nam
 entry and a limit, ember derives the inputs, runs them with no frame in between and
 reports as it does for a batch. Seeds, calibration, crash minimization and imports from
 other workers still go as single INPUTs.
-`build/test_mutate` checks the mutator, including the growth figures above, and the
+`build/tests/test_mutate` checks the mutator, including the growth figures above, and the
 input-to-state candidates.
 
 **Dictionaries** (`--dict FILE`, repeatable) are ember's own format, one token per line:
@@ -828,36 +828,36 @@ unless `--fuzz-net-timeout SEC` is given: then SEC seconds without a frame from 
 ```
 python3 fuzz/tools/fuzz_brain.py --listen 127.0.0.1:7000 --seeds seeds/ --out run/ --status-file run/status.jsonl
 build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
-    --fuzz-input uart0 --fuzz-iter-insns 200000 --fuzz-net 127.0.0.1:7000 build/firmware/fuzztarget.elf
+    --fuzz-input uart0 --fuzz-iter-insns 200000 --fuzz-net 127.0.0.1:7000 build/tests/firmware/fuzztarget.elf
 python3 fuzz/tools/status_tui.py run/status.jsonl     # a live status screen (--once: one frame)
 
 python3 fuzz/tools/fuzz_launch.py -n 4 --out camp --seeds seeds/ --dict fw.dict -- \
     build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
-    --fuzz-input uart0 --fuzz-iter-insns 200000 build/firmware/fuzztarget.elf
+    --fuzz-input uart0 --fuzz-iter-insns 200000 build/tests/firmware/fuzztarget.elf
 python3 fuzz/tools/status_tui.py --sync-dir camp      # every worker
 ```
 
 Replaying the brain's `crashes/` or `hangs/` directory (`--fuzz-replay run/crashes`) runs
-the inputs and skips their `.info` notes. `make fuzz-lists-test` checks the protocol frame
+the inputs and skips their `.info` notes. `meson test -C build --suite fuzz-lists` checks the protocol frame
 by frame against a scripted brain (`tests/fuzz/fake_brain.py`, SPARSE and CMPS included), runs
 sessions with the brain (`tests/fuzz/brain-check.sh`: the planted crash is reported, saved
 with its reason, minimized, and the session ends with BYE; a session per schedule; the
 planted crash found from a dictionary alone; the magic value found by compare logging and
 not without it) and a parallel campaign
 (`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
-crashes, and survive a killed ember). `make unit-test` runs `tests/fuzz/brain_unit.py` (the
+crashes, and survive a killed ember). `meson test -C build --suite unit` runs `tests/fuzz/brain_unit.py` (the
 campaign logic on synthetic data), `test_mutate` (the mutator and the input-to-state
 candidates), `test_fuzz`'s checks of the harness's hit lists, compare logging and the
 campaign engine's batches and stages, and
 `test_cov`'s of the compare pass and `CMPLOG` on every ISA and backend.
 
-**Throughput.** `make fuzz-throughput` (part of `make bench-test`) times a HAVOC batch with
+**Throughput.** `meson test -C build --suite fuzz-throughput` (part of `meson test -C build`) times a HAVOC batch with
 a fixed seed, input-to-state stages and trims on the RV32 fuzz target
 (`tests/fuzz/throughput.py`) and one long run of plain guest code on the same host, and
 compares what one execution costs, in guest instructions at that plain speed, with the
 figures recorded per host architecture in `tests/fuzz/throughput.ref`: a stage that costs
 over 1.5 times its figure fails, so a change that halves the executions per second is
-noticed. `make fuzz-throughput-record` rewrites the figures (on a quiet machine, after a
+noticed. `meson compile -C build fuzz-throughput-record` rewrites the figures (on a quiet machine, after a
 change meant to move them); `THROUGHPUT_REF=` only reports. Between two inputs the harness
 restores its snapshot: only the memory that changed is written back, and translated code
 keeps its links and the JIT's data cache its entries for loads unless the input changed

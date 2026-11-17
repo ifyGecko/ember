@@ -1,4 +1,4 @@
-; selftest.asm - the 8051 self-test, common part (as31). The Makefile appends the
+; selftest.asm - the 8051 self-test, common part (as31). meson.build appends the
 ; model's part (model-*.asm, which defines model_tests) and the generated vectors.
 ;
 ; Console: the serial port (SBUF), polled. The finisher is at external data 0xFF00:

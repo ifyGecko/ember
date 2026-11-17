@@ -28,13 +28,16 @@
 #                      x86_64                an x86-64 PC (uam_isa_x86_64): the board comes from
 #                                            templates/board-pc.c.in - ember's generic PC devices,
 #                                            boot flash ending at 4 GiB, chipset left to add
-#   --ember-upstream clone source for the project's own ember clone (<dir>/ember-src, the
-#                    default and the rule). Default: $EMBER_UPSTREAM, else ~/ember.
-#   --ember-src      use this existing clone instead (recorded in ember.src): only a clone
-#                    dedicated to this project, never someone's ember working copy. Reset to
-#                    ember.commit by build-ember.sh, which refuses to discard or move work.
-#   --ember-commit   commit/tag to pin. Default and rule: the latest ember commit (upstream's
-#                    HEAD). Anything older needs a reason in the README.
+#   --ember-upstream clone source for the project's own ember clone (<dir>/subprojects/ember,
+#                    the default and the rule), recorded as the url of subprojects/ember.wrap.
+#                    Default: $EMBER_UPSTREAM, else ~/ember.
+#   --ember-src      use this existing clone instead (recorded in ember.src, reached through
+#                    the link subprojects/ember): only a clone dedicated to this project,
+#                    never someone's ember working copy. Reset to the pin by build-ember.sh,
+#                    which refuses to discard or move work.
+#   --ember-commit   commit/tag to pin (the revision of subprojects/ember.wrap). Default and
+#                    rule: the latest ember commit (upstream's HEAD). Anything older needs a
+#                    reason in the README.
 #   --ram-base ...   numbers from RECON.md for the generated board (all optional; the board
 #                    file marks them for review either way; addresses are bus addresses, so
 #                    a Harvard ISA's data RAM includes its data-space base). Defaults follow
@@ -44,11 +47,14 @@
 #                    0xFFFFFFF0; the microcontroller ISAs get the reference model's program
 #                    memory, data RAM and reset vector.
 #
-# Creates: emulation/<board>_board.{c,h} (a minimal board that already builds), emulation/
-# main.c (a PC also emulation/master_abort_log.{c,h}), Makefile, patches/, ember.commit,
-# ember.upstream or ember.src, run.sh, scripts/ (copies of the helpers, so the project is
-# self-sufficient), tools/, README.md, .gitignore; initializes git if the directory is not
-# already a repository. Writes NOTHING into ember.
+# Creates the layout every ember board project has (references/organization.md):
+# meson.build, subprojects/ember.wrap (where ember comes from and the pinned revision;
+# with --ember-src also ember.src), emulation/ (meson.build listing the sources, main.c,
+# <board>_board.{c,h}: a minimal board that already builds; a PC also
+# master_abort_log.{c,h}), firmware/ (the images under emulation), tests/ (meson.build,
+# registered.sh, boot.sh, boot.expect), patches/, tools/, scripts/ (copies of the helpers,
+# so the project is self-sufficient), run.sh, README.md, .gitignore; initializes git if the
+# directory is not already a repository. Writes NOTHING into ember.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,7 +77,7 @@ while [[ $# -gt 0 ]]; do
         --image-base) IMAGE_BASE="$2"; shift 2;;
         --entry) ENTRY="$2"; shift 2;;
         --reset-vec) RESET_VEC="$2"; shift 2;;
-        -h|--help) sed -n '2,51p' "$0"; exit 0;;
+        -h|--help) sed -n '2,56p' "$0"; exit 0;;
         -*) die "unknown option: $1";;
         *) BOARD="$1"; shift;;
     esac
@@ -561,7 +567,7 @@ ENTRY="${ENTRY:-$IMAGE_BASE}"
 
 DIR="${DIR:-${EMU_ROOT:-$HOME/emu}/$BOARD}"
 mkdir -p "$DIR"; PROJ="$(cd "$DIR" && pwd)"
-for f in emulation patches ember.commit run.sh scripts Makefile; do
+for f in emulation patches subprojects run.sh scripts meson.build tests; do
     [[ -e "$PROJ/$f" ]] && die "$PROJ/$f already exists; refusing to clobber an existing project"
 done
 
@@ -570,6 +576,7 @@ if [[ -n "$SRC" ]]; then
     SRC="$(cd "$SRC" && pwd)"; [[ -d "$SRC/.git" ]] || die "--ember-src is not a git checkout: $SRC"
     [[ -f "$SRC/include/uam/machine.h" ]] || die "$SRC does not look like ember (no include/uam/machine.h)"
     echo "$SRC" > "$PROJ/ember.src"
+    UPSTREAM="$SRC"
     [[ -n "$COMMIT" ]] || COMMIT="$(git -C "$SRC" rev-parse HEAD)"
 else
     if [[ -z "$UPSTREAM" ]]; then
@@ -578,7 +585,6 @@ else
     fi
     [[ -n "$UPSTREAM" ]] || die "no ember source: pass --ember-src or --ember-upstream (or set EMBER_UPSTREAM)"
     [[ -d "$UPSTREAM" ]] && UPSTREAM="$(cd "$UPSTREAM" && pwd)"
-    echo "$UPSTREAM" > "$PROJ/ember.upstream"
     if [[ -z "$COMMIT" ]]; then
         # the pattern HEAD also matches refs/remotes/*/HEAD in a local clone: take HEAD itself
         COMMIT="$(git ls-remote "$UPSTREAM" HEAD | awk '$2 == "HEAD" {print $1; exit}')" || true
@@ -589,9 +595,20 @@ LATEST="$(if [[ -n "$SRC" ]]; then git -C "$SRC" rev-parse HEAD; else git ls-rem
 if [[ -n "$LATEST" && "$COMMIT" != "$LATEST"* ]]; then
     echo "note: pinning $COMMIT, not the latest ember commit ${LATEST:0:12}; record why in README.md" >&2
 fi
-echo "$COMMIT" > "$PROJ/ember.commit"
-mkdir -p "$PROJ/emulation" "$PROJ/patches" "$PROJ/scripts" "$PROJ/tools"
+mkdir -p "$PROJ/emulation" "$PROJ/patches" "$PROJ/scripts" "$PROJ/tools" "$PROJ/subprojects" \
+         "$PROJ/firmware" "$PROJ/tests"
 touch "$PROJ/patches/.keep" "$PROJ/tools/.keep"
+cat > "$PROJ/subprojects/ember.wrap" <<EOF
+# The ember this project builds against: where it comes from, and the pin. scripts/repin.sh
+# moves the revision; scripts/build-ember.sh puts it, plus patches/, in subprojects/ember.
+[wrap-git]
+url = $UPSTREAM
+revision = $COMMIT
+
+[provide]
+uam = uam_dep
+EOF
+[[ -z "$SRC" ]] || ln -sfn "$SRC" "$PROJ/subprojects/ember"
 
 # --- project-local copies of the helpers ---------------------------------------------
 cp "$HERE"/_common.sh "$HERE"/build-ember.sh "$HERE"/rebuild.sh "$HERE"/regen-patches.sh \
@@ -629,8 +646,33 @@ EOF
 subst "$TMPB" "$PROJ/emulation/${CNAME}_board.c"
 subst "$TPL/board.h.in" "$PROJ/emulation/${CNAME}_board.h"
 subst "$TPL/main.c.in" "$PROJ/emulation/main.c"
-subst "$TPL/Makefile.in" "$PROJ/Makefile"
-[[ "$ISA" == x86_64 ]] && cp "$TPL/master_abort_log.c" "$TPL/master_abort_log.h" "$PROJ/emulation/"
+subst "$TPL/meson.build.in" "$PROJ/meson.build"
+EXTRA_SOURCES=""; IMAGE_VAR=IMAGE
+if [[ "$ISA" == x86_64 ]]; then
+    cp "$TPL/master_abort_log.c" "$TPL/master_abort_log.h" "$PROJ/emulation/"
+    EXTRA_SOURCES="  'master_abort_log.c',   # logs each first access nothing answers (a PC master-aborts)\\n"
+    IMAGE_VAR=FLASH
+fi
+sed -e "s|@CNAME@|$CNAME|g" -e "s|^@EXTRA_SOURCES@|$EXTRA_SOURCES|" "$TPL/emulation.meson.build.in" \
+    > "$PROJ/emulation/meson.build"
+sed -e "s|@IMAGE_VAR@|$IMAGE_VAR|g" "$TPL/tests.meson.build.in" > "$PROJ/tests/meson.build"
+cp "$TPL/registered.sh" "$TPL/boot.sh" "$PROJ/tests/"
+chmod +x "$PROJ/tests/registered.sh" "$PROJ/tests/boot.sh"
+: > "$PROJ/tests/boot.expect"
+cat > "$PROJ/firmware/README.md" <<EOF
+# firmware/
+
+The firmware images this board runs: inputs, never edited. For each image record where it
+came from (vendor, version, how it was extracted) and its SHA-256. Commit an image only if
+you may redistribute it; otherwise list it in \`.gitignore\` and say here how to obtain it.
+
+| file | what | sha256 |
+|---|---|---|
+| \`firmware.bin\` | the image under emulation: \`tests/meson.build\` boots it; by hand, \`$IMAGE_VAR=firmware/firmware.bin ./run.sh\` | |
+
+Data the firmware reads that is not part of the image (flash partitions, NVRAM,
+calibration) is generated by a script under \`tools/\` into \`build/\`, never kept here.
+EOF
 
 # The images run.sh hands the board (literal text for the script below).
 if [[ "$ISA" == x86_64 ]]; then
@@ -695,21 +737,26 @@ project links against ember's library, built from a pinned commit.
 |---|---|
 | \`RECON.md\` | recon fact sheet (input) |
 | \`iter-XX.md\` | bring-up journal, one per iteration |
-| \`emulation/\` | our C sources: \`${CNAME}_board.c\` (wiring only), one file per hardware component, \`main.c\` |
-| \`ember.commit\` | pinned ember commit; \`ember.upstream\` / \`ember.src\`: where ember comes from |
+| \`meson.build\` | the build: ember as a subproject, \`build/$BOARD-run\` from the sources listed in \`emulation/meson.build\` |
+| \`subprojects/ember.wrap\` | where ember comes from (\`url\`) and the pinned commit (\`revision\`); \`subprojects/ember/\` is the project's own clone (not committed) |
+| \`emulation/\` | our C sources: \`${CNAME}_board.c\` (wiring only), one file per hardware component, \`main.c\`, and \`meson.build\` listing them |
+| \`firmware/\` | the firmware images under emulation (inputs, never edited) |
+| \`tests/\` | the board's checks (\`meson test -C build\`): the board is registered; the firmware boots to the lines in \`boot.expect\` |
 | \`patches/\` | every change to ember itself, as \`git format-patch\` files applied as commits on the pin (normally empty) |
 | \`scripts/\` | build-ember.sh, rebuild.sh, regen-patches.sh, repin.sh, check-layering.sh, log_summary.py, gdb_trace_calls.py |
 | \`tools/\` | generators for data the firmware reads (flash, NVRAM, calibration) |
 | \`run.sh\` | the runner invocation under construction |
 
-## ember.commit
-\`$COMMIT\`: the latest ember commit when the project was created. Move it to the latest
-with \`scripts/repin.sh\` (it rebases patches/ onto the new commit), and note each move here.
+## The ember pin
+\`$COMMIT\` (\`revision\` in \`subprojects/ember.wrap\`): the latest ember commit when the
+project was created. Move it to the latest with \`scripts/repin.sh\` (it rebases patches/
+onto the new commit), and note each move here.
 
-## Build
-    scripts/build-ember.sh    # full: ember-src reset to ember.commit -> patches/ as commits -> libuam -> build/$BOARD-run
-    scripts/rebuild.sh        # fast: after editing emulation/ files
-    scripts/regen-patches.sh  # after committing a change to ember in ember-src: export it to patches/
+## Build (meson and ninja)
+    scripts/build-ember.sh    # full: subprojects/ember reset to the pin -> patches/ as commits -> meson setup build -> build/$BOARD-run
+    scripts/rebuild.sh        # fast: after editing emulation/ files (a new file: add it to emulation/meson.build)
+    meson test -C build       # the checks in tests/
+    scripts/regen-patches.sh  # after committing a change to ember in subprojects/ember: export it to patches/
     scripts/repin.sh          # move to the latest ember commit, carrying patches/ along
 ## Run
     IMAGE=/path/to/firmware timeout -k 5 300 ./run.sh -n 200000000 > build/console.txt 2> build/emu.log < /dev/null
@@ -726,7 +773,7 @@ if [[ -n "$RECON" ]]; then
 fi
 
 touch "$PROJ/.gitignore"
-for pat in .ember-build/ ember-src/ build/ '*.log' __pycache__/; do
+for pat in build/ subprojects/ember subprojects/packagecache/ .repin-target '*.log' __pycache__/; do
     grep -qxF "$pat" "$PROJ/.gitignore" || echo "$pat" >> "$PROJ/.gitignore"
 done
 if ! git -C "$PROJ" rev-parse --git-dir >/dev/null 2>&1; then
@@ -734,4 +781,4 @@ if ! git -C "$PROJ" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 echo "== scaffolded $PROJ (board '$BOARD', $ISA, ember ${COMMIT:0:12}) =="
 echo "next: fill BOARD_* constants and board_windows[] in emulation/${CNAME}_board.c from RECON.md,"
-echo "      then scripts/build-ember.sh"
+echo "      put the image in firmware/ (firmware/README.md), then scripts/build-ember.sh"

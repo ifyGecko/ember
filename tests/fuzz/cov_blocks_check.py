@@ -2,7 +2,7 @@
 """cov_blocks_check.py RUN BUILD - block coverage with N-grams, ranges, splits and interrupt
 contexts, and symbol names for the pc options (docs/fuzzing.md "Block coverage").
 
-BUILD is the build directory (its firmware*/fuzztarget*.elf and firmware/irqtarget.elf).
+BUILD is the build directory (its tests/firmware*/fuzztarget*.elf and tests/firmware/irqtarget.elf).
   - On RV32, MIPS32 BE, ARM and PowerPC fuzz targets, --cov-blocks --cov-ngram 3
     --cov-rotate: the map of every input is the same, byte for byte, with blocks cut at 32
     or 2 instructions, on the interpreter and the JIT (splits do not make blocks).
@@ -59,8 +59,8 @@ def main():
         out = os.path.join(tmp, "map")
 
         # Splits: the map does not depend on where ember cuts blocks.
-        targets = [("rv32-ref", "firmware/fuzztarget.elf"), ("mips-ref", "firmware-mips/fuzztarget-be.elf"),
-                   ("arm-ref", "firmware-arm/fuzztarget.elf"), ("ppc-ref", "firmware-ppc/fuzztarget.elf")]
+        targets = [("rv32-ref", "tests/firmware/fuzztarget.elf"), ("mips-ref", "tests/firmware-mips/fuzztarget-be.elf"),
+                   ("arm-ref", "tests/firmware-arm/fuzztarget.elf"), ("ppc-ref", "tests/firmware-ppc/fuzztarget.elf")]
         inputs = [b"hello", b"ok", b"Mabcdefgh", b"hello world, a longer input " * 3, b"FUZ?"]
         for board, rel in targets:
             fw = os.path.join(build, rel)
@@ -82,7 +82,7 @@ def main():
                   % (board, [len(v) for v in maps.values()]))
 
         # Interrupt contexts: where the timer lands does not change the buckets.
-        irq = os.path.join(build, "firmware/irqtarget.elf")
+        irq = os.path.join(build, "tests/firmware/irqtarget.elf")
         payload = b"hello world 12345 the quick brown fox jumps 0987 zz"
 
         def sets(mode, extra=()):
@@ -107,7 +107,7 @@ def main():
                   "irqtarget: --cov-range %s: %s" % (r, [len(s or ()) for s in part]))
 
         # Symbols for the pc options: the same as the numbers.
-        fw = os.path.join(build, "firmware/fuzztarget.elf")
+        fw = os.path.join(build, "tests/firmware/fuzztarget.elf")
         open(inp, "wb").write(b"FUZ?")
         by_sym = fuzz(run, "rv32-ref", fw, inp, ["--cov-blocks", "--fuzz-begin", "fuzz_iteration",
                                                  "--fuzz-crash-pc", "fuzz_panic"])
@@ -145,7 +145,7 @@ def main():
         subprocess.run([sys.executable, os.path.join(here, "mk_lists.py"), fw, tmp],
                        check=True, capture_output=True)
         sites = os.path.join(tmp, "sites.uams")
-        raw = os.path.join(build, "firmware-arm/fuzztarget.bin")
+        raw = os.path.join(build, "tests/firmware-arm/fuzztarget.bin")
         for args, board, image, want in (
                 (["--cov-blocks", "--fuzz-begin", "no_such_function"], "rv32-ref", fw, "no such symbol"),
                 (["--cov-blocks", "--fuzz-begin", "fuzz_iteration"], "arm-ref", raw, "no ELF file"),

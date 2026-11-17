@@ -282,6 +282,11 @@ Rewrite the draft into the shape in `references/recon-report-schema.md`, includi
 for a PC the *PC firmware* section). `RECON.md` is the handoff to `ember-dev-build` and the
 first entry of the session record, followed by the build phase's `iter-XX.md` journal.
 
+The build phase turns this directory into the board project: a meson project with ember as
+its pinned subproject, in a fixed layout (`emulation/`, `firmware/`, `tests/`). The image
+you analysed goes into its `firmware/`, unmodified, with the origin and SHA-256 you
+recorded.
+
 ## PC firmware (x86-64: UEFI, coreboot, legacy BIOS)
 The BIOS region is decoded to end at 4 GiB, the processor starts at 0xFFFFFFF0, and every
 UEFI module carries its own image base, so steps 1-5 become:

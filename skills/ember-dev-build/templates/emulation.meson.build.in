@@ -1,0 +1,7 @@
+# Every source of the runner, one line each: meson compiles what is listed here, and
+# scripts/rebuild.sh refuses an emulation/*.c that is not. A new device is a new file, its
+# line here, and one create/map/connect block in the board file.
+board_sources = files(
+  'main.c',             # registers the board, runs ember's stock command line
+  '@CNAME@_board.c',    # the board: processor, memory, images, wiring. No device logic.
+@EXTRA_SOURCES@)

@@ -4,8 +4,11 @@
  * The same memory map as the stock mips-ref board (so the MIPS self-test runs
  * on it), plus what out-of-tree boards typically need: a CPU identity of the
  * board's own (here derived from the reference identity), a catch-all window for the not-yet-modelled peripheral block
- * under the real devices, a board option (-o banner=TEXT) and a named image
- * slot (--image rom=FILE, loaded at the reset vector).
+ * under the real devices, a device of the project's own (ext_id.c), a board option
+ * (-o banner=TEXT) and a named image slot (--image rom=FILE, loaded at the reset vector).
+ *
+ * The board wires: it creates the processor, maps memory, places images, instantiates
+ * devices and connects their lines. Device behaviour lives in the device files.
  */
 #include <stdio.h>
 
@@ -16,11 +19,13 @@
 #include "uam/loader.h"
 
 #include "ext_board.h"
+#include "ext_id.h"
 
 #define RAM_SIZE   (UINT64_C(32) << 20)
 #define PERIPH     UINT64_C(0x1fd00000)   /* peripheral block */
 #define UART_PHYS  UINT64_C(0x1fd003f8)
 #define TEST_PHYS  UINT64_C(0x1fd00010)
+#define ID_PHYS    UINT64_C(0x1fd00100)
 #define ROM_PHYS   UINT64_C(0x1fc00000)
 
 static uam_status attach(uam_machine *m, uam_device *dev, uint64_t base, uint64_t size)
@@ -61,7 +66,8 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
     uam_device *uart = uam_uart16550_create("uart0", cfg->console);
     if ((st = attach(m, uart, UART_PHYS, 8)) != UAM_OK
         || (st = attach(m, uam_test_finisher_create("test", uam_machine_stop_cb, m), TEST_PHYS, 0x10))
-               != UAM_OK)
+               != UAM_OK
+        || (st = attach(m, ext_id_create("id", 0x45585431 /* "EXT1" */), ID_PHYS, EXT_ID_SIZE)) != UAM_OK)
         return st;
     uam_signal_connect(uam_uart16550_irq_line(uart), uam_cpu_irq_sink, &m->cpu, UAM_MIPS_IRQ_HW0);
 

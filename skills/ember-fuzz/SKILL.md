@@ -46,7 +46,10 @@ Before anything else, check and **stop and hand back to ember-dev-build** if one
   elsewhere it falls back to the interpreter and this check proves nothing.)
 
 All board and device changes below follow ember-dev-build's organization rules: the project
-is the same, the board only wires, one device per file, `scripts/rebuild.sh` after edits.
+is the same meson project in the same layout, the board only wires, one device per file
+(listed in `emulation/meson.build`), `scripts/rebuild.sh` after edits (it ends in
+`meson compile -C build`; the runner is `build/<board>-run`). Fuzzing adds no build of its
+own: the harness is part of ember's library, which the project already links.
 
 ## Workflow
 

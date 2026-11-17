@@ -5,6 +5,58 @@ maps RAM, places the firmware, makes the hart start at the entry point, instanti
 peripheral, maps it at its MMIO address and connects its lines. **It wires things; it does
 not implement devices.** One board file per target: `emulation/<board>_board.c`.
 
+## Where the board file sits: the project and its meson files
+
+The board is one file of a project whose layout is fixed (`organization.md` has all of it):
+
+```
+<project>/
+  meson.build                 the runner build/<board>-run; ember through dependency('uam')
+  subprojects/ember.wrap      ember's url and the pinned revision
+  emulation/meson.build       board_sources = files('main.c', '<board>_board.c', ...)
+  emulation/main.c            uam_board_register(&<board>_board); return uam_run_main(argc, argv);
+  emulation/<board>_board.c   this page
+  emulation/<soc>_<block>.c   one device each (device-anatomy.md)
+  firmware/                   the images the board runs
+  tests/                      meson test: registered, boot
+```
+
+`new-emulation.sh` writes the three meson files and they stay as written, except that
+every source added to `emulation/` gets a line in `emulation/meson.build`. The project's
+`meson.build` in full (generated from `templates/meson.build.in`):
+
+```meson
+project('<board>', 'c', version: '0.1', meson_version: '>= 1.1',
+  default_options: ['c_std=c11', 'warning_level=2', 'werror=true', 'buildtype=debugoptimized',
+                    'wrap_mode=forcefallback'])    # always the pinned ember of subprojects/
+board = '<board>'
+add_project_arguments('-D_DEFAULT_SOURCE',
+  meson.get_compiler('c').get_supported_arguments('-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes'),
+  language: 'c')
+uam_dep = dependency('uam')                        # ember's headers, libuam.a, libm
+subdir('emulation')                                # sets board_sources
+runner = executable(board + '-run', board_sources,
+  include_directories: include_directories('emulation'), dependencies: uam_dep)
+subdir('tests')
+```
+
+and `subprojects/ember.wrap`:
+
+```ini
+[wrap-git]
+url = <ember's repository>
+revision = <the pinned commit, a full hash>
+
+[provide]
+uam = uam_dep
+```
+
+The board is compiled with warnings as errors, like ember. Build with
+`scripts/build-ember.sh` the first time and after the pin or `patches/` change,
+`scripts/rebuild.sh` after edits; both end in `meson compile -C build`.
+
+## The generated board
+
 `new-emulation.sh` generates a board that already builds and runs
 (`templates/board.c.in`). This page explains each part and what to change. The tested
 `skills/tests/fixture/testbrd_board.c` (in the ember repository, next to this skill) shows

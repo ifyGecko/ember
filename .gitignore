@@ -1,10 +1,10 @@
-# Build output (make, make test).
+# Build output (meson setup build; any build-* directory, e.g. a cross build).
 /build/
+/build-*/
 
 # Python bytecode caches (the tools run in place).
 __pycache__/
 *.py[cod]
 
-# Stray build output: object files, and benchmark builds made with OUT inside the tree.
+# Stray build output: object files.
 *.o
-/tests/bench/build/

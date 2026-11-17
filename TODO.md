@@ -89,7 +89,7 @@ What it leaves open:
 
 ## Throughput
 
-`make fuzz-throughput` checks what an execution costs against recorded figures
+`meson test -C build --suite fuzz-throughput` checks what an execution costs against recorded figures
 (`tests/fuzz/throughput.py`). What a profile of the RV32 fuzz target still shows between two
 inputs, after restores stopped dropping translations:
 

@@ -64,7 +64,7 @@ Ember builds and runs on any POSIX host with a C11 compiler (GCC or Clang) that 
 the host-independent core in `src/exec/jit.c`; on any other host `--jit` falls back to the
 interpreter. Guest behaviour does not depend on the host, apart from the precision of x87
 transcendentals (macOS note below): the x87 model computes in software
-(`isa/x86/x86_f80.c`), and `make test` passes the same checks on both JIT hosts.
+(`isa/x86/x86_f80.c`), and `meson test -C build` passes the same checks on both JIT hosts.
 
 - **Linux on x86-64 and on AArch64**: everything, tested.
 - **macOS** (Apple silicon and Intel): written for and not yet tested there. The code arena
@@ -75,26 +75,44 @@ transcendentals (macOS note below): the x87 model computes in software
   Linux-only; x87 transcendentals compute in the host's `long double`, a `double` on Apple
   silicon (everything else in the x87 model is exact there too).
 
-To build for another host, point the build at its compiler, e.g.
-`make CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar BUILD=build-a64`, and run
-`make test` with the same variables on that host. The firmware images are
-host-independent.
+To build for another host, give meson a cross file that names its compiler:
+`meson setup build-a64 --cross-file cross/aarch64-linux-gnu.ini` configures an AArch64
+Linux build next to the native one. Run `meson test -C build-a64` on that host (or from the
+build machine, once a second cross file tells meson how to run the host's programs: the
+cross file's header says how). The firmware images are host-independent.
 
 ## Build and test
 
+Ember builds with [meson](https://mesonbuild.com) (1.1 or newer) and ninja; nothing else
+is needed for the library and the runner.
+
 ```bash
-make                 # build/uam-run and the libraries (build/uam-test-run: make build/uam-test-run)
-make test            # unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32, PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, external-board example,
-                     # snapshot split runs (interpreter and JIT), coverage and fuzzing checks, the gdb stub,
-                     # the runner's debugging options, the cross-ISA benchmark's checksums
-                     # (and site lists, boundary files and the fuzz brain)
-make runner-test     # one group on its own (also unit-test, fuzz-test, gdb-test, bench-test, ...)
-make jitdiff-soak    # the JIT-against-interpreter differential test, at length
-make xbench          # time the cross-ISA benchmark (docs/jit-perf.md)
-make net-check       # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
-make lib BUILD=DIR   # libraries only, into DIR (for out-of-tree projects)
-make install PREFIX=DIR
+meson setup build                        # configure, once; the options: meson_options.txt
+meson compile -C build                   # build/uam-run, the libraries (build/libuam.a), the test programs
+meson test -C build                      # everything: unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32,
+                                         # PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, the
+                                         # external-board example, snapshot split runs (interpreter and JIT),
+                                         # coverage and fuzzing checks, the gdb stub, the runner's debugging
+                                         # options, the cross-ISA benchmark's checksums, fuzz throughput
+                                         # (and site lists, boundary files and the fuzz brain)
+meson test -C build --suite runner       # one group on its own: unit, firmware, mips, arm, x86, ppc, avr,
+                                         # avr32, pic, mcs51, pic32, 6502, z80, xtensa, example, snapshot, cov,
+                                         # fuzz, fuzz-lists, gdb, runner, bench, fuzz-throughput
+meson test -C build --list               # every test by name; `meson test -C build NAME` runs one
+meson compile -C build firmware          # every test firmware image (build/tests/firmware*/)
+meson compile -C build jitdiff-soak      # the JIT-against-interpreter differential test, at length
+meson compile -C build xbench            # time the cross-ISA benchmark (docs/jit-perf.md)
+meson compile -C build net-check         # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
+meson install -C build                   # headers, libraries, uam-run and uam.pc (meson setup --prefix DIR)
 ```
+
+`meson configure build` lists the options and `meson configure build -Dname=value` changes
+one: the toolchain prefixes of the test firmware (below), `buildtype`, `b_sanitize=address`,
+`c_args`. The tests are registered one per check (`rv32-ref` self-test on the interpreter,
+on the JIT, each snapshot split, ...), run in parallel, and report failures by name; the
+full output of each is in `build/meson-logs/testlog.txt`. A test firmware is built only
+when its toolchain is found: the summary at the end of `meson setup` says which were, and
+the tests of a missing one are left out, not failed.
 
 The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc`; so does the PIC32
 self-test (`pic32-ref`), which is built as MIPS32 little-endian.
@@ -107,11 +125,11 @@ The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
 
 The PowerPC self-test needs a GCC for PowerPC: by default `powerpc64le-linux-gnu-gcc`, which
 builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works too
-(`make CROSS=powerpc-linux-gnu- ppc-test`).
+(`meson configure build -Dppc_cross=powerpc-linux-gnu-`).
 
 The x86 self-tests are assembled with `nasm`; the BIOS boot and gdb stub checks need `python3`,
 as do the 8051, 6502, Z80, Xtensa and PIC32 firmware builds and their checks, the fuzz
-tools' self-tests in `make unit-test`, and `make fuzz-lists-test`. That target's generator
+tools' self-tests in `meson test -C build --suite unit`, and `meson test -C build --suite fuzz-lists`. That target's generator
 check needs `rizin` with `rzpipe` (it is skipped without them) and also runs the Ghidra
 route when it finds headless Ghidra with Jython (`GHIDRA_HEADLESS`, `GHIDRA_HOME`, `PATH`,
 `~/ghidra*`, `/opt/ghidra*`).
@@ -121,61 +139,61 @@ benchmark need `avr-gcc` and avr-libc (Debian: `gcc-avr`, `binutils-avr`, `avr-l
 `python3` for their flag vectors.
 
 The AVR32 self-tests, fuzz target and benchmark builds need `avr32-gcc`, from the AVR32 GNU
-toolchain (3.4.3, gcc 4.4; no distribution packages it). `make AVR32_CROSS=PREFIX test` points
-the build at it (default `avr32-` in PATH); without it the AVR32 firmware checks are skipped
-with a note. Its tools want `LC_ALL=C`, and its static binaries call the legacy vsyscall page,
+toolchain (3.4.3, gcc 4.4; no distribution packages it). `-Davr32_cross=PREFIX` points
+the build at it (default `avr32-` in PATH); without it the AVR32 firmware checks are left
+out. Its tools want `LC_ALL=C`, and its static binaries call the legacy vsyscall page,
 which current kernels no longer provide: they crash in `time`/`gettimeofday` unless the kernel
 emulates vsyscalls (`vsyscall=emulate`) or the two calls are patched into system calls.
 
 The PIC self-tests (one per core family, and PIC18's extended instruction set) and the PIC
 fuzz target are assembled with `gpasm` from gputils (Debian: `gputils`) and need `python3`;
-without gpasm they are skipped with a note (`GPASM=path` names another). There is no PIC build
+without gpasm they are left out (`-Dgpasm=path` names another). There is no PIC build
 of the benchmark: its data (about 20 KiB) does not fit an 8-bit PIC's data space.
 The 8051 self-tests (one per core model) are assembled with `as31` (Debian: `as31`); the
 8051 fuzz target and benchmark build need SDCC (Debian: `sdcc`). Without either, its checks
-are skipped with a note (`AS31=`, `SDCC=` point the build at them).
+are left out (`-Das31=`, `-Dsdcc=` point the build at them).
 The 6502 self-tests (one per core model) are assembled with SDCC's `sdas6500` and linked with
 its `sdld`; the 6502 fuzz target and benchmark build need `sdcc` (all in Debian's `sdcc`).
-Without them those checks are skipped with a note (`SDAS6500=`, `SDLD=`, `SDCC=`).
+Without them those checks are left out (`-Dsdas6500=`, `-Dsdld=`, `-Dsdcc=`).
 The Z80 self-tests (one per core model) are assembled with SDCC's `sdasz80`, and the Z80 fuzz
-target and benchmark build with SDCC; without them they are skipped (`SDASZ80=` names it).
+target and benchmark build with SDCC; without them they are left out (`-Dsdasz80=` names it).
 The Xtensa firmware (self-test, fuzz target, benchmark) is built with each core's GNU
 toolchain: the LX106's `xtensa-lx106-elf-` (Debian's `gcc-xtensa-lx106`), the LX6's and LX7's
 `xtensa-esp32-elf-` and `xtensa-esp32s3-elf-` (Espressif's `xtensa-esp-elf` release). A model
-whose toolchain is missing is skipped with a note (`XTENSA_LX106_CROSS=`, `XTENSA_LX6_CROSS=`,
-`XTENSA_LX7_CROSS=` give the prefixes). No big-endian Xtensa toolchain is needed: the
+whose toolchain is missing is left out (`-Dxtensa_lx106_cross=`, `-Dxtensa_lx6_cross=`,
+`-Dxtensa_lx7_cross=` give the prefixes). No big-endian Xtensa toolchain is needed: the
 big-endian self-test is the little-endian build laid out the big-endian way
 (tests/isa-xtensa/le2be.py).
 
 ## Run firmware
 
 ```bash
-build/uam-run build/firmware/selftest.elf
+build/uam-run build/tests/firmware/selftest.elf
 build/uam-run --stats --trace exc --unknown-mmio zero path/to/firmware.elf
 build/uam-run --raw-base 0x80000000 path/to/image.bin
-build/uam-run -b arm-ref build/firmware-arm/selftest-thumb.elf   # ARMv7, Thumb-2 code
-build/uam-run -b armeb-ref build/firmware-arm/selftest-arm-be.elf # big-endian (BE8)
-build/uam-run -b ppc-ref build/firmware-ppc/selftest.elf        # 32-bit PowerPC
-build/uam-run -b ppc-ref -o model=booke build/firmware-ppc/selftest-booke.elf  # Book E
+build/uam-run -b arm-ref build/tests/firmware-arm/selftest-thumb.elf   # ARMv7, Thumb-2 code
+build/uam-run -b armeb-ref build/tests/firmware-arm/selftest-arm-be.elf # big-endian (BE8)
+build/uam-run -b ppc-ref build/tests/firmware-ppc/selftest.elf        # 32-bit PowerPC
+build/uam-run -b ppc-ref -o model=booke build/tests/firmware-ppc/selftest-booke.elf  # Book E
 build/uam-run -b ppc-ref --raw-base 0xfff00000 --entry 0xfff00100 boot.bin   # a PowerPC boot ROM
 build/uam-run -b x86_64-ref --image flash=fw.rom -o cpus=4       # a PC: boot flash ending at 4 GiB
 build/uam-run -b x86_64-ref --image bios=bios.rom                # a legacy BIOS ROM (also below 1 MiB)
 build/uam-run -b x86_64-ref --raw-base 0 --entry 0 flat.bin      # a flat image, entered in real mode
 build/uam-run --raw-base 0x80100000 --entry 0x801002bc image.bin  # reset code not at the base
-build/uam-run -b avr-ref build/firmware-avr/selftest-eplus.elf   # 8-bit AVR (ATmega2560 layout)
-build/uam-run -b avr-ref -o model=xm build/firmware-avr/selftest-xm.elf  # XMEGA
-build/uam-run -b avr32-ref build/firmware-avr32/selftest-a.elf   # AVR32A (UC3 class)
-build/uam-run -b avr32-ref -o model=b build/firmware-avr32/selftest-b.elf  # AVR32B (AP7 class)
-build/uam-run -b pic-ref build/firmware-pic/selftest-pic18.elf  # PIC18
-build/uam-run -b pic-ref -o model=enhanced build/firmware-pic/selftest-enhanced.elf  # PIC16F1xxx
-build/uam-run -b mcs51-ref build/firmware-mcs51/selftest-8052.bin  # an 8052 (raw image at 0)
-build/uam-run -b mcs51-ref -o model=cip51 build/firmware-mcs51/selftest-cip51.bin  # CIP-51 style
-build/uam-run -b 6502-ref build/firmware-6502/selftest-nmos.bin  # NMOS 6502 (raw ROM image at 0x8000)
-build/uam-run -b 6502-ref -o model=65c02 build/firmware-6502/selftest-65c02.bin  # WDC 65C02
-build/uam-run -b z80-ref build/firmware-z80/selftest-nmos.bin  # a Z80 (raw image at 0)
-build/uam-run -b xtensa-ref -o model=lx106 build/firmware-xtensa/selftest-lx106.elf  # ESP8266's core
-build/uam-run -b xtensa-ref build/firmware-xtensa/selftest-lx6.elf  # the ESP32's core (lx6, the default)
-build/uam-run -b pic32-ref -o model=mz build/firmware-pic32/selftest-mz.elf  # PIC32 (MIPS32, TLB, EIC)
+build/uam-run -b avr-ref build/tests/firmware-avr/selftest-eplus.elf   # 8-bit AVR (ATmega2560 layout)
+build/uam-run -b avr-ref -o model=xm build/tests/firmware-avr/selftest-xm.elf  # XMEGA
+build/uam-run -b avr32-ref build/tests/firmware-avr32/selftest-a.elf   # AVR32A (UC3 class)
+build/uam-run -b avr32-ref -o model=b build/tests/firmware-avr32/selftest-b.elf  # AVR32B (AP7 class)
+build/uam-run -b pic-ref build/tests/firmware-pic/selftest-pic18.elf  # PIC18
+build/uam-run -b pic-ref -o model=enhanced build/tests/firmware-pic/selftest-enhanced.elf  # PIC16F1xxx
+build/uam-run -b mcs51-ref build/tests/firmware-mcs51/selftest-8052.bin  # an 8052 (raw image at 0)
+build/uam-run -b mcs51-ref -o model=cip51 build/tests/firmware-mcs51/selftest-cip51.bin  # CIP-51 style
+build/uam-run -b 6502-ref build/tests/firmware-6502/selftest-nmos.bin  # NMOS 6502 (raw ROM image at 0x8000)
+build/uam-run -b 6502-ref -o model=65c02 build/tests/firmware-6502/selftest-65c02.bin  # WDC 65C02
+build/uam-run -b z80-ref build/tests/firmware-z80/selftest-nmos.bin  # a Z80 (raw image at 0)
+build/uam-run -b xtensa-ref -o model=lx106 build/tests/firmware-xtensa/selftest-lx106.elf  # ESP8266's core
+build/uam-run -b xtensa-ref build/tests/firmware-xtensa/selftest-lx6.elf  # the ESP32's core (lx6, the default)
+build/uam-run -b pic32-ref -o model=mz build/tests/firmware-pic32/selftest-mz.elf  # PIC32 (MIPS32, TLB, EIC)
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
@@ -507,14 +525,14 @@ backend, and a port left out is an unplugged cable. Backends:
 
 Append `,pcap=FILE` to record the port's traffic. The reference boards have no network
 ports (not every board of their architecture has one). The test board `rv32-test`
-(`tests/boards/`, run by `build/uam-test-run`) shows how a board adds them: ports
+(`tests/boards/`, run by `build/tests/uam-test-run`) shows how a board adds them: ports
 `net0`..`net7` put a virtio-net device in the matching virtio-mmio slot
 (`-o net0.mac=02:75:61:6d:01:00`).
 
 ```bash
 ip tuntap add dev tap0 mode tap user $USER       # once, as root: then no privilege is needed
 ip addr add 10.0.2.2/24 dev tap0 && ip link set tap0 up
-build/uam-test-run -b rv32-test --nic net0=tap:tap0,pcap=net0.pcap fw.elf
+build/tests/uam-test-run -b rv32-test --nic net0=tap:tap0,pcap=net0.pcap fw.elf
 ```
 
 A host interface implies `--realtime`, because a guest network stack times out in virtual
@@ -522,24 +540,219 @@ time; `--virtual-time` keeps the run deterministic anyway. Boards built on the l
 ports with `uam_board_config_netdev(cfg, "wan")`; devices reach guest memory with
 `uam_bus_dma_read` / `uam_bus_dma_write`.
 
-## Using UAM from another project
+## Building a board on ember
 
-Register a board and reuse the stock runner; see `examples/external-board/`:
+Ember is a component library: processors (the ISA modules), the bus, the scheduler, the
+executors, generic device models, the runner's command line. An emulated board or device
+is **its own project, outside this tree**, that links the library. This section is the
+layout such a project has and the meson files it starts from. It is prescriptive on
+purpose: every ember board is organised the same way, so anyone (and any tool) who has seen
+one can work on another. `examples/external-board/` is this layout as a complete, tested
+project to copy; `skills/ember-dev-build/scripts/new-emulation.sh <board> --isa <arch>`
+generates it for any of ember's architectures, with the bring-up helpers on top
+(`skills/README.md`).
+
+### What belongs where
+
+| in ember (this repository) | in your board project |
+|---|---|
+| ISA modules: decoders, lifters, CPU models with their reference identities (`isa/`, `include/uam/isa/`) | the CPU identity your firmware checks: a board-local copy of the reference model with its fields changed |
+| the bus, scheduler, signals, snapshots, executors, the JIT, the loader, the runner (`src/`) | nothing of this kind: a capability ember lacks is a patch to ember, proposed upstream |
+| generic device models that exist as parts or standards: 16550, GIC, CLINT/PLIC, 8259/8254, CFI flash, virtio-net, ... (`devices/`, `include/uam/dev/`) | every device specific to your SoC or board: its UART, timers, interrupt controller, clock/reset block, flash controller, MACs. One file each. |
+| the reference boards `<arch>-ref`: only what every board of an architecture has (`boards/`) | your board: the memory map, image placement, which devices exist, how their lines are wired |
+| the fuzz harness, coverage, the fuzz brain (`fuzz/`) | the fuzz target's addresses and input route, as options to the runner; firmware-specific hooks |
+| - | the firmware images, and everything named after a product, a vendor, a firmware function or its ABI |
+
+Ember names no device and no firmware. If a change to ember would mention your board, it
+belongs in your project. Nothing of yours is ever written into the ember tree, and no file
+of ember is copied into yours: you include its public headers (`include/uam/`) and link
+`libuam.a`.
+
+### The layout
+
+```
+<board>/                         a git repository of its own
+  meson.build                    the project: ember as a subproject, the runner <board>-run
+  subprojects/
+    ember.wrap                   where ember comes from, and the revision the project is pinned to
+    ember/                       (not committed) the ember checkout at that revision
+  emulation/                     all C code of the emulation, nothing else
+    meson.build                  the list of sources, one per line
+    main.c                       registers the board, calls uam_run_main()
+    <board>_board.c  .h          the board: processor, memory, images, wiring. No device logic.
+    <chip>_uart.c    .h          one hardware component per file, with its header
+    <chip>_intc.c    .h
+    <chip>_timer.c   .h
+    <board>_hle.c    .h          (only if needed) hooks that replace firmware functions
+  firmware/                      the firmware images the board runs: inputs, never edited
+    README.md                    where each image came from, its SHA-256
+  tests/                         the board's checks, run by `meson test`
+    meson.build
+    registered.sh                the runner lists the board
+    boot.sh  boot.expect         the firmware boots to the console lines in boot.expect
+  tools/                         (when needed) generators for data the firmware reads (flash, NVRAM) -> build/
+  patches/                       (when needed) changes to ember itself, as git format-patch files
+  README.md                      what the board is, the pin and why it moved, how to run it
+  build/                         (not committed) meson's build directory: build/<board>-run
+```
+
+Names are fixed by the board's name, lower case `[a-z0-9-]` (`<board>`; in C identifiers
+and file names `-` becomes `_`): the runner is `<board>-run`, the board file
+`<board>_board.c`, the descriptor `<board>_board`, and `-b <board>` selects it. A board
+whose only purpose is to be the plain member of an architecture is named `<arch>-ref`, as
+ember's own are; a board for a product is named after the product. Device files are named
+after the chip family and the function (`<chip>_uart.c`), never after the board.
+
+### The meson files
+
+`meson.build`, complete; only the two names at the top change from project to project:
+
+```meson
+project('<board>', 'c',
+  version: '0.1',
+  meson_version: '>= 1.1',
+  default_options: [
+    'c_std=c11',
+    'warning_level=2',
+    'werror=true',
+    'buildtype=debugoptimized',
+    'wrap_mode=forcefallback',   # always the pinned ember of subprojects/, never a system one
+  ],
+)
+
+board = '<board>'
+
+add_project_arguments('-D_DEFAULT_SOURCE',
+  meson.get_compiler('c').get_supported_arguments('-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes'),
+  language: 'c')
+
+uam_dep = dependency('uam')      # ember: its public headers, libuam.a and libm
+
+subdir('emulation')              # sets board_sources
+
+runner = executable(board + '-run', board_sources,
+  include_directories: include_directories('emulation'),
+  dependencies: uam_dep)
+
+subdir('tests')
+```
+
+`subprojects/ember.wrap`, the pin. `revision` is a full commit hash, the latest ember
+commit when the project was created or last moved, never a branch: a fresh clone of the
+project then builds the same runner.
+
+```ini
+[wrap-git]
+url = https://github.com/ifyGecko/ember.git
+revision = 0123456789abcdef0123456789abcdef01234567
+
+[provide]
+uam = uam_dep
+```
+
+`emulation/meson.build`, every source listed (meson compiles what is listed; there is no
+wildcard):
+
+```meson
+board_sources = files(
+  'main.c',
+  '<board>_board.c',
+  '<chip>_uart.c',
+  '<chip>_intc.c',
+  '<chip>_timer.c',
+)
+```
+
+`tests/meson.build`:
+
+```meson
+test('registered', find_program('registered.sh'), args: [runner, board])
+
+boot_image = meson.project_source_root() / 'firmware' / 'firmware.bin'
+test('boot', find_program('boot.sh'),
+  args: [runner, board, boot_image, meson.current_source_dir() / 'boot.expect'],
+  timeout: 300)
+```
+
+`registered.sh` and `boot.sh` are in `examples/external-board/tests/`; `boot` reports itself
+skipped (exit status 77) while `firmware/` has no image.
+
+`emulation/main.c` is the same in every project: it registers the board and hands over to
+ember's stock command line (consoles, network ports, tracing, breakpoints, gdb, snapshots,
+fuzzing), so `<board>-run` takes every option `uam-run` does:
 
 ```c
+#include "uam/runner.h"
+
+#include "<board>_board.h"
+
 int main(int argc, char **argv)
 {
-    uam_board_register(&my_board);
+    uam_board_register(&<board>_board);
     return uam_run_main(argc, argv);
 }
 ```
 
-Build with `make -C path/to/uam BUILD=$PWD/build/uam lib` and link
-`build/uam/libuam.a -lm` (or `pkg-config --cflags --libs uam` after `make install`).
-Compile against the headers of the same tree the library was built from. A board
-built from different headers is stopped at `uam_board_register` / `uam_machine_init`
-with an `abi:` error that names each struct whose size differs and exit status 2, instead
-of corrupting memory. Rebuild the library and the board together after updating UAM.
+The board file starts from the reference board of its architecture: read
+`boards/<arch>_ref.c` for the ISA descriptor (`uam_isa_<arch>`, `include/uam/isa/`), the
+CPU model call and the memory every board of that architecture maps, then describe your
+hardware. `examples/external-board/emulation/ext_board.c` is a whole one, and
+`ext_id.c` beside it a whole device.
+
+### The rules
+
+1. **The project is out of tree and pins ember.** It builds against the ember revision in
+   `subprojects/ember.wrap`, compiled as its subproject with its own options: the library
+   and the runner are always built together, from the same headers. (A runner linked
+   against a libuam from other headers stops at `uam_board_register` / `uam_machine_init`
+   with an `abi:` error that names each struct whose size differs, exit status 2, instead
+   of corrupting memory.) Move the pin deliberately: change `revision`, update
+   `subprojects/ember` (`meson subprojects update ember`), rebuild, re-run `meson test`,
+   and note the move in the README.
+2. **The board file wires; it does not implement.** `<board>_board.c` creates the
+   processor, maps memory, places images, instantiates devices, maps them and connects
+   their lines. Register behaviour, state machines and timing live in device files.
+3. **One hardware component, one file.** Each device is a `.c` with a `.h` for its create
+   function and its lines. A device includes only ember's device-side interfaces
+   (`uam/common.h access.h device.h signal.h sched.h chardev.h netdev.h blockdev.h state.h
+   bus.h`, stock device headers `uam/dev/*.h`): never the CPU, an ISA, the machine or the
+   board. What it needs from them the board passes to its create function (a scheduler, a
+   bus for DMA, a character device, a callback) or connects as a signal. That keeps a
+   device reusable on the next board and testable alone.
+4. **Reuse before writing.** If `include/uam/dev/` has the part, use it; write a device
+   only for what is specific to your hardware.
+5. **Every device saves its state** (`save`/`restore` in its ops, or
+   `UAM_DEVICE_STATELESS`), so the board can be snapshotted and fuzzed from a snapshot.
+6. **Firmware and data are inputs with a fixed place.** Images live in `firmware/` and are
+   never edited; data the firmware reads that is not part of an image is generated by a
+   script in `tools/` into `build/`. The board takes them as named images
+   (`--image name=path`), not as paths compiled in.
+7. **Diagnostics are opt-in.** A normal run prints the guest's console and nothing else;
+   board options (`-o key=value`) and the runner's `--trace` switches turn the rest on.
+8. **A change to ember is a patch, not a fork.** When the public API is not enough, the
+   change is a `git format-patch` file in `patches/`, written for ember's history (no
+   board or firmware names), applied to `subprojects/ember` on top of the pin, and sent
+   upstream. Never an edit that only your checkout has.
+
+### Build, test, run
+
+```bash
+meson setup build                # fetches ember at the pinned revision into subprojects/ember
+meson compile -C build           # ember's libraries and build/<board>-run
+meson test -C build              # tests/: registered, boot
+build/<board>-run -b <board> --image os=firmware/firmware.bin    # every uam-run option applies
+```
+
+Ember's own tests are not built in a board project, and its warnings-as-errors apply to
+its sources only. Compiler and build options given to the project (`buildtype`,
+`b_sanitize`, `c_args`) apply to ember too, as it is compiled with it.
+
+An ember installed with `meson install` can be used instead of the subproject
+(`meson setup build -Dwrap_mode=nofallback` finds it through pkg-config, package `uam`;
+outside meson, `pkg-config --cflags --libs uam`). That suits packaging a finished board; a
+board under development uses the pinned subproject, so that its ember cannot change under
+it.
+
 Only the modules you reference are linked: a MIPS-only board pulls in neither
 the RISC-V lifter nor the stock boards.
 
@@ -547,9 +760,10 @@ the RISC-V lifter nor the stock boards.
 
 `skills/` holds agent skills that take a firmware image from an unknown blob to a running
 ember board and then fuzz it: `ember-dev-recon` (triage: architecture, load address, memory
-map, MMIO, whether ember can run it), `ember-dev-build` (an out-of-tree board brought up one
-device at a time, against a local ember clone pinned to the latest commit, with any change
-to ember kept as `git am`-ready patch files) and `ember-fuzz` (the snapshot
+map, MMIO, whether ember can run it), `ember-dev-build` (an out-of-tree board in the layout
+of "Building a board on ember", brought up one device at a time, against a local ember
+clone pinned to the latest commit, with any change to ember kept as `git am`-ready patch
+files) and `ember-fuzz` (the snapshot
 fuzz harness with ember's own block coverage, the brain, and opt-in site lists). They are plain `SKILL.md` folders; `skills/install.sh` links them
 into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agents/skills`).
 `skills/tests/run-tests.sh ~/ember` checks their tooling end to end. See `skills/README.md`.
@@ -646,7 +860,9 @@ boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 tools/             also xbench.sh / jitbench.sh (timing),
                    jitprof.py (native-code profiles; docs/jit-perf.md)
-examples/          external-board: an out-of-tree board using the library
+meson.build        the build (meson_options.txt: its options; tests/meson.build: the tests;
+                   cross/: cross files for other hosts)
+examples/          external-board: an out-of-tree board project in the prescribed layout
 skills/            agent skills (recon, board bring-up, fuzzing), their installer and tests
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
@@ -668,7 +884,7 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    instruction flags, MEMPTR, the CTC) and test_xtensa (special registers per
                    model, interrupt levels, CCOMPARE, window exceptions, BREAK, the ERI)
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
-                   use (storage, VGA, printer, virtio-net), run by build/uam-test-run
+                   use (storage, VGA, printer, virtio-net), run by build/tests/uam-test-run
 tests/firmware/    bare-metal RV32 self-test, network-test, multiprocessor, fuzz-target and
                    scripted-console images
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian), fuzz target, multiprocessor test
@@ -703,12 +919,12 @@ tests/smp/         the multiprocessor self-test shared by RISC-V, MIPS, ARM and 
 tests/snapshot/    snapshot-check.sh: split runs must equal the uninterrupted run
 tests/cov/ tests/fuzz/  block-coverage maps across backends; the fuzz harness on planted bugs
 tests/fuzz/        also site lists, boundary files, the coverage region, the fuzz protocol and
-                   a session with the brain (make fuzz-lists-test)
+                   a session with the brain (meson test -C build --suite fuzz-lists)
 tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
 tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch;
                    trace-check.sh: --trace exc/mmio/mmio-summary/sysreg/irq/console/dma,
                    --history, --trace-file, --log-pc registers, --unknown-mmio stop, --log-stamp
-tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC (make bench-test,
-                   make xbench)
+tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC, a meson project of
+                   its own (meson test -C build --suite bench, meson compile -C build xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
 ```

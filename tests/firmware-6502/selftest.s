@@ -1,4 +1,4 @@
-; selftest.s - the 6502 self-test, common part (sdas6500). The Makefile appends the
+; selftest.s - the 6502 self-test, common part (sdas6500). meson.build appends the
 ; model's part (model-*.s: model_tests, model_cmos) and the generated vectors.
 ;
 ; Console: the 16550 at 0x7F00, polled. The finisher is at 0x7F10: 0x55 there passes, a

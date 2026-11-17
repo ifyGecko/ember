@@ -2,7 +2,7 @@
 """bios-check.py - a legacy BIOS boot on the generic legacy devices of x86_64-test
 (tests/boards/: x86_64-ref plus storage, VGA and a printer).
 
-    bios-check.py RUNNER BIOSROM          (RUNNER: build/uam-test-run)
+    bios-check.py RUNNER BIOSROM          (RUNNER: build/tests/uam-test-run)
 
 Runs biosrom.bin (--image bios=) with a floppy whose boot sector reports to the
 test finisher, an IDE disk whose sector n holds bytes n, a VGA and a printer,

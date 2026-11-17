@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate xtensa_fpu_vectors.h (BUILD/gen/, made by the Makefile), the test vectors of isa/xtensa/xtensa_fpu.c.
+"""Generate xtensa_fpu_vectors.h (made by tests/meson.build), the test vectors of isa/xtensa/xtensa_fpu.c.
 
 Expected results come from exact rational arithmetic (fractions.Fraction), not from the
 host's floating point: every arithmetic result is the exact value rounded once with the
@@ -18,7 +18,7 @@ rounding modes over zeros of both signs, subnormals, normals, the largest values
 infinities and NaNs, ties, overflow and underflow, cancellation, and the conversions at
 their range limits with every scale factor.
 
-    python3 -I -B tests/isa-xtensa/gen-fpu-vectors.py > build/gen/xtensa_fpu_vectors.h
+    python3 -I -B tests/isa-xtensa/gen-fpu-vectors.py > build/tests/xtensa_fpu_vectors.h
 """
 import math
 import os
