@@ -667,8 +667,12 @@ after the baseline). The queue is walked
 in cycles:
 
 - **Favored entries:** for every bucket, the entry that hits it with the smallest
-  instructions × size; the favored set covers every bucket seen. While favored entries
-  wait, 99% of the others are skipped (95% once fuzzed, 75% when new, otherwise).
+  instructions × size, and the longest entry that hits it; each of the two sets covers
+  every bucket seen. The cheapest entries are the shortest ones, and mutations start from
+  the entry's length, so working on those alone would keep a campaign at short inputs:
+  the second set has every piece of code mutated from its longest form as well. While
+  favored entries wait, 99% of the others are skipped (95% once fuzzed, 75% when new,
+  otherwise).
 - **Calibration:** each new entry runs twice. ember is deterministic, so the runs must
   match; a difference is reported as `UNSTABLE` with the buckets that differed (the harness
   leaks state between iterations) and counted in the status. `--no-calibrate` skips it.
@@ -722,22 +726,27 @@ log-uniform) havoc operators:
 |---|---|
 | `BIT_FLIP`, `BYTE_FLIP`, `BYTE_ARITH`, `WORD_ARITH_LE/BE`, `DWORD_ARITH_LE/BE` | flip bits; add or subtract up to 35 at 8, 16 or 32 bits in either order |
 | `SET_INTERESTING_U8`, `_U16_LE/BE`, `_U32_LE/BE`, `RANDOM_BYTE` | write a boundary value (0, -1, 127, 128, 255, 256, 32767, 65535, 2^31 ...) or a random byte |
-| `DELETE_CHUNK`, `CLONE_CHUNK`, `OVERWRITE_CHUNK`, `SWAP_CHUNKS` | delete, duplicate, overwrite or swap runs of bytes |
-| `INSERT_BLOCK` | insert constant or random bytes |
-| `RESIZE` | set the length anywhere in 1..`--max-size`, log-uniformly (each power-of-two size class alike), padding with constant or random bytes |
+| `DELETE_CHUNK`, `CLONE_CHUNK`, `OVERWRITE_CHUNK`, `SWAP_CHUNKS` | delete (up to two thirds of the input), duplicate (up to the input's length), overwrite or swap runs of bytes |
+| `INSERT_BLOCK` | insert constant or random bytes (up to the input's length) |
+| `RESIZE` | the long step: grow to a length between the input's and `--max-size`, or cut to one between the input's and one byte, either as likely, log-uniformly on that side (each power-of-two size class alike); bytes are added or cut at a random place |
 | `DICT_INSERT`, `DICT_OVERWRITE`, `DICT_INT_ADJ` | insert or write a dictionary token; write an integer token ±1 |
 
 Chunk lengths are drawn the way AFL's havoc draws them: a third of the time 1-32 bytes, a
-third 32-128, a third 128-1500 (now and then 1500-32768), within what fits. Growing and
-shrinking are balanced against the room there is: the further an input is below
-`--max-size`, on a log scale, the more of its `DELETE_CHUNK`s are done as `INSERT_BLOCK`s
-instead (every second one at one byte, none at `--max-size`), because a short input has
-little to delete and nothing long to duplicate and would otherwise mostly get shorter. So
-seeds of a few bytes spread over the sizes up to the cap: of the mutations of a 16-byte
-seed with `--max-size 9000`, about 58% are longer than it, a quarter the same length and
-18% shorter; about one in four passes 256 bytes and one in 14 passes 2000. An input at the
-cap shrinks or stays. Set `--max-size` to the buffer the firmware really has: the balance
-is taken against it, and inputs longer than the route delivers only cost time. ember judges each mutation itself against its record (every INPUT and every batch
+third 32-128, a third 128-1500 (now and then more), within the operator's limit. The length
+moves both ways and evenly: whenever an operator that changes it is drawn, a coin decides
+between growing and cutting, whatever the weights. `DELETE_CHUNK`, `CLONE_CHUNK` and
+`INSERT_BLOCK` become a cut or a growth of the same scale; a `DICT_INSERT` inserts its
+token or cuts as many bytes as a token has (as does `DICT_INT_ADJ` where it would insert);
+`RESIZE` picks its side. So a mutation is as likely to come out shorter as longer wherever
+the input stands between one byte and `--max-size`: with `--max-size 9000`, of the
+mutations of a 16-byte, a 512-byte and a 4500-byte input about 40% are shorter, 36% longer
+and the rest the same length (39-44% and 42-46% with a dictionary), about 3% of a 16-byte
+input's pass 2000 bytes and about 5% of a 9000-byte input's fall under 64. A chain of
+mutations from one byte or from the cap covers the whole range and spends about as long
+under 64 bytes as over 1000. At the ends the move without room does nothing: an input at
+the cap shrinks or stays. A direction whose operators have weight 0 stays off. Set
+`--max-size` to the buffer the firmware really has: the lengths spread up to it, and inputs
+longer than the route delivers only cost time. ember judges each mutation itself against its record (every INPUT and every batch
 counts) and sends a FIND only for new coverage, a novel crash, or a hang (up to
 `--max-hangs`); a batch ends with its totals (executions per verdict, per operator, per
 path), and says PROGRESS when it has been silent for a second, so a batch of slow inputs

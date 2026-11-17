@@ -1,6 +1,6 @@
 # What one fuzz execution costs, in guest instructions at the host's plain JIT
 # speed (tests/fuzz/throughput.py; `make fuzz-throughput-record` rewrites it).
 # host-arch board stage cost
-x86_64 rv32-ref havoc 7829
-x86_64 rv32-ref i2s 8197
-x86_64 rv32-ref trim 10056
+x86_64 rv32-ref havoc 7031
+x86_64 rv32-ref i2s 8276
+x86_64 rv32-ref trim 10189

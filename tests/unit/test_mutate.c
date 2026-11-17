@@ -265,78 +265,117 @@ static void test_splice_and_corpus(void)
     uam_mutator_destroy(m);
 }
 
-/* Inputs must grow from a tiny seed toward max_size. A lineage that keeps every child
- * (what a queue does when each child finds something) and single mutations of a small
- * seed both have to reach the size classes a fuzzer with a large max_size should try. */
+/* How one mutation moves the length of a LEN-byte input: counts of shorter and longer
+ * results, and of results beyond FAR bytes away on the far side of LEN. */
+static void moves(uam_mutator *m, size_t len, int n, size_t *shorter, size_t *longer)
+{
+    static uint8_t src[9000];
+    memset(src, 'A', len);
+    *shorter = *longer = 0;
+    for (int i = 0; i < n; i++) {
+        size_t k;
+        uam_mutator_mutate(m, src, len, &k, NULL);
+        *shorter += k < len;
+        *longer += k > len;
+    }
+}
+
+/* The length has to move both ways and evenly: a campaign that starts from seeds of a
+ * few bytes must come to try inputs of max_size, one that starts at max_size short ones,
+ * and neither direction may be the likelier one, or the inputs settle at one end. */
 static void test_growth(void)
 {
-    enum { MAX = 9000, GENS = 3000 };
+    enum { MAX = 9000, GENS = 3000, N = 20000 };
+    static uint8_t cur[MAX];
+    /* A chain that keeps every child (a queue whose every child finds something), from
+     * one byte and from max_size. */
+    static const size_t start[] = { 1, MAX };
+    for (unsigned k = 0; k < 2; k++) {
+        uam_mutator *m = uam_mutator_create();
+        uam_mutator_set_max_size(m, MAX);
+        uam_mutator_seed(m, 1);
+        size_t len = start[k], peak = 0, low = MAX, under64 = 0, over1k = 0;
+        memset(cur, 'A', len);
+        for (int g = 0; g < GENS; g++) {
+            size_t n;
+            const uint8_t *p = uam_mutator_mutate(m, cur, len, &n, NULL);
+            memcpy(cur, p, n);
+            len = n;
+            peak = n > peak ? n : peak;
+            low = n < low ? n : low;
+            under64 += n < 64;
+            over1k += n > 1000;
+        }
+        printf("test_mutate: chain from %zu of %u bytes: %zu..%zu, %.0f%% under 64, "
+               "%.0f%% over 1000\n", start[k], MAX, low, peak,
+               100.0 * (double)under64 / GENS, 100.0 * (double)over1k / GENS);
+        CHECK(peak > 7000, "a chain from %zu bytes reaches near max_size (peak %zu)", start[k], peak);
+        CHECK(low < 8, "a chain from %zu bytes reaches a few bytes (low %zu)", start[k], low);
+        CHECK(over1k > GENS / 8 && under64 > GENS / 8,
+              "and spends time at both ends (%zu over 1000, %zu under 64 of %d)",
+              over1k, under64, GENS);
+        uam_mutator_destroy(m);
+    }
+
+    /* One mutation: as often shorter as longer, wherever the input stands between the
+     * ends, with and without a dictionary. */
+    for (int dict = 0; dict < 2; dict++) {
+        uam_mutator *m = uam_mutator_create();
+        uam_mutator_set_max_size(m, MAX);
+        uam_mutator_seed(m, 2);
+        if (dict) {
+            uam_mutator_add_token(m, (const uint8_t *)"GET ", 4);
+            uam_mutator_add_token(m, (const uint8_t *)"Content-Length", 14);
+            uam_mutator_add_int_token(m, 0x6a3c91e5, 4, false);
+        }
+        static const size_t at[] = { 16, 512, 4500 };
+        for (unsigned k = 0; k < 3; k++) {
+            size_t shorter, longer;
+            moves(m, at[k], N, &shorter, &longer);
+            printf("test_mutate: one mutation of %zu bytes%s: %.0f%% shorter, %.0f%% longer\n",
+                   at[k], dict ? " (dictionary)" : "", 100.0 * (double)shorter / N,
+                   100.0 * (double)longer / N);
+            const size_t gap = shorter > longer ? shorter - longer : longer - shorter;
+            CHECK(shorter > N * 3 / 10 && longer > N * 3 / 10 && gap < N / 10,
+                  "%zu bytes%s: shorter and longer about as often (%zu, %zu of %d)",
+                  at[k], dict ? " with a dictionary" : "", shorter, longer, N);
+        }
+        /* At max_size nothing pushes further: it shrinks or stays. */
+        size_t shorter, longer;
+        moves(m, MAX, 2000, &shorter, &longer);
+        CHECK(shorter > 2000 / 3 && !longer, "an input at max_size shrinks (%zu of 2000)", shorter);
+        uam_mutator_destroy(m);
+    }
+
+    /* One mutation reaches far: a 16-byte input to thousands of bytes, a full one to a few. */
     uam_mutator *m = uam_mutator_create();
     uam_mutator_set_max_size(m, MAX);
-    uam_mutator_seed(m, 1);
-    static uint8_t cur[MAX];
-    size_t len = 1;
-    cur[0] = 'A';
-    size_t peak = 0, over1k = 0, over4k = 0;
-    double sum = 0;
-    for (int g = 0; g < GENS; g++) {
-        size_t n;
-        const uint8_t *p = uam_mutator_mutate(m, cur, len, &n, NULL);
-        memcpy(cur, p, n);
-        len = n;
-        sum += (double)n;
-        peak = n > peak ? n : peak;
-        over1k += n > 1000;
-        over4k += n > 4000;
-    }
-    printf("test_mutate: lineage from 1 byte, max %u: mean %.0f, peak %zu, %.0f%% > 1000, "
-           "%.0f%% > 4000\n", MAX, sum / GENS, peak, 100.0 * (double)over1k / GENS,
-           100.0 * (double)over4k / GENS);
-    CHECK(peak > 7000, "the lineage reaches near max_size (peak %zu)", peak);
-    CHECK(over1k > GENS / 5, "the lineage spends time above 1000 bytes (%zu of %d)", over1k, GENS);
-
-    /* Single mutations of a 16-byte seed: most stay small (cheap to run), some grow far. */
-    uint8_t seed[16];
-    memset(seed, 'A', sizeof(seed));
-    size_t bigger = 0, smaller = 0, over256 = 0, over2k = 0;
-    enum { N = 20000 };
+    uam_mutator_seed(m, 3);
+    size_t far_up = 0, far_down = 0;
+    memset(cur, 'A', MAX);
     for (int i = 0; i < N; i++) {
         size_t n;
-        uam_mutator_mutate(m, seed, sizeof(seed), &n, NULL);
-        bigger += n > sizeof(seed);
-        smaller += n < sizeof(seed);
-        over256 += n > 256;
-        over2k += n > 2000;
+        uam_mutator_mutate(m, cur, 16, &n, NULL);
+        far_up += n > 2000;
+        uam_mutator_mutate(m, cur, MAX, &n, NULL);
+        far_down += n < 64;
     }
-    printf("test_mutate: one mutation of 16 bytes: %.0f%% larger, %.0f%% smaller, %.1f%% > 256, "
-           "%.1f%% > 2000\n", 100.0 * (double)bigger / N, 100.0 * (double)smaller / N,
-           100.0 * (double)over256 / N, 100.0 * (double)over2k / N);
-    CHECK(bigger > N * 45 / 100, "with room to grow, more mutations grow a short seed than "
-          "shrink it (%zu of %d grow)", bigger, N);
-    CHECK(smaller > N / 10 && smaller < bigger, "and some still shrink it (%zu of %d)", smaller, N);
-    CHECK(over2k > N / 50 && over256 < N * 3 / 4,
-          "some mutations reach thousands of bytes, most stay small (%zu, %zu)", over2k, over256);
-    /* An input at max_size: nothing pushes it further; it shrinks or stays. */
-    static uint8_t full[MAX];
-    memset(full, 'B', sizeof(full));
-    size_t shrunk = 0;
-    for (int i = 0; i < 2000; i++) {
-        size_t n;
-        uam_mutator_mutate(m, full, sizeof(full), &n, NULL);
-        shrunk += n < MAX;
-    }
-    CHECK(shrunk > 2000 / 3, "an input at max_size shrinks (%zu of 2000)", shrunk);
-    /* INSERT_BLOCK switched off: a delete is a delete. */
+    CHECK(far_up > N / 100 && far_down > N / 100,
+          "single mutations cross the range (%zu up, %zu down of %d)", far_up, far_down, N);
+
+    /* A direction switched off stays off: nothing is turned into it. */
+    size_t shorter, longer;
     uam_mutator_set_weight(m, UAM_MUT_INSERT_BLOCK, 0);
     uam_mutator_set_weight(m, UAM_MUT_CLONE_CHUNK, 0);
     uam_mutator_set_weight(m, UAM_MUT_RESIZE, 0);
-    bool grew = false;
-    for (int i = 0; i < 2000; i++) {
-        size_t n;
-        uam_mutator_mutate(m, seed, sizeof(seed), &n, NULL);
-        grew = grew || n > sizeof(seed);
-    }
-    CHECK(!grew, "with the growing operators off nothing grows");
+    moves(m, 16, 2000, &shorter, &longer);
+    CHECK(!longer && shorter, "with the growing operators off nothing grows");
+    uam_mutator_reset_weights(m);
+    uam_mutator_set_weight(m, UAM_MUT_DELETE_CHUNK, 0);
+    uam_mutator_set_weight(m, UAM_MUT_RESIZE, 0);
+    uam_mutator_add_token(m, (const uint8_t *)"token", 5);
+    moves(m, 16, 2000, &shorter, &longer);
+    CHECK(!shorter && longer, "with DELETE_CHUNK and RESIZE off nothing shrinks");
     uam_mutator_destroy(m);
 }
 

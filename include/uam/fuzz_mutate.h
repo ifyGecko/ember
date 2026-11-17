@@ -7,15 +7,21 @@
  * between the first and last byte in which the two differ). Everything is deterministic
  * given uam_mutator_seed.
  *
- * Inputs grow as well as shrink. The chunk operators draw their lengths the way AFL's
- * havoc does: usually 1-32 bytes, sometimes 32-128, sometimes 128-1500 and now and then
- * 1500-32768, within what fits. INSERT_BLOCK inserts constant or random bytes whatever the
- * input's current length, and RESIZE sets the length anywhere in [1, max_size]
- * (honggfuzz's resize), so a seed of a few bytes reaches every size up to max_size.
- * Growing and shrinking are balanced against the room there is: the further an input is
- * below max_size (on a log scale), the more of its DELETE_CHUNKs are done as INSERT_BLOCKs
- * instead (up to every second one), so that short seeds under a large max_size spread over
- * the sizes in between rather than staying short; near max_size inputs shrink as usual.
+ * The length moves both ways and evenly. The chunk operators draw their lengths the way
+ * AFL's havoc does (usually 1-32 bytes, sometimes 32-128, sometimes 128-1500 and now and
+ * then more), within a step that scales with the input: a growth (CLONE_CHUNK,
+ * INSERT_BLOCK) adds up to the input's own length, a cut (DELETE_CHUNK) removes up to two
+ * thirds of it. Whenever an operator that changes the length is drawn, a coin decides
+ * between growing and cutting, whatever the weights: one of the three chunk operators
+ * becomes a cut or a growth, a DICT_INSERT inserts its token or cuts as many bytes as a
+ * token has (so does DICT_INT_ADJ where it would insert), and RESIZE, the long step, goes
+ * to a length between the input's and max_size or between the input's and one byte,
+ * log-uniform on that side. So a mutation is as likely to come out shorter as longer
+ * wherever the input stands between one byte and max_size, a seed of a few bytes reaches
+ * max_size and one of max_size a few bytes, and a campaign's inputs do not settle at
+ * either end. At the ends the move without room does nothing. A direction whose
+ * operators have weight 0 stays off (DELETE_CHUNK for cuts; CLONE_CHUNK and INSERT_BLOCK
+ * for the chunk growths).
  *
  * Dictionary tokens are byte strings or integers (1, 2, 4 or 8 bytes, little- or
  * big-endian); DICT_INT_ADJ writes an integer token plus or minus 1, the off-by-one

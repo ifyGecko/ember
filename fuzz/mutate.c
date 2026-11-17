@@ -37,11 +37,11 @@ static const struct { const char *name; unsigned weight; } op_info[UAM_MUT_OP_LI
     [UAM_MUT_CLONE_CHUNK]            = { "CLONE_CHUNK", 16 },
     [UAM_MUT_OVERWRITE_CHUNK]        = { "OVERWRITE_CHUNK", 20 },
     [UAM_MUT_SWAP_CHUNKS]            = { "SWAP_CHUNKS", 8 },
-    [UAM_MUT_DICT_INSERT]            = { "DICT_INSERT", 32 },
+    [UAM_MUT_DICT_INSERT]            = { "DICT_INSERT", 64 },
     [UAM_MUT_DICT_OVERWRITE]         = { "DICT_OVERWRITE", 24 },
     [UAM_MUT_DICT_INT_ADJ]           = { "DICT_INT_ADJ", 16 },
     [UAM_MUT_INSERT_BLOCK]           = { "INSERT_BLOCK", 4 },
-    [UAM_MUT_RESIZE]                 = { "RESIZE", 1 },
+    [UAM_MUT_RESIZE]                 = { "RESIZE", 2 },
     [UAM_MUT_SPLICE]                 = { "SPLICE", 0 },
 };
 
@@ -492,13 +492,31 @@ static void fill(uam_mutator *m, uint8_t *p, size_t n, const mbuf *x)
     }
 }
 
-static void op_delete(uam_mutator *m, mbuf *x)
+/*
+ * The three chunk operators move the length by a step of the same scale in either
+ * direction, so that balance() below can make a growth and a cut equally likely and
+ * about equally large: a growth adds up to the input's own length (at most a doubling),
+ * a cut removes up to two thirds of it. (Measured: with cuts of up to all but one byte a
+ * chain of mutations spends most of its time at a few bytes; with cuts of up to half,
+ * mutations of a short input come out longer more often than shorter.)
+ */
+/* Cut n bytes at a random place, leaving at least one. */
+static void cut(uam_mutator *m, mbuf *x, size_t n)
 {
     if (x->len < 2)
         return;
-    size_t n = block_len(m, x->len - 1), pos = below(m, x->len - n + 1);
+    if (n > x->len - 1)
+        n = x->len - 1;
+    size_t pos = below(m, x->len - n + 1);
     memmove(x->b + pos, x->b + pos + n, x->len - pos - n);
     x->len -= n;
+}
+
+/* n: how many bytes to cut (the mirror of a token's insertion), 0: a chunk. */
+static void op_delete(uam_mutator *m, mbuf *x, size_t n)
+{
+    if (x->len >= 2)
+        cut(m, x, n ? n : block_len(m, x->len - x->len / 3));
 }
 
 static void op_clone(uam_mutator *m, mbuf *x, uint8_t *tmp)
@@ -521,7 +539,9 @@ static void op_insert_block(uam_mutator *m, mbuf *x)
 {
     if (x->len == x->cap)
         return;
-    size_t n = block_len(m, x->cap - x->len), pos = below(m, x->len + 1);
+    size_t n = block_len(m, x->len ? x->len : 1), pos = below(m, x->len + 1);
+    if (n > x->cap - x->len)
+        n = x->cap - x->len;
     mbuf before = *x;
     fill(m, open_gap(x, pos, n), n, &before);
 }
@@ -550,19 +570,39 @@ static void op_swap(uam_mutator *m, mbuf *x, uint8_t *tmp)
     memcpy(x->b + b, tmp, n);
 }
 
-/* A new length, log-uniform in [1, cap]: each power-of-two size class as likely as the
- * next, so a large max_size is reached without most resizes landing near it. */
+static unsigned log2_of(size_t v)
+{
+    unsigned n = 0;
+    while (v >>= 1)
+        n++;
+    return n;
+}
+
+/* A length in [lo, hi] (1 <= lo <= hi), log-uniform: each power-of-two size class in
+ * the range as likely as the next. */
+static size_t log_range(uam_mutator *m, size_t lo, size_t hi)
+{
+    unsigned k = (unsigned)range(m, log2_of(lo), log2_of(hi));   /* the class [2^k, 2^(k+1)) */
+    size_t a = (size_t)1 << k, b = (size_t)((2ull << k) - 1);
+    return range(m, a > lo ? a : lo, b < hi ? b : hi);
+}
+
+/*
+ * The long step: to a length anywhere between the input's and one byte, or between the
+ * input's and max_size, either direction as likely as the other while both are open. The
+ * new length is log-uniform on its side, so a few bytes can become thousands in one
+ * mutation and the other way round. Bytes are added (fill) or cut at a random place.
+ */
 static void op_resize(uam_mutator *m, mbuf *x)
 {
-    unsigned bits = 0;
-    while (bits < 63 && (2ull << bits) <= x->cap)
-        bits++;
-    unsigned k = (unsigned)below(m, bits + 1);   /* the size class [2^k, 2^(k+1)) */
-    size_t lo = (size_t)1 << k, hi = (size_t)((2ull << k) - 1);
-    size_t n = range(m, lo, hi < x->cap ? hi : x->cap);
-    if (n > x->len)
-        fill(m, x->b + x->len, n - x->len, x);
-    x->len = n;
+    const bool can_grow = x->len < x->cap, can_cut = x->len > 1;
+    if (can_grow && (!can_cut || below(m, 2))) {
+        size_t n = log_range(m, x->len + 1, x->cap) - x->len, pos = below(m, x->len + 1);
+        mbuf before = *x;
+        fill(m, open_gap(x, pos, n), n, &before);
+    } else if (can_cut) {
+        cut(m, x, x->len - log_range(m, 1, x->len - 1));
+    }
 }
 
 static void op_dict_insert(uam_mutator *m, mbuf *x)
@@ -589,11 +629,13 @@ static void op_dict_int_adj(uam_mutator *m, mbuf *x)
                (unsigned)t->len, t->big_endian);
     if (x->len >= t->len && below(m, 2))
         memcpy(x->b + below(m, x->len - t->len + 1), enc, t->len);
+    else if (m->weight[UAM_MUT_DELETE_CHUNK] && below(m, 2))
+        cut(m, x, t->len);                 /* as often as the insertion: see balance() */
     else if (t->len <= x->cap - x->len)
         insert(x, below(m, x->len + 1), enc, t->len);
 }
 
-static void apply(uam_mutator *m, mbuf *x, unsigned op)
+static void apply(uam_mutator *m, mbuf *x, unsigned op, size_t cut_len)
 {
     switch (op) {
     case UAM_MUT_BIT_FLIP:
@@ -620,7 +662,7 @@ static void apply(uam_mutator *m, mbuf *x, unsigned op)
         else
             x->b[x->len++] = (uint8_t)next64(m);
         break;
-    case UAM_MUT_DELETE_CHUNK:            op_delete(m, x); break;
+    case UAM_MUT_DELETE_CHUNK:            op_delete(m, x, cut_len); break;
     case UAM_MUT_CLONE_CHUNK:             op_clone(m, x, m->tmp); break;
     case UAM_MUT_OVERWRITE_CHUNK:         op_overwrite(m, x); break;
     case UAM_MUT_SWAP_CHUNKS:             op_swap(m, x, m->tmp); break;
@@ -661,31 +703,46 @@ static bool splice(uam_mutator *m, mbuf *x)
 
 size_t uam_mutator_max_size(const uam_mutator *m) { return m->max_size; }
 
-static unsigned log2_of(size_t v)
-{
-    unsigned n = 0;
-    while (v >>= 1)
-        n++;
-    return n;
-}
-
 /*
- * Which way a DELETE_CHUNK goes. Deleting is as likely as growing by weight, but a short
- * input has little to delete and nothing long to clone, so seeds of a few bytes would
- * mostly shrink and seldom leave their size class however large max_size is. Where the
- * input stands between one byte and max_size, on a log scale, decides: at one byte every
- * second delete becomes an INSERT_BLOCK, at max_size none, in between in proportion.
- * Long inputs shrink as before; only the lean of short ones towards shorter goes. With
- * INSERT_BLOCK's weight at 0 a delete is always a delete.
+ * Which way an operator that changes the length moves it. By their weights and by what a
+ * short or a full input leaves them to do, cuts and growths would not come out even, and
+ * the inputs of a campaign would drift to one end of [1, max_size] and stay there. So
+ * when such an operator is drawn a coin picks the direction:
+ *
+ *   DELETE_CHUNK, CLONE_CHUNK, INSERT_BLOCK   a cut, or a growth by CLONE_CHUNK or
+ *       INSERT_BLOCK in the ratio of their weights. The steps are of the same scale both
+ *       ways (see above op_delete).
+ *   DICT_INSERT   the token's insertion, or a cut of as many bytes as a token has
+ *       (*cut_len; the operator becomes DELETE_CHUNK). DICT_INT_ADJ does the same for
+ *       its insertions.
+ *   RESIZE        decides for itself (op_resize).
+ *
+ * At one byte and at max_size the move that has no room does nothing. With
+ * DELETE_CHUNK's weight at 0 nothing is turned into a cut, and with CLONE_CHUNK's and
+ * INSERT_BLOCK's at 0 no cut into a growth: a caller that turned a direction off keeps
+ * it off.
  */
-static unsigned balance(uam_mutator *m, const mbuf *x, unsigned op)
+static unsigned balance(uam_mutator *m, unsigned op, size_t *cut_len)
 {
-    if (op != UAM_MUT_DELETE_CHUNK || !m->weight[UAM_MUT_INSERT_BLOCK] || x->len >= x->cap)
+    *cut_len = 0;
+    if (!m->weight[UAM_MUT_DELETE_CHUNK])
         return op;
-    const unsigned top = log2_of(x->cap);
-    if (!top || below(m, 2 * top) >= top - log2_of(x->len ? x->len : 1))
+    if (op == UAM_MUT_DICT_INSERT) {
+        if (below(m, 2))
+            return op;
+        *cut_len = pick_token(m)->len;
+        return UAM_MUT_DELETE_CHUNK;
+    }
+    if (op != UAM_MUT_DELETE_CHUNK && op != UAM_MUT_CLONE_CHUNK && op != UAM_MUT_INSERT_BLOCK)
         return op;
-    return UAM_MUT_INSERT_BLOCK;
+    const unsigned clone = m->weight[UAM_MUT_CLONE_CHUNK], block = m->weight[UAM_MUT_INSERT_BLOCK];
+    if (!(clone + block))
+        return op;
+    if (below(m, 2))
+        return UAM_MUT_DELETE_CHUNK;
+    if (op != UAM_MUT_DELETE_CHUNK)
+        return op;
+    return below(m, clone + block) < clone ? UAM_MUT_CLONE_CHUNK : UAM_MUT_INSERT_BLOCK;
 }
 
 uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
@@ -702,14 +759,16 @@ uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
         used |= 1ull << UAM_MUT_SPLICE;
     for (unsigned k = m->stack[below(m, m->n_stack)]; k; k--) {
         unsigned op = pick_op(m);
+        size_t cut_len = 0;
         /* An empty input: only an operator that adds bytes does anything. */
         if (!x.len && op != UAM_MUT_DICT_INSERT && op != UAM_MUT_DICT_INT_ADJ
             && op != UAM_MUT_CLONE_CHUNK && op != UAM_MUT_RANDOM_BYTE
             && op != UAM_MUT_INSERT_BLOCK && op != UAM_MUT_RESIZE)
             op = m->n_tokens ? UAM_MUT_DICT_INSERT : UAM_MUT_INSERT_BLOCK;
-        op = balance(m, &x, op);
+        else
+            op = balance(m, op, &cut_len);
         used |= 1ull << op;
-        apply(m, &x, op);
+        apply(m, &x, op, cut_len);
     }
     *out_len = x.len;
     if (ops)

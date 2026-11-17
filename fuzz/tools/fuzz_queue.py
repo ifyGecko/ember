@@ -9,7 +9,8 @@ Kept apart from the protocol and the main loop so that it can be tested on its o
   path_id        a hash of a hit list (indices and count classes): "the same path";
                  ember computes the same one for the inputs it mutates itself.
   Entry          one queue entry and its statistics.
-  Queue          the entries, path and edge frequencies, the favored set (culling), and
+  Queue          the entries, path and edge frequencies, the favored set (culling: the
+                 cheapest and the longest entry per bucket), and
                  the power schedules that turn an entry into its energy.
   OpStats        which mutation operators found coverage, for adaptive weights.
   entry names    id:000123,src:000045,op:havoc,+cov / id:000124,sync:w2,src:000310 /
@@ -162,6 +163,8 @@ class Queue:
         self.track_edges = schedule == "rare" if track_edges is None else track_edges
         self.edge_freq: Dict[int, int] = {}
         self.top_rated: Dict[int, Entry] = {}      # bucket -> cheapest entry hitting it
+        self.top_long: Dict[int, Entry] = {}       # bucket -> longest entry hitting it
+        self.long_stale = False                    # an entry in top_long got shorter
         self.dirty = False                         # top_rated changed: cull again
         self.pending_favored = 0                   # favored entries never chosen
         self.cycle = 0
@@ -184,6 +187,10 @@ class Queue:
             if cur is None or cost < cur.cost():
                 self.top_rated[i] = e
                 self.dirty = True
+            cur = self.top_long.get(i)
+            if cur is None or e.size > cur.size:
+                self.top_long[i] = e
+                self.dirty = True
 
     def rescore(self, e: Entry):
         """An entry's cost changed (trimmed): it may now be top-rated for its buckets."""
@@ -193,21 +200,36 @@ class Queue:
             if cur is None or (cur is not e and cost < cur.cost()):
                 self.top_rated[i] = e
                 self.dirty = True
+            if self.top_long.get(i) is e:          # no longer known to be the longest
+                self.long_stale = self.dirty = True
 
     def cull(self):
-        """The favored set: walk the buckets; an uncovered one brings in its top-rated
-        entry, whose buckets are then all covered (AFL's cull_queue)."""
+        """The favored set, two covers of the buckets seen. One is AFL's cull_queue: walk
+        the buckets; an uncovered one brings in its cheapest entry, whose buckets are then
+        all covered. The cheapest entries are the shortest, and a campaign that worked
+        only on those would mutate small parents only, so the walk is done a second time
+        with the longest entry per bucket: what reaches a piece of code is mutated from
+        its shortest and from its longest form."""
         if not self.dirty:
             return
         self.dirty = False
+        if self.long_stale:
+            self.long_stale = False
+            self.top_long = {}
+            for e in self.entries:
+                for i in e.buckets:
+                    cur = self.top_long.get(i)
+                    if cur is None or e.size > cur.size:
+                        self.top_long[i] = e
         for e in self.entries:
             e.favored = False
-        covered = set()
-        for i, e in self.top_rated.items():
-            if i in covered:
-                continue
-            e.favored = True
-            covered.update(e.buckets)
+        for top in (self.top_rated, self.top_long):
+            covered = set()
+            for i, e in top.items():
+                if i in covered:
+                    continue
+                e.favored = True
+                covered.update(e.buckets)
         self.pending_favored = sum(1 for e in self.entries if e.favored and not e.times_chosen)
 
     def favored_count(self) -> int:

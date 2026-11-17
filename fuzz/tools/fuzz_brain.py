@@ -18,7 +18,8 @@ The brain
     each iteration's set buckets and instruction count (SPARSE);
   - keeps a disk-backed **queue** under <out>/queue (id:NNNNNN,... names that
     record lineage) and **resumes** it on start;
-  - walks the queue in cycles: a **favored** set (the cheapest entry per bucket),
+  - walks the queue in cycles: a **favored** set (the cheapest and the longest entry
+    per bucket),
     **calibration** (a new entry runs twice; ember is deterministic, so a
     difference is a harness bug, reported as UNSTABLE), **trimming**, and an
     **energy** per entry from a performance score times its **power schedule**

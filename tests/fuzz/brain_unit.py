@@ -4,7 +4,8 @@ on synthetic data: no ember, no sockets.
 
   - hit-count classes (ember keeps the coverage record: tests/fuzz/fake_brain.py);
   - path ids (same hits, same path; a count class change, a new path);
-  - the favored set (the cheapest entry per bucket, greedy cover) and AFL's skip rule;
+  - the favored set (the cheapest and the longest entry per bucket, greedy covers) and
+    AFL's skip rule;
   - every schedule's factor and energy behaving as specified;
   - adaptive operator weights (toward the operators that find coverage, with a floor);
   - entry names, saving and resuming a queue with its state;
@@ -56,23 +57,27 @@ def test_favored_and_skip():
     big = entry(0, [1, 2, 3], insns=1000, data=b"x" * 50)
     small = entry(1, [1, 2], insns=10, data=b"y")
     other = entry(2, [3], insns=500, data=b"z" * 5)
-    for e in (big, small, other):
+    mid = entry(3, [1, 2, 3], insns=800, data=b"m" * 20)
+    for e in (big, small, other, mid):
         q.add(e)
     q.cull()
-    check(small.favored and other.favored and not big.favored,
+    check(small.favored and other.favored,
           "favored: the cheapest entry per bucket, a greedy cover")
-    check(q.pending_favored == 2, "both favored entries are pending")
+    check(big.favored and not mid.favored,
+          "favored: and the longest entry per bucket, a second cover")
+    check(q.pending_favored == 3, "the favored entries are pending")
     check(not q.skip(small, 0.999), "a favored entry is never skipped")
-    check(q.skip(big, 0.98) and not q.skip(big, 0.995), "99% skipped while favored ones wait")
+    check(q.skip(mid, 0.98) and not q.skip(mid, 0.995), "99% skipped while favored ones wait")
     q.pending_favored = 0
-    check(q.skip(big, 0.7) and not q.skip(big, 0.8), "75% of new non-favored entries")
-    big.times_chosen = 1
-    check(q.skip(big, 0.9) and not q.skip(big, 0.96), "95% of fuzzed non-favored entries")
+    check(q.skip(mid, 0.7) and not q.skip(mid, 0.8), "75% of new non-favored entries")
+    mid.times_chosen = 1
+    check(q.skip(mid, 0.9) and not q.skip(mid, 0.96), "95% of fuzzed non-favored entries")
     small.insns = 100000                       # trimmed elsewhere would lower it; here it grows
-    big.insns, big.data = 1, b"q"
+    big.insns, big.data = 1, b"q"              # trimmed to one byte
     q.rescore(big)
     q.cull()
     check(big.favored, "a cheaper entry after rescore becomes favored")
+    check(mid.favored, "and the next longest takes the place of one that got shorter")
 
 
 def test_schedules():
