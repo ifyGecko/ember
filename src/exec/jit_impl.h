@@ -235,6 +235,7 @@ struct uam_jit {
 #define REXC(f) ((int32_t)(offsetof(uam_jit_ctx, res) + offsetof(uam_block_result, exc) + offsetof(uam_exception, f)))
 #define SLOT(f) ((int32_t)offsetof(jit_slot, f))
 #define COV(f)  ((int32_t)offsetof(uam_cov_state, f))
+#define FRM(f)  ((int32_t)offsetof(uam_frame_state, f))
 #define TOUCH(f) ((int32_t)offsetof(uam_cov_touched, f))
 
 /* ---- what jit.c provides to a code generator ----------------------------------- */

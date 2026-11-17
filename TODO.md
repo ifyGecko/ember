@@ -41,9 +41,6 @@ The return guard (`--guard-returns`) and the guarded heap (`uam/heap.h`) exist
   each call and return (which register that is per ISA, an exact register file at the FRAME
   op in the JITs, and how far a return moves it on the ISAs that keep return addresses in
   memory).
-- Call tracking inline in the JITs (a push for a call, a compare and pop for a return that
-  matches the innermost frame): today each is a call out of translated code, about 3.5 ns
-  for a call with its return.
 - Frame stacks per task: today one history per processor, so a task switch mixes them.
 - The guarded heap's checks leave the JIT's inline memory path for the arena's pages; a
   shadow the JIT tests inline would keep heap-heavy targets fast.

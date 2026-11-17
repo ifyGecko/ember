@@ -141,23 +141,29 @@ void uam_ret_sites_load(uam_ret_sites *rs, uam_state_reader *r)
 
 /* ---- frames --------------------------------------------------------------- */
 
+void uam_frame_state_init(uam_frame_state *s)
+{
+    s->f[0] = (uam_frame){ .ret = UAM_FRAME_MARK };   /* matches no return */
+    s->top = s->f + 1;
+    s->end = s->f + 1 + UAM_FRAME_DEPTH;
+}
+
 void uam_frame_reset(uam_frame_state *s)
 {
-    s->n = 0;
+    s->top = s->f + 1;
 }
 
 static void push(uam_frame_state *s, uint64_t ret, uint64_t callee)
 {
-    if (s->n == UAM_FRAME_DEPTH) {   /* keep the innermost half */
-        memmove(s->f, s->f + UAM_FRAME_DEPTH / 2, sizeof(*s->f) * (UAM_FRAME_DEPTH / 2));
-        s->n = UAM_FRAME_DEPTH / 2;
+    if (s->top == s->end) {   /* keep the innermost half */
+        memmove(s->f + 1, s->f + 1 + UAM_FRAME_DEPTH / 2, sizeof(*s->f) * (UAM_FRAME_DEPTH / 2));
+        s->top = s->f + 1 + UAM_FRAME_DEPTH / 2;
     }
-    s->f[s->n++] = (uam_frame){ .ret = ret, .callee = callee };
+    *s->top++ = (uam_frame){ .ret = ret, .callee = callee };
 }
 
 void uam_frame_call(uam_frame_state *s, uint64_t ret, uint64_t callee)
 {
-    s->calls++;
     push(s, ret, callee);
 }
 
@@ -168,9 +174,9 @@ void uam_frame_mark(uam_frame_state *s, uint64_t pc)
 
 void uam_frame_eret(uam_frame_state *s)
 {
-    for (uint32_t i = s->n; i-- > 0;) {
-        if (s->f[i].ret == UAM_FRAME_MARK) {
-            s->n = i;
+    for (uam_frame *f = s->top; f-- > s->f + 1;) {
+        if (f->ret == UAM_FRAME_MARK) {
+            s->top = f;
             return;
         }
     }
@@ -178,23 +184,23 @@ void uam_frame_eret(uam_frame_state *s)
 
 void uam_frame_hook_return(uam_frame_state *s, uint64_t pc)
 {
-    if (s->n && s->f[s->n - 1].ret == (pc & s->pc_mask))
-        s->n--;
+    if (s->top > s->f + 1 && s->top[-1].ret != UAM_FRAME_MARK
+        && (s->top[-1].ret & s->pc_mask) == (pc & s->pc_mask))
+        s->top--;
 }
 
 void uam_frame_ret(uam_frame_state *s, uint64_t target, uint64_t pc)
 {
-    const uint64_t t = target & s->pc_mask;
-    s->returns++;
-    if (s->n && s->f[s->n - 1].ret == t) {
-        s->n--;
+    if (s->top[-1].ret == target) {   /* what native code does itself */
+        s->top--;
         return;
     }
     /* A return to an older frame: whatever was above it was left without returning. */
-    for (uint32_t i = s->n; i-- > 0;) {
-        if (s->f[i].ret == t) {
-            s->n = i;
-            s->resyncs++;
+    const uint64_t t = target & s->pc_mask;
+    for (uam_frame *f = s->top; f-- > s->f + 1;) {
+        if (f->ret != UAM_FRAME_MARK && (f->ret & s->pc_mask) == t) {
+            s->resyncs += f != s->top - 1;
+            s->top = f;
             return;
         }
     }
@@ -227,6 +233,8 @@ uam_status uam_exec_set_frames(uam_exec *x, uam_frame_state *s)
         return UAM_OK;
     if (!s->sites)
         return UAM_ERR_INVALID;
+    if (!s->top)
+        uam_frame_state_init(s);
     s->pc_mask = ~uam_isa_pc_state_bits(x->cpu->isa);
     s->cpu = x->cpu;
     uam_frame_pass *fp = uam_frame_pass_create(s->pc_mask, note_site, s->sites);

@@ -382,10 +382,10 @@ The stack is a best-effort history: code that leaves functions without returning
 frames behind until a return to an older frame drops them, tasks are not told apart, and at
 most 512 frames are kept per processor. The guard's verdict does not depend on it.
 
-Tracking costs one call out of translated code per call and per return: about 3.5 ns for a
-call with its return on the x86-64 JIT, which is a few percent on ordinary code and much more
-on code that does little but call tiny functions (a loop of six instructions around a call
-runs 3.4 times slower). Nothing when off. Its state (the frames and the set of return addresses)
+Tracking is a few instructions of translated code per call and per return (a push, and a
+compare and pop when the return matches the innermost frame; anything else calls out): about
+0.75 ns for a call with its return on the x86-64 JIT. A loop of six instructions around a
+call runs 1.5 times slower with it. Nothing when off. Its state (the frames and the set of return addresses)
 is machine state: `--fuzz-snapshot` and `--save-snapshot` carry it, and a snapshot taken
 without `--guard-returns`/`--backtrace` cannot be loaded with them, nor the reverse. In a
 program: `uam_machine_guard_returns`, `uam_machine_add_return_site`,

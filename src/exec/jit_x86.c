@@ -749,22 +749,47 @@ static void emit_cmplog(uam_jit *j, const uam_block *blk, const uam_insn *in)
 }
 
 /*
- * UAM_OP_FRAME (docs/uam-isa.md section 7.7): with cpu->frames NULL a load and an untaken
- * branch; with the exit's guard false another; otherwise jit_br_frame(frames, flags, a, c)
- * with the live temps saved around it, the operands loaded as for CMPLOG.
+ * UAM_OP_FRAME (docs/uam-isa.md section 7.7; uam_frame_call and uam_frame_ret in frames.c
+ * are the reference). Inline: a call pushes its frame at `top` unless the stack is full;
+ * a return whose target is the innermost frame's return address pops it (the sentinel
+ * below the first frame matches nothing, so an empty stack needs no test). Everything
+ * else - a full stack, a return that matches no innermost frame, an exception return -
+ * is jit_br_frame(frames, flags, a, c) with the live temps saved around it. The pass
+ * only exists while cpu->frames is set, so that is not tested. With the exit's guard
+ * false nothing happens.
  */
 static void emit_frame(uam_jit *j, const uam_block *blk, const uam_insn *in)
 {
     const unsigned W = in->width;
     const bool guarded = !uam_ref_is_imm(in->b);
-    size_t off2 = 0;
-    ld_mem(j, RAX, R14, CPU(frames));                      /* rax = cpu->frames */
-    rex(j, 1, 0, 0, 0); g8(j, 0x85); modrm_reg(j, RAX, RAX); /* test rax, rax */
-    size_t off = jcc_fwd(j, 0x84);                         /* jz skip */
+    size_t skip = 0, slow = 0, done = 0;
     if (guarded) {
         load_operand(j, RAX, blk, in->b, 1);
         g8(j, 0xA8); g8(j, 1);                             /* test al, 1 */
-        off2 = jcc_fwd(j, 0x84);
+        skip = jcc_fwd(j, 0x84);
+    }
+    const bool fast = !(in->flags & UAM_FRAME_ERET);
+    if (fast) {
+        ld_mem(j, RAX, R14, CPU(frames));                  /* rax = cpu->frames */
+        ld_mem(j, RCX, RAX, FRM(top));                     /* rcx = top */
+        if (in->flags & UAM_FRAME_CALL) {
+            rex(j, 1, 0, 0, 0); g8(j, 0x3B); modrm_mem(j, RCX, RAX, FRM(end));   /* cmp rcx, [end] */
+            slow = jcc_fwd(j, 0x83);                       /* jae: full */
+            mov_imm(j, RDX, blk->imm[uam_ref_index(in->a)] & uam_mask(W));
+            st_mem(j, RDX, RCX, (int32_t)offsetof(uam_frame, ret));
+            load_operand(j, RDX, blk, in->c, W);
+            st_mem(j, RDX, RCX, (int32_t)offsetof(uam_frame, callee));
+            g8(j, 0x48); g8(j, 0x83); g8(j, 0xC1); g8(j, (uint8_t)sizeof(uam_frame));   /* add rcx, 16 */
+        } else {
+            load_operand(j, RDX, blk, in->a, W);
+            rex(j, 1, 0, 0, 0); g8(j, 0x3B);               /* cmp rdx, [rcx - 16 + ret] */
+            modrm_mem(j, RDX, RCX, (int32_t)offsetof(uam_frame, ret) - (int32_t)sizeof(uam_frame));
+            slow = jcc_fwd(j, 0x85);                       /* jne: not the innermost frame's */
+            g8(j, 0x48); g8(j, 0x83); g8(j, 0xE9); g8(j, (uint8_t)sizeof(uam_frame));   /* sub rcx, 16 */
+        }
+        st_mem(j, RCX, RAX, FRM(top));
+        done = jmp_fwd(j);
+        patch(j, slow);
     }
     jit_ra_save(j, false);
     load_operand(j, RDX, blk, in->a, W);
@@ -773,9 +798,10 @@ static void emit_frame(uam_jit *j, const uam_block *blk, const uam_insn *in)
     ld_mem(j, RDI, R14, CPU(frames));
     call_bridge(j, jit_br_frame);
     jit_ra_save(j, true);
-    patch(j, off);
+    if (fast)
+        patch(j, done);
     if (guarded)
-        patch(j, off2);
+        patch(j, skip);
 }
 
 /* Store a block result into jc and jump to the epilogue. */

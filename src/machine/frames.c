@@ -37,8 +37,9 @@ static void save(void *ctx, uam_state_writer *w)
     const struct uam_machine_frames *f = ctx;
     uam_state_put_u32(w, f->on ? f->n : 0);
     for (uint32_t i = 0; f->on && i < f->n; i++) {
-        uam_state_put_u32(w, f->st[i]->n);
-        uam_state_put_bytes(w, f->st[i]->f, sizeof(uam_frame) * f->st[i]->n);
+        const uint32_t k = uam_frame_depth(f->st[i]);
+        uam_state_put_u32(w, k);
+        uam_state_put_bytes(w, f->st[i]->f + 1, sizeof(uam_frame) * k);
     }
     uam_ret_sites_save(f->sites, w);
 }
@@ -56,12 +57,12 @@ static void restore(void *ctx, uam_state_reader *r)
         }
         uam_state_get_bytes(r, tmp, sizeof(uam_frame) * k);
         if (f->on && i < f->n) {
-            memcpy(f->st[i]->f, tmp, sizeof(uam_frame) * k);
-            f->st[i]->n = k;
+            memcpy(f->st[i]->f + 1, tmp, sizeof(uam_frame) * k);
+            f->st[i]->top = f->st[i]->f + 1 + k;
         }
     }
     for (uint32_t i = n; f->on && i < f->n; i++)
-        f->st[i]->n = 0;
+        uam_frame_reset(f->st[i]);
     uam_ret_sites_load(f->sites, r);
 }
 
@@ -127,6 +128,7 @@ uam_status uam_machine_track_calls(uam_machine *m, bool on)
             st = UAM_ERR_NOMEM;
             break;
         }
+        uam_frame_state_init(f->st[i]);
         f->st[i]->sites = f->sites;
     }
     apply(f);
@@ -175,8 +177,8 @@ size_t uam_machine_backtrace(const uam_machine *m, unsigned cpu, uam_frame *out,
 {
     const uam_frame_state *s = uam_machine_frames(m, cpu);
     size_t k = 0;
-    for (uint32_t i = s ? s->n : 0; i-- > 0 && k < max;)
-        out[k++] = s->f[i];
+    for (uint32_t d = s ? uam_frame_depth(s) : 0; k < d && k < max; k++)
+        out[k] = *uam_frame_at(s, (uint32_t)k);
     return k;
 }
 
@@ -194,16 +196,16 @@ void uam_machine_backtrace_print(const uam_machine *m, unsigned cpu, FILE *out, 
                                  uam_symbolize_fn sym, void *ctx)
 {
     const uam_frame_state *s = uam_machine_frames(m, cpu);
-    unsigned k = 0;
-    for (uint32_t i = s ? s->n : 0; i-- > 0; k++) {
+    for (uint32_t k = 0, d = s ? uam_frame_depth(s) : 0; k < d; k++) {
+        const uam_frame *fr = uam_frame_at(s, k);
         char a[200], b[200];
-        if (s->f[i].ret == UAM_FRAME_MARK)
+        if (fr->ret == UAM_FRAME_MARK)
             fprintf(out, "%s#%u interrupted at %s\n", prefix, k,
-                    name_of(sym, ctx, s->f[i].callee, a, sizeof(a)));
+                    name_of(sym, ctx, fr->callee, a, sizeof(a)));
         else
             fprintf(out, "%s#%u %s called, returns to %s\n", prefix, k,
-                    name_of(sym, ctx, s->f[i].callee, a, sizeof(a)),
-                    name_of(sym, ctx, s->f[i].ret, b, sizeof(b)));
+                    name_of(sym, ctx, fr->callee, a, sizeof(a)),
+                    name_of(sym, ctx, fr->ret, b, sizeof(b)));
     }
 }
 

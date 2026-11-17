@@ -190,9 +190,8 @@ static void test_return_guard(const prog *p, backend bk)
     const uam_frame_state *fs = uam_machine_frames(&m, 0);
     CHECK(fs != NULL, "%s: no frame state", tag);
     if (fs) {
-        EQ64(fs->calls, 2, tag);
-        EQ64(fs->returns, 2, tag);
         EQ64(fs->bad_returns, 1, tag);
+        EQ64(fs->resyncs, 0, tag);
     }
     /* f's frame went with its return; g's is still there: its return matched nothing. */
     uam_frame bt[4];
@@ -281,6 +280,67 @@ static void test_frames_snapshot(const prog *p, backend bk)
     uam_machine_fini(&m);
 }
 
+/* Recursion deeper than the frame stack (the oldest frames are dropped, and returns to
+ * them are returns to known call sites), and calls and returns that are conditional:
+ * nothing is reported, and the stack is empty when the program is back in main. */
+static void test_frames_shapes(backend bk)
+{
+    {
+        prog p = { .name = "rv32-recursion", .isa = &uam_isa_rv32, .base = 0x1000, .phys = 0x1000 };
+        uint32_t *w = p.w;
+        w[0] = 0x00008137u;              /* 00  lui sp, 8 */
+        w[1] = RV_ADDI(10, 0, 700);      /* 04  li a0, 700 */
+        w[2] = rv_jal(1, 8);             /* 08  jal ra, f */
+        w[3] = rv_jal(0, 0);             /* 0c  j . */
+        w[4] = 0x00050E63u;              /* 10  f: beqz a0, 2c */
+        w[5] = RV_ADDI(2, 2, -4);        /* 14  addi sp, sp, -4 */
+        w[6] = 0x00112023u;              /* 18  sw ra, 0(sp) */
+        w[7] = RV_ADDI(10, 10, -1);      /* 1c  addi a0, a0, -1 */
+        w[8] = rv_jal(1, -16);           /* 20  jal ra, f */
+        w[9] = 0x00012083u;              /* 24  lw ra, 0(sp) */
+        w[10] = RV_ADDI(2, 2, 4);        /* 28  addi sp, sp, 4 */
+        w[11] = RV_RET;                  /* 2c  ret */
+        p.n = 12;
+        uam_machine m = { 0 };
+        machine_for(&m, &p, bk);
+        CHECK(uam_machine_guard_returns(&m, true, UAM_GUARD_STOP) == UAM_OK, "recursion: guard on");
+        CHECK(uam_exec_run(&m.exec, 20000) == UAM_STOP_INSN_LIMIT, "%s: recursion stopped the run", bk_name[bk]);
+        EQ64(m.cpu.pc, p.base + 0x0C, "recursion: back in main");
+        const uam_frame_state *fs = uam_machine_frames(&m, 0);
+        EQ64(uam_machine_guard_hits(&m), 0, "recursion: hits");
+        EQ64(fs->bad_returns, 0, "recursion: bad returns");
+        EQ64(uam_frame_depth(fs), 0, "recursion: frames left");
+        uam_machine_fini(&m);
+    }
+    {
+        prog p = { .name = "arm-conditional", .isa = &uam_isa_arm, .base = 0x1000, .phys = 0x1000 };
+        uint32_t *w = p.w;
+        w[0] = 0xE3500000u;              /* 00  cmp r0, #0 */
+        w[1] = 0x1B000002u;              /* 04  blne f (not taken) */
+        w[2] = 0x0B000001u;              /* 08  bleq f */
+        w[3] = 0xEAFFFFFEu;              /* 0c  b . */
+        w[4] = 0xE1A00000u;              /* 10  nop */
+        w[5] = 0x112FFF1Eu;              /* 14  f: bxne lr (not taken) */
+        w[6] = 0xE12FFF1Eu;              /* 18  bx lr */
+        p.n = 7;
+        uam_machine m = { 0 };
+        machine_for(&m, &p, bk);
+        CHECK(uam_machine_guard_returns(&m, true, UAM_GUARD_STOP) == UAM_OK, "conditional: guard on");
+        /* in f, before its return: exactly the taken call's frame */
+        for (int i = 0; i < 20 && m.cpu.pc != p.base + 0x18; i++)
+            uam_exec_run(&m.exec, 1);
+        uam_frame bt[4];
+        EQ64(uam_machine_backtrace(&m, 0, bt, 4), 1, "conditional: one frame in f");
+        EQ64(bt[0].ret, p.base + 0x0C, "conditional: the taken call's return address");
+        CHECK(uam_exec_run(&m.exec, 200) == UAM_STOP_INSN_LIMIT, "%s: conditional stopped the run", bk_name[bk]);
+        const uam_frame_state *fs = uam_machine_frames(&m, 0);
+        EQ64(uam_machine_guard_hits(&m), 0, "conditional: hits");
+        EQ64(fs->bad_returns + fs->resyncs, 0, "conditional: every return matched");
+        EQ64(uam_frame_depth(fs), 0, "conditional: frames left");
+        uam_machine_fini(&m);
+    }
+}
+
 /* ---- the frame state by itself --------------------------------------------- */
 
 static unsigned g_bad;
@@ -298,6 +358,7 @@ static void test_frame_state(void)
     uam_ret_sites *rs = uam_ret_sites_create();
     uam_frame_state *s = calloc(1, sizeof(*s));
     CHECK(rs && s, "alloc");
+    uam_frame_state_init(s);
     s->sites = rs;
     s->pc_mask = ~UINT64_C(1);
     s->guard = true;
@@ -314,12 +375,12 @@ static void test_frame_state(void)
     uam_frame_call(s, 0x1000, 0x5000);
     uam_frame_call(s, 0x1008, 0x6000);
     uam_frame_ret(s, 0x1009, 0x6010);     /* state bit set: masked */
-    EQ64(s->n, 1, "pop");
+    EQ64(uam_frame_depth(s), 1, "pop");
     /* a return to an older frame drops the ones above it */
     uam_frame_call(s, 0x1010, 0x7000);
     uam_frame_call(s, 0x1018, 0x8000);
     uam_frame_ret(s, 0x1000, 0x8010);
-    EQ64(s->n, 0, "resync");
+    EQ64(uam_frame_depth(s), 0, "resync");
     EQ64(s->resyncs, 1, "resync count");
     EQ64(g_bad, 0, "no report yet");
     /* a return to a call's return address with no frame: another task's, fine */
@@ -339,22 +400,23 @@ static void test_frame_state(void)
     uam_frame_mark(s, 0x5004);
     uam_frame_call(s, 0x1008, 0x6000);
     uam_frame_eret(s);
-    EQ64(s->n, 1, "eret pops to the marker");
+    EQ64(uam_frame_depth(s), 1, "eret pops to the marker");
     uam_frame_eret(s);
-    EQ64(s->n, 1, "eret without a marker pops nothing");
+    EQ64(uam_frame_depth(s), 1, "eret without a marker pops nothing");
     /* a hook that returned for the function it replaced */
     uam_frame_hook_return(s, 0x2000);
-    EQ64(s->n, 1, "a hook's jump elsewhere");
+    EQ64(uam_frame_depth(s), 1, "a hook's jump elsewhere");
     uam_frame_hook_return(s, 0x1001);
-    EQ64(s->n, 0, "a hook's return");
+    EQ64(uam_frame_depth(s), 0, "a hook's return");
 
     /* deeper than the stack: the innermost half stays */
     for (uint64_t i = 0; i < UAM_FRAME_DEPTH + 10; i++)
         uam_frame_call(s, 0x1000 + 8 * i, 0x5000);
-    CHECK(s->n > UAM_FRAME_DEPTH / 2 && s->n <= UAM_FRAME_DEPTH, "depth %u", s->n);
-    EQ64(s->f[s->n - 1].ret, 0x1000 + 8 * (UAM_FRAME_DEPTH + 9), "innermost kept");
+    CHECK(uam_frame_depth(s) > UAM_FRAME_DEPTH / 2 && uam_frame_depth(s) <= UAM_FRAME_DEPTH,
+          "depth %u", uam_frame_depth(s));
+    EQ64(uam_frame_at(s, 0)->ret, 0x1000 + 8 * (UAM_FRAME_DEPTH + 9), "innermost kept");
     uam_frame_reset(s);
-    EQ64(s->n, 0, "reset");
+    EQ64(uam_frame_depth(s), 0, "reset");
 
     free(s);
     uam_ret_sites_destroy(rs);
@@ -770,6 +832,8 @@ int main(void)
             test_frames_snapshot(&progs[i], (backend)bk);
         }
     }
+    for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++)
+        test_frames_shapes((backend)bk);
     test_frame_state();
     test_checked_watch();
     test_heap_blocks();

@@ -73,7 +73,7 @@ static uam_status frames_run(void *ctx, uam_block *blk)
                 && ((blk->imm[uam_ref_index(in->a)] & am) & fp->pc_mask) == ret)
                 continue;   /* reads its own address: not a call */
             op.flags = UAM_FRAME_CALL;
-            op.a = uam_block_imm(blk, ret);
+            op.a = uam_block_imm(blk, end);   /* as the return will present it: state bits kept */
             op.c = in->a;
             if (fp->site)
                 fp->site(fp->ctx, ret);

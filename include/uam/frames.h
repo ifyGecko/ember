@@ -44,7 +44,7 @@ struct uam_state_reader;
 #define UAM_FRAME_MARK UINT64_MAX
 
 typedef struct uam_frame {
-    uint64_t ret;      /* where the call returns to (pc state bits cleared) */
+    uint64_t ret;      /* where the call returns to (with the ISA's pc state bits) */
     uint64_t callee;   /* where it went */
 } uam_frame;
 
@@ -63,19 +63,42 @@ void           uam_ret_sites_load(uam_ret_sites *rs, struct uam_state_reader *r)
  * Called from inside the block; it may ask the executor to stop. */
 typedef void (*uam_bad_return_fn)(void *ctx, struct uam_cpu *cpu, uint64_t pc, uint64_t target);
 
+/*
+ * The stack lives in f[1..]: f[0] is a sentinel no return matches, so that native code
+ * can compare a return's target with the frame below `top` without asking whether there
+ * is one. A frame's `ret` is the return address as the returning instruction will
+ * present it, ISA state bits included (the pass takes it from the call's own pc); the
+ * set and every comparison off the fast path clear those bits (pc_mask).
+ */
 typedef struct uam_frame_state {
-    uint32_t           n;          /* frames in use: f[0] oldest, f[n - 1] innermost */
+    uam_frame         *top;        /* one past the innermost frame; f + 1: none */
+    uam_frame         *end;        /* f + 1 + UAM_FRAME_DEPTH */
     bool               guard;      /* report bad returns */
     uint64_t           pc_mask;    /* clears the ISA's pc state bits (set by uam_exec_set_frames) */
     uam_ret_sites     *sites;
     uam_bad_return_fn  bad_return;
     void              *bad_ctx;
     struct uam_cpu    *cpu;        /* the processor it is attached to */
-    uint64_t           calls, returns, resyncs, bad_returns;
-    uam_frame          f[UAM_FRAME_DEPTH];
+    uint64_t           resyncs;    /* returns that went to an older frame */
+    uint64_t           bad_returns;
+    uam_frame          f[UAM_FRAME_DEPTH + 1];
 } uam_frame_state;
 
-/* What UAM_OP_FRAME does (the interpreter and both JITs call these). */
+/* Make a zeroed state an empty stack (sites, guard and bad_return are the caller's). */
+void uam_frame_state_init(uam_frame_state *s);
+/* Frames in use, and the k-th from the innermost (k < depth). */
+static inline uint32_t uam_frame_depth(const uam_frame_state *s)
+{
+    return (uint32_t)(s->top - (s->f + 1));
+}
+static inline const uam_frame *uam_frame_at(const uam_frame_state *s, uint32_t k)
+{
+    return s->top - 1 - k;
+}
+
+/* What UAM_OP_FRAME does: the interpreter calls these; native code pushes a call's frame
+ * and pops the one a return matches itself, and calls them for the rest (a full stack, a
+ * return that does not match the innermost frame, an exception return). */
 void uam_frame_call(uam_frame_state *s, uint64_t ret, uint64_t callee);
 void uam_frame_ret(uam_frame_state *s, uint64_t target, uint64_t pc);
 void uam_frame_eret(uam_frame_state *s);

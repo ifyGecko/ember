@@ -401,14 +401,18 @@ if frames != NULL and b == 1:
 
 `b` is the exit's guard as a value (the immediate 1 for an unguarded exit), so a
 conditional call or return is reported only when taken. A call's `a` is an immediate: the
-end of the instruction the exit belongs to (the delay slot included), with the ISA's pc
-state bits cleared. Like `COV` and `CMPLOG`, `FRAME` reads and writes no register, memory or
+end of the instruction the exit belongs to (the delay slot included). Like `COV` and `CMPLOG`, `FRAME` reads and writes no register, memory or
 bus, cannot fault, does not count as an instruction and never changes what the guest does;
 with no state attached it does nothing. Lifters never emit it: the frame pass
 (`analysis/frames.c`) inserts one before each `EXIT` of kind `CALL`, `RET` or `EXC_RETURN`,
 except a call whose target is its own return address (the get-pc idiom). It stands before
 the exit, the fences that must directly precede the exit and any `COV` marker there (§8
 rule 12).
+
+A call's `a` keeps the ISA's pc state bits, as the return will present its target. Native
+code pushes a call's frame and pops the frame a return matches itself, and calls the
+functions above for the rest (a full stack, a return that matches no innermost frame, an
+exception return).
 
 What the tracker keeps, and the return guard built on it, is in `frames.h` and
 `docs/fuzzing.md` ("Memory oracles").

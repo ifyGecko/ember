@@ -755,22 +755,44 @@ static void emit_cmplog(uam_jit *j, const uam_block *blk, const uam_insn *in)
 }
 
 /*
- * UAM_OP_FRAME (docs/uam-isa.md section 7.7), as on x86-64 (jit_x86.c, emit_frame): with
- * cpu->frames NULL a load and an untaken cbz, with the exit's guard false another;
- * otherwise jit_br_frame(frames, flags, a, c) with the live temps saved around it.
+ * UAM_OP_FRAME (docs/uam-isa.md section 7.7), as on x86-64 (jit_x86.c, emit_frame): a
+ * call's push and a matching return's pop inline, jit_br_frame(frames, flags, a, c) for
+ * the rest, nothing with the exit's guard false. Scratch: x0-x3.
  */
 static void emit_frame(uam_jit *j, const uam_block *blk, const uam_insn *in)
 {
     const unsigned W = in->width;
     const bool guarded = !uam_ref_is_imm(in->b);
-    size_t off2 = 0;
-    ld64(j, X1, CPUR, CPU(frames));                        /* x1 = cpu->frames */
-    size_t off = j->n;
-    g32(j, 0xB4000000u | X1);                              /* cbz x1, skip */
+    size_t skip = 0, slow = 0, done = 0;
+    _Static_assert(sizeof(uam_frame) == 16 && offsetof(uam_frame, ret) == 0, "frame layout");
     if (guarded) {
         load_operand(j, X1, blk, in->b, 1);
-        off2 = j->n;
+        skip = j->n;
         g32(j, 0x36000000u | X1);                          /* tbz x1, #0, skip */
+    }
+    const bool fast = !(in->flags & UAM_FRAME_ERET);
+    if (fast) {
+        ld64(j, X0, CPUR, CPU(frames));                    /* x0 = cpu->frames */
+        ld64(j, X1, X0, FRM(top));                         /* x1 = top */
+        if (in->flags & UAM_FRAME_CALL) {
+            ld64(j, X2, X0, FRM(end));
+            g32(j, 0xEB00001Fu | X2 << 16 | X1 << 5);      /* cmp x1, x2 */
+            slow = bcond_fwd(j, 2);                        /* b.hs: full */
+            mov_imm(j, X2, blk->imm[uam_ref_index(in->a)] & uam_mask(W));
+            st64(j, X2, X1, 0);
+            load_operand(j, X2, blk, in->c, W);
+            st64(j, X2, X1, 8);
+            addsub_imm(j, false, true, false, X1, X1, 16, false);
+        } else {
+            load_operand(j, X2, blk, in->a, W);
+            g32(j, 0xF8400000u | 0x1F0u << 12 | X1 << 5 | X3);   /* ldur x3, [x1, #-16] */
+            g32(j, 0xEB00001Fu | X3 << 16 | X2 << 5);      /* cmp x2, x3 */
+            slow = bcond_fwd(j, 1);                        /* b.ne: not the innermost frame's */
+            addsub_imm(j, true, true, false, X1, X1, 16, false);
+        }
+        st64(j, X1, X0, FRM(top));
+        done = b_fwd(j);
+        patch(j, slow);
     }
     jit_ra_save(j, false);
     load_operand(j, X2, blk, in->a, W);
@@ -779,9 +801,10 @@ static void emit_frame(uam_jit *j, const uam_block *blk, const uam_insn *in)
     mov_imm(j, X1, in->flags);
     call_bridge(j, jit_br_frame);
     jit_ra_save(j, true);
-    patch(j, off);
+    if (fast)
+        patch(j, done);
     if (guarded)
-        patch(j, off2);
+        patch(j, skip);
 }
 
 /* Store a block result into jc (the caller then goes to the epilogue). */
