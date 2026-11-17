@@ -546,7 +546,14 @@ all are ISA-neutral and unused by ISAs that do not need them.
   through a mapping the ISA did not mark `fixed`, while `cpu->xlate_gen` is
   unchanged or, after it changes, while the block's pages still translate to the frames it
   was fetched from; the ISA bumps it with `uam_cpu_xlate_changed()` on TLB writes and
-  address-space switches. A load or store (not an `AMO` or `CAS`) that crosses a page boundary is translated at
+  address-space switches. An answer that came from the processor's registers alone (a TLB or
+  protection unit held in registers, translation switched off) is also marked `regs_only`;
+  one that read a table in guest memory is not. A snapshot restore puts memory back without
+  the guest having said that a mapping changed, so it drops every translation, unless the
+  machine was at that snapshot before, `xlate_gen` has not moved since and nothing was
+  translated through such a table: then translated code keeps its links and the JIT's data
+  cache its entries for loads, which is what a fuzz harness restoring before every input
+  wants. A load or store (not an `AMO` or `CAS`) that crosses a page boundary is translated at
   both ends (its pages may map to unrelated frames); unless they turn out physically
   contiguous the executor moves its bytes one at a time, in the access's byte order, and
   a translation fault on the second page reports that page's first byte as `tval`.

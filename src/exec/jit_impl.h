@@ -108,6 +108,7 @@ typedef struct uam_jit_ctx {
     uint32_t                chain_left;  /* chained jumps still allowed */
     uint32_t                chain_budget;/* hops taken = chain_budget - chain_left */
     uint32_t                dgen;        /* bus->direct_gen at entry */
+    uint32_t                wgen;        /* bus->write_gen at entry */
     unsigned                priv;        /* cpu->priv at entry */
     uam_sched              *sched;
     uint64_t                next_when;   /* next timer at entry */

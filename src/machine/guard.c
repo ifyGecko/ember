@@ -275,6 +275,8 @@ static bool split(uam_machine *m, guard *g, char *err, size_t errlen)
                         (unsigned long long)va);
                 return false;
             }
+            if (!xl.fixed && !xl.regs_only)
+                cpu->xlate_tables = true;
             pa = xl.paddr;
         }
         piece *last = g->n_pieces ? &g->pieces[g->n_pieces - 1] : NULL;

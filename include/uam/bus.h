@@ -161,6 +161,9 @@ typedef struct uam_bus {
     uint32_t           n_watches, cap_watches;
     int                next_watch_id;
     uint32_t           direct_gen;         /* bumped when uam_bus_page_host answers may change */
+    uint32_t           write_gen;          /* bumped when only its answers for writes may have
+                                            * been withdrawn (uam_bus_dirty_reset): what it
+                                            * said for reads still holds */
     uint32_t           code_gen;           /* bumped when the generation of a page holding code,
                                             * or the map, may have changed: while it holds,
                                             * translations need not recheck their pages */

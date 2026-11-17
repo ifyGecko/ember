@@ -73,8 +73,10 @@ static bool block_still_mapped(void *ctx, const uam_block *blk)
     for (uint32_t i = 0; i < blk->n_pages; i++) {
         uint64_t v = i == 0 ? va : (va & UAM_PAGE_MASK) + UAM_PAGE_SIZE;
         uam_xlate xl = { 0 };
-        if (cpu->isa->translate(cpu, v, UAM_XLATE_FETCH, &xl) != UAM_OK
-            || (xl.paddr & UAM_PAGE_MASK) != blk->page[i])
+        uam_status st = cpu->isa->translate(cpu, v, UAM_XLATE_FETCH, &xl);
+        if (!xl.fixed && !xl.regs_only)
+            cpu->xlate_tables = true;
+        if (st != UAM_OK || (xl.paddr & UAM_PAGE_MASK) != blk->page[i])
             return false;
     }
     return true;
@@ -145,6 +147,7 @@ bool uam_exec_enable_jit(uam_exec *x)
     if (x->use_jit) {
         uam_cpu_dtlb_flush(x->cpu);
         x->seen_dgen = x->cpu->bus->direct_gen;
+        x->seen_wgen = x->cpu->bus->write_gen;
         x->seen_xgen = x->cpu->xlate_gen;
     }
     uam_tcache_flush(&x->tc);   /* recompile everything through the new backend */
@@ -462,6 +465,8 @@ static uam_status fetch_xlate(lift_core *lc, uint64_t addr, uint64_t *pa)
     }
     uam_xlate xl = { 0 };
     uam_status st = cpu->isa->translate(cpu, addr, UAM_XLATE_FETCH, &xl);
+    if (!xl.fixed && !xl.regs_only)
+        cpu->xlate_tables = true;
     if (st != UAM_OK) {
         if (lc->fault_st == UAM_OK) {
             lc->fault_st = st;
@@ -577,6 +582,7 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
     if (x->jit && cpu->bus->direct_gen != x->seen_dgen) {
         uam_cpu_dtlb_flush(cpu);
         x->seen_dgen = cpu->bus->direct_gen;
+        x->seen_wgen = cpu->bus->write_gen;
     }
 
     uam_print_ctx pc_ctx = print_ctx(isa);
@@ -853,7 +859,13 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         if (x->jit && (cpu->bus->direct_gen != x->seen_dgen || cpu->xlate_gen != x->seen_xgen)) {
             uam_cpu_dtlb_flush(cpu);
             x->seen_dgen = cpu->bus->direct_gen;
+            x->seen_wgen = cpu->bus->write_gen;
             x->seen_xgen = cpu->xlate_gen;
+        } else if (x->jit && cpu->bus->write_gen != x->seen_wgen) {
+            /* Direct write access was withdrawn (dirty tracking starts over: a snapshot
+             * taken or restored); what is mapped where did not change, loads keep theirs. */
+            uam_cpu_dtlb_flush_writes(cpu);
+            x->seen_wgen = cpu->bus->write_gen;
         }
 
         /* 1. Time: fire due timers. Host input is polled periodically. A timer

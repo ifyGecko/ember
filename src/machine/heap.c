@@ -544,6 +544,8 @@ static bool split(uam_heap *h, bool phys, char *err, size_t errlen)
                         (unsigned long long)va);
                 return false;
             }
+            if (!xl.fixed && !xl.regs_only)
+                cpu->xlate_tables = true;
             pa = xl.paddr;
         }
         piece *last = h->n_pieces ? &h->pieces[h->n_pieces - 1] : NULL;

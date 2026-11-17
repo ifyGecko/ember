@@ -171,6 +171,7 @@ typedef struct ppc_tlb_entry {
     uint32_t ppage;         /* real address >> 12 (36-bit real addresses fit) */
     bool     read_ok;       /* a load may use it */
     bool     write_ok;      /* a store may use it (permitted, C already set) */
+    bool     regs;          /* from registers (a BAT, a Book E TLB entry), not the page table */
 } ppc_tlb_entry;
 #define PPC_TLB_NONE 0xFFFFFFFFu
 

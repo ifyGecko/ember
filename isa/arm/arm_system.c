@@ -280,8 +280,10 @@ static uam_status arm_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind kin
     const arm_state *a = arm_st(cpu);
     uint32_t va = (uint32_t)vaddr;
     out->fixed = false;   /* the mapping changes with SCTLR.M and the tables */
+    out->regs_only = false;
     if (!(a->s.sctlr & SCTLR_M)) {
         out->paddr = va;
+        out->regs_only = true;   /* no table read; a write to SCTLR says the mapping changed */
         return UAM_OK;
     }
     bool debug = kind == UAM_XLATE_DEBUG;

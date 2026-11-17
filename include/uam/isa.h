@@ -99,6 +99,14 @@ typedef struct uam_xlate {
      * e.g. MIPS kseg0/kseg1. Code translated through a non-fixed mapping is
      * dropped when the ISA calls uam_cpu_xlate_changed(). */
     bool     fixed;
+    /* The answer came from the processor's registers alone (a TLB or protection unit held
+     * in registers, translation switched off), with no table in guest memory read on the
+     * way to it or to the cached entry it came from: it holds until the next
+     * uam_cpu_xlate_changed(). Leave it false for a page-table walk. A snapshot restore
+     * keeps translated code's links and the data-TLB when nothing else was translated
+     * (cpu->xlate_tables); memory going back to the snapshot's contents can then change
+     * no cached translation. */
+    bool     regs_only;
 } uam_xlate;
 
 /* Context handed to lift(): where to emit, and how to read code. */

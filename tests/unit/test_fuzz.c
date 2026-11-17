@@ -1531,6 +1531,133 @@ static void test_campaign(const target *t, backend bk)
           t->name, bk_name[bk], again[0], again[1]);
 }
 
+/* ---- what a restore keeps of translations ---------------------------------- */
+
+/* A restore before every input keeps the processor's translations (translated code's
+ * links, the data-TLB) when nothing can have changed them: xlate_gen stays where it was,
+ * and the runs are what they were. */
+static void test_restore_keeps(const target *t)
+{
+    uam_machine m;
+    machine_for(&m, t, BK_JIT);
+    uam_fuzz *f = harness_for(&m, t, &t->end, 1, UAM_FUZZ_EXC_ALL);
+    uam_fuzz_result r, first;
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "%s: keeps: boot", t->name);
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &first) == UAM_OK, "run");
+    const uint32_t gen = m.cpu.xlate_gen;
+    CHECK(!m.cpu.xlate_tables, "%s: nothing translated through tables in memory", t->name);
+    uint64_t chained = 0;
+    for (int k = 0; k < 4; k++) {
+        const uint64_t c0 = m.exec.stats.blocks_chained;
+        CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) == UAM_OK, "run");
+        CHECK(r.verdict == first.verdict && r.insns == first.insns && r.pc == first.pc,
+              "%s: run %d is the first run again", t->name, k);
+        if (k && t->end != t->begin)
+            CHECK(m.exec.stats.blocks_chained - c0 >= chained, "%s: links survive the restore "
+                  "(%llu blocks chained, %llu the run before)", t->name,
+                  (unsigned long long)(m.exec.stats.blocks_chained - c0), (unsigned long long)chained);
+        chained = m.exec.stats.blocks_chained - c0;
+    }
+    EQ64(m.cpu.xlate_gen, gen, "xlate_gen unmoved by restores");
+    /* a crash in between (an exception: the privilege and the registers move) and the
+     * same input again */
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"B", 1, &r) == UAM_OK
+          && r.verdict == UAM_FUZZ_CRASH_FAULT, "%s: keeps: the fault", t->name);
+    CHECK(uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r) == UAM_OK
+          && r.verdict == first.verdict && r.insns == first.insns, "%s: the same after a crash",
+          t->name);
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+}
+
+/*
+ * Page tables in guest memory: ARMv7 with the MMU on, one section table. Virtual
+ * 0x00100000 maps to physical 0x00100000 (which holds 0xAA); an input 'R' rewrites that
+ * entry to physical 0x00200000 (0xBB) with no TLB operation and reads through it. The
+ * restore puts the table back, so the next input must read 0xAA again: a translation
+ * cached from the rewritten table (the data-TLB's, a linked block's) must not survive it.
+ * Reading 0xBB ends at the crash pc.
+ */
+static void test_restore_tables(backend bk)
+{
+    uint32_t w[64];
+    unsigned i = 0;
+    w[i++] = 0xE3A00801u;                         /* mov r0, #0x10000 (the table) */
+    w[i++] = 0xE3A01B03u;                         /* mov r1, #0xC00 (AP = 3) */
+    w[i++] = 0xE3811002u;                         /* orr r1, r1, #2 (a section) */
+    w[i++] = 0xE5801000u;                         /* str r1, [r0]: 0x000xxxxx -> 0 */
+    w[i++] = 0xE3812601u;                         /* orr r2, r1, #0x100000 */
+    w[i++] = 0xE5802004u;                         /* str r2, [r0, #4]: 0x001xxxxx -> 0x00100000 */
+    w[i++] = 0xE3A03601u;                         /* mov r3, #0x100000 */
+    w[i++] = 0xE3A020AAu;                         /* mov r2, #0xAA */
+    w[i++] = 0xE5C32000u;                         /* strb r2, [r3] */
+    w[i++] = 0xE3A03602u;                         /* mov r3, #0x200000 */
+    w[i++] = 0xE3A020BBu;                         /* mov r2, #0xBB */
+    w[i++] = 0xE5C32000u;                         /* strb r2, [r3] */
+    w[i++] = 0xE3E02000u;                         /* mvn r2, #0 */
+    w[i++] = 0xEE032F10u;                         /* mcr p15, 0, r2, c3, c0, 0 (DACR: managers) */
+    w[i++] = 0xE3A02000u;                         /* mov r2, #0 */
+    w[i++] = 0xEE022F50u;                         /* mcr p15, 0, r2, c2, c0, 2 (TTBCR) */
+    w[i++] = 0xEE020F10u;                         /* mcr p15, 0, r0, c2, c0, 0 (TTBR0) */
+    w[i++] = 0xEE112F10u;                         /* mrc p15, 0, r2, c1, c0, 0 */
+    w[i++] = 0xE3822001u;                         /* orr r2, r2, #1 */
+    w[i++] = 0xEE012F10u;                         /* mcr p15, 0, r2, c1, c0, 0 (SCTLR.M) */
+    const unsigned b = i;
+    w[i++] = 0xE3A03902u;                         /* BEGIN: mov r3, #0x8000 */
+    w[i++] = 0xE5D37000u;                         /* ldrb r7, [r3] */
+    w[i++] = 0xE3570052u;                         /* cmp r7, #'R' */
+    w[i] = ARM_B(0x1A000000u, i, i + 6); i++;     /* bne read */
+    w[i++] = 0xE3A00801u;                         /* mov r0, #0x10000 */
+    w[i++] = 0xE3A01B03u;                         /* mov r1, #0xC00 */
+    w[i++] = 0xE3811002u;                         /* orr r1, r1, #2 */
+    w[i++] = 0xE3811602u;                         /* orr r1, r1, #0x200000 */
+    w[i++] = 0xE5801004u;                         /* str r1, [r0, #4]: 0x001xxxxx -> 0x00200000 */
+    w[i++] = 0xE3A03601u;                         /* read: mov r3, #0x100000 */
+    w[i++] = 0xE5D30000u;                         /* ldrb r0, [r3] */
+    w[i++] = 0xE35000AAu;                         /* cmp r0, #0xAA */
+    w[i] = ARM_B(0x1A000000u, i, i + 2); i++;     /* bne crash */
+    const unsigned end = i;
+    w[i] = ARM_B(0xEA000000u, i, b); i++;         /* END: b BEGIN */
+    const uint64_t crash = 0x1000 + 4 * i;
+    w[i++] = 0xEAFFFFFEu;                         /* crash: b . */
+
+    uam_machine m;
+    CHECK(uam_machine_init(&m, &uam_isa_arm) == UAM_OK, "machine init");
+    CHECK(uam_bus_map_ram(&m.bus, "ram", 0, 4 << 20) == UAM_OK, "map ram");
+    for (unsigned k = 0; k < i; k++) {
+        const uint8_t bytes[4] = { (uint8_t)w[k], (uint8_t)(w[k] >> 8), (uint8_t)(w[k] >> 16),
+                                   (uint8_t)(w[k] >> 24) };
+        uam_bus_load_bytes(&m.bus, 0x1000 + 4 * k, bytes, 4);
+    }
+    uam_machine_reset(&m, 0x1000);
+    if (bk != BK_INTERP)
+        CHECK(uam_exec_enable_jit(&m.exec), "jit");
+    m.exec.chain = bk == BK_JIT;
+    const uint64_t end_pc = 0x1000 + 4 * end;
+    uam_fuzz_config cfg = { .begin_pc = 0x1000 + 4 * b, .end_pcs = &end_pc, .n_end_pcs = 1,
+                            .iter_insns = 20000, .boot_insns = 100000, .crash_exc = UAM_FUZZ_EXC_ALL,
+                            .crash_pcs = &crash, .n_crash_pcs = 1, .map_size = MAP_SIZE };
+    char err[256];
+    uam_fuzz *f = uam_fuzz_create(&m, &cfg, err, sizeof(err));
+    CHECK(f != NULL, "tables: create: %s", err);
+    CHECK(uam_fuzz_set_block_coverage(f) == UAM_OK, "coverage");
+    CHECK(uam_fuzz_select_route(f, "mem:0x8000,len=0x7ffc,max=64", err, sizeof(err)) == UAM_OK,
+          "route: %s", err);
+    uam_fuzz_result r;
+    CHECK(uam_fuzz_boot(f, &r) == UAM_OK, "tables/%s: boot (stop %d at 0x%llx)", bk_name[bk],
+          (int)r.stop, (unsigned long long)m.cpu.pc);
+    static const char seq[] = "xRxxRRx";
+    for (unsigned k = 0; seq[k]; k++) {
+        CHECK(uam_fuzz_run_one(f, (const uint8_t *)&seq[k], 1, &r) == UAM_OK, "run");
+        const uam_fuzz_verdict want = seq[k] == 'R' ? UAM_FUZZ_CRASH_ORACLE : UAM_FUZZ_OK;
+        CHECK(r.verdict == want, "tables/%s: input %u ('%c') reads through the %s table "
+              "(verdict %d)", bk_name[bk], k, seq[k], seq[k] == 'R' ? "rewritten" : "snapshot's",
+              (int)r.verdict);
+    }
+    uam_fuzz_destroy(f);
+    uam_machine_fini(&m);
+}
+
 int main(void)
 {
     test_misc();
@@ -1559,6 +1686,10 @@ int main(void)
         test_begin_skip(&ts[i]);
         test_begins(&ts[i]);
     }
+    for (size_t i = 0; i < UAM_ARRAY_LEN(ts); i++)
+        test_restore_keeps(&ts[i]);
+    for (int bk = BK_INTERP; bk <= BK_JIT_NOCHAIN; bk++)
+        test_restore_tables((backend)bk);
     printf("test_fuzz: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

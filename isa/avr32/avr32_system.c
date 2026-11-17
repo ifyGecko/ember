@@ -494,6 +494,7 @@ static uam_status avr32_translate(uam_cpu *cpu, uint64_t vaddr, uam_xlate_kind k
     out->paddr = va;
     out->fault = 0;
     out->fixed = false;
+    out->regs_only = true;   /* the MPU's and the TLB's entries are registers */
     if (!is_b(s)) {
         if (!s->cfg.mmu_entries) {
             out->fixed = true;

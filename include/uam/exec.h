@@ -257,6 +257,10 @@ typedef struct uam_exec {
     bool             chain;           /* JIT: jump straight from block to block (default on) */
     struct uam_jit  *jit;             /* native backend, or NULL (interpreter only) */
     uint32_t         seen_dgen, seen_xgen;  /* dtlb is flushed when these fall behind */
+    uint32_t         seen_wgen;             /* ... its entries for stores when this one does */
+    /* cpu->xlate_gen when the machine's snapshot baseline was set: a restore to that
+     * baseline that finds it unchanged keeps the processor's translations (snapshot.c). */
+    uint32_t         base_xgen;
     unsigned         trace;           /* enum uam_trace_flag */
     FILE            *trace_out;
     uint64_t         trace_lo, trace_hi;  /* UAM_TRACE_BLOCKS: only pcs in [lo, hi) (hi=0: all) */

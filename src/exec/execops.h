@@ -49,6 +49,8 @@ static inline uam_status uam_execops_xlate(uam_cpu *cpu, uint64_t vaddr, uam_xla
     }
     uam_xlate x = { 0 };
     uam_status st = cpu->isa->translate(cpu, vaddr, kind, &x);
+    if (!x.fixed && !x.regs_only)
+        cpu->xlate_tables = true;
     *paddr = x.paddr;
     *xfault = x.fault;
     return st;

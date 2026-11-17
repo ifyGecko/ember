@@ -206,6 +206,12 @@ typedef struct uam_cpu {
     unsigned              priv;            /* current privilege level (ISA-defined); translated
                                             * code is only reused at the same level */
     uint32_t              xlate_gen;       /* bumped by uam_cpu_xlate_changed() */
+    /* isa->translate has answered from tables in guest memory (neither uam_xlate.fixed
+     * nor .regs_only) since the last uam_cpu_xlate_changed: translations that memory
+     * going back to other contents would change may be cached. While it is false, what
+     * is cached holds until the next uam_cpu_xlate_changed, and a snapshot restore that
+     * finds xlate_gen unmoved keeps it (snapshot.c). */
+    bool                  xlate_tables;
     unsigned              hartid;
     uam_reservation       resv;
     struct uam_bus       *bus;
@@ -256,6 +262,14 @@ static inline void uam_cpu_dtlb_flush(uam_cpu *cpu)
         cpu->dtlb_rt[i] = cpu->dtlb_wt[i] = UAM_DTLB_NONE;
 }
 
+/* The entries for stores only: for a change that withdraws direct write access and
+ * leaves what is mapped where as it was (bus->write_gen). */
+static inline void uam_cpu_dtlb_flush_writes(uam_cpu *cpu)
+{
+    for (unsigned i = 0; i < UAM_DTLB_SIZE; i++)
+        cpu->dtlb_wt[i] = UAM_DTLB_NONE;
+}
+
 /* Ask the hart to leave its current block at the next instruction boundary
  * (and stop the JIT from chaining into another block). The run loop clears it
  * before every block it dispatches. Call it on anything the run loop must act
@@ -273,6 +287,7 @@ static inline void uam_cpu_request_exit(uam_cpu *cpu)
 static inline void uam_cpu_xlate_changed(uam_cpu *cpu)
 {
     cpu->xlate_gen++;
+    cpu->xlate_tables = false;   /* nothing translated before this is still cached */
     uam_cpu_dtlb_flush(cpu);
     uam_cpu_request_exit(cpu);
 }

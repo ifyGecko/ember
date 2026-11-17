@@ -376,9 +376,10 @@ static bool save_components(uam_machine *m, uam_state_writer *w, dev_table *devs
 /* Make s the machine's baseline: memory now equals it, track writes from here. */
 static void set_baseline(uam_machine *m, const uam_snapshot *s)
 {
-    uam_bus_dirty_reset(&m->bus);
+    uam_bus_dirty_reset(&m->bus);   /* bus->write_gen moves: cached write access to the
+                                     * now-clean pages goes before the next block runs */
     for (uint32_t i = 0; i <= m->n_aps; i++)
-        uam_cpu_dtlb_flush(uam_machine_cpu(m, i));   /* cached write access to now-clean pages */
+        uam_machine_exec(m, i)->base_xgen = uam_machine_cpu(m, i)->xlate_gen;
     m->snap_base = s->id;
 }
 
@@ -705,6 +706,7 @@ uam_status uam_snapshot_restore(uam_machine *m, const uam_snapshot *s)
     }
     /* Memory first, so that device and extra-state restore callbacks see the
      * restored memory (to resync a flash file, re-read descriptors, ...). */
+    const bool same_base = m->snap_base == s->id;
     restore_memory(m, s);
     devs.cursor = 0;
     bool ok = restore_components(m, s, &devs);
@@ -712,15 +714,25 @@ uam_status uam_snapshot_restore(uam_machine *m, const uam_snapshot *s)
         m->snap_base = 0;
         return UAM_ERR_INVALID;
     }
-    set_baseline(m, s);
     /* A stop requested after the snapshot (the firmware finishing, SIGINT)
      * belongs to the run that is being undone: the restored machine runs. */
     m->exec.stop_request = false;
     m->exec.stop_status = 0;
-    /* TLB contents and privilege may differ: drop mapped translations and
-     * stop any block in flight at the next boundary. */
-    for (uint32_t i = 0; i <= m->n_aps; i++)
-        uam_cpu_xlate_changed(uam_machine_cpu(m, i));
+    /* TLB contents and page tables may differ from what translations were made with: drop
+     * them, and stop any block in flight at the next boundary. Not when they cannot
+     * differ: this machine was at this snapshot before, the processor's translation state
+     * has not moved since (every change bumps xlate_gen) and nothing it translated came
+     * from tables in guest memory (xlate_tables), which is going back to other contents. Then
+     * translated code keeps its links and the data-TLB its entries for loads, which a
+     * fuzz harness restoring before every input would otherwise rebuild each time. */
+    for (uint32_t i = 0; i <= m->n_aps; i++) {
+        uam_cpu *cpu = uam_machine_cpu(m, i);
+        if (same_base && !cpu->xlate_tables && cpu->xlate_gen == uam_machine_exec(m, i)->base_xgen)
+            uam_cpu_request_exit(cpu);
+        else
+            uam_cpu_xlate_changed(cpu);
+    }
+    set_baseline(m, s);
     /* Restored from a PC hook in the middle of a slice: the scheduler resumes
      * from the restored slice state rather than the one in flight. */
     if (m->n_aps && m->exec.running)

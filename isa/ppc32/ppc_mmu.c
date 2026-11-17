@@ -117,8 +117,10 @@ static uam_status xlate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store, bool 
 
     /* The mapping depends on MSR, BATs, segments and SDR1, which all may change. */
     out->fixed = false;
+    out->regs_only = false;
     if (!(msr & (fetch ? MSR_IR : MSR_DR))) {
         out->paddr = ea;
+        out->regs_only = true;
         return UAM_OK;
     }
 
@@ -127,6 +129,7 @@ static uam_status xlate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store, bool 
         te = &(fetch ? s->itlb : s->dtlb)[tlb_set(ea >> 12)];
         if (te->vpage == ea >> 12 && (!store || te->write_ok)) {
             out->paddr = (te->ppage << 12) | (ea & 0xFFF);
+            out->regs_only = te->regs;
             return UAM_OK;
         }
     }
@@ -139,9 +142,10 @@ static uam_status xlate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store, bool 
             return UAM_ERR_XLATE;
         }
         out->paddr = pa;
+        out->regs_only = true;
         if (te)
             *te = (ppc_tlb_entry){ .vpage = ea >> 12, .ppage = pa >> 12, .read_ok = true,
-                                   .write_ok = acc == 2 };
+                                   .write_ok = acc == 2, .regs = true };
         return UAM_OK;
     }
 

@@ -791,6 +791,7 @@ static uam_status xt_translate(uam_cpu *cpu, uint64_t va, uam_xlate_kind kind, u
     out->paddr = va & 0xFFFFFFFFu;
     out->fault = 0;
     out->fixed = !(s->cfg.options & UAM_XT_OPT_REGION_PROT);
+    out->regs_only = true;   /* the region attributes are registers */
     if (out->fixed || kind == UAM_XLATE_DEBUG)
         return UAM_OK;
     unsigned region = (uint32_t)va >> 29;

@@ -342,6 +342,7 @@ uam_status ppc_booke_translate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store
     const unsigned ts = (msr & (fetch ? MSR_IS : MSR_DS)) ? 1 : 0;
 
     out->fixed = false;
+    out->regs_only = true;   /* the TLB arrays are registers */
     ppc_tlb_entry *te = NULL;
     if (!debug) {
         te = &(fetch ? s->itlb : s->dtlb)[(ea >> 12 ^ ea >> 20) & (PPC_TLB_SETS - 1)];
@@ -370,6 +371,7 @@ uam_status ppc_booke_translate(uam_cpu *cpu, uint32_t ea, bool fetch, bool store
             .vpage = ea >> 12, .ppage = (uint32_t)(out->paddr >> 12),
             .read_ok = fetch || (e->perm & (pr ? UAM_PPC_TLB_UR : UAM_PPC_TLB_SR)),
             .write_ok = !fetch && (e->perm & (pr ? UAM_PPC_TLB_UW : UAM_PPC_TLB_SW)),
+            .regs = true,
         };
     return UAM_OK;
 }

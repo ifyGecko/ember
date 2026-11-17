@@ -952,7 +952,7 @@ void uam_bus_dirty_reset(uam_bus *bus)
         }
     }
     bus->track_dirty = true;
-    bus->direct_gen++;   /* clean pages must lose their direct write access */
+    bus->write_gen++;    /* clean pages must lose their direct write access; reads keep theirs */
 }
 
 void uam_bus_mark_dirty(uam_bus *bus, uint64_t addr, uint64_t len)

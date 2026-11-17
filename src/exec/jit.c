@@ -46,7 +46,8 @@ void     uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *t, uam_jit_chai
  * requests an exit too (the machine's scheduler kick). */
 static void chain_check(uam_jit_ctx *jc)
 {
-    if (jc->cpu->bus->direct_gen != jc->dgen || jc->cpu->priv != jc->priv
+    if (jc->cpu->bus->direct_gen != jc->dgen || jc->cpu->bus->write_gen != jc->wgen
+        || jc->cpu->priv != jc->priv
         || uam_sched_next(jc->sched) != jc->next_when) {
         jc->chain_budget -= jc->chain_left;   /* keeps the hop count */
         jc->chain_left = 0;
@@ -1301,6 +1302,7 @@ void uam_jit_run(uam_jit *j, const uam_block *blk, uint64_t *temps, uam_jit_chai
     jc->chain_left = jc->chain_budget = chain->budget;
     jc->link_slot = NULL;
     jc->dgen = cpu->bus->direct_gen;
+    jc->wgen = cpu->bus->write_gen;
     jc->priv = cpu->priv;
     jc->next_when = uam_sched_next(x->sched);
     /* Where native code stops at an IMARK: at once after an exit request, else at the

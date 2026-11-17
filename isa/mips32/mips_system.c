@@ -326,6 +326,7 @@ static uam_status tlb_translate(const mips_state *s, uint32_t va, uam_xlate_kind
     uint64_t pfn_base = (uint64_t)((lo >> 6) & 0xFFFFFu) << 12;
     out->paddr = (pfn_base & ~(uint64_t)page_mask) | (va & page_mask);
     out->fixed = false;
+    out->regs_only = true;   /* the TLB is CP0 state */
     return UAM_OK;
 }
 
