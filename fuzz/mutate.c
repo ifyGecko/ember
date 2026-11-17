@@ -661,6 +661,33 @@ static bool splice(uam_mutator *m, mbuf *x)
 
 size_t uam_mutator_max_size(const uam_mutator *m) { return m->max_size; }
 
+static unsigned log2_of(size_t v)
+{
+    unsigned n = 0;
+    while (v >>= 1)
+        n++;
+    return n;
+}
+
+/*
+ * Which way a DELETE_CHUNK goes. Deleting is as likely as growing by weight, but a short
+ * input has little to delete and nothing long to clone, so seeds of a few bytes would
+ * mostly shrink and seldom leave their size class however large max_size is. Where the
+ * input stands between one byte and max_size, on a log scale, decides: at one byte every
+ * second delete becomes an INSERT_BLOCK, at max_size none, in between in proportion.
+ * Long inputs shrink as before; only the lean of short ones towards shorter goes. With
+ * INSERT_BLOCK's weight at 0 a delete is always a delete.
+ */
+static unsigned balance(uam_mutator *m, const mbuf *x, unsigned op)
+{
+    if (op != UAM_MUT_DELETE_CHUNK || !m->weight[UAM_MUT_INSERT_BLOCK] || x->len >= x->cap)
+        return op;
+    const unsigned top = log2_of(x->cap);
+    if (!top || below(m, 2 * top) >= top - log2_of(x->len ? x->len : 1))
+        return op;
+    return UAM_MUT_INSERT_BLOCK;
+}
+
 uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
                             size_t *out_len, uint64_t *ops)
 {
@@ -680,6 +707,7 @@ uint8_t *uam_mutator_mutate(uam_mutator *m, const uint8_t *src, size_t len,
             && op != UAM_MUT_CLONE_CHUNK && op != UAM_MUT_RANDOM_BYTE
             && op != UAM_MUT_INSERT_BLOCK && op != UAM_MUT_RESIZE)
             op = m->n_tokens ? UAM_MUT_DICT_INSERT : UAM_MUT_INSERT_BLOCK;
+        op = balance(m, &x, op);
         used |= 1ull << op;
         apply(m, &x, op);
     }

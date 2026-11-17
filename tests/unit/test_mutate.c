@@ -298,20 +298,45 @@ static void test_growth(void)
     /* Single mutations of a 16-byte seed: most stay small (cheap to run), some grow far. */
     uint8_t seed[16];
     memset(seed, 'A', sizeof(seed));
-    size_t bigger = 0, over256 = 0, over2k = 0;
+    size_t bigger = 0, smaller = 0, over256 = 0, over2k = 0;
     enum { N = 20000 };
     for (int i = 0; i < N; i++) {
         size_t n;
         uam_mutator_mutate(m, seed, sizeof(seed), &n, NULL);
         bigger += n > sizeof(seed);
+        smaller += n < sizeof(seed);
         over256 += n > 256;
         over2k += n > 2000;
     }
-    printf("test_mutate: one mutation of 16 bytes: %.0f%% larger, %.1f%% > 256, %.1f%% > 2000\n",
-           100.0 * (double)bigger / N, 100.0 * (double)over256 / N, 100.0 * (double)over2k / N);
-    CHECK(bigger > N / 3, "a third of the mutations grow the seed (%zu of %d)", bigger, N);
+    printf("test_mutate: one mutation of 16 bytes: %.0f%% larger, %.0f%% smaller, %.1f%% > 256, "
+           "%.1f%% > 2000\n", 100.0 * (double)bigger / N, 100.0 * (double)smaller / N,
+           100.0 * (double)over256 / N, 100.0 * (double)over2k / N);
+    CHECK(bigger > N * 45 / 100, "with room to grow, more mutations grow a short seed than "
+          "shrink it (%zu of %d grow)", bigger, N);
+    CHECK(smaller > N / 10 && smaller < bigger, "and some still shrink it (%zu of %d)", smaller, N);
     CHECK(over2k > N / 50 && over256 < N * 3 / 4,
           "some mutations reach thousands of bytes, most stay small (%zu, %zu)", over2k, over256);
+    /* An input at max_size: nothing pushes it further; it shrinks or stays. */
+    static uint8_t full[MAX];
+    memset(full, 'B', sizeof(full));
+    size_t shrunk = 0;
+    for (int i = 0; i < 2000; i++) {
+        size_t n;
+        uam_mutator_mutate(m, full, sizeof(full), &n, NULL);
+        shrunk += n < MAX;
+    }
+    CHECK(shrunk > 2000 / 3, "an input at max_size shrinks (%zu of 2000)", shrunk);
+    /* INSERT_BLOCK switched off: a delete is a delete. */
+    uam_mutator_set_weight(m, UAM_MUT_INSERT_BLOCK, 0);
+    uam_mutator_set_weight(m, UAM_MUT_CLONE_CHUNK, 0);
+    uam_mutator_set_weight(m, UAM_MUT_RESIZE, 0);
+    bool grew = false;
+    for (int i = 0; i < 2000; i++) {
+        size_t n;
+        uam_mutator_mutate(m, seed, sizeof(seed), &n, NULL);
+        grew = grew || n > sizeof(seed);
+    }
+    CHECK(!grew, "with the growing operators off nothing grows");
     uam_mutator_destroy(m);
 }
 

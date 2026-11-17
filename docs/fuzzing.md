@@ -728,10 +728,16 @@ log-uniform) havoc operators:
 | `DICT_INSERT`, `DICT_OVERWRITE`, `DICT_INT_ADJ` | insert or write a dictionary token; write an integer token ±1 |
 
 Chunk lengths are drawn the way AFL's havoc draws them: a third of the time 1-32 bytes, a
-third 32-128, a third 128-1500 (now and then 1500-32768), within what fits. So a seed of a
-few bytes grows: about a third of one seed's mutations are longer than it, about one in
-eight passes 256 bytes and one in 25 passes 2000 (`--max-size 9000`), while most stay
-cheap. ember judges each mutation itself against its record (every INPUT and every batch
+third 32-128, a third 128-1500 (now and then 1500-32768), within what fits. Growing and
+shrinking are balanced against the room there is: the further an input is below
+`--max-size`, on a log scale, the more of its `DELETE_CHUNK`s are done as `INSERT_BLOCK`s
+instead (every second one at one byte, none at `--max-size`), because a short input has
+little to delete and nothing long to duplicate and would otherwise mostly get shorter. So
+seeds of a few bytes spread over the sizes up to the cap: of the mutations of a 16-byte
+seed with `--max-size 9000`, about 58% are longer than it, a quarter the same length and
+18% shorter; about one in four passes 256 bytes and one in 14 passes 2000. An input at the
+cap shrinks or stays. Set `--max-size` to the buffer the firmware really has: the balance
+is taken against it, and inputs longer than the route delivers only cost time. ember judges each mutation itself against its record (every INPUT and every batch
 counts) and sends a FIND only for new coverage, a novel crash, or a hang (up to
 `--max-hangs`); a batch ends with its totals (executions per verdict, per operator, per
 path), and says PROGRESS when it has been silent for a second, so a batch of slow inputs

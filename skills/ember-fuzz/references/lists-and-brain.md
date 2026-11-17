@@ -184,7 +184,8 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   the mutating (havoc + splice, `fuzz/mutate.c`) in batches the brain asks for (HAVOC) and
   reports only new coverage, new crashes and hangs, so the brain is no bottleneck: exec
   rate follows the target's path length. Inputs grow from tiny seeds up to `--max-size`
-  (`INSERT_BLOCK`, `RESIZE`, AFL-sized chunks), so a one-byte seed is fine. Set `--max-size` (default
+  (`INSERT_BLOCK`, `RESIZE`, AFL-sized chunks; short inputs grow more often than they shrink,
+  inputs near the cap the other way round), so a one-byte seed is fine. Set `--max-size` (default
   65536) to what the route can deliver: `mem:`'s `max` (default 4096) or the UART's buffer. A
   plain route tests only a longer input's prefix; a `reject` route answers CRASH
   `REJECTED`, which the brain counts (`rejected` in its status) and does not save.

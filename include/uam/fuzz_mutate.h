@@ -12,6 +12,10 @@
  * 1500-32768, within what fits. INSERT_BLOCK inserts constant or random bytes whatever the
  * input's current length, and RESIZE sets the length anywhere in [1, max_size]
  * (honggfuzz's resize), so a seed of a few bytes reaches every size up to max_size.
+ * Growing and shrinking are balanced against the room there is: the further an input is
+ * below max_size (on a log scale), the more of its DELETE_CHUNKs are done as INSERT_BLOCKs
+ * instead (up to every second one), so that short seeds under a large max_size spread over
+ * the sizes in between rather than staying short; near max_size inputs shrink as usual.
  *
  * Dictionary tokens are byte strings or integers (1, 2, 4 or 8 bytes, little- or
  * big-endian); DICT_INT_ADJ writes an integer token plus or minus 1, the off-by-one
