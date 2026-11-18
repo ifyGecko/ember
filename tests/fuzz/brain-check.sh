@@ -24,7 +24,8 @@
 #
 # Which crash is minimized when, from two seeds that are the two planted FAULTs: the first
 # is minimized at once, the second is saved as found and minimized later; with
-# --minimize-share 0 it stays as found. Both are saved in either case, and each .info says
+# --minimize-share 0 it stays as found, until a later session on the same output directory
+# takes the queue up again. Both are saved in either case, and each .info says
 # whether it was minimized.
 set -eu
 run=$1
@@ -238,6 +239,18 @@ if session stay 300 --seeds "$tmp/two" --no-cmplog --minimize-share 0; then
             echo "brain-check: $board: the crash left for later is not the input as found" >&2
             fail=1
         fi
+    fi
+    # A later session on the same output directory (a restarted worker) takes the queue up
+    # again: the crash left for later is minimized, though this session never finds it.
+    if session stay 3000 --seeds "$tmp/plain" --no-cmplog; then
+        if ! grep -q '1 saved crashes from an earlier session wait' "$tmp/stay.log" \
+           || [ "$(faults "$tmp/stay")" -ne 2 ] || [ "$(minimized "$tmp/stay" yes)" -ne 2 ]; then
+            echo "brain-check: $board: a crash left for later was not minimized after a restart:" >&2
+            grep -E 'CRASH|wait' "$tmp/stay.log" >&2
+            fail=1
+        fi
+    else
+        fail=1
     fi
 else
     fail=1

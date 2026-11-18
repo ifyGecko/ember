@@ -797,14 +797,15 @@ firmware without symbols. Minimizing costs up to 200 runs a crash, though, and o
 often faults at many instructions (a bad pointer used all through a routine), each a
 `(reason, status)` of its own. So only **the first crash is minimized at once**. Every
 later one is saved as found and queued, and the queue is worked off, one crash at a time
-between queue entries, while the runs spent on it stay under `--minimize-share` percent of
+between batches, while the runs spent on it stay under `--minimize-share` percent of
 all runs (default 2; 0 leaves them as found). That cap bounds the cost however many
 crashes turn up. The queue's order is only a preference: ember counts, for each crash, the
 buckets it hit that no earlier crash had (a crash's `new_buckets` in JUDGE and FIND), and
 the crash with the most goes first, as the one most likely to be another bug. Before
 minimizing, a brain looks at the `crashes/` directories of its campaign (its own, from an
 earlier session too, and with `--sync-dir` the other workers'): a crash someone already
-holds minimized is saved as found and not minimized again. The status feed has
+holds minimized is saved as found and not minimized again. A worker that starts again on
+its output directory takes its queue up again (the `minimized=later` notes). The status feed has
 `crashes_deferred`, the length of the queue. `--no-minimize` keeps every crash as found.
 `--iter-insns N|auto` sets ember's per-input budget (`auto`: 5× the slowest queue entry
 after the baseline). The queue is walked

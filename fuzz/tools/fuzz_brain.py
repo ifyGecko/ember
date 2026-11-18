@@ -97,7 +97,7 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fuzz_crashes import LATER, NOW, Triage, saved_crashes  # noqa: E402
+from fuzz_crashes import LATER, NOW, Triage, read_info, saved_crashes, waiting  # noqa: E402
 from fuzz_dict import Dictionary, IntToken, parse_dict  # noqa: E402
 from fuzz_queue import (SCHEDULES, Entry, OpStats, Queue, entry_name,  # noqa: E402
                         hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
@@ -470,6 +470,10 @@ def main():
     minimize_execs = 0        # runs spent shrinking findings (part of execs, not of mutated)
     deferred_execs = 0        # those of them spent on crashes left for later (--minimize-share)
     triage = Triage(name)     # which crash is minimized, and when (fuzz_crashes.py)
+    for left in waiting(crash_dir):   # an earlier session's queue (a restarted worker's)
+        triage.defer(*left)
+    if len(triage):
+        log("%d saved crashes from an earlier session wait to be minimized" % len(triage))
     cmplog_done = set()    # queue entry ids already through the input-to-state stage
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
@@ -886,6 +890,8 @@ def main():
         no (kept as found) | later (in the queue) | peer (another worker holds it minimized)."""
         fname = "%s_r%d_s%d_%s" % (prefix, reason, status,
                                    hashlib.sha1(data).hexdigest()[:12])
+        if read_info(os.path.join(where, fname + ".info")).get("minimized") == "yes":
+            minimized = "yes"             # this very input, minimized before: it stays so
         with open(os.path.join(where, fname), "wb") as f:
             f.write(data)
         with open(os.path.join(where, fname + ".info"), "w") as f:
@@ -924,6 +930,8 @@ def main():
         if not os.path.exists(os.path.join(crash_dir, fname)):
             return                        # removed by hand: nothing to replace
         who = triage.held_by(reason, status, on_disk())
+        if who == name:
+            return                        # queued twice (found again after a restart)
         if who is not None:
             write_finding(crash_dir, "crash", data, reason, status, "peer")
             log("CRASH %s status=%s stays as found: %s holds it minimized (%s)"
@@ -1290,11 +1298,11 @@ def main():
                     maybe_status()
                     maybe_reweight()
                     sync()
+                    if not limit():
+                        minimize_deferred()
                 e.times_chosen += 1
                 state_dirty[e.id] = e
                 flush_state()
-                if not limit():
-                    minimize_deferred()
                 if pending and queue.pending_favored:
                     queue.pending_favored -= 1
             queue.cycle += 1

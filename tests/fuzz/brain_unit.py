@@ -315,6 +315,9 @@ def test_crash_triage():
                                        for w in ("main", "w2", "gone")]))
         check(got == [S("main", 1, 4112, True), S("main", 1, 4128, False), S("main", 3, 7, False)],
               "saved crashes read back from .info files (one without minimized= counts as not)")
+        check(fc.waiting(os.path.join(d, "main", "crashes")) == [("crash_r1_s4128_bb", b"", 1, 4128)]
+              and fc.waiting(os.path.join(d, "gone")) == [],
+              "the crashes an earlier session left for later")
 
 
 def main():

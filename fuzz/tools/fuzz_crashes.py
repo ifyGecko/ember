@@ -17,7 +17,8 @@ What is SAVED and what is MINIMIZED are decided apart:
 The queue's order is a guess, and only an order: the crash that hit the most buckets no
 earlier crash had hit (ember's count, a crash's new_buckets) goes first, as the one most
 likely to be another bug. A crash another worker of the campaign already holds minimized
-is saved as found and not minimized again.
+is saved as found and not minimized again. The queue is rebuilt from the .info notes
+(minimized=later) when a worker starts again.
 """
 import collections
 import heapq
@@ -64,6 +65,28 @@ def saved_crashes(dirs):
                                  info.get("minimized") == "yes"))
             except (KeyError, ValueError):
                 continue
+    return out
+
+
+def waiting(crash_dir):
+    """The crashes under `crash_dir` an earlier session left to be minimized later
+    (minimized=later), by name: (file name, data, reason, status) each."""
+    out = []
+    try:
+        names = sorted(os.listdir(crash_dir))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".info"):
+            continue
+        info = read_info(os.path.join(crash_dir, n))
+        if info.get("minimized") != LATER:
+            continue
+        try:
+            with open(os.path.join(crash_dir, n[:-5]), "rb") as f:
+                out.append((n[:-5], f.read(), int(info["reason"]), int(info["status"])))
+        except (OSError, KeyError, ValueError):
+            continue
     return out
 
 
