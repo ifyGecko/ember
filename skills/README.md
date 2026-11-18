@@ -81,6 +81,12 @@ Re-run it whenever the ember pin moves.
 | `EMU_ROOT` | build | `~/emu` (default parent of new projects when `--dir` is not given) |
 | `EMBER_UPSTREAM` | build, tests | `~/ember` (clone source for a project's own ember checkout) |
 | `EMBER_SRC` | build | build in this existing checkout (else `ember.src`, else `<project>/subprojects/ember`) |
+| `PROJ_DIR` | build | the project the build scripts work on (else `--proj`, the directory above the script, the current one) |
+| `CFLAGS` | build | extra compiler flags for `build-ember.sh` (as its `--cflags`) |
+| `EMU_BIN` | build | the runner `run.sh` starts (default `<project>/build/<board>-run`) |
+| `UNKNOWN_MMIO`, `TRACE` | build | `run.sh`: the `--unknown-mmio` policy (the generated default: `zero`, `fault` on the cores without a bus error) and the `--trace` list (`exc`; empty for none) |
+| `BOOT_BUDGET` | build | instructions the project's boot test may run (200000000) |
+| `OVMF_DIR` | tests | `/usr/share/OVMF` (an OVMF install for the PC board checks; skipped when absent) |
 | `EMBER_BUILD` | tests | `<ember checkout>/build` (ember's meson build directory, for its test firmware) |
 | `CLAUDE_SKILLS_DIR`, `QWEN_SKILLS_DIR` (`QWEN_HOME`), `AGENTS_SKILLS_DIR` | install | see Install |
 

@@ -42,6 +42,9 @@ input give **the same run, instruction for instruction**. Consequences:
   - virtual time never passes 2^62 ticks.
   So a run killed by `timeout` while the hart was idle was almost always waiting for host
   input: keep stdin on `/dev/null` and attach no host `--nic` for unattended runs.
+  `timeout` itself returns 124 when it kills the run, the same number as a used-up budget:
+  tell them apart by the stop line in the log (`instruction limit reached (status 0)` for
+  the budget, `stop requested (status 130)` for the kill), which `log_summary.py` prints.
 - `-n` and the other numeric options are parsed as C integers (decimal, `0x...`): write
   `200000000`, not `2e8` (which means 2).
 - A run is a reproducible experiment. Narrow a problem by instruction count: `-n N -d` dumps
@@ -122,14 +125,14 @@ trace and probe, and when to use which):
 | `irq: entered handler at .. from pc=.. lines=0x.. icount=N`, `reset: system icount=N` | `--trace exc`: interrupt entries (the lines pending), device-requested resets |
 | `mmio: r\|w SIZE 0xADDR dev+0xOFF = 0xVAL pc=.. icount=N` | `--trace mmio`: every access a device served (x86 ports at `0x10000000000 + port`) |
 | `irq-in: cpuN line L = 0\|1 icount=..`; `irq-in: cpuN line L: R rises, F falls, level V at the stop`; `irq-in: at the stop cpuN has an interrupt pending and enabled ...` | `--trace irq`: a processor's interrupt inputs |
-| `sysreg: first read\|write 0xID = 0xVAL pc=..`, `sysreg:   0xID: R reads, W writes` | `--trace sysreg`: system registers (ids as `uam/isa/<arch>.h` numbers them); a faulting access says so |
+| `sysreg: first read 0xID = 0xVAL pc=..`, `sysreg: first write 0xID <- 0xVAL pc=..`, `sysreg:   0xID: R reads, W writes` | `--trace sysreg`: system registers (ids as `uam/isa/<arch>.h` numbers them); a faulting access says so |
 | `console: icount=N pc=.. "text"` | `--trace console`: each console line and where in the run it was printed |
 | `mmio:   0xADDR dev+0xOFF: R reads (always\|last 0xV), W writes (last 0xV), first pc=..`; `mmio: most accessed: ..` | `--trace mmio` / `mmio-summary`, at the stop: each device register the firmware used; "always" on a hot register is what a polling loop keeps getting |
 | `exc:   KIND cause=.. pc=..: N times ..`; `irq:   0xHANDLER: N times ..` | `--trace exc`, at the stop: exceptions by kind, cause and pc; interrupt handlers entered |
 | `dma: r\|w LEN 0xADDR region+0xOFF pc=.. icount=N` | `--trace dma`: a device's DMA transfer |
 | `history: cpuN: the last K events ...`, `history:   blk\|exc\|irq ...` | `--history N`: the path to the stop, oldest first |
 | `uam-run: unmapped read\|write of S bytes at 0x.. by cpu N pc 0x.. (icount N)` | `--unknown-mmio stop`: the access that stopped the run (exit 131) |
-| `uam-run: pc 0x.. reached (hit H, icount N) a0=0x.. ra=0x..` | `--log-pc ADDR,a0,ra`: the registers at each arrival |
+| `uam-run: pc 0x.. reached (hit H, icount N) a0=0x.. ra=0x..` | `--log-pc ADDR,a0,ra`: the registers at each arrival (gdb's names: `r4`, `r31` on MIPS) |
 | `@ICOUNT [warn] ...` | `--log-stamp`: the icount at which a log line was made |
 | `<runner>: <reason> (status N) at pc=.. after N instructions` | how the run ended |
 
@@ -163,6 +166,10 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 | `exc: kind=0 cause=10` (MIPS RI) / RISC-V illegal instruction right away | wrong base, entry, endianness, or an instruction ember lacks | re-check recon; for a real gap see `organization.md` rule 4 |
 | `exc: kind=0 cause=11` (MIPS CpU) | FPU (COP1) use on a CPU model without one (`uam_mips_ref` has none), or Status.CU1 still clear | if the part has an FPU, set Config1.FP (and `fir`) in the board's CPU model (as `uam_mips_mz_ref`); a soft-float/lazy-FPU kernel handles CpU itself |
 | illegal instruction early on a configurable core (MIPS16e/microMIPS/DSP, Xtensa options, AVR/PIC/8051 families) | the CPU model lacks an option the part has, or the wrong family/model | match the model to the part (`--model`, the config's option bits); a missing option's instructions trap as on hardware |
+| exit 127 | a `--break` address was reached, or the guest executed a debug trap (a breakpoint instruction with no handler) | with `--break` that is the stop you asked for; otherwise decompile the pc: an assertion or a debugger hook in the firmware |
+| exit 130 | SIGINT/SIGTERM: you, or `timeout`, stopped it | where it was (`-d`, `--history`) says whether it was working, spinning or waiting for input |
+| exit 2, no `abi:` line | a setup error before the run: a bad option or value, an unknown trace kind, a `--log-pc` register the ISA does not have, an image that cannot be loaded | the `uam-run:` line says which |
+| exit 1 to 123 | the firmware's own status through a finisher device (a status outside that range is reported as 1) | the firmware's meaning of it |
 | exit 2 with `abi:` errors | the runner was linked against a libuam built from other headers | `scripts/build-ember.sh` (rebuilds both) |
 | `--save-snapshot` fails: `device X has no save/restore` | a device without snapshot support | add `save`/`restore` (or `UAM_DEVICE_STATELESS`) |
 
@@ -170,7 +177,9 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 - Decompile the function at the faulting pc or the polling site (Ghidra MCP
   `decompile_function_by_address`; without the MCP server, headless:
   `<ember-dev-recon>/scripts/ghidra-query.sh --blob fw.bin decompile 0x<pc>`, and `disasm`,
-  `xrefs` the same way). For loops of register stores (bit-bang, delays) read the
+  `xrefs` the same way; the Ghidra project is named after the file recon analysed,
+  `<name>_recon`, so once the image is `firmware/firmware.bin` keep giving the original
+  file's name, or `--project <original>_recon`). For loops of register stores (bit-bang, delays) read the
   **disassembly**; the decompiler drops those stores as dead.
 - To identify a register, `get_xrefs_to` the page or search the disassembly for the `lui`
   value. Every function that touches the device tells you part of its semantics.
@@ -183,7 +192,9 @@ Read in **time order**: `log_summary.py` lists first events top-down, then how t
 
 ```bash
 ./run.sh -n 200000000 --log-pc 0x8023f00c ...  # every arrival at a pc, with icount
-./run.sh --log-pc 0x8023f00c,a0,a1,ra ...      # ... and the registers (gdb names: a0 / r4 / r0 / rdi)
+./run.sh --log-pc 0x8023f00c,a0,a1,ra ...      # ... and the registers, by gdb's names (RISC-V here;
+                                               # MIPS: r4,r5,r31; ARM: r0,r1,lr; x86-64: rdi,rsi)
+./run.sh --backtrace --break 0x8023f00c ...    # the call chain when it stops (names from an ELF image)
 UNKNOWN_MMIO=stop ./run.sh --history 32 -d ... # stop at the first unmodelled access (exit 131)
 ./run.sh --history 64 ...                      # the last 64 blocks/exceptions/interrupts before the stop
 ./run.sh -t mmio-summary ...                   # one line per device register used; the polled one
@@ -221,6 +232,11 @@ gdb-multiarch -q -batch -ex 'set endian big' -ex 'target remote :1234' \
   -ex 'trace 0x80012340 suspect_a' -ex 'trace 0x80045670 suspect_b' -ex continue > build/gdb.txt 2>&1
 ```
 
+`trace ADDR NAME` logs each call with its arguments and return value. On x86 say which
+calling convention the code uses first, with `-ex 'trace-abi NAME'` before the `trace`
+lines: the default is the Microsoft x64 one (UEFI DXE and later), `trace-abi i386` is for
+32-bit code (SEC, PEI, a romstage), `trace-abi sysv` for System V x86-64 code (coreboot).
+
 - The stub sends a target description, so gdb picks the architecture; a big-endian guest
   (MIPS BE, ARM BE8, PowerPC, AVR32, Xtensa BE) still needs `set endian big` (`run.sh` records
   `GDB_ENDIAN`). gdb-multiarch works with MIPS, RISC-V, ARM, x86, PowerPC and AVR; its
@@ -254,7 +270,7 @@ script under `tools/`, documented in the journal), not the device. Mark syntheti
 clearly as synthetic.
 
 **Replacing a firmware function (HLE) is a last resort.** A PC hook
-(`uam_exec_add_pc_hook`, in `<board>_hle.c`) can emulate a function: set the return
+(`uam_machine_add_pc_hook`, in `<board>_hle.c`: every processor gets it) can emulate a function: set the return
 register, set `cpu->pc` to the return address. Use it only for code whose hardware is out of
 scope (a radio calibration that needs real RF, a cryptographic co-processor self-test), never
 to skip a device you could model. List every hook in the journal and in the board header:

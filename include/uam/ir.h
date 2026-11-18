@@ -2,7 +2,7 @@
  * uam/ir.h - UAM-IR: the Universal Abstract Machine instruction set.
  *
  * This header is the single contract between frontends (ISA modules that
- * lift guest code) and backends (interpreter, future JIT, analysis passes).
+ * lift guest code) and backends (interpreter, JIT, analysis passes).
  * The normative specification is docs/uam-isa.md; section numbers in the
  * comments below refer to it.
  *

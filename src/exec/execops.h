@@ -197,7 +197,7 @@ static inline uint64_t uam_execops_amo_apply(uam_amo_op op, uint64_t old, uint64
 }
 
 /*
- * AMO / CAS (section 6.4): read-modify-write of one location. For an AMO, b is the
+ * AMO / CAS (section 6.2): read-modify-write of one location. For an AMO, b is the
  * operand and sub the operation; for a CAS (cas = true), b is the expected value and
  * c the new one, written only on a match. *old receives the memory value. A fault on
  * either half is reported as a store fault, as architectures do for atomics.

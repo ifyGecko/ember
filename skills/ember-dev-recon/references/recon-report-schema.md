@@ -1,8 +1,11 @@
 # Recon fact sheet schema (`RECON.md`)
 
 The recon pass produces **one `RECON.md`** in the session project directory. It is the contract
-`ember-dev-build` consumes (`new-emulation.sh --recon RECON.md`) and the first entry of the
-session record. Every quantitative claim carries its evidence; a number without evidence is a
+`ember-dev-build` consumes and the first entry of the session record. It is read by the
+agent, not by a program: `new-emulation.sh --recon RECON.md` only copies it into the
+project, and its numbers reach the board as that script's options (`--isa`, `--model`,
+`--ram-base`, `--ram-size`, `--image-base`, `--entry`, `--reset-vec`; the build skill's
+`board-skeleton.md` maps the architecture names below to `--isa`) or as edits to the board. Every quantitative claim carries its evidence; a number without evidence is a
 bug. Device labels are hypotheses for the build phase to confirm.
 
 ```markdown
@@ -95,9 +98,9 @@ Flash partitions (one row per partition; label from the WRITER):
 | on-chip SRAM / scratch | ... | ... | rw- | used by which stage, for what; must survive reset? |
 
 ## Candidate MMIO regions (ranked)
-| page (virtual) | physical | R / W | offsets touched (off:count) | guessed device | evidence: functions, strings, compares |
-|---|---|---|---|---|---|
-| 0xB1000000 | 0x11000000 | 120 / 40 | +0x0:6 +0x10:42 +0x80:40 ... | reset/timer/intc block | FUN_..: polls +0x0 in delay loop; +0x80 compared with 0x...|
+| page (virtual) | physical | size (from the highest offset any stage touches, `max_off`, rounded up) | R / W | offsets touched (off:count) | guessed device | evidence: functions, strings, compares |
+|---|---|---|---|---|---|---|
+| 0xB1000000 | 0x11000000 | 0x100 | 120 / 40 | +0x0:6 +0x10:42 +0x80:40 ... | reset/timer/intc block | FUN_..: polls +0x0 in delay loop; +0x80 compared with 0x...|
 | ... | | | | | |
 
 ### Not MMIO (filtered constants)

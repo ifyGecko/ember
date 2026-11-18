@@ -1,7 +1,7 @@
 # UAM: a Universal Abstract Machine firmware emulator
 
 UAM runs raw firmware images by lifting the native instruction set into a small,
-ISA-neutral IR (47 opcodes, plus COV for instrumentation) and executing that IR. The abstract machine only does
+ISA-neutral IR (47 opcodes, plus COV, CMPLOG and FRAME for instrumentation) and executing that IR. The abstract machine only does
 computation. Memory, time, interrupts and devices all sit behind explicit interfaces,
 with one module per concern.
 
@@ -101,27 +101,36 @@ meson test -C build --suite runner       # one group on its own: unit, firmware,
 meson test -C build --list               # every test by name; `meson test -C build NAME` runs one
 meson compile -C build firmware          # every test firmware image (build/tests/firmware*/)
 meson compile -C build jitdiff-soak      # the JIT-against-interpreter differential test, at length
-meson compile -C build xbench            # time the cross-ISA benchmark (docs/jit-perf.md)
+meson compile -C build xbench            # time the cross-ISA benchmark (docs/jit-perf.md; the script's
+                                         # arguments: -Dxbench_args="--per-kernel")
+meson compile -C build fuzz-throughput-record  # rewrite the figures the fuzz-throughput test checks against
+                                         # (tests/fuzz/throughput.ref; on a quiet machine)
 meson compile -C build net-check         # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
 meson install -C build                   # headers, libraries, uam-run and uam.pc (meson setup --prefix DIR)
 ```
 
 `meson configure build` lists the options and `meson configure build -Dname=value` changes
 one: the toolchain prefixes of the test firmware (below), `buildtype`, `b_sanitize=address`,
-`c_args`. The tests are registered one per check (`rv32-ref` self-test on the interpreter,
+`c_args`, `-Dtests=false` (the library and the runner only), `-Djitdiff_blocks=N` (the
+length of `jitdiff-soak`), `-Dthroughput_ref=` (empty: the fuzz-throughput test only
+reports). The tests are registered one per check (`rv32-ref` self-test on the interpreter,
 on the JIT, each snapshot split, ...), run in parallel, and report failures by name; the
 full output of each is in `build/meson-logs/testlog.txt`. A test firmware is built only
 when its toolchain is found: the summary at the end of `meson setup` says which were, and
 the tests of a missing one are left out, not failed.
 
-The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc`; so does the PIC32
-self-test (`pic32-ref`), which is built as MIPS32 little-endian.
+Each toolchain is named by a prefix option (`-Dmips_cross=mips-linux-gnu-`: the compiler is
+`<prefix>gcc`) or a tool option (`-Dnasm=`, `-Dsdcc=`), with the defaults given here.
+
+The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc` (`-Dmips_cross=`,
+`-Dmipsel_cross=`); so does the PIC32 self-test (`pic32-ref`), which is built as MIPS32
+little-endian.
 
 The ARM self-test (built as ARM and as Thumb-2 code, little-endian and BE8) needs
-`arm-linux-gnueabi-gcc`.
+`arm-linux-gnueabi-gcc` (`-Darm_cross=`).
 
 The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
-`riscv64-unknown-elf-gcc` both work).
+`riscv64-unknown-elf-gcc` both work; `-Driscv_cross=` names another).
 
 The PowerPC self-test needs a GCC for PowerPC: by default `powerpc64le-linux-gnu-gcc`, which
 builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works too
@@ -156,7 +165,7 @@ The 6502 self-tests (one per core model) are assembled with SDCC's `sdas6500` an
 its `sdld`; the 6502 fuzz target and benchmark build need `sdcc` (all in Debian's `sdcc`).
 Without them those checks are left out (`-Dsdas6500=`, `-Dsdld=`, `-Dsdcc=`).
 The Z80 self-tests (one per core model) are assembled with SDCC's `sdasz80`, and the Z80 fuzz
-target and benchmark build with SDCC; without them they are left out (`-Dsdasz80=` names it).
+target and benchmark build with SDCC; without them they are left out (`-Dsdasz80=`, `-Dsdldz80=` and `-Dsdcc=` name them).
 The Xtensa firmware (self-test, fuzz target, benchmark) is built with each core's GNU
 toolchain: the LX106's `xtensa-lx106-elf-` (Debian's `gcc-xtensa-lx106`), the LX6's and LX7's
 `xtensa-esp32-elf-` and `xtensa-esp32s3-elf-` (Espressif's `xtensa-esp-elf` release). A model
@@ -196,6 +205,9 @@ build/uam-run -b xtensa-ref build/tests/firmware-xtensa/selftest-lx6.elf  # the 
 build/uam-run -b pic32-ref -o model=mz build/tests/firmware-pic32/selftest-mz.elf  # PIC32 (MIPS32, TLB, EIC)
 build/uam-run --jit path/to/firmware.elf       # native execution on x86-64 and AArch64 hosts
 build/uam-run --jit --no-chain fw.elf          # return to the run loop after every block
+build/uam-run --jit --perf-map fw.elf          # /tmp/perf-PID.map: perf names compiled blocks by guest pc
+build/uam-run --jit --jit-opmap ops.txt fw.elf # which IR op each piece of native code came from
+                                               # (tools/jitprof.py; docs/jit-perf.md)
 build/uam-run --no-opt path/to/firmware.elf    # skip the block optimizer
 build/uam-run --cov-blocks --cov-out cov.map fw.elf  # block coverage map of a plain run
 build/uam-run --fuzz-begin handler --fuzz-input uart0 --fuzz-replay crashes/ fw.elf  # fuzz: block coverage by default
@@ -203,13 +215,17 @@ build/uam-run --help
 ```
 
 Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
-names the boards. Every reference board takes `--ram SIZE` and, but `avr-ref`, `avr32-ref`, `pic-ref`,
+names the boards. The keys and image names are each board's own (the ones of the reference
+boards are in this section); a key the board does not read is ignored without a message,
+so check the spelling of one that seems to have no effect. Every reference board takes `--ram SIZE` and, but `avr-ref`, `avr32-ref`, `pic-ref`,
 `pic32-ref`, `mcs51-ref`, `6502-ref` and `z80-ref`,
 `-o cpus=N` (up to 8; `x86_64-ref` 64, Xtensa 4)
 (`--quantum N`: instructions each processor runs before the next, default 4096); `ppc-ref` takes
 `-o model=classic|booke` (default `classic`). `--map` prints any board's map on stderr. Default
 RAM is 128 MiB at 0x80000000 on `rv32-ref`, 32 MiB at physical 0 on `mips-ref`, 64 MiB at 0 on
-`arm-ref` and `ppc-ref` (which also has a 1 MiB boot ROM at 0xfff00000), and 512 MiB on `x86_64-ref`. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
+`arm-ref` and `ppc-ref` (which also has a 1 MiB boot ROM at 0xfff00000), 512 MiB on `x86_64-ref`,
+16 MiB (`-o model=a`) or 32 MiB (`b`) on `avr32-ref`, and what the part has on `pic32-ref`
+(512 KiB for `mz`); `--map` shows the size and place on any board. `avr-ref` takes `-o model=e|eplus|xm|xt|rc` (default `eplus`), each
 with the memory layout of a common part of that core family, so firmware built for that part
 runs (`e` ATmega328P, `eplus` ATmega2560, `xm` ATxmega128A1U, `xt` ATmega4809, `rc`
 ATtiny40; boards/avr_ref.c has the map); its devices (a 16550, a timer, the test finisher) are
@@ -413,8 +429,11 @@ build/uam-run --console pty fw.elf            # console on a pseudo-terminal (al
                                               # stdio-raw, file:OUT[,in=FILE], string:TEXT,
                                               # script:FILE, null)
 build/uam-run --console 'string:ls\n,after=# ' fw.elf  # type "ls" once the shell's prompt is printed
+build/uam-run --uart-input 'ls\n' fw.elf      # shorthand for --console 'string:ls\n'
 build/uam-run --realtime fw.elf               # pace virtual time to the host clock
-build/uam-run --map -b mips-ref               # print the bus map on stderr, then run (no image: exit 126)
+build/uam-run --map -n 1 -b mips-ref fw.elf   # print the bus map on stderr, then run: -n 1 stops at
+                                              # once (--map alone goes on; with no image the board
+                                              # runs empty memory and ends with exit 126)
 ```
 
 `--dump-mem` and gdb read memory without side effects. A device region (a ROM or flash window
@@ -548,9 +567,10 @@ is **its own project, outside this tree**, that links the library. This section 
 layout such a project has and the meson files it starts from. It is prescriptive on
 purpose: every ember board is organised the same way, so anyone (and any tool) who has seen
 one can work on another. `examples/external-board/` is this layout as a complete, tested
-project to copy; `skills/ember-dev-build/scripts/new-emulation.sh <board> --isa <arch>`
-generates it for any of ember's architectures, with the bring-up helpers on top
-(`skills/README.md`).
+project to copy; `skills/ember-dev-build/scripts/new-emulation.sh <board> --isa <isa>`
+generates it for any of ember's architectures (`<isa>` is the name of an ISA descriptor:
+`mips32be`, `rv32`, `arm`, `x86_64`, ...; the script's header lists them with their CPU
+models), with the bring-up helpers on top (`skills/README.md`).
 
 ### What belongs where
 
@@ -602,10 +622,13 @@ and file names `-` becomes `_`): the runner is `<board>-run`, the board file
 whose only purpose is to be the plain member of an architecture is named `<arch>-ref`, as
 ember's own are; a board for a product is named after the product. Device files are named
 after the chip family and the function (`<chip>_uart.c`), never after the board.
+(`examples/external-board/` has the layout but not these names: it is ember's own test of
+an out-of-tree build, with a board `ext-mips` in `ext_board.c` and a runner `ext-run`.)
 
 ### The meson files
 
-`meson.build`, complete; only the two names at the top change from project to project:
+`meson.build`, complete; only the two names at the top change from project to project
+(the project's and the board's):
 
 ```meson
 project('<board>', 'c',
@@ -639,7 +662,8 @@ subdir('tests')
 
 `subprojects/ember.wrap`, the pin. `revision` is a full commit hash, the latest ember
 commit when the project was created or last moved, never a branch: a fresh clone of the
-project then builds the same runner.
+project then builds the same runner. (The in-tree example alone follows `head`, because it
+tests the ember it sits in.)
 
 ```ini
 [wrap-git]
@@ -693,10 +717,12 @@ int main(int argc, char **argv)
 }
 ```
 
-The board file starts from the reference board of its architecture: read
-`boards/<arch>_ref.c` for the ISA descriptor (`uam_isa_<arch>`, `include/uam/isa/`), the
-CPU model call and the memory every board of that architecture maps, then describe your
-hardware. `examples/external-board/emulation/ext_board.c` is a whole one, and
+The board file starts from the reference board of its architecture: read that board's
+file in `boards/` (one per ISA module: `mips_ref.c` is both `mips-ref` and `mipsel-ref`,
+`arm_ref.c` both `arm-ref` and `armeb-ref`, `m6502_ref.c` is `6502-ref`) for the ISA
+descriptor (`uam_isa_mips32be`, `uam_isa_rv32`, `uam_isa_x86_64`, ...; each is declared in
+its header in `include/uam/isa/`), the CPU model call and the memory every board of that
+architecture maps, then describe your hardware. `examples/external-board/emulation/ext_board.c` is a whole one, and
 `ext_id.c` beside it a whole device.
 
 ### The rules
@@ -727,7 +753,8 @@ hardware. `examples/external-board/emulation/ext_board.c` is a whole one, and
    never edited; data the firmware reads that is not part of an image is generated by a
    script in `tools/` into `build/`. The board takes them as named images
    (`--image name=path`), not as paths compiled in.
-7. **Diagnostics are opt-in.** A normal run prints the guest's console and nothing else;
+7. **Diagnostics are opt-in.** A normal run prints the guest's console and, on stderr, one
+   line saying how it ended, and nothing else;
    board options (`-o key=value`) and the runner's `--trace` switches turn the rest on.
 8. **A change to ember is a patch, not a fork.** When the public API is not enough, the
    change is a `git format-patch` file in `patches/`, written for ember's history (no
@@ -742,6 +769,9 @@ meson compile -C build           # ember's libraries and build/<board>-run
 meson test -C build              # tests/: registered, boot
 build/<board>-run -b <board> --image os=firmware/firmware.bin    # every uam-run option applies
 ```
+
+The image names (`os` here) are the board's: each is a name its build function asks for
+with `uam_board_config_image`, and the board places the file where its hardware has it.
 
 Ember's own tests are not built in a board project, and its warnings-as-errors apply to
 its sources only. Compiler and build options given to the project (`buildtype`,
@@ -773,8 +803,8 @@ into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agen
 ```
 include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.h signal.h sched.h
                    cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
-                   blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h guard.h frames.h
-                   heap.h fuzz.h
+                   blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h cmp.h guard.h
+                   frames.h heap.h fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
                    pic.h mcs51.h m6502.h z80.h xtensa.h)
@@ -789,7 +819,7 @@ src/machine/       machine lifecycle, resets, board registry, snapshots, guards,
 src/host/          chardev/netdev/block-device backends, host loop, real-time pacing
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
-analysis/          IR passes (cov.c: the edge-coverage pass)
+analysis/          IR passes (cov.c: coverage; cmp.c: compare logging; frames.c: call tracking)
 fuzz/              the persistent-mode fuzz harness, the replay frontend, the runner's fuzz
                    options, site lists, boundary files, the coverage region and the fuzz
                    protocol; fuzz/tools/: the list generators, the brain and its tools

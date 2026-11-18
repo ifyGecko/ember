@@ -133,7 +133,11 @@ one directory, each with its own seed and the next of `--schedules` (round robin
 restarts a worker that dies. The firmware boots once: the first worker saves the begin
 snapshot (`--fuzz-snapshot DIR/begin.snap`) and the others, and every restart, start from it
 (`--no-shared-boot` boots each worker; a snapshot made from another firmware or command
-line is detected by its `.key` fingerprint and replaced):
+line is detected by its `.key` fingerprint and replaced; if the first worker has not saved
+it within `--boot-timeout`, 3600 s, the others boot themselves). `-n` is 1 to 256,
+`--iters N` ends each worker after N mutated executions, `--brain-arg` passes an option on
+to every brain, and the launcher exits 0 when all workers ended cleanly, 1 when one ran out
+of restarts:
 
 ```bash
 IMAGE=fw.bin python3 $EMBER/fuzz/tools/fuzz_launch.py -n 8 --out fuzz/camp \

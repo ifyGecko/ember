@@ -12,7 +12,7 @@ IR fits into the rest of the emulator.
 
 ## 1. Design goals
 
-1. **Small but proficient.** 47 opcodes, plus the instrumentation ops `COV` (§7.5) and `CMPLOG` (§7.6). (The native JIT was added without adding any: the
+1. **Small but proficient.** 47 opcodes, plus the instrumentation ops `COV` (§7.5), `CMPLOG` (§7.6) and `FRAME` (§7.7), which only passes insert. (The native JIT was added without adding any: the
    optimizer and an inline memory fast path carried the speed, so the universal opcode set
    stayed exactly as below.)  Enough to express real ISAs (RISC-V, ARM, MIPS,
    PowerPC, x86) directly, without encoding tricks. Not so many that every backend and every
@@ -71,7 +71,9 @@ whose guard is true, the final unguarded terminator, or an abort (fault or exit 
 
 A backend may go straight from one block's `EXIT` into the next block, without the loop's
 steps in between (the JIT's block chaining), only when those steps would do nothing: no exit
-request pending and the deadline not reached, the same test an `IMARK` makes. The result must
+request pending (§9) and the deadline not reached (the instruction count at which the run
+loop wants control back: the next timer event or the end of a slice, `cpu->icount_deadline`),
+the same test an `IMARK` makes. The result must
 be the same as running the loop.
 
 ---
@@ -169,7 +171,7 @@ Ops that accept a guard: `PUT, LD, ST, AMO, CAS, SYSRD, SYSWR, HELPER (effectful
 | Control | `EXIT` | 1 |
 | System / escape | `SYSRD SYSWR TRAP WAIT HELPER` | 5 |
 | Instrumentation | `COV CMPLOG FRAME` (inserted by passes only, §7.5, §7.6, §7.7) | 3 |
-| **Total** | | **49** |
+| **Total** | | **50** (47 + 3) |
 
 Some opcodes are left out on purpose. `NOT`, `NEG`, `MOV`, `SGT`/`UGT`, `ROTL`, `MULHSU`, and
 partial-register insert/extract are all short compositions of the ops above (§10). Leaving them
@@ -188,10 +190,11 @@ out keeps every backend smaller. A peephole pass can always fuse common patterns
 | `X`               | Exclusive: load-reserved or store-conditional (§6.3). |
 | `ACQ` / `REL`     | Acquire and/or release ordering. Both together mean sequentially consistent. |
 | `UNPRIV`          | Reserved: the verifier accepts it and the JIT keeps such an access off its fast path, but the executor gives it no meaning and no lifter emits it. |
-| `PHYS`            | Bypass address translation. Lifters use it for accesses to a space of its own: AVR `LPM`, PIC `TBLRD`, x86 `IN`/`OUT`. |
+| `PHYS`            | Bypass address translation. Lifters use it for accesses to a space of its own: AVR `LPM`, PIC `TBLRD`, the x86 string port instructions `INS`/`OUTS`. |
 
 The executor translates an address through `isa->translate`, which sees the hart's privilege
-(`cpu->priv`). The bus then decodes the physical address, and uses only the byte order,
+(`cpu->priv`, a value the ISA module defines and keeps: its privilege level and whatever
+else selects how code is translated). The bus then decodes the physical address, and uses only the byte order,
 `ALIGNED` and the core-only fetch and debug attributes.
 
 Address operands have the hart's **address width** (AW = 32 or 64), which the ISA module declares.
@@ -277,13 +280,13 @@ Comparisons and flag ops take W-bit operands and produce a 1-bit result.
 
 | Op | Form | Semantics |
 |---|---|---|
-| `IMARK` | `IMARK pc {aux=len}` | Starts guest instruction `pc` of `len` bytes. Records the *current instruction pc* for faults, increments `icount`, and is the point where pending exit requests are honoured (§9), except at the block's first `IMARK`, so every block makes progress, and at continuations. |
+| `IMARK` | `IMARK pc {aux=len}` | Starts guest instruction `pc` of `len` bytes. Records the *current instruction pc* for faults, increments `icount`, and is the point where pending exit requests are honoured (§9), except at the block's first `IMARK`, so every block makes progress, and at continuations (an `IMARK` flagged `UAM_IMARK_CONT`: an instruction that must retire together with the one before it, such as a MIPS delay slot; §10a). |
 | `GET` | `dst:W = GET {aux=offset}` | Read the register file. Pure storage, no side effects. |
 | `PUT` | `[g] PUT val {aux=offset}` | Write the register file. Pure storage, no side effects. |
 | `SYSRD` | `[g] dst:W = SYSRD {aux=id}` | Read system register `id` through the ISA module's handler. May have side effects (counters, read-to-clear) and may fault (illegal or privileged). |
 | `SYSWR` | `[g] SYSWR val {aux=id}` | Write system register `id` through the ISA handler. May fault. The handler may raise an *exit request* (for example, interrupts enabled or translation regime changed). |
 | `HELPER` | `[g] dst = HELPER a,b,c {aux=id}` | Call a native function registered by an ISA module or analysis pass (§7.4). |
-| `TRAP` | `[g] TRAP cause, tval {aux=class}` | Raise a synchronous event. Ends the block. Classes: `EXCEPTION` (guest exception, passed to `isa->take_exception` in a `uam_exception` with an ISA-defined `cause`), `DEBUG` (stop into the emulator's debugger, not the guest), `HALT` (stop emulation, e.g. semihosting exit). |
+| `TRAP` | `[g] TRAP cause, tval {aux=class}` | Raise a synchronous event (`tval` is the value that goes with the cause, as in `uam_exception`: a faulting address, or whatever the ISA defines). Ends the block. Classes: `EXCEPTION` (guest exception, passed to `isa->take_exception` in a `uam_exception` with an ISA-defined `cause`), `DEBUG` (stop into the emulator's debugger, not the guest), `HALT` (stop emulation, e.g. semihosting exit). |
 | `WAIT` | `WAIT next_pc` | The hart idles until `isa->irq_wakeup` is true (an interrupt pending and enabled, whether or not interrupts are globally on). The scheduler may fast-forward virtual time to the next event, and execution resumes at `next_pc`. Terminator. |
 | `EXIT` | `[g] EXIT target {aux=kind}` | Leave the block and continue at `target`. An immediate target is a *direct* exit, a temporary target an *indirect* one; the JIT may chain both. Kinds `JUMP`, `CALL`, `RET`, `EXC_RETURN`, `RETRY` are hints for analysis (call graphs, the call tracker of §7.7) and do not change semantics; `RETRY` marks an exit that sends the hart back to run the block's own code another way (Xtensa's loop-end check), not a guest branch. A lifter marks `CALL` every transfer that leaves a return address behind and `RET` every transfer through one (`jr ra`, `blr`, `bx lr`, a pop of the pc, `ret`), conditional ones included; transfers that only look like one stay `JUMP`: x86 far calls and returns (firmware switches segments, modes and privilege with them), and a return directly behind a push on the AVR, 8051, 6502 and Z80 (the jump-table idiom; the lifter reads the bytes before the return, and a misreading takes a return for a jump). |
 
@@ -333,13 +336,13 @@ rotl(v, r) = ((v << r) | (v >> (bits - r))) & mask      // 32-bit arithmetic
 shape in (the default shape costs exactly what the one-predecessor op always did), and
 changing it means calling `uam_exec_set_coverage` again, which flushes every translation.
 With the default shape (depth 1, no rotation; `hist[0]` is also called `prev`) the rule is
-`idx = (A ^ prev) & mask; prev = B`, which covers AFL-style edges (`A = cur`,
+`idx = (A ^ prev) & mask; prev = B`, which covers classic edges (`A = cur`,
 `B = cur >> 1`) and block counts (`B = 0`). Deeper histories give N-gram coverage that
 folds the last N-1 sites, and rotation makes the fold order-sensitive (the site-list schemes,
 [`fuzz-formats.md`](fuzz-formats.md); `uam_cov_count` in `cpu.h` is the reference implementation). `skip_repeat`, also part of
 the shape, makes a site count only when it is not the site that counted last (`last_pc`,
 which `uam_cov_reset_prev` keeps): back-to-back executions of one site count once and no
-site-to-itself edge is ever made (`--cov-mode leapfrog`, the default for block coverage and site lists). `COV` reads and writes nothing else: no register, no
+site-to-itself edge is ever made (`--cov-mode leapfrog`, the default for site lists; block coverage defaults to `every`, without it). `COV` reads and writes nothing else: no register, no
 memory, no bus access, and it does not count as an instruction (`icount` is unchanged). With
 no coverage state attached (`cov` is NULL) it does nothing. Lifters never emit it; a pass
 inserts it directly after the `IMARK` of an instrumented instruction (§8 rule 8), so it runs
@@ -442,7 +445,8 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
 8. **Coverage op.** `COV` has width 32, two immediate operands and no guard, and comes
    directly after an `IMARK` that is not a continuation (`UAM_IMARK_CONT`); with
    `UAM_COV_SPLIT` or `UAM_COV_ERET` (one of them) it comes instead right before an `EXIT`
-   (the final one for a split, one of kind `EXC_RETURN` for an eret), only fences between.
+   (the final one for a split, one of kind `EXC_RETURN` for an eret), with only fences,
+   `FRAME`s and other such flagged `COV`s between.
 9. **`IMARK` shape.** Its pc is an immediate of address width, its length is non-zero, its only
    flags are `CONT` and `BREAK`, and a `CONT` mark cannot start a block. `n_guest` equals the
    number of `IMARK`s.
@@ -450,7 +454,9 @@ The verifier (run on every lifted block unless disabled with `--no-verify`) enfo
     a `TRUNC` destination; everything else, memory and `GET`/`PUT` included, needs `W >= 8`
     (`BSWAP` 16). A conversion's source is a temporary, never an immediate. `TRAP` and `WAIT`
     operands are address-width. The fetch and debug access attributes are core-only and are
-    rejected in IR.
+    rejected in IR. (The verifier enforces the `W >= 8` limit on the computing, memory and
+    register ops; `EXIT`, `TRAP`, `WAIT`, `FENCE` and `HELPER` it holds only to a valid
+    width, and lifters give them address width.)
 11. **Compare record.** `CMPLOG` has width 8..64, operands `a` and `b` of that width, no `c`,
     no guard and no destination, only `UAM_CMP_*` flags, and does not start a block.
 12. **Call frame.** `FRAME` has the address width, exactly one of the `UAM_FRAME_*` flags, no
@@ -476,7 +482,7 @@ Executing a block returns exactly one of these results:
 | `TRAPPED(class, cause, tval)` | `TRAP` | Decided by `isa->take_exception` or the debugger |
 | `WAITING(next_pc)` | `WAIT` | `next_pc` once woken |
 | `FAULT(kind, addr)` | A memory, sysreg or helper fault | Decided by `isa->take_exception`. The faulting instruction's pc is the last `IMARK`. |
-| `INTERRUPTED(pc)` | An exit request, a deadline or a `BREAK` mark seen at an `IMARK` | `pc` of that `IMARK` (instruction not yet started) |
+| `INTERRUPTED(pc)` | An exit request, a deadline or a `BREAK` mark (`UAM_IMARK_BREAK`: an `IMARK` the lifter flags so the block is left before that instruction, §10a) seen at an `IMARK` | `pc` of that `IMARK` (instruction not yet started) |
 
 Every exception report (`uam_exception`, `isa.h`) carries the faulting
 instruction's `pc` and, when that instruction is a continuation
@@ -517,6 +523,13 @@ These are canonical compositions that lifters should emit and optimisers should 
 | Instruction loops (x86 `REP`) | Execute one iteration, then `[more] EXIT <same pc>` |
 
 ---
+
+Sections 10a to 10k record, one ISA at a time, what each needed from the IR and the core and
+the conventions its lifter follows (the module is named at the start of each). RISC-V, the
+first ISA, has no such section: the base rules above were written for it, and §13 shows its
+lifting. Which CPU models a module has, what it models and what it leaves out are not
+part of this specification: they are in [`architecture.md`](architecture.md), section 5,
+and the README's status.
 
 ## 10a. Delay slots and address translation (added for MIPS32)
 
@@ -867,6 +880,8 @@ Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
 
 ## 10k. Privilege as translation state, and interrupt shadows (x86-64)
 
+The module is `isa/x86`.
+
 - **`cpu->priv` holds everything decoding and translation depend on**: CPL (bits 0-1), mode
   (bits 2-3: real, protected, IA-32e, virtual-8086), SMM (4), default code size (5-6), 32-bit
   stack (7), paging (8), A20M# (9), an interrupt shadow carried into the block (10) and the SMM
@@ -874,7 +889,7 @@ Xtensa needed no new IR; these are conventions of its lifter (`isa/xtensa`).
 - **`CONT` for the interrupt shadow.** The instruction after `STI` or `MOV SS` is a
   continuation, so no interrupt lands between them. Unlike a delay slot, its fault is its own:
   the parent has completed.
-- **I/O ports are memory.** `IN` and `OUT` are `PHYS` `LD`/`ST` at `UAM_X86_PIO_BASE` + port.
+- **I/O ports are memory.** A port is the physical address `UAM_X86_PIO_BASE` + port. The string forms `INS` and `OUTS` are `PHYS` `LD`/`ST` there; plain `IN` and `OUT` are one helper, which makes the same bus access and also records the I/O state an SMI handler reads.
 - **128-bit division is a helper**, as is everything that touches descriptors or system state.
 
 ## 11. Opcode numbering and extension profiles
@@ -898,17 +913,19 @@ is a dotted suffix). There is no parser: the form is output only.
 
 ```
 imark   0x80000010 {len=4}
-t0:32 = get.32  {a0}
-t1:32 = add.32  t0, 0x10
-t2:32 = ld.le.32 t1
-        put.32  t2 {a1}
-t3:1  = eq.32   t2, 0
-[t3]    exit.32 0x80000100 {jump}
-        exit.32 0x80000014 {jump}
+         t0:32  = get.32  {a0}
+         t1:32  = add.32 t0, 0x10
+         t2:32  = ld.le.32 t1
+                  put.32 t2 {a1}
+         t3:1   = eq.32 t2, 0
+  [t3]            exit.32 0x80000100 {jump}
+                  exit.32 0x80000014 {jump}
 ```
 
+The guard, if any, comes first in its own column, then the result, then the op.
+
 Each block starts with a `block 0x...: N guest insns, N ops, N temps` line. An `imark` shows
-`,cont` or `,break`. Further access attributes print as `.al`, `.sc`, `.unpriv` and `.phys`.
+`,cont` or `,break`. Further access attributes print as `.x`, `.al`, `.acq`, `.rel` (`.sc` for both), `.unpriv` and `.phys`. An absent operand that a later one follows prints as `_`. The instrumentation ops print like the rest (`cov.32 A, B`, `cmplog.W a, b`, `frame.W target, kind, return {call|ret|...}`), but not their flags or a `CMPLOG`'s site: a split or eret `COV` looks like a counting one.
 Immediates below 10 are decimal and the rest hex. A register offset prints by name when the
 ISA's table has one of that width (`{reg+N}` otherwise), and a system register as `{sys 0xN}`.
 

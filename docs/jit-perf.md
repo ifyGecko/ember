@@ -13,6 +13,18 @@ map.
 Ember's own reference measure is the cross-ISA benchmark in `tests/bench` ("Parity
 across ISAs" below): every change is judged on all guests at once with it.
 
+How to read it. "Measuring" is the tools, and is current. "Log" is one row per step, in
+order, with the newest last; the sections "After step N" under "Parity across ISAs" give
+each step's figures on the bench, and the last of them is where the JIT stands now.
+"After step 8c" is a snapshot from that step, kept for its profile. "Not done yet", at
+the end, is the open list. The words the log uses for the JIT's parts (a block's exit
+*slot* and the *epoch* that invalidates links, the *bridge* from native code to C for a
+slow load or store, the *stop stub* an instruction's check branches to, the *data TLB*
+the inline memory path probes, the *chain budget* that bounds jumps from block to block,
+`code_gen` and the *tcache*, the translation cache) are explained in
+[`architecture.md`](architecture.md), section 6 (the bullets "JIT block chaining" and
+"Stores next to code"), and at the top of `src/exec/jit.h`.
+
 ## Measuring
 
 ### `--stats`
@@ -96,6 +108,17 @@ prints one tab-separated row:
 
 On a VM without a PMU the host-instruction column is `-`; use the median time there.
 
+### Checking a change
+
+A change to the JIT is checked before it is timed:
+- `meson test -C build` runs every firmware self-test on the interpreter and the JIT, and
+  `test_jitdiff`, which runs random and hand-written blocks on both backends (and at
+  `UAM_JIT_REGS=1`, so that values spill) and compares the whole state;
+- `meson compile -C build jitdiff-soak` is the same differential test at length
+  (`-Djitdiff_blocks=N` random blocks per seed, default 200000);
+- `meson test -C build --suite bench` requires the host build's checksums from the bench on
+  every guest, interpreted and compiled.
+
 ## External workloads used for the log below
 
 The log was measured on two firmware images run by boards that are not
@@ -139,7 +162,10 @@ Medians of 5 runs on a 12-core x86-64 VM (no PMU):
 
 ## Log
 
-Each step below lists its effect on the two workloads (5-run medians, same machine).
+Each step below lists its effect on the two workloads (5-run medians, same machine). From
+step 14 on the two columns are `-`: the external boards were no longer available to
+measure with, and those steps were judged on the bench alone (their figures are in the
+"After step N" sections below).
 
 | step | OVMF time | VxWorks time | notes |
 |---|---:|---:|---|
@@ -159,14 +185,18 @@ Each step below lists its effect on the two workloads (5-run medians, same machi
 | 10: jump table for computed exits | 1.69 s | 1.72 s | a computed EXIT whose slot holds another target looks its target pc up in a 4096-entry direct-mapped table of links shared by all blocks (hash, then pc and epoch compared) and links it there on a miss, instead of returning to the run loop. Measured against 1.71 s / 1.81 s in the same session; blocks returning to the run loop 0.41 M -> 0.25 M / 5.5 M -> 3.2 M; code +1%. `UAM_JIT_JTAB_BITS=N` uses 2^N entries (test_jit runs N=1 so links collide). Consoles and the interpreter-vs-JIT state identical on both |
 | 11: spin loops | 1.69 s | 0.51 s | not a code generation change: the run loop adds the passes of a block that waits on memory (jumps back to itself, only loads, pure ops and register writes) up to the next deadline or host poll to icount at once, after evaluating one pass without effect shows it would change nothing (src/exec/spin.h; both backends). Measured against 1.68 s / 1.72 s in the same session; VxWorks under the interpreter 40.2 s -> 4.4 s; xbench unchanged (no kernel spins). `UAM_SPIN_SKIP=0` turns it off. Consoles, block counts and the interpreter-vs-JIT state identical on both |
 | 12: stores next to code | 1.74 s | 0.54 s | a page holding translated code goes into the data-TLB write set under a tag the inline probe never matches; a store that misses calls one of 16 shared stubs (size, byte order, alignment) that read the page's 64-byte code-line mask and store inline unless a byte falls in a code line (src/exec/jit_x86.c, emit_code_probe; `uam_bus_page_host_code`). Unchanged against 1.74 s / 0.53 s in the same session (bridge stores 76 K -> 38 K / 1.56 M -> 1.56 M, the rest device writes); code +1.1% / +1.5% (inline probes instead of stubs were +11% / +17% for 1-2% more on the bench). Consoles and the interpreter-vs-JIT state identical on both |
-| 13N: narrow register reads | 1.61 s | 8.22 s* | a GET of the low bytes of a register whose wider value the block already knows (from a PUT or a GET) becomes a TRUNC of that value instead of a register-file read, and folds from there (src/ir/opt.c, `lookup_wider`; docs/jit-carry-design.md, stage N). Only x86 has such reads (455 sites on the bench, 7802 on OVMF; none on the other guests, whose IR is unchanged). Measured against 1.64 s / 8.37 s in the same session; OVMF code +0.2%. *VxWorks is not comparable with the rows above: its board sources (~/tplink-qwen-emu, uncommitted GMAC work) changed since, and the baseline build of the same board sources gives the same console. Consoles and the interpreter-vs-JIT state identical on both |
+| 13N: narrow register reads | 1.61 s | 8.22 s* | a GET of the low bytes of a register whose wider value the block already knows (from a PUT or a GET) becomes a TRUNC of that value instead of a register-file read, and folds from there (src/ir/opt.c, `lookup_wider`; docs/jit-carry-design.md, stage N). Only x86 has such reads (455 sites on the bench, 7802 on OVMF; none on the other guests, whose IR is unchanged). Measured against 1.64 s / 8.37 s in the same session; OVMF code +0.2%. *VxWorks is not comparable with the rows above: the external board's own sources changed in between (it models more hardware), and the baseline build of the same board sources gives the same console. Consoles and the interpreter-vs-JIT state identical on both |
 | 14: results in place | - | - | the allocator picks a result's register before the op is emitted (a free one, or that of an operand read for the last time) and the op computes there: no move through rax / x0 afterwards, `lea` for a three-operand add on x86-64 |
 | 15: data-TLB probe | - | - | the probe reads the address in its temp's register and a store its value there (or as an immediate); the page-crossing test is folded into the tag compare (first byte's entry, last byte's page), and an ACC_ALIGNED access keeps only its alignment test |
 | 16: exit path | - | - | an EXIT stores res only on the ways out of native code (stop, budget spent, link miss); a constant target reads its slot's epoch and entry pc-relative; one `sub` on memory tests and counts the chain budget |
 | 17: icount against the stop point | - | - | the icount register holds icount - icount_stop as last read (on entry, after every bridge): an IMARK is `inc r13; jg stub`, an EXIT tests the sign; nothing read from memory. A stop from a signal handler is seen at the next return to the run loop (chains without a host poll are bounded to 4096 blocks) |
 | 18: direct links | - | - | an EXIT to a constant pc ends in `jmp rel32` (AArch64: `b`), patched to the next block's body when linked and back to the miss path when the epoch moves (the JIT lists the linked jumps); no epoch compare, no indirect jump: 5 host instructions per exit on x86-64, 6 on AArch64. Each linked jump records the arena generation; one from before a recycle is never written, and a patch whose site is not a jump of the current code aborts. `UAM_JIT_ARENA=bytes` shrinks the arena, to test recycling |
+| 19: flags read where they already are | - | - | after the host instruction that computed a subtract, a compare or an add, every compare, carry and overflow of the IR over the same operands, and the sign and zero tests of its result, is one set-on-condition from the host flags (`jit_hf` in `jit_impl.h`; `UAM_JIT_NOFLAGS=1` turns it off); the x86 lifter states the overflow of an add or subtract as `SCARRY`/`SBORROW`; call tracking's push and pop inline |
 
-## Where it stands (after step 8c)
+## After step 8c
+
+A snapshot from that step, on the two external workloads; the steps after it are in the
+log above and in the "After step N" sections below.
 
 Against the baseline: OVMF 3.96 s -> 2.06 s (253 -> 485 MIPS, 1.9x), VxWorks
 3.10 s -> 1.87 s (1291 -> 2143 MIPS, 1.7x).
@@ -182,7 +212,7 @@ Correctness, end to end:
 - Compares take 14%, zero-extensions 4.6%, `put.8` 1.8%, and part of the ALU ops
   build the x86 flags (CF/OF/AF/ZF/SF/PF). Roughly 15-20% of the run is flag work.
   Most of it is overwritten by the next instruction and never read, which is what
-  removing dead flag stores across instructions would recover.
+  removing dead flag stores across instructions would recover (step 9 then did).
 - The remaining C costs are small: port I/O 3.5%, libc 6%, translation 4%.
 
 **VxWorks profile.** Its idle loop is now one constant-address load, a fused compare
@@ -198,7 +228,7 @@ chasing, 64-bit arithmetic and number formatting, about 5e8 guest instructions i
 Everything it checksums is fixed-width (plain `int` and `unsigned` only for small counters and indices), so every build prints the same checksums.
 - `meson test -C build --suite bench` (part of `meson test -C build`) runs two rounds on every guest, under the
   interpreter and the JIT, and requires the host build's checksums.
-- `tools/xbench.sh` (`meson compile -C build xbench`) times the full run on every guest. Each does the
+- `tools/xbench.sh` (`meson compile -C build xbench`; the script's options go through the build option, `meson configure build -Dxbench_args="--per-kernel"`, or run the script itself) times the full run on every guest. Each does the
   same work, so wall time is the number to compare; `vs_best` divides it by the fastest
   guest's. `--times` also prints each kernel's seconds and their geometric mean. `--per-kernel` times each kernel on its own and prints the ratio matrix with
   a geometric mean per guest; `--interp` uses the interpreter.
@@ -241,7 +271,8 @@ bits 3 and 5 included, and counts R.
 
 The Xtensa builds (`bench-lx106.elf` with the LX106's CALL0 code, `bench-lx6.elf` and
 `bench-lx7.elf` with the windowed ABI) are in the timed run. Measured with the JIT against RV32
-(0.279 s, 1860 MIPS): LX106 0.459 s at 1700 MIPS (780 million instructions: no MULUH and no
+(0.279 s, 1860 MIPS in that session, which is not the one of the table above: compare within
+this paragraph): LX106 0.459 s at 1700 MIPS (780 million instructions: no MULUH and no
 divide, so libgcc's routines run instead), LX6 0.567 s at 840 MIPS and LX7 0.491 s at 980 MIPS
 (about 480 million). The windowed builds pay for every call and return: ENTRY and RETW are
 helpers that store the current window into the physical register file and load the next one
@@ -465,9 +496,12 @@ Tried and left out:
   operands): emitting it later needs a snapshot of the allocator, as IMARK stubs have for
   their replays only. A larger change than its 0 to 2% (measured earlier as a bound).
 
-Not done yet:
+## Not done yet
+
 - **The x86 gap** (x86 at about 1.35-1.65x RV32's kernel time): writes live at block exits.
-  Step 13, stages C1 and C2 in docs/jit-carry-design.md (approved; stage N done).
+  Step 13, stages C1 and C2 in docs/jit-carry-design.md (approved; stage N done). That
+  design's code generation and linking predate step 18's direct links and need redoing
+  for them first.
 - **Translation cost on OVMF**: about 0.23 s of 1.6-1.7 s (last measured at step 9).
 - **"Option B" for icount.** Count and check the deadline once at block entry instead of
   an add and a branch per instruction (step 17). It changes how stopping at a deadline is

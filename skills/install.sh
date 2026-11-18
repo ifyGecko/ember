@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
         --qwen) targets+=(qwen); shift;;
         --agents) targets+=(agents); shift;;
         --uninstall) uninstall=1; shift;;
-        -h|--help) sed -n '2,15p' "$0"; exit 0;;
+        -h|--help) sed -n '2,14p' "$0"; exit 0;;
         *) echo "error: unknown argument: $1 (see --help)" >&2; exit 1;;
     esac
 done

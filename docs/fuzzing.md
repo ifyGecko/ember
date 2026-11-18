@@ -14,6 +14,14 @@ blocks ember runs ("Block coverage" below): no site list, no rizin or Ghidra pas
 end and crash pcs may be ELF symbols. A site list made by static analysis is an opt-in for
 targets worth it ("Block coverage or a site list").
 
+Words used throughout: the **map** is an array of 8-bit counters, and a **bucket** is one of
+them (several pieces of code can share one). A bucket's count is read in **classes**
+(1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128-255), so that a loop running 5 or 6 times is the
+same behaviour and one running 5 or 50 times is not. The **history** is what the coverage
+state remembers of the code that ran just before (`prev` below; longer for N-grams), which
+is what makes a bucket stand for an edge or a path and not a place. The **INIT map** is
+the coverage of the boot up to the begin pc, reported once and apart from every input's.
+
 Coverage is one IR opcode, `UAM_OP_COV A, B` ([`uam-isa.md`](uam-isa.md) §7.5), which the
 coverage pass inserts right after the instruction marker of each instrumented instruction:
 
@@ -31,8 +39,8 @@ last; see the ISA document).
 
 | Scheme | A | B |
 |---|---|---|
-| AFL edges | `cur` | `cur >> 1` |
-| block counts | `id` | `0` |
+| plain edges (`cur`: a number for the current block) | `cur` | `cur >> 1` |
+| block counts (`id`: a number for the block), no edges | `id` | `0` |
 | site model, N=1 | `site_id` | `0` |
 | site model, N=2 | `site_id` | `spread(site_id)` |
 | hashed-pc model, N=1 | `hash_pc(offset, module)` | `0` |
@@ -87,7 +95,8 @@ code's path:
   handler continues the interrupted code's history, as plain edges would).
 
 `--cov-range R` (repeatable) counts only blocks that start in R: `LO-HI`, `LO+LEN`, an ELF
-symbol `SYM` (its size), `SYM-SYM2` or `SYM+LEN`. Code outside every range neither counts nor
+symbol `SYM` (its size), `SYM-SYM2` (from SYM up to where SYM2 starts: SYM2's own body is
+not in the range) or `SYM+LEN`; at most 64 ranges. Code outside every range neither counts nor
 enters the history, so the parser under test, not the scheduler, the idle task or a C
 library, makes the buckets. The map is 64 KiB for N <= 2 and four times larger for each N
 above (at most 4 MiB; `--cov-map-size`). Begin, end and crash pcs can be ELF symbols too, so
@@ -143,7 +152,9 @@ interrupt contexts (`--cov-irq`).
    no boot (the INIT map is then empty, and `--fuzz-begin-skip` is not applied again):
    parallel workers boot once. `FILE.key` holds a fingerprint of what the snapshot was made
    from (the image files' contents and the command line, less the options that only name a
-   run's inputs and outputs); a FILE made from anything else is replaced by a fresh boot.
+   run's inputs and outputs, and the library's ABI version); a FILE made from anything else
+   is replaced by a fresh boot. It does not combine with `--load-snapshot`, and fuzzing
+   itself does not combine with `--gdb` or `--save-snapshot` (the runner refuses both).
 3. **Each input**: restore the snapshot (only the memory lines the last input changed, and
    the components; repeat restores reuse the device table and skip the compatibility
    check), clear the map and `prev`, deliver the input, run
@@ -199,7 +210,7 @@ default), so under- and over-reads and under- and over-writes are each caught or
 |---|---|---|
 | `before=N` | `[ADDR-N, ADDR)`, armed at the first input | `buf[-1]`, a header read from in front of the buffer |
 | `after[=N]` | `[ADDR+L, ADDR+max+N)`, re-armed for each input | anything past the input's legitimate extent L: the unused rest of the buffer, and N bytes beyond it (default 0) |
-| `extent=@OFF:SZ[:le\|:be][+D\|-D]` | (places `after`) | L is the SZ-byte (1, 2, 4, 8) length field at input offset OFF, in the given byte order (default the CPU's), plus D, instead of the delivered byte count |
+| `extent=@OFF:SZ[:le\|:be][+D\|-D]` | (places `after`: giving `extent` without `after` is an error) | L is the SZ-byte (1, 2, 4, 8) length field at input offset OFF, in the given byte order (default the CPU's), plus D, instead of the delivered byte count |
 
 L never falls before the end of the length field itself, which the firmware may read; an input
 too short to hold the field gets no `after` zone. Guard memory that belongs to the firmware's
@@ -230,10 +241,14 @@ A crash (guard) names the guard and the access (`uam_fuzz_result.guard`). Here a
 over the rv32 fuzz target's input buffer catches `parse` reading it:
 
 ```
-build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
-    --fuzz-input uart0 --guard 0x80000470+256:r,name=g_buf --fuzz-replay in/ build/tests/firmware/fuzztarget.elf
-replay: in/1-hello: crash-guard pc=0x80000262 (read 1 at 0x80000470: +0 into guard g_buf [0x80000470, 0x80000570)) insns=60 buckets=8
+build/uam-run -b rv32-ref --fuzz-begin fuzz_iteration --fuzz-crash-pc fuzz_panic \
+    --fuzz-input uart0 --guard 0x800004f0+256:r,name=g_buf --fuzz-replay in/ build/tests/firmware/fuzztarget.elf
+replay: in//1-hello: crash-guard pc=0x80000274 (read 1 at 0x800004f0: +0 into guard g_buf [0x800004f0, 0x800005f0)) insns=61 buckets=8
 ```
+
+(`--guard` takes numbers, not symbols: 0x800004f0 is `g_buf` from
+`readelf -s build/tests/firmware/fuzztarget.elf`, and it and the pcs printed move with the
+toolchain. `in/` holds one file, `1-hello`.)
 
 A `--guard ...,fault` instead lets the guest take the bus fault: that is a crash (fault) if its
 class crashes, and the result names the guard as well. To a fuzz brain (`--fuzz-net`) a crash
@@ -241,8 +256,8 @@ class crashes, and the result names the guard as well. To a fuzz brain (`--fuzz-
 
 Exception classes: `fetch`, `load`, `store` (bus faults), `align`, `xlate` (TLB misses and
 protection: firmware with a TLB takes these routinely), `trap` (illegal instructions, but also
-system calls and breakpoints), `sysreg`, `all`, `none`. The default is
-`fetch,load,store,align`. Exceptions outside the policy are delivered to the firmware as
+system calls and breakpoints), `sysreg`, `all`, `none`, and `default` for the default set,
+`fetch,load,store,align` (so `default,trap` adds one class to it). Exceptions outside the policy are delivered to the firmware as
 usual; pointing `--fuzz-crash-pc` at its fatal-error handler catches those that end there.
 For x86 SMM handlers, SMM code-fetch confinement (`uam_x86_set_smm_confine`; `-o
 smm-confine=1` on `x86_64-ref`) turns an SMM instruction fetch outside SMRAM - a call-out
@@ -418,7 +433,7 @@ first instruction (`uam_machine_add_pc_hook`); each hook reads the arguments fro
 registers its calling convention uses, calls `uam_heap_alloc` / `uam_heap_free` /
 `uam_heap_realloc` / `uam_heap_calloc`, writes the result and continues at the return
 address, so the firmware's allocator never runs. `tests/boards/heap_hooks.c` is a complete
-example (60 lines for a RISC-V board), and `skills/ember-dev-build/references/board-skeleton.md`
+example (for a RISC-V board), and `skills/ember-dev-build/references/board-skeleton.md`
 has the recipe. What to know:
 
 - Checking starts with the heap's first allocation, so start-up code that clears the arena
@@ -443,16 +458,17 @@ brain treat their hits like any guard crash: reason "guard", status the pc.
 Runs each input once (a directory in name order) and prints one line per input:
 
 ```
-build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
+build/uam-run -b rv32-ref --fuzz-begin fuzz_iteration --fuzz-crash-pc fuzz_panic \
     --fuzz-input uart0 --fuzz-replay crashes/ build/tests/firmware/fuzztarget.elf
-replay: crashes//2-store: crash-fault pc=0x800002b2 (store-fault cause 0x0 tval 0x40000000) insns=95 buckets=17
+replay: crashes//2-store: crash-fault pc=0x8000038c (store-fault cause 0x0 tval 0x40000000) insns=98 buckets=16
 ```
 
-(The pcs are `fuzz_iteration` and `fuzz_panic` from `readelf -s`; they move with the
-toolchain.) The exit status is the most severe verdict of any input: a crash (the first
+(`fuzz_iteration` and `fuzz_panic` are symbols of the ELF image; with a raw image give the
+addresses. The pcs printed move with the toolchain. `crashes/2-store` holds `FUZ!`, the
+input of one of the target's planted bugs.) The exit status is the most severe verdict of any input: a crash (the first
 one's kind: 20 fault, 21 oracle, 25 guard), else a hang, else a timeout, else a rejected input (24), else 0. So a directory of crashes fails however
 it is ordered and whatever other files it holds. Every regular file runs as an input, except
-a fuzzer's notes saved beside an input: a runner extension can name their suffixes, and a
+those whose name starts with a `.`, and a fuzzer's notes saved beside an input: a runner extension can name their suffixes, and a
 file X plus that suffix is then skipped when X is in the directory too. The stock extension
 names `.info`, so the brain's `crashes/` or `hangs/` directory replays its inputs
 and not their `.info` sidecars (`uam_fuzz_replay_create_ex` in a program). `--cov-out FILE` writes the last input's map. `tests/fuzz/fuzztarget.h`
@@ -472,12 +488,18 @@ exception the harness stopped on is in the replay line, not in the history).
 uam_fuzz_config cfg = { .begin_pc = BEGIN, .crash_pcs = &panic_pc, .n_crash_pcs = 1,
                         .crash_exc = UAM_FUZZ_EXC_DEFAULT };
 uam_fuzz *f = uam_fuzz_create(&m, &cfg, err, sizeof(err));
-uam_fuzz_set_block_coverage(f);                  /* or uam_fuzz_set_sites */
+uam_fuzz_set_block_coverage(f);                  /* plain edges; see below */
 uam_fuzz_select_route(f, "uart0", err, sizeof(err));
 uam_fuzz_boot(f, &r);
 for (each input)
-    uam_fuzz_run_one(f, data, len, &r);          /* r.verdict, r.detail, uam_fuzz_map(f) */
+    uam_fuzz_run_one(f, data, len, &r);          /* r.verdict, r.detail, uam_fuzz_map(f, &size) */
 ```
+
+`uam_fuzz_set_block_coverage` is the plain form: one-predecessor edges between ember's
+blocks, without what the runner's default adds. For the runner's model (splits, ranges,
+interrupt contexts, N-grams) use `uam_fuzz_set_block_coverage_ex` with `uam_cov_block_opts`
+(`uam/cov.h`) and the history shape in `cfg.history`; for a site list, `uam_fuzz_set_sites`.
+A map from one form is not comparable with a map from another.
 
 or hand the loop to a frontend (`uam_fuzz_run(f, &frontend, ctx)`: `hello`, an INIT report
 with id 0, then one report per input, `bye`).
@@ -562,7 +584,19 @@ ELF's symbol table names (`STT_FUNC`, the entry point, `--symbols` for a raw ima
 name. A raw image needs `--raw --base ADDR --arch ARCH --bits N --endian E` (and
 `--symbols FILE`); run it with `--raw-base` and, if its reset code is not at its first byte,
 `--entry`. `gen_boundaries.py` writes markers for named functions,
-`NAME[:begin|end[:any|zero]]`, and with `--sites` checks that each is a site of the list.
+`NAME[:begin|end[:any|zero]]`, and with `--sites` checks that each is a site of the list
+(`--force` writes a begin-only file with the `zero` depth filter, which is otherwise
+refused: the filter only means something with END markers).
+A list over several images is made with `--module NAME:PATH` (repeatable; the first image
+is module 0), and each module's load base is then given to the runner with
+`--cov-module NAME=BASE`. `--strategy entry|terminator` chooses which instruction of a
+block is its site (the default is the architecture's: `entry` on MIPS, where a block's
+last instruction is a delay slot, `terminator` elsewhere); `--no-default-exclude` keeps
+the import stubs and C runtime functions that are left out by default;
+`--fail-on-overlap` makes overlapping sites an error where the later one is otherwise
+dropped with a warning; `--print-reachable` lists the functions a `--root` slice holds;
+`--allow-empty` writes a list with no sites. `python3 fuzz/tools/gen_sites.py --help` has
+them all.
 
 **Headless Ghidra instead of rizin.** `fuzz/tools/ghidra/` holds Jython ports of both, with
 the same rules, working on a program analysed in Ghidra. Where both analysers find the same
@@ -608,15 +642,9 @@ writes them; rizin gives such functions no sites).
 A site on an instruction ember runs as part of the one before it (a branch delay slot, an
 instruction inside a Thumb IT block) cannot be instrumented. The run stops with an error
 naming the site-list record and module. The generators never place one, so such a site
-usually means a wrong base or a hand-made list. Two designs remain open for later, and
-either would be fine:
-
-- **Count them.** ember runs a branch and its delay slot as one unit, so a COV right after the
-  delay slot's instruction marker would still count once per execution; the verifier's rule
-  that COV follows only non-continuation markers would be relaxed for it.
-- **Reject them, earlier.** Detect such sites when the list is loaded (a small ISA hook, "is
-  this pc a continuation?") instead of when that code is first translated, which can be
-  well into a run.
+usually means a wrong base or a hand-made list. The error comes when that code is first
+translated, which can be well into a run, not when the list is loaded (`TODO.md` has the
+two ways this could change).
 
 The bucket formula (`fuzz/cov_scheme.c`, [`fuzz-formats.md`](fuzz-formats.md#coverage-buckets))
 uses the coverage state's history for N>=2: depth N-1, with a rotation amount per slot when
@@ -632,8 +660,9 @@ formats end to end with lists written by `tests/fuzz/mk_lists.py`.
 decides what to work on and keeps the interesting inputs in a disk-backed queue that a
 restart resumes; **ember mutates** (see "Mutation in ember" below), runs and judges the
 inputs itself and sends back only what is worth keeping. The brain saves crashes and hangs
-and runs until stopped (`--iters N` caps the mutated executions). Its campaign logic is in `fuzz/tools/fuzz_queue.py`; the design and
-its reasons are in [`fuzz-ideas.md`](fuzz-ideas.md). Under `--out DIR`:
+and runs until stopped (`--iters N` caps the mutated executions). Its campaign logic is in `fuzz/tools/fuzz_queue.py`. Without `--seeds`
+(or with an empty directory) it starts from a few built-in seeds; `--out` defaults to
+`./fuzz_out`; `--listen HOST:0` takes a free port and prints it. Under `--out DIR`:
 
 - `queue/id:NNNNNN,...`: the queue. Names record each entry's origin:
   `id:000000,orig:SEEDNAME` (a seed), `id:000012,src:000003,op:havoc,+cov` (mutated from
@@ -706,7 +735,8 @@ in cycles:
   operand there, plus and minus one for ordered compares: at most `--cmplog-max` (256)
   candidates per entry, run back to back like a batch of mutations, each kept if it is new
   coverage (`op:cmplog` in the queue). Constants of the code that the input lacks become
-  dictionary integers (up to 256).
+  dictionary integers (at most 64 from one stage, and the brain keeps up to 256 of them in a
+  session).
   This finds what havoc cannot guess: a 32-bit magic value from `hello world!` in a few
   thousand executions on every tested board. `--no-cmplog` turns it off; the candidates
   count as mutated executions for `--iters`, and the status counts `cmplog_execs` and
@@ -718,8 +748,8 @@ in cycles:
 **Mutation in ember.** The brain mirrors its queue into ember (CORPUS frames) and asks for
 batches (HAVOC: up to `--batch` (1024) mutations of one entry, at least `--min-energy` (64)
 each time an entry is chosen). ember's mutator (`fuzz/mutate.c`, `uam/fuzz_mutate.h`)
-copies the entry, splices it first with another entry `--splice` (150) times in 1000 (AFL's
-crossover between the first and last differing byte), and stacks 2-128 (`--stack`,
+copies the entry, splices it first with another entry `--splice` (150) times in 1000 (a
+crossover at a point between the first and the last byte in which the two differ), and stacks 2-128 (`--stack`,
 log-uniform) havoc operators:
 
 | Operators | What they do |
@@ -731,7 +761,7 @@ log-uniform) havoc operators:
 | `RESIZE` | the long step: grow to a length between the input's and `--max-size`, or cut to one between the input's and one byte, either as likely, log-uniformly on that side (each power-of-two size class alike); bytes are added or cut at a random place |
 | `DICT_INSERT`, `DICT_OVERWRITE`, `DICT_INT_ADJ` | insert or write a dictionary token; write an integer token ±1 |
 
-Chunk lengths are drawn the way AFL's havoc draws them: a third of the time 1-32 bytes, a
+Chunk lengths are drawn in three classes: a third of the time 1-32 bytes, a
 third 32-128, a third 128-1500 (now and then more), within the operator's limit. The length
 moves both ways and evenly: whenever an operator that changes it is drawn, a coin decides
 between growing and cutting, whatever the weights. `DELETE_CHUNK`, `CLONE_CHUNK` and
@@ -744,15 +774,24 @@ and the rest the same length (39-44% and 42-46% with a dictionary), about 3% of 
 input's pass 2000 bytes and about 5% of a 9000-byte input's fall under 64. A chain of
 mutations from one byte or from the cap covers the whole range and spends about as long
 under 64 bytes as over 1000. At the ends the move without room does nothing: an input at
-the cap shrinks or stays. A direction whose operators have weight 0 stays off. Set
-`--max-size` to the buffer the firmware really has: the lengths spread up to it, and inputs
-longer than the route delivers only cost time. ember judges each mutation itself against its record (every INPUT and every batch
+the cap shrinks or stays. A direction whose operators have weight 0 stays off.
+
+Set `--max-size` to the buffer the firmware really has: the lengths spread up to it, and
+inputs longer than the route delivers only cost time.
+
+**Judging.** ember judges each mutation itself against its record (every INPUT and every batch
 counts) and sends a FIND only for new coverage, a novel crash, or a hang (up to
 `--max-hangs`); a batch ends with its totals (executions per verdict, per operator, per
 path), and says PROGRESS when it has been silent for a second, so a batch of slow inputs
-does not look like a dead ember. A board can repair mutated inputs before they run
+does not look like a dead ember.
+
+**Fix-ups.** A board can repair mutated inputs before they run
 (`uam_machine_set_input_fixup` on its named input, or `uam_fuzz_set_fixup`: a checksum, a
-length field), and what ember reports and the brain saves is the repaired input. ember tells the brain its operators and their default
+length field), and what ember reports and the brain saves is the repaired input. Firmware that checks a
+checksum or a length before it parses needs one: without it nearly every mutation is
+thrown out at that check.
+
+**Stages.** ember tells the brain its operators and their default
 weights (MUTATOR_INFO), so the two never disagree. Trimming and input-to-state run in ember
 as well, as stages of the campaign engine (`uam/fuzz_campaign.h`): the brain names the
 entry and a limit, ember derives the inputs, runs them with no frame in between and
@@ -785,15 +824,18 @@ runs N brain + ember pairs, each on its own port with its own output directory `
 every `--sync-interval` seconds (60), each one runs the other workers' new queue entries
 once and keeps those that are new to it (`sync:` names; `.synced/PEER` records how far it
 read). Each worker gets a distinct RNG seed, derived from `--seed-rng` and its name
-(identical workers would only repeat each other), and the next schedule of `--schedules` (by default the five main ones; any of the nine can
-be listed)
-(default all five, round robin); `--dict` and `--seeds` go to every worker, `--brain-arg`
+(identical workers would only repeat each other), and the next schedule of `--schedules`, round robin (by default the five main ones; any of
+the nine can be listed); `--dict` and `--seeds` go to every worker, `--brain-arg`
 passes anything else. A worker whose brain or ember exits unexpectedly is restarted from
 its queue (`--max-restarts`, 5); Ctrl-C stops them all with BYE. The firmware boots once:
 the launcher gives every ember `--fuzz-snapshot DIR/begin.snap`, starts `main` first, and
 starts the others when `main` has saved the begin snapshot there, so they (and every
 restart) skip the boot; a snapshot left from an earlier launch is removed first, and
-`--no-shared-boot` boots each worker.
+`--no-shared-boot` boots each worker. If `main` ends or `--boot-timeout` (3600 s) passes
+before the snapshot is saved, the others boot themselves; a command that already has
+`--fuzz-snapshot` or `--load-snapshot` is left as it is. `-n` is 1 to 256; `--iters N`
+caps each worker's mutated executions; the launcher exits 0 when every worker ended
+normally, 1 when one failed for good, 2 on a usage error.
 `python3 fuzz/tools/status_tui.py --sync-dir DIR` shows one row per worker and a total.
 
 ember dials the brain (retrying for a few seconds while it starts), runs each INPUT through
@@ -817,7 +859,8 @@ is the ISA's name (`rv32imac`, `mips32be`, `armv7`, ...).
 | rejected | CRASH `REJECTED` (6) | 0 (the brain counts it, and saves nothing) |
 
 A malformed INPUT gets CRASH `MALFORMED` (7) and runs nothing; unknown frame types are
-ignored. A BYE from the brain ends the run (exit 0); the brain closing the connection without
+ignored. A malformed CORPUS, HAVOC or STAGE frame (a short payload, a length that does not
+match) is not answered: the stream is broken, and ember ends with an error (exit 2). A BYE from the brain ends the run (exit 0); the brain closing the connection without
 one is an error (exit 2), and so is an internal error of ember's, which sends BYE first. SIGINT
 sends BYE in place of the pending reply and exits 130. TCP keepalive (probes after a minute
 of silence, giving up about a minute later) notices a brain host that vanished without
@@ -827,12 +870,12 @@ unless `--fuzz-net-timeout SEC` is given: then SEC seconds without a frame from 
 
 ```
 python3 fuzz/tools/fuzz_brain.py --listen 127.0.0.1:7000 --seeds seeds/ --out run/ --status-file run/status.jsonl
-build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
+build/uam-run -b rv32-ref --fuzz-begin fuzz_iteration --fuzz-crash-pc fuzz_panic \
     --fuzz-input uart0 --fuzz-iter-insns 200000 --fuzz-net 127.0.0.1:7000 build/tests/firmware/fuzztarget.elf
 python3 fuzz/tools/status_tui.py run/status.jsonl     # a live status screen (--once: one frame)
 
 python3 fuzz/tools/fuzz_launch.py -n 4 --out camp --seeds seeds/ --dict fw.dict -- \
-    build/uam-run -b rv32-ref --cov-blocks --fuzz-begin 0x80000336 --fuzz-crash-pc 0x80000240 \
+    build/uam-run -b rv32-ref --fuzz-begin fuzz_iteration --fuzz-crash-pc fuzz_panic \
     --fuzz-input uart0 --fuzz-iter-insns 200000 build/tests/firmware/fuzztarget.elf
 python3 fuzz/tools/status_tui.py --sync-dir camp      # every worker
 ```
@@ -858,7 +901,7 @@ compares what one execution costs, in guest instructions at that plain speed, wi
 figures recorded per host architecture in `tests/fuzz/throughput.ref`: a stage that costs
 over 1.5 times its figure fails, so a change that halves the executions per second is
 noticed. `meson compile -C build fuzz-throughput-record` rewrites the figures (on a quiet machine, after a
-change meant to move them); `THROUGHPUT_REF=` only reports. Between two inputs the harness
+change meant to move them); `-Dthroughput_ref=` (the build option, empty) makes the test only report. Between two inputs the harness
 restores its snapshot: only the memory that changed is written back, and translated code
 keeps its links and the JIT's data cache its entries for loads unless the input changed
 the processor's address translation or the firmware translates through page tables in its

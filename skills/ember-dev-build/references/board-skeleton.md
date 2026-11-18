@@ -65,8 +65,8 @@ block and a finisher wired in.
 
 ## Per ISA: what the generated board starts from
 
-The defaults come from ember's reference board of each ISA (`boards/<isa>_ref.c`), which has
-only what every board of that architecture has; `--model` picks its CPU model. Addresses are
+The defaults come from ember's reference board of each ISA (its file is in the second table
+below), which has only what every board of that architecture has; `--model` picks its CPU model. Addresses are
 bus (physical) addresses; RECON's numbers replace them.
 
 | `--isa` (`--model`) | descriptor, CPU model call | memory the scaffold maps | start | interrupt inputs (`uam_cpu_irq_sink`) |
@@ -84,6 +84,24 @@ bus (physical) addresses; RECON's numbers replace them.
 | `m6502` (nmos, 2a03, 65c02, r65c02) | `uam_isa_m6502`; `uam_m6502_configure` | RAM 0-0x7FFF, ROM 0x8000-0xFFFF | the reset vector at 0xFFFC | lines 0-29 wired-OR into IRQ, `UAM_M6502_LINE_NMI`, `UAM_M6502_LINE_SO`; devices clear their own lines |
 | `z80` (nmos, cmos) | `uam_isa_z80`; `uam_z80_configure` + `uam_z80_set_io_decode` | RAM 0-0xFFFF; an `io` catch-all over the ports at `UAM_Z80_IO_BASE` | 0 | `UAM_Z80_LINE_INT`, `UAM_Z80_LINE_NMI`; IM 0/2 data-bus bytes: `uam_z80_set_inta`; RETI: `uam_z80_set_reti` |
 | `xtensa`, `xtensaeb` (lx6, lx106, lx7) | `uam_isa_xtensa`/`xtensaeb`; `uam_xtensa_configure` (`uam_xtensa_<m>`) + `uam_xtensa_set_prid` | RAM at 0x40000000 (4 MiB; VECBASE resets there) | the model's reset vector (0x40000400; LX106 0x40000080) | line n = interrupt n as the model's table types it (level, edge, NMI); CCOMPARE timers are the core's |
+
+Where each `--isa` lives in ember, and the name RECON.md gives the architecture
+(ember-dev-recon's `--arch` and its "Architecture" line), which is not always the `--isa`:
+
+| `--isa` (`--model`) | RECON architecture | reference board | ISA header (`include/uam/isa/`) |
+|---|---|---|---|
+| `mips32be`, `mips32le` | `mips32` + endianness be / le | `boards/mips_ref.c` | `mips32.h` |
+| `pic32` (`mx`, `mm`, `mz`) | `pic32` | `boards/pic32_ref.c` | `mips32.h` |
+| `rv32` | `rv32` | `boards/rv32_ref.c` | `riscv.h` |
+| `arm`, `armeb` | `arm`, `armeb` | `boards/arm_ref.c` | `arm.h` |
+| `x86_64` | `x86_64` (also `x86_16`, `x86_32` stages of the same PC) | `boards/x86_64_ref.c` | `x86.h` |
+| `ppc` | `ppc32` | `boards/ppc_ref.c` | `ppc.h` |
+| `avr`, `avr32` | `avr`, `avr32` | `boards/avr_ref.c`, `avr32_ref.c` | `avr.h`, `avr32.h` |
+| `pic` (`baseline`, `mid`, `enhanced`, `pic18`) | `pic-baseline`, `pic-mid`, `pic-enhanced`, `pic18` | `boards/pic_ref.c` | `pic.h` |
+| `mcs51` | `mcs51` | `boards/mcs51_ref.c` | `mcs51.h` |
+| `m6502` (`nmos`, `2a03`, `65c02`, `r65c02`) | `6502`, `65c02` | `boards/m6502_ref.c` | `m6502.h` |
+| `z80` | `z80` | `boards/z80_ref.c` | `z80.h` |
+| `xtensa`, `xtensaeb` | `xtensa`, `xtensaeb` | `boards/xtensa_ref.c` | `xtensa.h` |
 
 The microcontroller ISAs (AVR, AVR32, PIC, PIC32, 8051, 6502, Z80) have one processor per
 board (`BOARD_MAX_CPUS` 1); the image is usually the whole flash, started at the reset vector.
@@ -110,7 +128,17 @@ static const struct board_reg { ... } board_entry_regs[] = {      /* RECON entry
 `build()` then does, in order:
 
 1. `uam_machine_init(m, &uam_isa_mips32be)` (the ISA's descriptor), `m->board_name`,
-   `m->reset_pc = BOARD_RESET_VEC`. `uam_machine_init`, `uam_machine_add_device` and
+   `m->reset_pc = BOARD_RESET_VEC`. Then, where the ISA can have several processors
+   (`BOARD_MAX_CPUS` over 1), `-o cpus=N`: `uam_machine_add_cpus(m, N - 1)`, before the
+   first reset. Processor 0 is `m->cpu`, processor i `uam_machine_cpu(m, i)`; everything
+   per processor (the CPU model of step 2, a timer or interrupt line wired to one, a
+   per-processor device: `uam_machine_current_cpu` tells a device who is asking) is done
+   for each. The processors share the bus and the clock and take turns, `--quantum N`
+   instructions each (default 4096), deterministically. How the others start is the
+   board's to model, as the hardware does it: held in reset or parked in a loop until the
+   boot processor releases them (a register of your reset block, an IPI device; a PC's
+   wait for SIPI is in `pc-platform.md`). Hooks for all processors are added after
+   `uam_machine_add_cpus`, with `uam_machine_add_pc_hook`. `uam_machine_init`, `uam_machine_add_device` and
    `uam_board_register` are macros that pass the struct layout the board was compiled
    with; if libuam was built from other headers, the run stops at once with `abi:` errors
    and exit 2. Rebuild the library and the board together (`scripts/build-ember.sh`).
@@ -263,11 +291,12 @@ uam_status board_hle_install(uam_machine *m, const uam_board_config *cfg)
 {
     if (!uam_board_config_option(cfg, "hle"))             /* opt-in while it is evaluated */
         return UAM_OK;
-    return uam_exec_add_pc_hook(&m->exec, 0x80123450 /* rfCalibrate */, skip_rf_cal, NULL);
+    return uam_machine_add_pc_hook(m, 0x80123450 /* rfCalibrate */, skip_rf_cal, NULL);   /* every processor */
 }
 ```
 
-(`reg()` looks a name up in `cpu->isa->regs`.) Hook a function's first instruction, never a
+(`reg()` looks a name up in `cpu->isa->regs`, the ISA module's own register table: MIPS has
+`v0`, `a0`, `ra` there. `--log-pc` and gdb use other names, `r2`, `r4`, `r31`.) Hook a function's first instruction, never a
 branch delay slot. Adding a hook discards translated code once; it costs nothing afterwards.
 The board calls the install function before `uam_machine_reset`.
 
@@ -278,7 +307,11 @@ own, over the memory the firmware's heap used (the arena): redzones around every
 quarantine for freed ones, every access to the arena checked to the byte, double and bad
 frees reported. Ember does not know which functions of your firmware allocate or how they
 take arguments; the board does, and says so with hooks (the HLE mechanism above). Tested
-version: `tests/boards/heap_hooks.c` in ember (RISC-V).
+version: `tests/boards/heap_hooks.c` in ember (RISC-V). `<board>_heap.c` is a board-level
+file like `<board>_hle.c` (`check-layering.sh` lets both include any ember header): add it
+to `emulation/meson.build`. The snippet uses `reg()` and `hle_return()` from the HLE section
+above: put it in `<board>_hle.c` beside them, or declare the two in `<board>_hle.h`
+(without `static`) and include that.
 
 1. **Find the functions** in Ghidra: the allocate, release and (if any) resize, zeroing
    and aligned variants the firmware's code calls (`malloc`/`free`, `pvPortMalloc`,
@@ -388,11 +421,12 @@ grep -n "uam_bus_map_\|uam_map_attrs\|UAM_PRIO_\|dirty" include/uam/bus.h      #
 grep -n "impl_min\|write_masked\|endian\|save\|STATELESS" include/uam/device.h  # device ops contract
 grep -n "uam_state_put_\|uam_state_get_" include/uam/state.h       # snapshot streams
 grep -n "uam_board_add_" include/uam/boards.h                     # board helpers (MMIO rules)
-grep -n "_configure\|_ref;\|_BASE" include/uam/isa/<isa>.h       # CPU models, address spaces
-sed -n '/^static uam_status .*build(/,/^}/p' boards/<isa>_ref.c   # how ember wires that ISA
+grep -n "_configure\|_ref;\|_BASE" include/uam/isa/mips32.h      # CPU models, address spaces (your ISA's header:
+                                                                  # the second table of "Per ISA")
+sed -n '/^static uam_status .*build/,/^}/p' boards/mips_ref.c     # how ember wires that ISA (its reference board)
 grep -n "uam_exec_add_pc_hook\|uam_hook_action\|UAM_STOP_" include/uam/exec.h
 sed -n '/static void usage/,/^}/p' src/runner/runner.c            # the runner's options
-sed -n '/^ \* Exit status/,/\*\//p' src/runner/runner.c             # exit codes
+sed -n '/^ \* Exit status/,/\*\//p' src/runner/runner.c             # exit codes (also in uam-run --help)
 sed -n '/Dependency rules/,/^## 4/p' docs/architecture.md          # layering (check-layering.sh mirrors it)
 ```
 

@@ -7,7 +7,7 @@
  *   fault loop, 127 debug trap or breakpoint, 128 livelock (waiting while timers
  *   keep firing, and no console or network input that could wake the hart),
  *   129 a --guard stopped the run, 130 interrupted (SIGINT/SIGTERM),
- *   2 usage or setup error.
+ *   131 an unmapped access under --unknown-mmio stop, 2 usage or setup error.
  * With --fuzz-replay, the most severe verdict of any input instead (uam/fuzz.h):
  *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout, 24 rejected (the
  *   input route refused it), 25 crash (guard); of several crashes, the first one's.
@@ -504,8 +504,9 @@ static void usage(FILE *out)
         "      --cov-out FILE      write the raw coverage map to FILE when the run stops\n"
         "                          (fuzzing: the last input's map)\n"
         "      --fuzz-begin PC     fuzz: boot to PC, snapshot there, run each input from it\n"
-        "                          (PC: an address or an ELF symbol, SYM[+OFF]; so for every\n"
-        "                          PC and ADDR option)\n"
+        "                          (PC: an address or an ELF symbol, SYM[+OFF]; so for\n"
+        "                          --fuzz-end, --fuzz-crash-pc, --break, --snapshot-at and\n"
+        "                          --return-ok; every other address is a number)\n"
         "                          (repeatable: the snapshot is at the first one reached, and\n"
         "                          any of them begins an iteration)\n"
         "      --fuzz-end PC       an iteration ends at PC (repeatable: any of them; default:\n"

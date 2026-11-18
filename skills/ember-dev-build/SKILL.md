@@ -75,11 +75,19 @@ scripts/new-emulation.sh <board> --dir <project-dir> --recon RECON.md \
   booke; `avr`: eplus, e, xm, xt, rc; `avr32`: a, b; `pic`: pic18, baseline, mid, enhanced;
   `pic32`: mx, mm, mz; `mcs51`: 8052, 8051, cip51; `m6502`: nmos, 2a03, 65c02, r65c02; `z80`:
   nmos, cmos; `xtensa*`: lx6, lx106, lx7). The memory map, reset vector, CPU model call and
-  interrupt example follow ember's `boards/<isa>_ref.c` (table in `references/board-skeleton.md`).
+  interrupt example follow ember's reference board of that ISA (the table in
+  `references/board-skeleton.md` names its file and header, and maps RECON's architecture
+  names to `--isa`/`--model`). `--recon` only copies RECON.md into the project: its numbers
+  reach the board through `--ram-base`, `--ram-size`, `--image-base`, `--entry` and
+  `--reset-vec` (the reset pc of a board that starts at a vector), or by editing the board.
 - It generates the whole project in the fixed layout, with a **minimal board that already
   builds and runs**: `meson.build`, `subprojects/ember.wrap`, `emulation/` (`meson.build`,
-  `main.c`, `<board>_board.c`), `firmware/` (put the image there), `tests/` (`meson test`:
-  the board is registered; the firmware boots to the lines in `boot.expect`), `run.sh`,
+  `main.c`, `<board>_board.c`), `firmware/` (put the image there **as
+  `firmware/firmware.bin`**, the name `tests/meson.build` has; with another name the boot
+  test is skipped without a word until you change it there), `tests/` (`meson test`:
+  the board is registered; the firmware boots to the lines in `boot.expect`, within
+  `BOOT_BUDGET` instructions, default 200000000; a PC board's test passes only `FLASH=`, so
+  an OVMF `CODE=`+`VARS=` board edits `tests/meson.build`), `run.sh`,
   with the RECON numbers you pass filled in. `--isa x86_64`
   generates a **PC board** instead (`templates/board-pc.c.in`): processors with local APICs,
   8259/8254/RTC/HPET/8042/COM1/POST/port 92h, PCI configuration at 0xCF8, the boot flash
@@ -115,7 +123,9 @@ further, add the console lines it must reach to `tests/boot.expect`: `meson test
 then guards every milestone already passed.
 Before writing code against a new pin, run the API checklist in `references/board-skeleton.md`
 and, when the pin moved, the skills' end-to-end test against it:
-`skills/tests/run-tests.sh <ember checkout>` (from the ember repository holding this skill).
+`skills/tests/run-tests.sh <ember checkout>` (from the ember repository holding this skill;
+the checkout is ember's own working copy at that commit with its `build/` and test firmware
+built, not the project's `subprojects/ember`).
 
 ## The iteration loop (authority: `references/iteration-loop.md`)
 
@@ -133,12 +143,16 @@ and, when the pin moved, the skills' end-to-end test against it:
    are deterministic: the same inputs give the same run, instruction for instruction, also
    with several processors.
 2. **Pick the single next blocker**: the first failure in time order, not the loudest line.
+   Read the exit code from the stop line in `build/emu.log` (`... (status N) at pc=...`;
+   `log_summary.py` prints it), not from `$?`: `timeout` also returns 124 when it kills the
+   run, and the log then says `stop requested (status 130)`.
    Exit codes help: 124 budget or `--max-ticks` used (look at hot offsets), 125 deadlock (a
    timer/interrupt not modelled or wired), 128 livelock (a timer fires but its interrupt
    never reaches the CPU), 126 fetch-fault loop, internal error, or a reset nothing handles,
    127 breakpoint or debug trap, 129 a `--guard` hit, 130 interrupted, 131 an unmapped access
-   under `--unknown-mmio stop`, 2 setup error (`abi:` =
-   rebuild with `build-ember.sh`); any other status is the firmware's own, through a finisher.
+   under `--unknown-mmio stop`, 2 setup error (a bad option, an unknown trace or register
+   name; `abi:` = rebuild with `build-ember.sh`); any other status is the firmware's own,
+   through a finisher (1 to 123 as given; one outside that range is reported as 1).
    An AVR, 8-bit PIC, 8051, 6502 or Z80 has no bus error: a `core halted` line before a 125
    names the address nothing answered, and no timer is missing. On
    x86 an `x86: ... hart shut down` line means the processor shut down (the run then ends
@@ -162,8 +176,11 @@ and, when the pin moved, the skills' end-to-end test against it:
      and pc); *how did it get here?* `--history N`;
    - *system registers, CPU identity?* `-t sysreg`; *DMA?* `-t dma`; *where was a console
      line printed?* `-t console`;
-   - *which call fails, what does a loop check?* `--log-pc ADDR,a0,a1,ra`, `--break ADDR -d`,
-     `-n N -d`, `--dump-mem`, gdb (`--gdb`, `scripts/gdb_trace_calls.py`); *who writes this
+   - *which call fails, what does a loop check?* `--log-pc ADDR,REG,...` with the registers
+     as gdb names them (RISC-V `a0,a1,ra`; MIPS `r4,r5,r31`; ARM `r0,r1,lr`; an unknown name
+     lists them all), `--break ADDR -d`, `-n N -d`, `--dump-mem`, gdb (`--gdb`,
+     `scripts/gdb_trace_calls.py`); *who called this?* `--backtrace` (the call chain at the
+     stop; names need an ELF image, a raw image gets addresses); *who writes this
      memory?* `--watch` / `--guard ADDR+LEN:w`.
    Turn on one or two for the question at hand, not `-t all` on a long boot; narrow with
    `--trace-mmio-range`, `--trace-after N` and `--trace-range`. Test a register hypothesis

@@ -77,7 +77,7 @@ while [[ $# -gt 0 ]]; do
         --image-base) IMAGE_BASE="$2"; shift 2;;
         --entry) ENTRY="$2"; shift 2;;
         --reset-vec) RESET_VEC="$2"; shift 2;;
-        -h|--help) sed -n '2,56p' "$0"; exit 0;;
+        -h|--help) sed -n '2,57p' "$0"; exit 0;;
         -*) die "unknown option: $1";;
         *) BOARD="$1"; shift;;
     esac
@@ -693,7 +693,7 @@ fi
 cat > "$PROJ/run.sh" <<EOF
 #!/usr/bin/env bash
 # run.sh - launch the $BOARD emulation. Extra args go to the runner, e.g.
-#   -n 200000000 (instruction budget)  --gdb 1234  --log-pc 0x...[,a0,ra]  --break 0x... -d  --jit
+#   -n 200000000 (instruction budget)  --gdb 1234  --log-pc 0x...[,REG,...]  --break 0x... -d  --jit
 #   -t mmio-summary  -t mmio --trace-mmio-range LO:HI  -t irq,sysreg,dma,console  --history 64
 #   --trace-file build/trace.txt  (diagnostics: the skill's references/diagnostics.md)
 # Env: UNKNOWN_MMIO=zero|echo|fault|stop (stop: halt at the first unmodelled access, exit 131),

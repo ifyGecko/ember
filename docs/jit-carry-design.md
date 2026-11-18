@@ -1,6 +1,10 @@
 # Step 13 design: the x86 gap (narrow register reads, writes carried across chained exits)
 
-Status: **approved** (2026-10-28). Stage N is implemented (§9); stages C1 and C2 are not yet. It builds on step 9 (docs/jit-dead-puts-design.md) and on the chaining of steps 7 and 10 (docs/jit-perf.md).
+Status: **approved** (2026-10-28). Stage N is implemented (§9); stages C1 and C2 are **not built**. It builds on step 9 (docs/jit-dead-puts-design.md) and on the chaining of steps 7 and 10 (docs/jit-perf.md).
+
+How to read this document: §3 is the plan stage N was built from, and §9 says where the code differs from it (the function is `lookup_wider`, only the same-offset case exists, and the test is in `test_jitdiff`). §4–§6 are a design for stage C that nothing in the tree implements: none of the names it introduces (`carry_vals`, `jc->carry`, `CARRY_MAX_VALS`, `UAM_JIT_NOCARRY`, test level E) exists. It was also written against the chain path as it was before step 18. "Today" and "as today" in §4 mean that state: a chained exit then tested its slot at run time, and §4.3–§4.4 put the carry flag in that test. Since step 18 an exit to a constant target ends in a patched direct jump with no slot test (docs/jit-perf.md), and that is the self-loop case stage C is for. So §4.3 and §4.4 have to be redesigned before stage C is built; the correctness model (§4.1) and the analysis (§4.2) do not depend on the chain path.
+
+Terms used here without a definition (slot, epoch, bridge, stop stub, chain budget) are explained in docs/architecture.md, section 6 (the bullets "JIT block chaining" and "Stores next to code"), and at the top of `src/exec/jit.h`.
 
 ## 1. What it is, in one paragraph
 
@@ -16,7 +20,7 @@ This step fixes both generically:
 
 ### 2.1 Where the time goes
 
-**Loop exit (x86 crc kernel, block 0x120, `inc rdi`; from `-t ir`).** The whole block-exit cost is in this shape. One guest instruction, 18 ops after the optimizer:
+**Loop exit (x86 crc kernel, block 0x120, an `add rdi, 1`; from `-t ir`).** The whole block-exit cost is in this shape. One guest instruction, 18 ops after the optimizer (the listing leaves some out):
 
 ```
 t0:64  = get.64  {rdi}
@@ -60,7 +64,7 @@ This attacks the same spread step 9 did, where flag-heavy ISAs are slower than f
 
 ## 3. Stage N: narrow reads of a known wider value
 
-**Where:** `src/ir/opt.c`, at its GET case (`lookup_known`).
+**Where:** `src/ir/opt.c`, at its GET case (planned beside `lookup_known`; built as `lookup_wider`, §9).
 
 **Rule:** a GET of bytes [off, off+w) whose bytes all lie inside a known value v at [koff, koff+kw) becomes:
 - `TRUNC.w v` when off == koff;
@@ -74,10 +78,10 @@ The register file is little-endian by definition, so this holds for every guest 
 - Only the source of a GET's value changes, and the replacement computes exactly the bytes the GET would read.
 
 **Tests:**
-- `test_jitdiff` checks the rewrite (pattern 9, `check_narrow_reads`; planned for test_ir). Cases: same offset; higher offset; a narrower PUT in between, which must block it; a helper in between, which must block it; a guarded wider PUT.
+- `test_jitdiff` checks the rewrite (pattern 9, `check_narrow_reads`; the plan had it in test_ir). Cases: same offset; higher offset; a narrower PUT in between, which must block it; a helper in between, which must block it; a guarded wider PUT.
 - test_jitdiff level C gets the same shapes, run against the unoptimized interpreter.
 
-**Expected:** 3–5% on x86 kernels. On other ISAs it should be neutral or slightly positive: ARM byte loads into a register that is then read whole do not match, but PowerPC and x86 sub-register reads do.
+**Expected:** 3–5% on x86 kernels. On other ISAs it should be neutral or slightly positive: ARM byte loads into a register that is then read whole do not match, but PowerPC and x86 sub-register reads do. (Measured, §9: only x86 has such reads.)
 
 This stage is independent of the others and lands first.
 
@@ -162,7 +166,7 @@ It uses only rax, rcx, rdx and the flags (on AArch64 x0, x1, x2, x16, x17 and th
 **Blocks entered from the run loop:** `jc->carry` is 0 on entry, because native code never returns with it set. In debug builds `uam_jit_run` asserts that.
 
 **Cost on the hot path, crc loop:**
-- Today: about 18 IR ops and 6 byte stores of flag work at the loop's last `inc`/`cmp`.
+- Today: about 18 IR ops and 6 byte stores of flag work at the loop's last `add`/`cmp`.
 - Carried: the exit stores about 3 inputs and one pointer, and the slot check gains a byte compare.
 
 ### 4.4 Linking
@@ -228,7 +232,7 @@ The comparison covers the register file, RAM, icount and the device log.
 **Unit tests and end to end:**
 - test_jit: a hop count that shows carried links happen on a looping guest.
 - `meson test -C build` (every firmware self-test on the interpreter and the JIT).
-- Both end-to-end workloads: identical consoles and identical interpreter-vs-JIT `-d` state, and the UEFI boot check of an external x86 board if one is available, with secure boot after C2 (ember has no such make target).
+- Both end-to-end workloads: identical consoles and identical interpreter-vs-JIT `-d` state, and the UEFI boot check of an external x86 board if one is available, with secure boot after C2 (ember has no target for it: such a board is its own project).
 
 **Measurement:**
 - The op map labels materializers and carry stores as their own region kinds, `carry`, so `tools/jitprof.py` can show their share.

@@ -197,7 +197,10 @@ OS assumes (e.g. a `sysPhysMemTop`/`mem=`-style constant).
 `scripts/recon.sh <stage> [--arch ARCH] [--base 0x...]` runs fwinfo, binwalk, basefind, the
 raw MMIO scan (MIPS32) and a headless Ghidra import with `FirmwareRecon.java` and
 `FindMmio.java` (plus `FindX86Io.java` on x86), and writes a draft `./RECON.md` (working files
-in `./.recon/`). ARCH is `mips32`, `pic32`, `rv32`, `arm`, `armeb`, `x86_16`, `x86_32`,
+in `./.recon/`). **Every run writes its draft over the report file** (the last content is
+kept as `RECON.md.prev`) and reuses `./.recon`: for a second stage, or a later run once
+RECON.md is filled in and annotated, give `--report RECON-<stage>.md --out .recon-<stage>`
+and merge what it found into RECON.md by hand. ARCH is `mips32`, `pic32`, `rv32`, `arm`, `armeb`, `x86_16`, `x86_32`,
 `x86_64`, `ppc32`, `avr`, `avr32`, `pic-baseline`, `pic-mid`, `pic-enhanced`, `pic18`,
 `mcs51`, `6502`, `65c02`, `z80`, `xtensa` or `xtensaeb`; without `--arch` it takes what
 `fwinfo.py` reads from an ELF or Espressif header, or a clear fingerprint/vector-table lead of
@@ -252,7 +255,7 @@ Also look for the **interrupt routing table** (which CPU line or vector each dev
 **chip revision / bootstrap** registers the code compares against constants, and device
 descriptor tables (`{base, irq, vendor/device id}`).
 
-Do this for **every stage** and merge the results:
+Do this for **every stage** (each run with its own `--report` and `--out`, above) and merge the results:
 - **Polling loops** (`mmio_scan.py` POLL lines, plus wait helpers that take
   `(reg, mask, value, timeout)`) are the first bring-up blockers. List each one with what ends
   the wait.
@@ -306,7 +309,8 @@ scripts/recon.sh bios.bin --arch x86_64 [--modules pei|all|NAME,GUID,...] [--no-
   `.x86io.txt`; the x86io and mmio tables are appended to the draft per module.
   `--modules pei` (default) selects SEC, PEI core and PEIMs (types `PEIM+DRIVER` too), `all`
   every module, or a comma list of names/GUIDs from `modules.tsv` (a DXE or SMM driver once
-  the build reaches it). `--no-ghidra` stops after `uefi_scan.py`; `--reuse` re-runs the
+  the build reaches it; by then RECON.md is the working fact sheet, so give that run
+  `--report` and `--out` of its own). `--no-ghidra` stops after `uefi_scan.py`; `--reuse` re-runs the
   scripts on the existing project.
 - A legacy BIOS (no volumes, no descriptor) takes the embedded flow: `--arch x86_16` (real
   mode) or `x86_32`, with `--base`; `uefi_scan.py <image>` still reports its reset vector,

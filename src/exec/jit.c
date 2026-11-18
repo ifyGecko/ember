@@ -733,7 +733,7 @@ static uint8_t obs_kind(const uam_block *blk, const uam_insn *in, bool *first)
     case UAM_OP_HELPER: case UAM_OP_AMO: case UAM_OP_CAS:
         return OK_HARD;
     default:
-        return OK_NONE;   /* pure ops, COV, FENCE */
+        return OK_NONE;   /* pure ops, COV, FENCE; CMPLOG and FRAME call C with their operands only */
     }
 }
 

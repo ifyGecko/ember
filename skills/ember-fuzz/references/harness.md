@@ -97,7 +97,7 @@ taken is host state, not snapshot state: never leave a step pending into the ite
   the input is delivered right after; if the handler already polled an empty FIFO, every
   input runs as "no data". Use the handler's first instruction.
 - Firmware that runs the handler during start-up (a self-test, a first request of its own):
-  `--fuzz-begin-skip N` (a boot that never arrives N+1 times stops with exit 2).
+  `--fuzz-begin-skip N` (the snapshot is at arrival N+1. A boot that never gets there runs until something stops it, so bound it with `-n`: it then stops with exit 2).
 - Several handlers: repeat `--fuzz-begin`; the snapshot is at whichever the boot reaches
   first, and each input goes wherever the firmware takes it.
 - Recursion: with `--fuzz-end` the first end reached ends the iteration, so a recursive
@@ -146,7 +146,7 @@ and under- and over-writes are each caught or let through.
 |---|---|---|
 | `before=N` | `[ADDR-N, ADDR)`, armed at the first input | `buf[-1]`, a header read from in front of the buffer |
 | `after[=N]` | `[ADDR+L, ADDR+max+N)`, re-armed for each input | anything past the input's legitimate extent L: the unused rest of the buffer, and N bytes beyond it (default 0) |
-| `extent=@OFF:SZ[:le\|:be][+D\|-D]` | (places `after`) | L is the SZ-byte (1, 2, 4, 8) length field at input offset OFF, in the given byte order (default the CPU's), plus D, instead of the delivered byte count |
+| `extent=@OFF:SZ[:le\|:be][+D\|-D]` | (places `after`; without `after` it is an error) | L is the SZ-byte (1, 2, 4, 8) length field at input offset OFF, in the given byte order (default the CPU's), plus D, instead of the delivered byte count |
 
 **When to use them.** On flat memory (MIPS kseg0, RV32 M-mode, ARM and x86 with identity
 maps, every 8-bit core) an over-read or overflow of a buffer lands in other mapped RAM: no
@@ -223,7 +223,7 @@ if ((st = uam_machine_add_input(m, "uart0", uart_input, uart)) != UAM_OK)
 
 | oracle | option | verdict |
 |---|---|---|
-| exception classes | `--fuzz-crash-exc LIST` (default `fetch,load,store,align`; also `xlate`, `trap`, `sysreg`, `all`, `none`) | crash (fault), detail = faulting pc |
+| exception classes | `--fuzz-crash-exc LIST` (default `fetch,load,store,align`; also `xlate`, `trap`, `sysreg`, `all`, `none`, and `default` to add to the default set: `default,trap`) | crash (fault), detail = faulting pc |
 | crash pcs | `--fuzz-crash-pc PC` (repeatable) | crash (oracle), detail = pc |
 | redzones | `mem:` route `before=`, `after`, `extent=` (above) | crash (guard), detail = pc of the access |
 | guarded memory | `--guard SPEC` (repeatable, below) | crash (guard) (`,stop`, the default), or the bus fault for `--fuzz-crash-exc` to classify (`,fault`) |
@@ -525,8 +525,13 @@ uam_fuzz_set_block_coverage(f);
 uam_fuzz_select_route(f, "uart0", err, sizeof(err));
 uam_fuzz_boot(f, &r);
 for (each input)
-    uam_fuzz_run_one(f, data, len, &r);      /* r.verdict, r.detail, uam_fuzz_map(f) */
+    uam_fuzz_run_one(f, data, len, &r);      /* r.verdict, r.detail, uam_fuzz_map(f, &size) */
 ```
+
+`uam_fuzz_set_block_coverage` gives plain edges between blocks. For the model `uam-run`
+uses by default (splits, ranges, interrupt contexts, N-grams) call
+`uam_fuzz_set_block_coverage_ex` with `uam_cov_block_opts` (`uam/cov.h`) and set
+`cfg.history`; maps from the two are not comparable.
 
 Such a program is analysis code, not part of the board: keep it outside `emulation/` (e.g.
 `fuzz/driver.c` with its own `executable()` in the project's `meson.build`, linking

@@ -13,6 +13,7 @@
 # Usage: repin.sh [--proj DIR] [--ember-src DIR] [--to REF] [--finish] [--no-build]
 #   --to REF    pin to REF (a commit, tag or origin/<branch>) instead of origin's HEAD
 #   --finish    after resolving a conflicted rebase: record the new pin, export, build
+#   --no-build  stop after the pin and patches/ are written (build with build-ember.sh)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +22,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --proj) P="$2"; shift 2;; --ember-src) S="$2"; shift 2;;
         --to) TO="$2"; shift 2;; --finish) FINISH=1; shift;; --no-build) BUILD=0; shift;;
-        -h|--help) sed -n '2,15p' "$0"; exit 0;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0;;
         *) _die "unknown argument: $1";;
     esac
 done

@@ -7,7 +7,8 @@
 #            [--processor <ghidra-lang-id>] [--name <ghidra-project-name>]
 #            [--base 0x...]     # skip the base search and use this base
 #            [--align 0x1000]   # candidate base alignment for basefind.py
-#            [--report FILE]    # draft fact sheet (default: ./RECON.md)
+#            [--report FILE]    # draft fact sheet (default: ./RECON.md; an existing file is
+#                               # replaced, its last content kept as FILE.prev)
 #            [--out DIR]        # working artifacts (default: ./.recon)
 #            [--no-ghidra]      # stop after the Python tools (fwinfo, binwalk, basefind,
 #                               # raw MMIO scan, uefi_scan)
@@ -81,7 +82,7 @@ while [[ $# -gt 0 ]]; do
         --reuse) REUSE=1; shift;;
         --uefi) UEFI=1; shift;;
         --modules) MODULES="$2"; shift 2;;
-        -h|--help) sed -n '2,50p' "$0"; exit 0;;
+        -h|--help) sed -n '2,51p' "$0"; exit 0;;
         -*) die "unknown option: $1";;
         *) BLOB="$1"; shift;;
     esac
@@ -97,6 +98,12 @@ GHIDRA_PROJECTS="${GHIDRA_PROJECTS:-$HOME/GhidraProjects}"
 # absolute paths: they end up in modules.tsv, symlink targets and Ghidra script arguments
 [[ "$OUT" == /* ]] || OUT="$(pwd)/$OUT"
 [[ "$REPORT" == /* ]] || REPORT="$(pwd)/$REPORT"
+# The draft replaces whatever is at $REPORT: keep the last one (a finished fact sheet with
+# the build phase's corrections is not something to lose to a second run).
+if [[ -f "$REPORT" ]]; then
+    cp -p "$REPORT" "$REPORT.prev"
+    echo "recon: $REPORT exists; kept as $REPORT.prev (use --report FILE for another stage)" >&2
+fi
 [[ "$GHIDRA_PROJECTS" == /* ]] || GHIDRA_PROJECTS="$(pwd)/$GHIDRA_PROJECTS"
 mkdir -p "$OUT"
 [[ "$ARCH" == pic32 ]] && { ARCH=mips32; ENDIAN=le; }

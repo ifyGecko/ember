@@ -80,6 +80,19 @@ What it leaves open:
 - Colorization: telling which input bytes a compare's operand came from, instead of looking
   for the operand's bytes anywhere in the input.
 
+## Site lists: sites on continuation instructions
+
+A site on an instruction ember runs as part of the one before it (a branch delay slot, an
+instruction inside a Thumb IT block) stops the run with an error when that code is first
+translated, which can be well into a run (`docs/fuzzing.md`). Either of two changes would
+do:
+
+- Count them: a branch and its delay slot run as one unit, so a COV right after the delay
+  slot's instruction marker would still count once per execution; the verifier's rule that
+  COV follows only non-continuation markers would be relaxed for it.
+- Reject them earlier: detect such sites when the list is loaded (a small ISA hook, "is
+  this pc a continuation?").
+
 ## Mutator
 
 - Operators that know a length or checksum field (found from compare logs, or declared).

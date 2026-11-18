@@ -180,8 +180,8 @@ Every integer is big-endian, and maps are raw u8 counters.
 | 11 MUTATOR_INFO | ember → brain, the reply to each MUTATOR | u8 status (0 accepted, 1 refused), u16 msg_len, msg (why, when refused), u16 n, then n × (u8 op, u16 default weight, u16 weight, u8 name_len, name) |
 | 12 CORPUS | brain → ember | u32 entry, u32 len, data |
 | 13 HAVOC | brain → ember | u64 first_id, u32 entry, u32 n, u64 seed, u32 flags (bit 0 EDGES) |
-| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (the three 0 unless reason 0), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
-| 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n (a stage's limit) is 0 or over its maximum or the stage's kind is unknown, 4 input-to-state without compare logging), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges, then n × (u32 index, u32 execs) (EDGES only) |
+| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (the three, and insns, 0 unless reason 0), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
+| 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n (a stage's limit) is 0 or over its maximum (HAVOC: 2^20), first_id is 0, or the stage's kind is unknown, 4 input-to-state without compare logging), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges (always there; 0 without EDGES), then n_edges × (u32 index, u32 execs) |
 | 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0), u8 novel_crash |
 | 17 PROGRESS | ember → brain, in a batch silent for 1 s | u64 first_id, u32 execs (runs so far) |
 | 18 STAGE | brain → ember | u64 first_id, u32 entry, u8 kind (1 input-to-state, 2 trimming), u32 limit (inputs derived at most: 1 .. 4096 candidates, 1 .. 65536 cuts), u32 flags (bit 0 EDGES) |
@@ -192,6 +192,14 @@ kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE (or SPA
 ITER if the input ended normally, CRASH otherwise. Every MUTATOR gets one MUTATOR_INFO, every
 HAVOC any number of FIND and PROGRESS frames and then one HAVOC_DONE, every STAGE the same
 with one STAGE_RESULT before the HAVOC_DONE; CORPUS and OPTIONS get none. Unknown frame types are ignored.
+
+**Malformed frames.** A malformed INPUT gets CRASH MALFORMED. A CORPUS, HAVOC or STAGE
+whose payload is short (or a CORPUS whose length field does not match) gets no answer:
+ember ends the session with an error (exit 2). A MUTATOR is refused (MUTATOR_INFO status 1,
+with the reason as text) when max_size is not 1 .. 32 MiB, the stack bounds are not
+1 ≤ lo ≤ hi ≤ 1024, splice is over 1000, a byte token is not 1 .. 256 bytes, an integer
+token's width is not 1, 2, 4 or 8, bytes follow the last token, or no operator is left
+with a weight.
 
 **SPARSE.** A brain that sends OPTIONS with bit 0 gets every later map as the list of its
 set buckets instead of the whole map: a typical iteration sets a few hundred to a few
@@ -265,7 +273,7 @@ Right before that HAVOC_DONE, a stage that ran sends one STAGE_RESULT.
   not looked for; the first 8 places of a pattern are tried; candidates are distinct.
   STAGE_RESULT gives the number of records, of records left out, and of candidates, and
   the code's constants with two or more significant bytes that the entry holds in neither
-  byte order (at most 64): dictionary material.
+  byte order (at most 64 per stage): dictionary material.
 - *Trimming* (kind 2): the entry runs once for its path; then chunks are cut out of it,
   from a sixteenth of its length (rounded up to a power of two) down to a 1024th, at least
   4 bytes, never the first chunk, and a cut stays when the run still ends normally on the
@@ -297,7 +305,7 @@ turns each site into the two operands of a `UAM_OP_COV` and the coverage state's
 does the rest ([`uam-isa.md`](uam-isa.md)). `tests/unit/test_cov_formats.c` pins the result
 with golden maps.
 
-**Parameters:** the model (`--cov-scheme site|pc`, default site), N (`--cov-ngram 1..8`,
+**Parameters:** the model (the block model without a site list, which is the default when fuzzing; with one, `--cov-scheme site|pc`, default site, an option the block model refuses), N (`--cov-ngram 1..8`,
 default 2), rotation (`--cov-rotate`), and `map_size`, a power of two. Let
 `mask = map_size − 1` and `W = max(N − 1, 1)`. The history `prev[0..W−1]` is all zeros at
 the start of every iteration (and of the boot).
@@ -328,12 +336,12 @@ width. So the order of sites changes the bucket.
 much for each N above (at most 4 MiB). The site model sizes the map from the site count *n*:
 `F = 2` for N = 1, `16 << (N − 2)` otherwise; `size = min(next_pow2(max(n,1) × F), 2^24)`,
 then at least 4 KiB and at least `next_pow2(n)`, so every site id has its own bucket.
-No map is larger than 2 GiB. `--cov-map-size` overrides the rule. HELLO and the region
+No map is larger than 2 GiB. `--cov-map-size` overrides the rule (a power of two up to 1 GiB; with `--fuzz-net` the map must also fit a frame, 64 MiB). HELLO and the region
 header carry the actual size.
 
-**Which executions count.** In `--cov-mode leapfrog`, the default, a site counts again only
+**Which executions count.** In `--cov-mode leapfrog`, the default for site lists, a site counts again only
 after another site has counted: a block looping on itself counts once per entry, and no
-self-edge appears. `--cov-mode every` counts each execution. A boundary marker's own hit
+self-edge appears. `--cov-mode every`, the default for the block model, counts each execution. A boundary marker's own hit
 counts before the map is published and the history is reset. A BEGIN's hit therefore lands
 in the snapshot it closes (INIT, or the previous iteration in begin-only mode), and an
 iteration's first count is the next site after the marker, with an empty history.

@@ -57,7 +57,7 @@ What goes where, when in doubt:
 |---|---|
 | a register, a state machine, a timing rule of a hardware block | a device file `emulation/<soc>_<block>.c` |
 | which devices exist, at which addresses, which line goes where, where images are placed | `emulation/<board>_board.c` |
-| a firmware function replaced or observed (HLE, heap hooks) | `emulation/<board>_hle.c` / `<board>_heap.c` |
+| a firmware function replaced or observed (HLE, heap hooks) | `emulation/<board>_hle.c` / `<board>_heap.c` (board-level files, like the board itself) |
 | a firmware image | `firmware/` |
 | data the firmware reads that is not an image | a generator in `tools/`, output in `build/` |
 | a pass/fail check of the board | `tests/` (registered in `tests/meson.build`) |
@@ -94,7 +94,9 @@ board_sources = files(
 
 `rebuild.sh` refuses to build while an `emulation/*.c` is not listed, so a file cannot be
 silently left out of the runner. Nothing else in the meson files changes during a
-bring-up: no per-device flags, no extra targets in `emulation/`. Analysis programs that
+bring-up: no per-device flags, no extra targets in `emulation/`. (One exception, in
+`tests/meson.build`: the boot test names its image, `firmware/firmware.bin` as generated;
+an image under another name, or a PC that boots from `CODE=`+`VARS=`, is named there.) Analysis programs that
 are not part of the board (a fuzz driver) get their own `executable()` in the top-level
 `meson.build`, from sources outside `emulation/`.
 
@@ -148,7 +150,7 @@ Ember's dependency rules (its `docs/architecture.md`, section 3) apply to your f
 | file | may include |
 |---|---|
 | device files | `uam/common.h access.h device.h signal.h sched.h chardev.h netdev.h blockdev.h state.h bus.h`, stock device headers `uam/dev/*.h`, other device headers of the project |
-| `*_board.[ch]`, `*_hle.[ch]`, `main.c` | any public ember header except `uam/host.h` |
+| `*_board.[ch]`, `*_hle.[ch]`, `*_heap.[ch]`, `main.c` | any public ember header except `uam/host.h` |
 
 A device never sees the CPU, the ISA, the executor, the machine or the host. What it needs
 from them arrives as a **parameter from the board**: a `uam_sched *` for time, a `uam_bus *`
@@ -215,10 +217,10 @@ journal.
 
 | script | does |
 |---|---|
-| `build-ember.sh` | full build: clone if needed → guard → clone reset to the pin → patches as commits (`git am`) → `meson setup build` (first time) → `meson compile -C build` (ember's libraries and `build/<board>-run`) → confirm the board is registered |
+| `build-ember.sh` | full build (`--fresh`: delete the clone and `build/` first; `--cflags "..."`: extra compiler flags, e.g. `-fsanitize=address`; `--jobs N`): clone if needed → guard → clone reset to the pin → patches as commits (`git am`) → `meson setup build` (first time) → `meson compile -C build` (ember's libraries and `build/<board>-run`) → confirm the board is registered |
 | `rebuild.sh` | fast build: clone still pin + patches, nothing uncaptured → every `emulation/*.c` listed → layering check → `meson compile -C build` |
 | `regen-patches.sh` | export the clone's commits since the pin as `patches/` (`-m MSG` first commits pending edits, `--add PATH` new files) |
-| `repin.sh` | move to the latest ember commit (`--to REF` for another): fetch → rebase the patch commits → the wrap file's `revision` → `patches/` → full build |
+| `repin.sh` | move to the latest ember commit (`--to REF` for another): fetch → rebase the patch commits → the wrap file's `revision` → `patches/` → full build (`--no-build` skips it). When a patch conflicts it stops in the clone: resolve it there (`git -C subprojects/ember rebase --continue`), then `repin.sh --finish` records the pin, exports and builds |
 | `check-layering.sh` | enforce rule 3 on `emulation/` |
 | `log_summary.py` | condense the runner's stderr into the next blocker |
 | `gdb_trace_calls.py` | gdb helper: log calls and return values of guest functions |

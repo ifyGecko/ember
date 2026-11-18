@@ -44,7 +44,7 @@ instruction that made it (`pc=0x.. icount=N`): decompile that pc.
 | `x86: triple fault ...`, `x86: ... hart shut down` | the x86 core | the processor shut down; the *first* exception before it is the blocker |
 | `[warn] chardev: console input: N byte(s) never sent, waiting for '...'` | scripted console input | the prompt never came |
 | `[error] snapshot: ...`, `[error] abi: ...` | snapshots, the library check | a device without save/restore; a board built against other headers |
-| `RUNNER: REASON (status S) at pc=0x.. after N instructions` | the runner, always last | how the run ended: the exit code table in SKILL.md / `iteration-loop.md` |
+| `RUNNER: REASON (status S) at pc=0x.. after N instructions` | the runner, when the run stops (only what was asked to print at the stop follows it: `history:`, `backtrace:`, the trace summaries, `--dump-mem`, `stats:`) | how the run ended: the exit code table in SKILL.md / `iteration-loop.md` |
 | `stats: ...` | `-s` / `--stats` (run.sh passes it) | instructions, exceptions, interrupts, idle ticks vs instructions (a hart that mostly idled), time |
 
 ## 2. Traces (`-t KIND[,KIND...]`, repeatable)
@@ -55,7 +55,7 @@ instruction that made it (`pc=0x.. icount=N`): decompile that pc.
 | `mmio-summary` | nothing | `mmio:   0xADDR DEV+0xOFF: R reads (always\|last 0xV), W writes (last 0xV), first pc=..` for every register touched, sorted by address, then `mmio: most accessed: ...` | the register map the firmware uses (cheap even on a long boot); the register a stalled run polls ("always" on a hot register is the value it keeps getting) |
 | `exc` | `exc: kind=K (NAME) pc=.. cause=.. tval=.. icount=N`; `irq: entered handler at 0xH from pc=0xF lines=0xL icount=N`; `reset: system\|cpu icount=N` | `exc:   NAME cause=.. pc=..: N times, last tval=.., first icount=..` per (kind, cause, pc); `irq:   0xH: N times, last lines=..` per handler | where control went; an exception storm in one line; which interrupts the firmware actually takes and how often |
 | `irq` | `irq-in: cpuN line L = 0\|1 icount=N (cpuM at pc=..)` for every change of a processor's interrupt input | each line's rises and falls and its level; `irq-in: at the stop cpuN has an interrupt pending and enabled ...` | did the device raise its line, did it reach the CPU, is it masked |
-| `sysreg` | `sysreg: first read\|write 0xID = 0xV pc=.. icount=N` (the first of each register, and every access that faults: the guest then takes an exception) | `sysreg:   0xID: R reads, W writes, first at pc=..` | which core and implementation registers the firmware relies on (ids as `uam/isa/<arch>.h` numbers them): CPU identity, caches, MMU, timers |
+| `sysreg` | `sysreg: first read 0xID = 0xV pc=.. icount=N`, `sysreg: first write 0xID <- 0xV pc=..` (the first of each register, and every access that faults: the guest then takes an exception) | `sysreg:   0xID: R reads, W writes, first at pc=..` | which core and implementation registers the firmware relies on (ids as `uam/isa/<arch>.h` numbers them): CPU identity, caches, MMU, timers |
 | `sysreg-all` | every system register access | as `sysreg` | a register whose value sequence matters |
 | `console` | `console: icount=N pc=.. "text"` per line the guest prints | | where in the run a message was printed: aim `--trace-after`, `-n N -d` and `--snapshot-at` at a console line |
 | `dma` | `dma: r\|w LEN 0xADDR REGION+0xOFF pc=.. icount=N` for every DMA transfer a device makes; `(fault)` when no RAM is there | | descriptor rings and buffers of network, storage and DMA engines: what the device reads and writes, and whether the addresses the driver gave it are sane |
@@ -76,7 +76,7 @@ addresses in [LO, HI).
 | `--unknown-mmio zero` / `echo` / `fault` | answer unmapped accesses with 0 / the last value written / a bus fault for the guest | `zero`: survey all unmodelled addresses in one run; `fault`: hardware-faithful (and what fuzzing uses) |
 | `--history N` | keeps each processor's last N events (blocks entered, exceptions taken, interrupt handlers entered) and prints them at the stop: `history: cpuN: the last K events ...` then `history:   blk\|exc\|irq ...` | "how did it get here": the path into a fault loop, a deadlock, a guard or unmapped stop, a breakpoint, or simply the stop at `-n`. Far cheaper than `--trace blocks` |
 | `--backtrace` | tracks calls and returns and prints the calls each processor is inside at the stop, innermost first, named from the ELF's symbols: `backtrace: #0 0x.. <parse+0x1c> called, returns to 0x.. <rx_task+0x40>` (`interrupted at` for an interrupt or exception taken on the way) | "who called this": the call chain into a crash, a guard stop, a breakpoint. A best-effort history (tasks are not told apart; a function left without returning stays until an older frame's return drops it). A snapshot taken with it is loaded with it |
-| `--log-pc ADDR[,REG...]` | `RUNNER: pc 0xADDR reached (hit H, icount N) a0=0x.. ra=0x..` at each arrival | a function's calls and arguments; a loop's iteration count. Register names as the ISA's gdb description has them (`a0` on RISC-V, `r4` on MIPS, `r0` on ARM, `rdi` on x86-64, `r3` on PowerPC); an unknown name lists them |
+| `--log-pc ADDR[,REG...]` | `RUNNER: pc 0xADDR reached (hit H, icount N) a0=0x.. ra=0x..` at each arrival | a function's calls and arguments; a loop's iteration count. Register names as the ISA's gdb description has them (`a0`, `ra` on RISC-V; `r4`, `r31` on MIPS, not `a0`, `ra`; `r0`, `lr` on ARM; `rdi` on x86-64; `r3` on PowerPC); an unknown name lists them. (Board code is the other namespace: `board_entry_regs` and an HLE hook's `reg()` use the ISA module's own register table, where MIPS has `a0`, `v0`, `ra`.) |
 | `--break ADDR` (+ `-d`) | stop when ADDR is reached (exit 127) and dump the processors | the state at a point of interest |
 | `-n N -d` | stop at exactly instruction N and dump every processor | the state at an icount from any trace line |
 | `--dump-mem [p:]ADDR+LEN[=FILE]` | hex-dump (or save) guest memory when the run stops | a descriptor ring, a buffer, a structure the firmware built |
@@ -140,7 +140,7 @@ access, with pc and value) or `--guard ADDR+LEN:w` (stop before the first write)
 decompile the writer. gdb `watch` does the same interactively.
 
 **Which function fails:** `--log-pc` on the candidates with their argument and return
-registers (`--log-pc 0x80012340,a0,a1,ra`), or `scripts/gdb_trace_calls.py`; a call that
+registers (`--log-pc 0x80012340,a0,a1,ra` on RISC-V; `r4,r5,r31` on MIPS), or `scripts/gdb_trace_calls.py`; a call that
 returns an error code leads to the device it needed.
 
 **DMA devices (network, storage, DMA engines):** `-t dma,mmio` shows the descriptor ring

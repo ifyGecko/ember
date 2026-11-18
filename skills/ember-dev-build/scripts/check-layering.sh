@@ -2,8 +2,8 @@
 # check-layering.sh - enforce ember's dependency rules (docs/architecture.md section 3) on
 # the project's emulation/ sources. Run by rebuild.sh; runnable standalone.
 #
-#   board files   *_board.[ch], *_hle.[ch], main.c   may include any public ember header
-#                 except uam/host.h (the runner owns the host side)
+#   board files   *_board.[ch], *_hle.[ch], *_heap.[ch], main.c   may include any public
+#                 ember header except uam/host.h (the runner owns the host side)
 #   device files  everything else                    may include only the device-side
 #                 interfaces: common.h access.h device.h signal.h sched.h chardev.h
 #                 netdev.h blockdev.h state.h bus.h, stock device headers (uam/dev/*.h), and
@@ -18,7 +18,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 P=""
 while [[ $# -gt 0 ]]; do
-    case "$1" in --proj) P="$2"; shift 2;; *) _die "unknown argument: $1";; esac
+    case "$1" in --proj) P="$2"; shift 2;; -h|--help) sed -n '2,16p' "$0"; exit 0;; *) _die "unknown argument: $1";; esac
 done
 PROJ="$(resolve_proj "$P")"
 ALLOWED='^uam/(common|access|device|signal|sched|chardev|netdev|blockdev|state|bus)\.h$|^uam/dev/[A-Za-z0-9_]+\.h$'
@@ -28,13 +28,13 @@ for f in "$PROJ"/emulation/*.[ch]; do
     base="$(basename "$f")"
     while IFS= read -r inc; do
         case "$base" in
-            *_board.[ch]|*_hle.[ch]|main.c)
+            *_board.[ch]|*_hle.[ch]|*_heap.[ch]|main.c)
                 [[ "$inc" == "uam/host.h" ]] && { echo "layering: $base includes $inc (host side belongs to the runner)"; bad=1; }
                 ;;
             *)
                 if [[ "$inc" == uam/* ]]; then
                     [[ "$inc" =~ $ALLOWED ]] || { echo "layering: device file $base includes \"$inc\""; bad=1; }
-                elif [[ "$inc" == *_board.h || "$inc" == *_hle.h ]]; then
+                elif [[ "$inc" == *_board.h || "$inc" == *_hle.h || "$inc" == *_heap.h ]]; then
                     echo "layering: device file $base includes board header \"$inc\""; bad=1
                 fi
                 ;;

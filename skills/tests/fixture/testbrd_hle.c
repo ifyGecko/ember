@@ -38,5 +38,5 @@ uam_status testbrd_hle_install(uam_machine *m, const uam_board_config *cfg)
 {
     if (!uam_board_config_option(cfg, "hle"))       /* opt-in while it is being evaluated */
         return UAM_OK;
-    return uam_exec_add_pc_hook(&m->exec, 0x800001c0, skip_puts, NULL);
+    return uam_machine_add_pc_hook(m, 0x800001c0, skip_puts, NULL);   /* every processor */
 }

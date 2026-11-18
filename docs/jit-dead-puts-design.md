@@ -1,6 +1,8 @@
 # Step 9 design: dead register writes across instructions
 
-Status: **approved and implemented** (2026-10-27): stage D1 in 72bc0af, stage D2 in the commit after it; results in docs/jit-perf.md. It builds on the work in docs/jit-perf.md (steps 0–8). Where the implementation differs from the text below, §9 says how.
+Status: **approved and implemented** (2026-10-27): stage D1 in 72bc0af, stage D2 in the commit after it; results in docs/jit-perf.md. It builds on the work in docs/jit-perf.md (steps 0–8). Where the implementation differs from the text below, §8 says how. §9 is an appendix: the audit of ember's generic layers for architecture bias that was made with this step, kept as a record (every finding in it is fixed; its line numbers are those of the time).
+
+Terms used here without a definition (bridge, stop stub, slot) are explained in docs/architecture.md, section 6 (the bullets "JIT block chaining" and "Stores next to code"), and at the top of `src/exec/jit.h`.
 
 ## 1. What it is, in one paragraph
 
@@ -16,7 +18,7 @@ At such a point the guest state must be exact. So the JIT does not delete those 
 
 ### Measured potential
 
-Method: I ran the analysis below on the final IR of every block (`-t ir`). For OVMF I weighted each block by its share of perf samples. All numbers are on the current main.
+Method: the analysis below was run on the final IR of every block (`-t ir`). For OVMF I weighted each block by its share of perf samples. All numbers are on the current main.
 
 | Workload / guest | Writes deferrable | Pure ops that only feed them | Hot-path share removed |
 |---|---:|---:|---|
@@ -64,6 +66,7 @@ Places where the register file can be observed in the middle of a block:
 | A non-first, non-CONT IMARK | soft | stops only on an exit request or deadline: the out-of-line stop stub |
 | LD / ST | soft | observable only on the bridge path: a fault, a device access (whose callback may read registers), a watchpoint, a page crossing |
 | COV, FENCE, pure ops | none | |
+| CMPLOG, FRAME (added later) | none | they call C, but only with their operand values: the compare log and the call tracker never read or write the register file |
 
 **Hard point:** every earlier write must already be done in place. Writes are deferred only past soft points.
 
@@ -124,7 +127,7 @@ An IR-level alternative (a `uam_finalize` pass that writes stub lists into the b
   - This is the same use-position machinery the allocator already has, with extra positions.
 - **Code size:** stubs are duplicated per soft point. Estimate for OVMF: about 81k stubs averaging 6 writes plus their cold ops, i.e. tens of percent more code, all of it out of line. Two controls:
   1. **D2 stub cap.** If a stub would exceed N ops (start with 32), the writes feeding it are un-deferred.
-  2. **Shared replay sequences**, only if measurement shows icache or translation-time cost. Consecutive soft points with the same pending list `call` one replay sequence ending in `ret`. Native code runs on its own stack frame, so this is legal.
+  2. **Shared replay sequences** (not built: the cap was enough), only if measurement shows icache or translation-time cost. Consecutive soft points with the same pending list `call` one replay sequence ending in `ret`. Native code runs on its own stack frame, so this is legal.
 
 ### 4.4 Stages
 
@@ -145,13 +148,13 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
   - a CONT IMARK in between (no stop) versus a plain IMARK (stop).
 - **Mutation checks**, as in earlier steps: drop a replay, replay out of order, ignore the overlap rule, forget a soft point.
 - **Bisecting:** `UAM_JIT_NODEFER=1`. `--stats` gets counters for deferred writes, sunk ops and stub bytes.
-- **End to end:** both workloads keep identical consoles and identical interpreter-vs-JIT state, and the UEFI boot and secure-boot checks of an external x86 board pass, if one is available (ember has no such make target).
+- **End to end:** both workloads keep identical consoles and identical interpreter-vs-JIT state, and the UEFI boot and secure-boot checks of an external x86 board pass, if one is available (ember has no target for it: such a board is its own project).
 
 ## 6. Risks
 
 | Risk | Mitigation |
 |---|---|
-| A missed observation point (some path that reads the register file mid-block) | The classification is deliberately conservative: anything that calls C is hard, except load/store slow paths, which replay before calling |
+| A missed observation point (some path that reads the register file mid-block) | The classification is deliberately conservative: anything that calls C and can reach the register file is hard, except load/store slow paths, which replay before calling |
 | Code size and translation time | Measured per stage; cap and shared replays as above |
 | Allocator pressure from longer-lived values | Spills are already handled; `UAM_JIT_REGS=1` soak exercises them |
 
@@ -160,7 +163,7 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
 - **Lazy flags in the lifters.** Keep the last operation and operands, and compute flags when they are read. This is architecture-specific work (x86 differently from ARM differently from PPC), and it changes the register-file layout: ABI, snapshots, gdb, every C reader of RFLAGS/CPSR. It is the opposite of keeping ember generic.
 - **An IMARK flag meaning "no stop here".** This would let deferral cross instruction boundaries trivially, but it changes when interrupts and deadlines are taken. That is visible to the guest and differs from the interpreter.
 
-## 9. As implemented
+## 8. As implemented
 
 - **Where:** `jit_defer_analyze` and `cold_analyze` in `src/exec/jit.c`, run on each block before register allocation; each code generator emits the replays with its own `emit_replays` (`jit_x86.c`, `jit_a64.c`).
 - **IMARK stop stubs** stay at the end of the block. Each records, at its IMARK, which register holds each temp its replay reads, and the stub is emitted with those locations, so stubs and load/store slow paths share one replay emitter.
@@ -172,13 +175,13 @@ Each stage gets its own commit and measurement, and goes ahead only if the diffe
 
 ---
 
-## 8. Architecture neutrality: steps 0–8 and the rest of ember
+## 9. Appendix: architecture neutrality of steps 0–8 and of the rest of ember
 
-You asked whether my changes, or anything else in ember, lean toward one architecture. Short answer:
+The question was whether the JIT work so far, or anything else in ember, leans toward one architecture. Short answer:
 - **Steps 0–8:** no change is guest-specific. Each acts on IR shapes or runtime structures that every ISA produces.
 - **Elsewhere in ember:** an audit of the generic layers found four real leaks and one bug on the generic/ISA boundary, each with a small generic fix; all have since been fixed (see below).
 
-### 8.1 Steps 0–8
+### 9.1 Steps 0–8
 
 | Step | Generic? | Which guests gain most, and why |
 |---|---|---|
@@ -193,9 +196,9 @@ You asked whether my changes, or anything else in ember, lean toward one archite
 
 One host-side fact: at the time the JIT targeted x86-64 hosts only; an AArch64 code generator has since joined it on the same core. That concerns the machine ember runs on, not the guests it runs. Other hosts use the interpreter.
 
-### 8.2 Audit of the generic layers
+### 9.2 Audit of the generic layers
 
-I read src/core, src/exec, src/ir, src/machine, src/runner, src/loader, src/host, include/uam, fuzz and analysis, and verified the important findings in the code.
+Read for it: src/core, src/exec, src/ir, src/machine, src/runner, src/loader, src/host, include/uam, fuzz and analysis, and verified the important findings in the code.
 
 **Clean:**
 - The bus has no I/O-port space and no SMM. The x86 port convention (2^40 + port) lives only in include/uam/isa/x86.h, isa/x86 and the x86 board.
@@ -233,10 +236,10 @@ I read src/core, src/exec, src/ir, src/machine, src/runner, src/loader, src/host
 | Edge cases follow particular ISAs | Division-by-zero results follow RISC-V and shift-by-≥width follows ARM. The other ISAs pay one extra op (a guard or an AND) |
 | Other limits | One translation per pc: code reached alternately under two privilege tags is retranslated each time. The minimum page size is 4 KiB: sub-4K pages (MIPS PageGrain 1K, ARMv5 tiny pages) are not supported. PC hooks never fire on an instruction that continues another (inside an ARM IT block, after x86 STI), which the docs describe only as "delay slot" |
 
-### 8.3 Measuring parity, not just reasoning about it
+### 9.3 Measuring parity, not just reasoning about it
 
 The in-repo self-tests run for milliseconds and measure translation, not execution speed. The honest way to check "roughly equal performance per ISA" is one shared C benchmark (CRC, sort, matrix, string search, a switch-dispatch interpreter) built for every guest. Report its guest-instructions-per-second and host-time-per-source-iteration for each guest.
 
-The cross toolchains are already used for the self-tests; x86 needs a small freestanding C entry. I recommend adding it, as `tests/bench/`, before or alongside step 9, so that both step 9 and any future change are judged on all ISAs at once.
+The cross toolchains are already used for the self-tests; x86 needs a small freestanding C entry. It was added as `tests/bench/` (docs/jit-perf.md, "Parity across ISAs"), so that step 9 and every later change are judged on all ISAs at once.
 
 **Done:** `tests/bench/` with `meson test -C build --suite bench` and `tools/xbench.sh` (docs/jit-perf.md, "Parity across ISAs"). Per-kernel geometric mean of time over the fastest guest, before step 9: RV32 1.04, MIPS 1.12 / 1.16 (BE/LE), PPC 1.26, ARM 1.27, Thumb 1.50 / 1.45 (LE/BE8), x86 2.17. The x86 gap is largest on the ALU kernels (matmul 3.7x, fmt 3.3x, crc 2.8x), where about three quarters of the IR is dead flag computation: step 9's gate holds on this benchmark too, and it is the measure step 9 should be judged by.
