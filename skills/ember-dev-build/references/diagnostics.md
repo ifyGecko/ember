@@ -36,7 +36,7 @@ depends on what kind of address X is. All of them name the pc and the icount of 
 | X is | you want | use |
 |---|---|---|
 | a device register, a block of them, an x86 I/O port (`0x10000000000 + port`) | every access in order, with values | `-t mmio --trace-mmio-range LO:HI` |
-| the same | one line per register: counts, the value reads return, the first pc | `-t mmio-summary` (every register of the run). `--trace-mmio-range` narrows it but also turns the per-access stream on: add `--trace-file F` and read the summary at its end |
+| the same | one line per register: counts, the value reads return, the first pc | `-t mmio-summary --trace-mmio-range LO:HI` (without the range: every register of the run) |
 | RAM, ROM or flash data (a variable, a buffer, a table, a flash partition), or a register when you want one tool for both | every read and write by the processors | `--watch [p:]ADDR+LEN` (`:r` reads only, `:w` writes only) |
 | the same | to stop at the first one, before it happens, with the state intact | `--guard [p:]ADDR+LEN[:r\|w]` (exit 129), then `-d`, `--history N`, `--backtrace` |
 | memory a device fills or reads by itself (a DMA ring, a receive buffer) | what the device moved, and for which instruction | `-t dma` (`--watch` does not see DMA) |
@@ -108,8 +108,7 @@ instruction that made it (`pc=0x.. icount=N`): decompile that pc.
 An unknown name is an error (exit 2) and lists the valid ones. `--trace-after N` holds
 back every trace but `ir` until icount N, and the summaries and sysreg's "first" count
 from there. `--trace-mmio-range LO:HI` limits `mmio` and its summary to physical
-addresses in [LO, HI), and turns the `mmio` stream on by itself, also next to
-`mmio-summary`.
+addresses in [LO, HI); given without either, it turns the `mmio` trace on.
 
 ## 3. Probes
 
@@ -156,8 +155,7 @@ address up first (`nm`, Ghidra). `--backtrace` names its frames from the same sy
   access to the block in order with values and pcs: the init sequence, the reset values it
   expects (reads), the configuration it writes, and the pcs of the driver's functions
   (decompile them for the bit meanings).
-- The summary that ends that trace (or `-t mmio-summary` alone, for the whole run without
-  the stream) gives one line per register: which ones matter at
+- `-t mmio-summary` over the same range gives one line per register: which ones matter at
   all (model those), which are write-only configuration (a stub that stores them), which are
   read in loops.
 - Test the semantics with `--mmio-rule` (`fixed:V`, `echo,set=0x1`, ...) and `-v` before

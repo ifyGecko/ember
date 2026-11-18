@@ -387,7 +387,8 @@ ones a bring-up step needs, all on stderr:
 | `all` | `exc,mmio,sysreg,irq,console,dma` | a first look at a short run |
 
 `--trace-mmio-range LO:HI` limits the `mmio` trace (and its summary) to physical addresses in
-[LO, HI). `--trace-file FILE` writes the traces (and `--watch`, `--history`) to FILE instead of
+[LO, HI); with `-t mmio-summary` it gives the summary of that range without the per-access
+lines, and on its own it turns the `mmio` trace on. `--trace-file FILE` writes the traces (and `--watch`, `--history`) to FILE instead of
 stderr, where the logs and the runner's own lines stay.
 
 Three more probes for "how did it get here" and "what does it want":

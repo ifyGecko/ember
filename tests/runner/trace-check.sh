@@ -140,6 +140,14 @@ grep -Eq '^history: cpu0: the last 16 events before the stop \(oldest first\):$'
 $RUN -t mmio-summary "$FW" </dev/null >/dev/null 2>"$T/ms" || true
 grep -q '^mmio:   0x10000005 uart0+0x5' "$T/ms" || fail "mmio-summary: no summary"
 grep -Eq '^mmio: [rw] ' "$T/ms" && fail "mmio-summary printed per-access lines"
+# a range next to mmio-summary narrows the summary and does not turn the stream on
+$RUN -t mmio-summary --trace-mmio-range 0x10000005:0x10000006 "$FW" </dev/null >/dev/null 2>"$T/msr" || true
+grep -q '^mmio:   0x10000005 uart0+0x5' "$T/msr" || fail "mmio-summary with a range: no summary"
+grep -Eq '^mmio: [rw] ' "$T/msr" && fail "mmio-summary with a range printed per-access lines"
+if grep -E '^mmio:   0x' "$T/msr" | grep -vq ' 0x10000005 '; then fail "mmio-summary with a range: other registers in the summary"; fi
+# and a range by itself still asks for the mmio trace
+$RUN --trace-mmio-range 0x10000005:0x10000006 "$FW" </dev/null >/dev/null 2>"$T/ronly" || true
+grep -q '^mmio: r 1 0x10000005' "$T/ronly" || fail "--trace-mmio-range alone: no mmio trace"
 
 # ---- --history on every processor ---------------------------------------------------
 $RUN -o cpus=2 --history 4 -n 20000 "$SMP" </dev/null >/dev/null 2>"$T/hs" || true

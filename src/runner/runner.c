@@ -442,7 +442,8 @@ static void usage(FILE *out)
         "                          all     exc, mmio, sysreg, irq, console, dma\n"
         "      --trace-file FILE   write the traces (and --watch, --history) to FILE, not stderr\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
-        "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI)\n"
+        "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI);\n"
+        "                          with mmio-summary, the summary of that range alone\n"
         "      --trace-after N     trace only once the instruction count reaches N (every\n"
         "                          trace but ir; the sysreg and irq summaries and sysreg's\n"
         "                          first accesses count from there). N is absolute, like every\n"
@@ -1199,7 +1200,6 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 fprintf(stderr, "uam-run: --trace-mmio-range wants LO:HI with LO < HI\n");
                 return 2;
             }
-            rt.flags |= RT_MMIO;
             break;
         }
         case OPT_LOG_STAMP: uam_log_stamp = true; break;
@@ -1510,6 +1510,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
         uam_board_list(stdout);
         return 0;
     }
+    /* A range alone asks for the mmio trace; next to mmio-summary it only narrows the
+     * summary. */
+    if (rt.mmio_hi && !(rt.flags & (RT_MMIO | RT_MMIO_SUM)))
+        rt.flags |= RT_MMIO;
     if (optind + 1 < argc) {
         usage(stderr);
         return 2;
