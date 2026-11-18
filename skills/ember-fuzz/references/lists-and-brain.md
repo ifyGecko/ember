@@ -148,7 +148,8 @@ python3 $EMBER/fuzz/tools/status_tui.py --sync-dir fuzz/camp   # one row per wor
 Each worker's files are under `fuzz/camp/NAME/` (`main`, `w1`, ...: queue, crashes, hangs,
 `brain.log`, `ember.log`); entries imported from another worker are named `sync:PEER`.
 Crashes are deduplicated per worker: replay every `crashes/` directory, or group them with
-`scripts/replay_summary.py`.
+`scripts/replay_summary.py`. A worker does not minimize a crash another worker already holds
+minimized (its copy stays as found, `minimized=peer` in the `.info`).
 
 - Ember connects, boots to the begin pc, and only then sends HELLO and the INIT map, so a
   long boot is fine (the brain's `--hello-timeout`, 600 s by default; 0 waits forever). `-n`
@@ -195,11 +196,18 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   `REJECTED`, which the brain counts (`rejected` in its status) and does not save.
 - Verdicts become CRASH frames: `FAULT` 1, `GUARD` 2 (a redzone or `--guard`, with the pc of
   the access), `ORACLE` 3, `HANG` 4, `TIMEOUT` 5. The brain saves one input per distinct
-  `(reason, status)` of a session under `--out/crashes/`, minimized (and up to
+  `(reason, status)` of a session under `--out/crashes/` (and up to
   `--crashes-per-sig` (4) more, as found, when a crash at that pc ran code no earlier crash
   ran: look at those too, they may be other bugs), as
   `crash_r<reason>_s<status>_<sha1>` plus an `.info` note (`reason=`, `reason_name=`,
-  `status=`, `status_hex=`, `len=`, `sig=`, `hex=`). With `--fuzz-uninit` on ember's side (an
+  `status=`, `status_hex=`, `function_hex=`, `minimized=`, `len=`, `sig=`, `hex=`). Give the
+  brain `--functions fw.elf` (or a symbols file, e.g. a Ghidra function export, for a raw
+  image; `fuzz_launch.py` passes ELF images itself): one bug often faults at many
+  instructions of a function, and the brain then minimizes only the first crash in each
+  function at once, saves the others as found and minimizes them later within
+  `--minimize-share` percent of the runs (default 2). Nothing is dropped for being in a
+  known function: triage every file, and read `minimized=later` as "not shrunk yet", not
+  as "duplicate". With `--fuzz-uninit` on ember's side (an
   opt-in check, `references/harness.md`) the inputs whose run depended on memory nothing wrote go
   under `uninit/`, one per distinct finding, with a `.info` (`differs=`, the filled run's verdict
   and length, and its `read_before_write=` lines); they are not crashes and the input's coverage

@@ -37,14 +37,20 @@ The brain
     (HELLO bits 13 and 12) is refused: rebuild it;
   - saves each crash as the **full input plus a .info sidecar** (reason name,
     status, size, hex) so it can be replayed (`uam-run --fuzz-replay`), and
-    **deduplicates** by (reason, status). HANG and TIMEOUT verdicts go to
+    **deduplicates** by (reason, status): every distinct one is kept. HANG and TIMEOUT
+    verdicts go to
     <out>/hangs: every distinct hang input is kept (up to --max-hangs). REJECTED
     (the input route refused the input) is not a bug: it is only counted. A
     finding is written before it is minimized, so it survives a lost connection;
   - **minimizes** a newly found crash (bounded block dropping). Not hangs: every
     probe of one costs ember a full per-input budget (--minimize-timeouts opts in).
     Its probes are counted (execs, and minimize_execs on their own) and the status
-    is written while it works, with the stage "minimize ...";
+    is written while it works, with the stage "minimize ...". Given the image's
+    functions (--functions), only the first crash in a function is minimized at once:
+    one bug often faults at many of a function's instructions. The others are saved
+    as found all the same and minimized later, within --minimize-share percent of the
+    runs. A crash another worker already holds minimized is saved as found and not
+    minimized again (fuzz/tools/fuzz_crashes.py; the .info says minimized=...);
   - with --sync-dir and --name, **shares work** with other workers: it imports
     their new queue entries that are new to it (fuzz/tools/fuzz_launch.py runs a
     whole parallel campaign).
@@ -64,6 +70,7 @@ Usage:
                 [--iter-insns N|auto] [--crashes-per-sig N]
                 [--name NAME --sync-dir DIR [--sync-interval S]]
                 [--max-size N] [--no-minimize] [--minimize-timeouts]
+                [--functions FILE]... [--minimize-share PERCENT]
                 [--max-hangs N] [--seed-rng N] [--accept-timeout S]
                 [--hello-timeout S] [--io-timeout S]
                 [--status-file FILE] [--status-interval S] [--quiet]
@@ -89,6 +96,7 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fuzz_crashes import LATER, NOW, Triage, load_functions, saved_crashes  # noqa: E402
 from fuzz_dict import Dictionary, IntToken, parse_dict  # noqa: E402
 from fuzz_queue import (SCHEDULES, Entry, OpStats, Queue, entry_name,  # noqa: E402
                         hits_from_map, load_queue, new_peer_inputs, peers, save_entry,
@@ -254,6 +262,14 @@ def main():
     ap.add_argument("--minimize-timeouts", action="store_true",
                     help="also minimize HANG/TIMEOUT inputs (off by default: "
                          "every probe costs ember a full per-input budget)")
+    ap.add_argument("--functions", action="append", default=[], metavar="FILE",
+                    help="where the image's functions start: its ELF file, or a symbols "
+                         "file (the formats of gen_sites.py --symbols); repeatable. Then "
+                         "only the first crash in a function is minimized at once; the "
+                         "others are saved as found and minimized later")
+    ap.add_argument("--minimize-share", type=float, default=2.0, metavar="PERCENT",
+                    help="most of the runs, in percent, spent minimizing the crashes left "
+                         "for later (default 2; 0: they stay as found)")
     ap.add_argument("--crashes-per-sig", type=int, default=4,
                     help="save at most N crashes with one (reason, status): the first, "
                          "minimized, then those that ran code no earlier crash ran (default 4)")
@@ -300,6 +316,9 @@ def main():
         sys.exit("brain: --min-energy must be at least 1")
     if not 1 <= args.batch <= HAVOC_MAX:
         sys.exit("brain: --batch must be 1..%d" % HAVOC_MAX)
+    if not 0 <= args.minimize_share <= 100:
+        sys.exit("brain: --minimize-share is a percentage, 0..100")
+    functions = load_functions(args.functions)
     if not 1 <= args.max_size <= NET_FRAME_MAX // 2:
         sys.exit("brain: --max-size must be 1..%d" % (NET_FRAME_MAX // 2))
 
@@ -346,6 +365,10 @@ def main():
     resumed = load_queue(queue_dir)
     if resumed:
         log("resumed %d queue entries from %s" % (len(resumed), queue_dir))
+
+    if len(functions):
+        log("functions: %d (--functions); the first crash in each is minimized at once, "
+            "the others within %g%% of the runs" % (len(functions), args.minimize_share))
 
     # ---- stop cleanly on Ctrl-C / SIGTERM (campaign state is on disk) ----
     stop = {"flag": False}
@@ -453,6 +476,8 @@ def main():
     unstable = imported = trimmed_bytes = 0
     cmplog_execs = cmplog_finds = cmplog_tokens = 0
     minimize_execs = 0        # runs spent shrinking findings (part of execs, not of mutated)
+    deferred_execs = 0        # those of them spent on crashes left for later (--minimize-share)
+    triage = Triage(functions, name)   # which crash is minimized, and when (fuzz_crashes.py)
     cmplog_done = set()    # queue entry ids already through the input-to-state stage
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
@@ -500,6 +525,7 @@ def main():
             "imported": imported, "sparse": sparse_seen[0],
             "cmplog_execs": cmplog_execs, "cmplog_finds": cmplog_finds,
             "minimize_execs": minimize_execs,
+            "crash_groups": len(triage.groups), "crashes_deferred": len(triage.deferred),
             "worker": name, "role": role_name, "schedule": args.schedule,
             "stage": stage[0], "finished": finished, "config": run_config,
         }) + "\n")
@@ -825,7 +851,7 @@ def main():
         which tells them apart), and the status is written while it works. The totals of
         crashes and hangs stay what fuzzing found: a probe that fails the same way again is
         this finding once more, not another one."""
-        nonlocal execs, minimize_execs, crashes
+        nonlocal execs, minimize_execs
         if not args.minimize or len(data) <= 1:
             return data
         if reason in HANG_REASONS and not args.minimize_timeouts:
@@ -856,21 +882,16 @@ def main():
                     continue
                 if (r and r[0] == "crash" and r[1] not in HANG_REASONS and r[1] != REJECTED
                         and (r[1], r[2]) not in crash_sigs):
-                    # Another bug on the way: keep it (as found; it is not minimized in turn).
-                    crashes += 1
-                    crash_sigs[(r[1], r[2])] = 1
-                    fname = write_finding(crash_dir, "crash", cand, r[1], r[2])
-                    log("CRASH %s status=%s NEW while minimizing (saved %s)"
-                        % (reason_name(r[1]), fmt_status(r[1], r[2]), fname))
-                    emit_event("crash", "%s status=%s %s"
-                               % (reason_name(r[1]), fmt_status(r[1], r[2]), fname))
+                    # Another bug on the way: keep it as found; its turn comes later.
+                    save_crash(cand, r[1], r[2], nested=True)
                 i += chunk
             chunk //= 2
         stage[0] = was
         return best
 
-    def write_finding(where, prefix, data, reason, status):
-        """Write one finding plus its .info sidecar; return the file name."""
+    def write_finding(where, prefix, data, reason, status, minimized="no"):
+        """Write one finding plus its .info sidecar; return the file name. minimized: yes |
+        no (kept as found) | later (in the queue) | peer (another worker holds it minimized)."""
         fname = "%s_r%d_s%d_%s" % (prefix, reason, status,
                                    hashlib.sha1(data).hexdigest()[:12])
         with open(os.path.join(where, fname), "wb") as f:
@@ -880,6 +901,10 @@ def main():
                     % (reason, reason_name(reason), status))
             if reason in HEX_STATUS:
                 f.write("status_hex=%s\n" % fmt_status(reason, status))
+            fn = triage.function(reason, status) if prefix == "crash" else None
+            if fn is not None:
+                f.write("function_hex=0x%x\n" % fn)
+            f.write("minimized=%s\n" % minimized)
             f.write("len=%d\nsig=r%d/s%d\nhex=%s\n"
                     % (len(data), reason, status, data.hex()))
         return fname
@@ -891,9 +916,43 @@ def main():
             except OSError:
                 pass
 
-    def save_crash(data, reason, status, counted=False, novel=False):
+    def on_disk():
+        """The crashes saved so far: this worker's (an earlier session's too) and, in a
+        parallel campaign, the other workers'."""
+        dirs = [(name, crash_dir)]
+        if args.sync_dir:
+            dirs += [(p, os.path.join(args.sync_dir, p, "crashes"))
+                     for p in peers(args.sync_dir, name)]
+        return saved_crashes(dirs)
+
+    def minimize_deferred():
+        """Minimize one crash left for later, if the share of runs allows one now."""
+        nonlocal deferred_execs
+        if not args.minimize or not triage.due(execs, deferred_execs, args.minimize_share):
+            return
+        fname, data, reason, status = triage.deferred.popleft()
+        rname, st = reason_name(reason), fmt_status(reason, status)
+        if not os.path.exists(os.path.join(crash_dir, fname)):
+            return                        # removed by hand: nothing to replace
+        who = triage.held_by(reason, status, on_disk())
+        if who is not None:
+            write_finding(crash_dir, "crash", data, reason, status, "peer")
+            log("CRASH %s status=%s stays as found: %s holds it minimized (%s)"
+                % (rname, st, who, fname))
+            return
+        before = minimize_execs
+        small = minimize(data, reason, status)
+        deferred_execs += minimize_execs - before
+        if small != data:
+            drop_finding(crash_dir, fname)
+        new = write_finding(crash_dir, "crash", small, reason, status, "yes")
+        log("CRASH %s status=%s minimized later, len=%d -> %d (saved %s; %d left for later)"
+            % (rname, st, len(data), len(small), new, len(triage.deferred)))
+
+    def save_crash(data, reason, status, counted=False, novel=False, nested=False):
         """counted: a HAVOC batch's totals already counted it. novel: ember judged that the
-        crash ran code no earlier crash ran (or has a new (reason, status))."""
+        crash ran code no earlier crash ran (or has a new (reason, status)). nested: met
+        while minimizing another crash."""
         nonlocal crashes, hangs, rejected
         if reason == REJECTED:            # the input route refused it: no bug
             rejected += 0 if counted else 1
@@ -931,14 +990,31 @@ def main():
         # Save the input as found first: minimizing re-sends it, and a BYE, a
         # timeout or a dropped connection there must not lose the finding.
         fname = write_finding(where, prefix, data, reason, status)
-        # A variant stays as found: minimizing it would lead back to the first one.
-        small = data if variant else minimize(data, reason, status)
-        if small != data:
-            drop_finding(where, fname)
-            fname = write_finding(where, prefix, small, reason, status)
-            data = small
-        log("%s #%d %s status=%s NEW len=%d (saved %s)"
-            % (label, nth, rname, st, len(data), fname))
+        note = ""
+        if is_hang:
+            small = minimize(data, reason, status)
+            if small != data:
+                drop_finding(where, fname)
+                fname = write_finding(where, prefix, small, reason, status, "yes")
+                data = small
+        elif variant or not args.minimize:
+            pass   # a variant stays as found: minimizing it would lead back to the first one
+        else:
+            # Every (reason, status) is saved; which one is minimized now is another matter.
+            when, why = triage.decide(reason, status, on_disk(), nested)
+            if when == NOW:
+                small = minimize(data, reason, status)
+                if small != data:
+                    drop_finding(where, fname)
+                    data = small
+                fname = write_finding(where, prefix, data, reason, status, "yes")
+            else:
+                fname = write_finding(where, prefix, data, reason, status, when)
+                if when == LATER:
+                    triage.defer(fname, data, reason, status)
+                note = ", as found: " + why
+        log("%s #%d %s status=%s NEW len=%d (saved %s%s)"
+            % (label, nth, rname, st, len(data), fname, note))
         emit_event(ev, "%s status=%s %s" % (rname, st, fname))
 
     def run(data):
@@ -1227,6 +1303,8 @@ def main():
                 e.times_chosen += 1
                 state_dirty[e.id] = e
                 flush_state()
+                if not limit():
+                    minimize_deferred()
                 if pending and queue.pending_favored:
                     queue.pending_favored -= 1
             queue.cycle += 1
@@ -1255,11 +1333,12 @@ def main():
     log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d, "
         "saved=%d) rejected=%d queue=%d favored=%d cycles=%d edges=%d unstable=%d "
         "imported=%d trimmed_bytes=%d cmplog_execs=%d cmplog_finds=%d cmplog_tokens=%d "
-        "minimize_execs=%d"
+        "minimize_execs=%d crash_groups=%d crashes_deferred=%d"
         % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
            len(hang_inputs), rejected, len(queue.entries), queue.favored_count(),
            queue.cycle, edges[0], unstable, imported, trimmed_bytes, cmplog_execs,
-           cmplog_finds, cmplog_tokens, minimize_execs))
+           cmplog_finds, cmplog_tokens, minimize_execs, len(triage.groups),
+           len(triage.deferred)))
     emit_status(finished=True)
     if status_fp:
         status_fp.close()

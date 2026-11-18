@@ -21,7 +21,9 @@ Ctrl-C / SIGTERM stops every worker cleanly (the brains say BYE).
 Everything after "--" is the ember command line; the launcher appends
 "--fuzz-net 127.0.0.1:PORT" to it, and "--fuzz-snapshot SYNC_DIR/begin.snap": the firmware
 boots once, in the first worker, which saves the begin snapshot; the others (and every
-restart) start from it. A snapshot left from an earlier launch is removed first (the
+restart) start from it. The ELF images on that command line go to every brain as
+--functions (unless a --brain-arg names its own): a brain minimizes the first crash in a
+function at once and the others later (fuzz_brain.py). A snapshot left from an earlier launch is removed first (the
 firmware may have changed). --no-shared-boot boots every worker itself. With --iters, each worker stops after that many
 mutated executions and the launcher ends when all have. Exit status: 0 when every worker
 ended cleanly, 1 otherwise (a worker that ran out of restarts), 2 on a usage error.
@@ -59,6 +61,20 @@ def brain_port(log_path, proc, after, timeout=15.0):
     return None
 
 
+def elf_files(argv):
+    """The arguments of ember's command line that are ELF files: the runner, then the
+    firmware images."""
+    out = []
+    for a in argv:
+        try:
+            with open(a, "rb") as f:
+                if f.read(4) == b"\x7fELF":
+                    out.append(a)
+        except OSError:
+            pass
+    return out
+
+
 def worker_seed(base, name):
     return int.from_bytes(hashlib.sha256(b"%d/%s" % (base, name.encode())).digest()[:4], "big")
 
@@ -91,6 +107,10 @@ class Worker:
             cmd += ["--dict", d]
         if not self.cmplog:
             cmd += ["--no-cmplog"]
+        if "--functions" not in a.brain_arg:
+            # The brain minimizes one crash per function first: tell it where they start.
+            for f in elf_files(self.ember_cmd)[1:]:   # the first one is the runner itself
+                cmd += ["--functions", f]
         cmd += a.brain_arg
         mode = "ab" if self.restarts else "wb"
         blog_path = os.path.join(self.dir, "brain.log")

@@ -10,7 +10,10 @@ on synthetic data: no ember, no sockets.
   - every schedule's factor and energy behaving as specified;
   - adaptive operator weights (toward the operators that find coverage, with a floor);
   - entry names, saving and resuming a queue with its state;
-  - sync bookkeeping (a peer's new entries, its own imports left out, .synced/).
+  - sync bookkeeping (a peer's new entries, its own imports left out, .synced/);
+  - crash triage (fuzz/tools/fuzz_crashes.py): every identity is kept, the first crash in a
+    function is minimized at once, the others later within a share of the runs, and a crash
+    another worker holds minimized is left as found.
 """
 import os
 import random
@@ -19,6 +22,7 @@ import tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fuzz", "tools"))
+import fuzz_crashes as fc  # noqa: E402
 import fuzz_queue as fq  # noqa: E402
 
 failures = []
@@ -263,8 +267,73 @@ def test_sync_bookkeeping():
         check(todo == [] and top == 2, "nothing new after it")
 
 
+def test_crash_triage():
+    F, G, O = 1, 2, 3                                    # FAULT, GUARD, ORACLE
+    fns = fc.Functions([0x1000, 0x2000, 0x1_0000_3000])
+    check(fns.find(0x0fff) is None and fns.find(0x1000) == 0x1000 and fns.find(0x1ffc) == 0x1000
+          and fns.find(0x2004) == 0x2000 and fns.find(0x3010) == 0x3000,
+          "a pc's function: the nearest start at or below it (low 32 bits)")
+    t = fc.Triage(fns, "w1")
+    check(t.group(F, 0x1010) == t.group(F, 0x1ff0) != t.group(F, 0x2000),
+          "faults in one function share a group")
+    check(t.group(F, 0x1010) != t.group(G, 0x1010), "another reason: another group")
+    check(t.group(O, 0x1010) != t.group(O, 0x1014), "a status that is no pc is its own group")
+    check(t.group(F, 0x10) != t.group(F, 0x14), "below every function: its own group")
+    check(t.decide(F, 0x1010)[0] == fc.NOW, "the first crash in a function: now")
+    check(t.decide(F, 0x1020)[0] == fc.LATER and t.decide(F, 0x1ff0)[0] == fc.LATER,
+          "others in that function: later")
+    check(t.decide(F, 0x2010)[0] == fc.NOW, "another function: now")
+    check(t.decide(G, 0x1010)[0] == fc.NOW, "another reason there: now")
+    check(t.decide(F, 0x3000, nested=True)[0] == fc.LATER
+          and t.decide(F, 0x3004)[0] == fc.NOW,
+          "met while minimizing: later, and it does not stand for its function")
+    check(len(t.groups) == 4, "the groups seen")
+    none = fc.Triage(None, "main")
+    check(none.decide(F, 0x1010)[0] == fc.NOW and none.decide(F, 0x1020)[0] == fc.NOW,
+          "no functions known: every identity is its own group")
+    # the queue of deferred ones and the share of runs it may take
+    check(not t.due(1000, 0, 2.0), "nothing deferred: nothing due")
+    t.defer("crash_a", b"aaaa", F, 0x1020)
+    check(t.due(1000, 0, 2.0) and t.due(10000, 199, 2.0) and not t.due(10000, 200, 2.0),
+          "due while deferred runs stay under the share")
+    check(not t.due(10**9, 0, 0.0), "a share of 0: never")
+    # what the other workers hold
+    S = fc.Saved
+    t = fc.Triage(fns, "w1")
+    check(t.decide(F, 0x1010, [S("main", F, 0x1010, True)])[0] == fc.PEER,
+          "a peer holds it minimized: not minimized here")
+    check(t.decide(F, 0x1020, [S("main", F, 0x1010, True)])[0] == fc.LATER,
+          "a peer holds a minimized crash in the function: later")
+    check(t.decide(F, 0x2010, [S("main", F, 0x2010, False)])[0] == fc.LATER,
+          "a peer of a lower name saved it first: later")
+    check(t.decide(G, 0x2010, [S("w2", G, 0x2010, False), S("w1", G, 0x2010, False)])[0] == fc.NOW,
+          "a peer of a higher name saved it as found, and this worker's own copy: now")
+    check(t.held_by(F, 0x2010, [S("main", F, 0x2010, False)]) is None
+          and t.held_by(F, 0x2010, [S("main", F, 0x2010, True)]) == "main", "held_by")
+    with tempfile.TemporaryDirectory() as d:
+        for w, files in (("main", (("crash_r1_s4112_aa", "reason=1\nstatus=4112\nminimized=yes\n"),
+                                   ("crash_r1_s4128_bb", "reason=1\nstatus=4128\nminimized=later\n"),
+                                   ("crash_old", "reason=3\nstatus=7\nlen=1\nhex=00\n"),
+                                   ("junk", "hello\n"))),
+                         ("w2", ())):
+            os.makedirs(os.path.join(d, w, "crashes"))
+            for n, text in files:
+                open(os.path.join(d, w, "crashes", n), "wb").close()
+                with open(os.path.join(d, w, "crashes", n + ".info"), "w") as f:
+                    f.write(text + "hex=" + "00" * 4096 + "\n")
+        got = sorted(fc.saved_crashes([(w, os.path.join(d, w, "crashes"))
+                                       for w in ("main", "w2", "gone")]))
+        check(got == [S("main", 1, 4112, True), S("main", 1, 4128, False), S("main", 3, 7, False)],
+              "saved crashes read back from .info files (one without minimized= counts as not)")
+        sym = os.path.join(d, "fw.syms")
+        with open(sym, "w") as f:
+            f.write("# functions\n0x1000 parse\n00002000 T other\n")
+        check(fc.load_functions([sym]).starts == [0x1000, 0x2000], "functions from a symbols file")
+        check(len(fc.load_functions([])) == 0, "no file: no functions")
+
+
 def main():
-    for t in (test_classes_and_fold, test_path_id, test_favored_and_skip, test_schedules,
+    for t in (test_crash_triage, test_classes_and_fold, test_path_id, test_favored_and_skip, test_schedules,
               test_opstats, test_names_and_persistence, test_sync_bookkeeping):
         t()
     if failures:
@@ -272,7 +341,7 @@ def main():
             print("brain_unit: FAIL: " + f, file=sys.stderr)
         return 1
     print("brain_unit: ok (coverage fold, paths, favored set, unknown costs, stage limits, "
-          "schedules, operator weights, queue files, sync bookkeeping)")
+          "schedules, operator weights, queue files, sync bookkeeping, crash triage)")
     return 0
 
 

@@ -210,6 +210,7 @@ fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists an
                   fuzz_brain.py fuzz_dict.py (the coverage-guided brain and its dictionaries;
                   ember mutates: fuzz/mutate.c)
                   fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)
+                  fuzz_crashes.py (which saved crash the brain minimizes, and when)
                   fuzz_launch.py (a parallel campaign of brain + ember workers)
                   status_tui.py (its status screen) cov_region.py (reads a coverage region)
 tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,

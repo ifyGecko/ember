@@ -21,6 +21,12 @@
 # default, from the seed "hello world!" and no dictionary, it must find the bug behind the
 # 32-bit magic value (the saved input holds it, little-endian, at offset 4) through
 # input-to-state finds; the same session with --no-cmplog must not.
+#
+# Which crash is minimized when (--functions), from two seeds that are the two planted
+# FAULTs: with the ELF's functions both are minimized at once (they are in two functions);
+# with a symbols file that calls the whole image one function, the second is saved as found
+# and minimized later, and with --minimize-share 0 it stays as found. Both are saved in
+# every case, and each .info says which function and whether it was minimized.
 set -eu
 run=$1
 board=$2
@@ -199,5 +205,57 @@ else
     fail=1
 fi
 
-[ $fail -eq 0 ] && echo "brain-check: $board: $(basename "$fw"): the brain saved and minimized the crash; every schedule; a dictionary find; compare logging"
+# Crash triage: the two FAULT seeds, with and without one function around both.
+mkdir "$tmp/two"
+printf 'hello' > "$tmp/two/a"
+printf 'FUZ!x' > "$tmp/two/b"
+printf 'Mxxx\345\221\074\152pad' > "$tmp/two/c"
+readelf -sW "$fw" | awk '$4 == "FUNC" { print "0x" $2 }' | sort | head -n 1 | sed 's/$/ image/' > "$tmp/one.syms"
+# faults DIR: the FAULTs saved there; minimized DIR HOW: how many of them say minimized=HOW
+faults() { grep -l '^reason_name=FAULT$' "$1"/crashes/*.info 2> /dev/null | wc -l | tr -d ' '; }
+minimized() { grep -l '^reason_name=FAULT$' "$1"/crashes/*.info 2> /dev/null | xargs grep -l "^minimized=$2\$" 2> /dev/null | wc -l | tr -d ' '; }
+if session fn-elf 300 --seeds "$tmp/two" --no-cmplog --functions "$fw"; then
+    if [ "$(faults "$tmp/fn-elf")" -ne 2 ] || [ "$(minimized "$tmp/fn-elf" yes)" -ne 2 ] \
+       || grep -q 'as found' "$tmp/fn-elf.log" \
+       || [ "$(cat "$tmp"/fn-elf/crashes/*.info | grep -c '^function_hex=0x')" -lt 2 ]; then
+        echo "brain-check: $board: crashes in two functions were not both minimized at once:" >&2
+        grep CRASH "$tmp/fn-elf.log" >&2
+        fail=1
+    fi
+else
+    fail=1
+fi
+if session fn-one 300 --seeds "$tmp/two" --no-cmplog --functions "$tmp/one.syms"; then
+    if [ "$(faults "$tmp/fn-one")" -ne 2 ] || [ "$(minimized "$tmp/fn-one" yes)" -ne 2 ] \
+       || ! grep -q 'as found: its function already has a minimized crash' "$tmp/fn-one.log" \
+       || ! grep -q 'minimized later' "$tmp/fn-one.log" \
+       || ! tail -n 1 "$tmp/fn-one.status" | grep -q '"crashes_deferred": 0,'; then
+        echo "brain-check: $board: the second crash in a function was not saved as found and" \
+             "minimized later:" >&2
+        grep CRASH "$tmp/fn-one.log" >&2
+        fail=1
+    fi
+else
+    fail=1
+fi
+if session fn-stay 300 --seeds "$tmp/two" --no-cmplog --functions "$tmp/one.syms" --minimize-share 0; then
+    if [ "$(faults "$tmp/fn-stay")" -ne 2 ] || [ "$(minimized "$tmp/fn-stay" yes)" -ne 1 ] \
+       || [ "$(minimized "$tmp/fn-stay" later)" -ne 1 ] \
+       || ! tail -n 1 "$tmp/fn-stay.status" | grep -q '"crashes_deferred": 1,'; then
+        echo "brain-check: $board: with --minimize-share 0 the second crash did not stay as found:" >&2
+        grep CRASH "$tmp/fn-stay.log" >&2
+        fail=1
+    else
+        # as found means the seed itself, and it replays as a crash
+        later=$(grep -l '^minimized=later$' "$tmp"/fn-stay/crashes/*.info)
+        if ! cmp -s "${later%.info}" "$tmp/two/b" && ! cmp -s "${later%.info}" "$tmp/two/c"; then
+            echo "brain-check: $board: the crash left for later is not the input as found" >&2
+            fail=1
+        fi
+    fi
+else
+    fail=1
+fi
+
+[ $fail -eq 0 ] && echo "brain-check: $board: $(basename "$fw"): the brain saved and minimized the crash; every schedule; a dictionary find; compare logging; one crash per function minimized first"
 exit $fail
