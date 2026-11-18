@@ -42,7 +42,9 @@ The brain
     (the input route refused the input) is not a bug: it is only counted. A
     finding is written before it is minimized, so it survives a lost connection;
   - **minimizes** a newly found crash (bounded block dropping). Not hangs: every
-    probe of one costs ember a full per-input budget (--minimize-timeouts opts in);
+    probe of one costs ember a full per-input budget (--minimize-timeouts opts in).
+    Its probes are counted (execs, and minimize_execs on their own) and the status
+    is written while it works, with the stage "minimize ...";
   - with --sync-dir and --name, **shares work** with other workers: it imports
     their new queue entries that are new to it (fuzz/tools/fuzz_launch.py runs a
     whole parallel campaign).
@@ -450,6 +452,7 @@ def main():
     uninit_details = set()
     unstable = imported = trimmed_bytes = 0
     cmplog_execs = cmplog_finds = cmplog_tokens = 0
+    minimize_execs = 0        # runs spent shrinking findings (part of execs, not of mutated)
     cmplog_done = set()    # queue entry ids already through the input-to-state stage
     init_edges = [None]    # edges in ember's INIT map (boot), once it arrived
     crash_sigs = {}        # (reason, status) -> count; the dedup key
@@ -496,6 +499,7 @@ def main():
             "pending_favored": queue.pending_favored, "unstable": unstable,
             "imported": imported, "sparse": sparse_seen[0],
             "cmplog_execs": cmplog_execs, "cmplog_finds": cmplog_finds,
+            "minimize_execs": minimize_execs,
             "worker": name, "role": role_name, "schedule": args.schedule,
             "stage": stage[0], "finished": finished, "config": run_config,
         }) + "\n")
@@ -816,7 +820,12 @@ def main():
     def minimize(data, reason, status):
         """Bounded block dropping: shrink `data` while it still fails with the
         same (reason, status) -- for FAULT / GUARD / ORACLE the status (a pc or
-        a detail code) is the bug's identity. A readable tmin, not an optimal one."""
+        a detail code) is the bug's identity. A readable tmin, not an optimal one.
+        Its runs are runs like any other: each one counts in execs (and in minimize_execs,
+        which tells them apart), and the status is written while it works. The totals of
+        crashes and hangs stay what fuzzing found: a probe that fails the same way again is
+        this finding once more, not another one."""
+        nonlocal execs, minimize_execs, crashes
         if not args.minimize or len(data) <= 1:
             return data
         if reason in HANG_REASONS and not args.minimize_timeouts:
@@ -824,18 +833,31 @@ def main():
         best = data
         chunk = max(1, len(best) // 2)
         budget = 200                      # cap re-sends so minimize stays cheap
+        was = stage[0]
+        announced = False
+        what = "minimize %s status=%s" % (reason_name(reason), fmt_status(reason, status))
         while chunk >= 1 and budget > 0:
             i = 0
             while i < len(best) and budget > 0:
                 cand = best[:i] + best[i + chunk:]
                 budget -= 1
+                stage[0] = "%s (%d bytes, %d probes left)" % (what, len(best), budget)
+                if not announced:
+                    announced = True
+                    emit_status()         # the stage shows at once, not an interval later
+                    last_status[0] = time.monotonic()
                 r = probe(cand) if cand else None
+                if r:
+                    execs += 1
+                    minimize_execs += 1
+                    maybe_status()
                 if r == ("crash", reason, status):
                     best = cand           # the drop kept the crash
                     continue
                 if (r and r[0] == "crash" and r[1] not in HANG_REASONS and r[1] != REJECTED
                         and (r[1], r[2]) not in crash_sigs):
                     # Another bug on the way: keep it (as found; it is not minimized in turn).
+                    crashes += 1
                     crash_sigs[(r[1], r[2])] = 1
                     fname = write_finding(crash_dir, "crash", cand, r[1], r[2])
                     log("CRASH %s status=%s NEW while minimizing (saved %s)"
@@ -844,6 +866,7 @@ def main():
                                % (reason_name(r[1]), fmt_status(r[1], r[2]), fname))
                 i += chunk
             chunk //= 2
+        stage[0] = was
         return best
 
     def write_finding(where, prefix, data, reason, status):
@@ -1231,11 +1254,12 @@ def main():
     # the keys, saved the distinct inputs kept under hangs/.
     log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d, "
         "saved=%d) rejected=%d queue=%d favored=%d cycles=%d edges=%d unstable=%d "
-        "imported=%d trimmed_bytes=%d cmplog_execs=%d cmplog_finds=%d cmplog_tokens=%d"
+        "imported=%d trimmed_bytes=%d cmplog_execs=%d cmplog_finds=%d cmplog_tokens=%d "
+        "minimize_execs=%d"
         % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
            len(hang_inputs), rejected, len(queue.entries), queue.favored_count(),
            queue.cycle, edges[0], unstable, imported, trimmed_bytes, cmplog_execs,
-           cmplog_finds, cmplog_tokens))
+           cmplog_finds, cmplog_tokens, minimize_execs))
     emit_status(finished=True)
     if status_fp:
         status_fp.close()

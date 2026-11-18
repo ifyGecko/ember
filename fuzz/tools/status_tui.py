@@ -49,6 +49,7 @@ unknown keys are ignored, missing ones render as "?"):
   imported       entries imported from other workers
   cmplog_execs, cmplog_finds   input-to-state candidates run, and those that were new
                  coverage (compare logging)
+  minimize_execs   runs spent minimizing crashes (they are part of execs)
   worker, role, schedule   the worker's name, main/secondary, its power schedule
   config         object of label:value pairs for the "run config" box
   finished       true when the run is over
@@ -174,6 +175,7 @@ class Status:
         "unstable": "unstable", "imported": "imported", "worker": "worker",
         "role": "role", "schedule": "schedule",
         "cmplog_execs": "cmplog_execs", "cmplog_finds": "cmplog_finds",
+        "minimize_execs": "minimize_execs",
     }
 
     def __init__(self):
@@ -199,6 +201,7 @@ class Status:
         self.imported = None
         self.cmplog_execs = None
         self.cmplog_finds = None
+        self.minimize_execs = None
         self.worker = None
         self.role = None
         self.schedule = None
@@ -484,6 +487,8 @@ def render(st, w, h, title="ember fuzz status", source=None,
         _field("imported", opt(st.imported), 14),
         _field("cmplog finds", "—" if st.cmplog_execs is None
                else f"{fmt_n(st.cmplog_finds or 0)}  ({fmt_n(st.cmplog_execs)} tried)", 14),
+        _field("minimizing", "—" if st.minimize_execs is None
+               else f"{fmt_n(st.minimize_execs)} runs", 14),
     ], "latest findings", [
         _field("find", st.last_msg.get("find", none), 5),
         _field("crash", st.last_msg.get("crash", none), 5),

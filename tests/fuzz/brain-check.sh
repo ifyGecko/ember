@@ -128,6 +128,19 @@ session() {
 
 for sched in explore exploit coe rare lin quad seek mmopt; do
     if session "s-$sched" 600 --seeds "$tmp/seeds" --schedule "$sched"; then
+        # Minimizing the seeded crash runs inputs: they are in the totals, and the status
+        # says so while it happens (execs is never below the runs it is made of).
+        if ! tail -n 1 "$tmp/s-$sched.status" | python3 -c '
+import json, sys
+st = json.loads(sys.stdin.read())
+sys.exit(not (st["minimize_execs"] > 0 and st["execs"] >= st["minimize_execs"] + 600))'; then
+            echo "brain-check: $board: schedule $sched: the minimizing runs are not counted:" >&2
+            tail -n 1 "$tmp/s-$sched.status" >&2
+            fail=1
+        elif ! grep -q '"stage": "minimize ' "$tmp/s-$sched.status"; then
+            echo "brain-check: $board: schedule $sched: no status was written while minimizing" >&2
+            fail=1
+        fi
         if ! ls "$tmp/s-$sched/crashes" | grep -q -v '\.info$'; then
             echo "brain-check: $board: schedule $sched: the seeded crash was not saved" >&2
             fail=1

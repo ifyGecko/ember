@@ -776,7 +776,9 @@ Start ember within `--accept-timeout` (15 s) of the brain; each reply is waited 
 inputs up to it from seeds of any size; `--seed-rng` fixes the campaign's random sequence
 (each batch's mutator seed comes from it), `--status-file FILE` writes the feed for the status screen (anew
 each session, every `--status-interval` seconds; its `execs` include the runs of the batch
-still under way, from ember's PROGRESS frames) and `--quiet` drops the log lines. The
+still under way, from ember's PROGRESS frames, and the probes that minimize a crash, which
+`minimize_execs` counts on their own while the stage reads `minimize ...`; `crashes` and
+`hangs` stay what fuzzing found, however often a probe fails the same way again) and `--quiet` drops the log lines. The
 brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 
 **The campaign.** ember keeps the one record of what has been seen (the campaign engine,
