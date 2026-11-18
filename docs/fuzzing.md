@@ -767,7 +767,7 @@ and runs until stopped (`--iters N` caps the mutated executions). Its campaign l
 - `crashes/crash_r<reason>_s<status>_<sha1, 12 digits>`: one input per distinct
   `(reason, status)` of a session, with a `.info` note beside it: `reason=`,
   `reason_name=`, `status=`, `status_hex=` (the pc, for fault, guard and oracle),
-  `function_hex=` (with `--functions`), `minimized=` (`yes`; `no`: kept as found; `later`:
+  `minimized=` (`yes`; `no`: kept as found; `later`:
   waiting its turn; `peer`: another worker holds it minimized), `len=`, `sig=`, `hex=`.
 - `hangs/hang_r<reason>_s<status>_<sha1>`: every distinct input that hung or timed out, up to
   `--max-hangs` (64), not minimized unless `--minimize-timeouts`.
@@ -791,24 +791,21 @@ never had. A crash is saved when its `(reason, status)` is new, and up to
 into that pc, or another bug there); a different crash met while minimizing is saved too.
 
 **Which crash is minimized, and when.** What is saved and what is minimized are decided
-by two different keys (`fuzz/tools/fuzz_crashes.py`). Every `(reason, status)` is saved,
-always. Minimizing costs up to 200 runs a crash, and one bug often faults at many
-instructions of one function (a bad pointer used all through it), so with
-`--functions FILE` (the ELF image, or a symbols file in a format `gen_sites.py --symbols`
-reads; repeatable) the brain groups fault and guard crashes by the function their pc is in
-and minimizes **the first crash of a function at once**. The others in that function are
-saved as found and queued; the queue is worked off, one crash at a time between queue
-entries, while the runs spent on it stay under `--minimize-share` percent of all runs
-(default 2; 0 leaves them as found). Two bugs in one function are both kept, one of
-them minimized a little later: the group never decides what is kept. Oracle crashes (whose
-status need not be a pc) and crashes outside every known function are each their own
-group, and so is every crash when no `--functions` is given (`fuzz_launch.py` passes the
-ELF images of ember's command line itself). Before minimizing, a brain looks at the
-`crashes/` directories of its campaign (its own, from an earlier session too, and with
-`--sync-dir` the other workers'): a crash someone already holds minimized is saved as
-found and not minimized again, and a crash in a function where someone holds a minimized
-one goes to the queue. The status feed has `crash_groups` and `crashes_deferred`.
-`--no-minimize` keeps every crash as found.
+apart (`fuzz/tools/fuzz_crashes.py`). Every `(reason, status)` is saved, always, and the
+brain never judges two of them to be the same bug: no such judgement is reliable on
+firmware without symbols. Minimizing costs up to 200 runs a crash, though, and one bug
+often faults at many instructions (a bad pointer used all through a routine), each a
+`(reason, status)` of its own. So only **the first crash is minimized at once**. Every
+later one is saved as found and queued, and the queue is worked off, one crash at a time
+between queue entries, while the runs spent on it stay under `--minimize-share` percent of
+all runs (default 2; 0 leaves them as found). That cap bounds the cost however many
+crashes turn up. The queue's order is only a preference: ember counts, for each crash, the
+buckets it hit that no earlier crash had (a crash's `new_buckets` in JUDGE and FIND), and
+the crash with the most goes first, as the one most likely to be another bug. Before
+minimizing, a brain looks at the `crashes/` directories of its campaign (its own, from an
+earlier session too, and with `--sync-dir` the other workers'): a crash someone already
+holds minimized is saved as found and not minimized again. The status feed has
+`crashes_deferred`, the length of the queue. `--no-minimize` keeps every crash as found.
 `--iter-insns N|auto` sets ember's per-input budget (`auto`: 5× the slowest queue entry
 after the baseline). The queue is walked
 in cycles:

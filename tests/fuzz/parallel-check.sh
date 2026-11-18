@@ -11,7 +11,6 @@
 #     its queue (its log says so) and still ends cleanly;
 #   - the firmware boots once: main saves the begin snapshot, w1 (and its restart) starts
 #     from it (fuzz_launch's shared boot, --fuzz-snapshot);
-#   - the launcher passes the image to the brains as --functions (crash triage);
 #   - only main runs the compare-guided stage (fuzz_launch's --cmplog-workers default);
 #   - status_tui.py --sync-dir shows both workers.
 set -eu
@@ -69,10 +68,6 @@ grep -q 'main: booted; the other workers start from' "$tmp/launch.log" ||
 for w in main w1; do
     grep -q "^fuzz_launch: $w: finished (brain 0, ember 0)" "$tmp/launch.log" ||
         { cat "$tmp/launch.log" >&2; fail "$w did not end cleanly"; }
-done
-for w in main w1; do
-    grep -q 'functions: [1-9][0-9]* (--functions)' "$tmp/camp/$w/brain.log" ||
-        fail "$w's brain was not given the image's functions"
 done
 grep -q 'compare logging on' "$tmp/camp/main/brain.log" ||
     fail "main does not run the compare-guided stage"

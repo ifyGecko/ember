@@ -200,14 +200,12 @@ minimized (its copy stays as found, `minimized=peer` in the `.info`).
   `--crashes-per-sig` (4) more, as found, when a crash at that pc ran code no earlier crash
   ran: look at those too, they may be other bugs), as
   `crash_r<reason>_s<status>_<sha1>` plus an `.info` note (`reason=`, `reason_name=`,
-  `status=`, `status_hex=`, `function_hex=`, `minimized=`, `len=`, `sig=`, `hex=`). Give the
-  brain `--functions fw.elf` (or a symbols file, e.g. a Ghidra function export, for a raw
-  image; `fuzz_launch.py` passes ELF images itself): one bug often faults at many
-  instructions of a function, and the brain then minimizes only the first crash in each
-  function at once, saves the others as found and minimizes them later within
-  `--minimize-share` percent of the runs (default 2). Nothing is dropped for being in a
-  known function: triage every file, and read `minimized=later` as "not shrunk yet", not
-  as "duplicate". With `--fuzz-uninit` on ember's side (an
+  `status=`, `status_hex=`, `minimized=`, `len=`, `sig=`, `hex=`). Only the first crash is
+  minimized at once: one bug often faults at many instructions, each a `(reason, status)`
+  of its own. The later ones are saved as found and minimized one by one within
+  `--minimize-share` percent of the runs (default 2), those that ran the most code no
+  earlier crash ran first. Nothing is dropped or merged: triage every file, and read
+  `minimized=later` as "not shrunk yet", not as "duplicate". With `--fuzz-uninit` on ember's side (an
   opt-in check, `references/harness.md`) the inputs whose run depended on memory nothing wrote go
   under `uninit/`, one per distinct finding, with a `.info` (`differs=`, the filled run's verdict
   and length, and its `read_before_write=` lines); they are not crashes and the input's coverage

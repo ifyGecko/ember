@@ -3,78 +3,29 @@
 fuzz_crashes.py -- which saved crash the fuzz brain minimizes, and when. Imported by
 fuzz_brain.py, not run.
 
-Two keys, kept apart on purpose:
+What is SAVED and what is MINIMIZED are decided apart:
 
-  - a crash's **identity** is (reason, status), as ember reports it (fuzz/formats.h). It
-    decides what is SAVED: every identity is written to crashes/ as found, whatever else
-    is known about it. Nothing below ever drops one.
-  - a crash's **group** is (reason, the function its pc is in), when the brain was given
-    the image's functions (--functions) and the status is a pc (FAULT, GUARD). It decides
-    only what is MINIMIZED FIRST. One bug often faults at many instructions of one
-    function, and minimizing each of them as it turns up costs more runs than fuzzing
-    does; two bugs in one function also share a group, which is why a group never decides
-    what is kept. Without functions, or for a status that is not a pc (ORACLE), the group
-    is the identity.
+  - a crash's identity is (reason, status), as ember reports it (fuzz/formats.h). Every
+    identity is written to crashes/ as found. Nothing here ever drops one, and nothing
+    here judges two crashes to be the same bug: no such judgement is reliable.
+  - minimizing costs runs (up to 200 a crash), and one bug often faults at many
+    instructions, each an identity of its own. So only the first crash of a campaign is
+    minimized at once. Every later one is saved as found and queued, and the queue is
+    worked off within a share of the campaign's runs (--minimize-share): that cap, not a
+    guess at which crashes are alike, is what bounds the cost.
 
-The first identity of a group is minimized at once. Later ones are saved as found and
-queued; the queue is worked off within a share of the campaign's runs (--minimize-share).
-A crash another worker of the campaign already holds minimized is saved as found and not
-minimized again.
+The queue's order is a guess, and only an order: the crash that hit the most buckets no
+earlier crash had hit (ember's count, a crash's new_buckets) goes first, as the one most
+likely to be another bug. A crash another worker of the campaign already holds minimized
+is saved as found and not minimized again.
 """
-import bisect
 import collections
+import heapq
 import os
-import sys
-
-from image_resolve import elf_code_entries, load_symbols
-
-FAULT, GUARD = 1, 2                      # enum uam_fuzz_net_reason: the status is a pc
-PC_REASONS = (FAULT, GUARD)
 
 NOW, LATER, PEER = "now", "later", "peer"
 
 INFO_HEAD = 512                          # the keys read back precede the input's hex
-
-
-class Functions:
-    """The start addresses of an image's functions, as far as the brain was told. A crash
-    status is the low 32 bits of a pc, so the starts are kept that way too."""
-
-    def __init__(self, starts=()):
-        self.starts = sorted({s & 0xffffffff for s in starts})
-
-    def __len__(self):
-        return len(self.starts)
-
-    def find(self, pc):
-        """Start of the function `pc` is in: the nearest start at or below it. None below
-        the first one. (A file of starts has no ends: a pc past the last function lands in
-        it, which costs a deferred minimization at worst.)"""
-        i = bisect.bisect_right(self.starts, pc & 0xffffffff)
-        return self.starts[i - 1] if i else None
-
-
-def load_functions(paths):
-    """Functions of the files named by --functions: an ELF's function symbols, or a
-    symbols file in any format gen_sites.py --symbols reads."""
-    starts = set()
-    for path in paths:
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError as e:
-            sys.exit("brain: --functions %s: %s" % (path, e))
-        found = elf_code_entries(data)
-        if found is not None:
-            if not found[1]:
-                sys.exit("brain: --functions %s: the ELF file has no function symbols" % path)
-            starts |= found[1]
-            continue
-        try:
-            starts |= set(load_symbols(path))
-        except SystemExit as e:
-            sys.exit(str(e).replace("error: --symbols", "brain: --functions"))
-    return Functions(starts)
 
 
 def read_info(path):
@@ -120,22 +71,14 @@ class Triage:
     """Decides, for each new crash identity, whether it is minimized now, later or not at
     all here; holds the queue of the ones left for later."""
 
-    def __init__(self, functions=None, me="main"):
-        self.functions = functions or Functions()
+    def __init__(self, me="main"):
         self.me = me
-        self.first = {}                  # group -> the identity minimized at once here
-        self.groups = set()              # every group seen
-        self.deferred = collections.deque()   # (file name, data, reason, status)
+        self.started = False             # a crash was minimized at once here
+        self.queue = []                  # heap of (-fresh, order of arrival, crash)
+        self.arrived = 0
 
-    def function(self, reason, status):
-        """Start of the function a crash is in, or None: not known, or no pc."""
-        if reason not in PC_REASONS:
-            return None
-        return self.functions.find(status)
-
-    def group(self, reason, status):
-        f = self.function(reason, status)
-        return (reason, "s", status) if f is None else (reason, "f", f)
+    def __len__(self):
+        return len(self.queue)
 
     def held_by(self, reason, status, others):
         """The worker that holds this identity minimized (None: nobody)."""
@@ -148,28 +91,30 @@ class Triage:
         """For an identity seen for the first time in this session: (NOW | LATER | PEER,
         why). `others`: the crashes on disk, this worker's and its peers' (saved_crashes).
         `nested`: found while another crash is being minimized, so it cannot be NOW."""
-        g = self.group(reason, status)
-        self.groups.add(g)
         who = self.held_by(reason, status, others)
         if who is not None:
             return PEER, "%s holds it minimized" % who
-        if g in self.first:
-            return LATER, "its function already has a minimized crash"
+        if nested:
+            return LATER, "found while minimizing another crash"
+        if self.started or any(o.minimized for o in others):
+            return LATER, "it waits its turn to be minimized"
         for o in others:
-            if o.minimized and self.group(o.reason, o.status) == g:
-                return LATER, "%s holds a minimized crash in its function" % o.worker
             if (o.reason, o.status) == (reason, status) and o.worker < self.me:
                 # Saved there moments ago and most likely being minimized: look again later.
                 return LATER, "%s saved it first" % o.worker
-        if nested:
-            return LATER, "found while minimizing another crash"
-        self.first[g] = (reason, status)
-        return NOW, "the first crash in its function" if g[1] == "f" else "a new crash"
+        self.started = True
+        return NOW, "the first crash"
 
-    def defer(self, fname, data, reason, status):
-        self.deferred.append((fname, data, reason, status))
+    def defer(self, fname, data, reason, status, fresh=0):
+        """Queue a saved crash. fresh: the buckets it hit that no earlier crash had."""
+        heapq.heappush(self.queue, (-fresh, self.arrived, (fname, data, reason, status)))
+        self.arrived += 1
+
+    def pop(self):
+        """The queued crash to minimize next: the most fresh buckets, then the oldest."""
+        return heapq.heappop(self.queue)[2]
 
     def due(self, execs, deferred_execs, share):
-        """Is a deferred crash to be minimized now? Only while the runs spent on deferred
+        """Is a queued crash to be minimized now? Only while the runs spent on queued
         ones stay under `share` percent of all runs."""
-        return bool(self.deferred) and deferred_execs * 100 < share * execs
+        return bool(self.queue) and deferred_execs * 100 < share * execs

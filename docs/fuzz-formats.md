@@ -180,9 +180,9 @@ Every integer is big-endian, and maps are raw u8 counters.
 | 11 MUTATOR_INFO | ember → brain, the reply to each MUTATOR | u8 status (0 accepted, 1 refused), u16 msg_len, msg (why, when refused), u16 n, then n × (u8 op, u16 default weight, u16 weight, u8 name_len, name) |
 | 12 CORPUS | brain → ember | u32 entry, u32 len, data |
 | 13 HAVOC | brain → ember | u64 first_id, u32 entry, u32 n, u64 seed, u32 flags (bit 0 EDGES) |
-| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (the three, and insns, 0 unless reason 0), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
+| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (new_classes, path and insns 0 unless reason 0; new_buckets of a crash: the buckets no earlier crash had hit), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
 | 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n (a stage's limit) is 0 or over its maximum (HAVOC: 2^20), first_id is 0, or the stage's kind is unknown, 4 input-to-state without compare logging), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges (always there; 0 without EDGES), then n_edges × (u32 index, u32 execs) |
-| 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0), u8 novel_crash |
+| 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0, but for a crash's new_buckets: the buckets no earlier crash had hit), u8 novel_crash |
 | 17 PROGRESS | ember → brain, in a batch silent for 1 s | u64 first_id, u32 execs (runs so far) |
 | 18 STAGE | brain → ember | u64 first_id, u32 entry, u8 kind (1 input-to-state, 2 trimming), u32 limit (inputs derived at most: 1 .. 4096 candidates, 1 .. 65536 cuts), u32 flags (bit 0 EDGES) |
 | 19 STAGE_RESULT | ember → brain, before the HAVOC_DONE of a stage that ran | u64 first_id, u8 kind, then for input-to-state: u32 compares, u32 dropped, u32 candidates, u16 n, then n × (u8 width (bytes: 2, 4 or 8), u64 value); for trimming: u8 ran, u64 insns, u64 path, u32 len, data |
@@ -249,7 +249,8 @@ A run that ended normally is new when it sets a bucket never hit or a count clas
 never had (the class of a count is 1, 2 or 4 for 1, 2 or 3, then 8 (4-7), 16 (8-15), 32
 (16-31), 64 (32-127) and 128 (128-255)). A crash is novel when its (reason, status) is new
 or when it ran code no earlier crash ran (a bucket no crash had hit), which tells two bugs
-at one pc apart. A path is named by its set of (index, class) pairs, whatever order they
+at one pc apart; how many such buckets it hit is the crash's new_buckets, a rough measure
+of how unlike the earlier crashes its way was. A path is named by its set of (index, class) pairs, whatever order they
 were hit in: `mix(sum of mix((index << 8 | class) + 1))` in 64-bit arithmetic, with the
 coverage formula's `mix`. With OPTIONS bit 2 (JUDGE), every INPUT and CMP_INPUT reply is
 preceded by a JUDGE frame (after CMPS, if there is one) with what the run added.

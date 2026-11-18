@@ -1459,12 +1459,16 @@ static void test_campaign(const target *t, backend bk)
     uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j2);
     CHECK(r.verdict == UAM_FUZZ_CRASH_FAULT && j1.novel_crash && !j2.novel_crash
           && j1.new_classes == 0, "%s %s: a crash is novel once", t->name, bk_name[bk]);
+    CHECK(j1.new_buckets > 0 && j1.new_buckets <= n && j2.new_buckets == 0,
+          "%s %s: a crash's new_buckets are the buckets no earlier crash hit (%u, then %u)",
+          t->name, bk_name[bk], j1.new_buckets, j2.new_buckets);
     uam_fuzz_run_one(f, (const uint8_t *)"O", 1, &r);
     uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j1);
     CHECK(j1.novel_crash, "%s: another crash is novel", t->name);
     uam_fuzz_run_one(f, (const uint8_t *)"H", 1, &r);
     uam_fuzz_campaign_judge(c, r.verdict, r.detail, &j1);
-    CHECK(r.verdict == UAM_FUZZ_TIMEOUT && !j1.novel_crash && !j1.new_classes, "a timeout adds nothing");
+    CHECK(r.verdict == UAM_FUZZ_TIMEOUT && !j1.novel_crash && !j1.new_classes && !j1.new_buckets,
+          "a timeout adds nothing");
 
     /* Batches: counted, reproducible, fixed up. */
     uam_mutator *mut = uam_fuzz_campaign_mutator(c);

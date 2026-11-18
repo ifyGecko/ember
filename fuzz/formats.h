@@ -292,10 +292,12 @@ enum uam_fuzz_net_frame {
  *           u32 n, u64 seed, u32 flags (UAM_NET_HAVOC_*)
  * FIND:     u64 id, u8 reason (0: new coverage; else enum uam_fuzz_net_reason), u32 status,
  *           u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets,
- *           u32 new_classes, u64 path (all three 0 unless reason 0), u32 len, u8 data[len],
+ *           u32 new_classes, u64 path (0 unless reason 0; new_buckets of a crash: the
+ *           buckets no earlier crash had hit), u32 len, u8 data[len],
  *           u32 n, then n x (u32 index, u8 count), indices ascending (n = 0 for a crash)
  * JUDGE:    u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally:
- *           buckets and (bucket, class) pairs never seen before, the path's name),
+ *           buckets and (bucket, class) pairs never seen before, the path's name; a crash:
+ *           new_buckets is the buckets no earlier crash had hit, the others 0),
  *           u8 novel_crash (a crash with a new (reason, status) or in code no crash reached)
  * PROGRESS: u64 first_id (the batch), u32 execs (runs so far)
  * HAVOC_DONE: u64 first_id, u8 status (UAM_NET_HAVOC_*), u32 execs,

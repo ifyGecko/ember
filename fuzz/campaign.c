@@ -256,14 +256,14 @@ static uam_status judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detai
         c->edges += j->new_buckets;
         j->path = uam_fuzz_path_end(sum);
     } else {
-        bool fresh = false;
+        /* new_buckets of a crash: the buckets no earlier crash had hit */
         for (size_t i = 0; i < n; i++) {
             if (!c->crash_seen[hits[i]]) {
                 c->crash_seen[hits[i]] = 1;
-                fresh = true;
+                j->new_buckets++;
             }
         }
-        j->novel_crash = sig_new(c, v, detail) || fresh;
+        j->novel_crash = sig_new(c, v, detail) || j->new_buckets != 0;
     }
     if (hits_out) {
         *hits_out = hits;

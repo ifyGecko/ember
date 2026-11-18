@@ -358,7 +358,7 @@ def havoc_checks(c, tag, msize, slow):
     send_input(c, 42, b"FUZ!")
     j3, t, p = judged(c)
     check(t == CRASH and j3[1] == 0 and j3[2] == 0 and j3[4] == 0,
-          f"{tag}: a crash seen before is not novel ({j3}, type {t})")
+          f"{tag}: a crash seen before is not novel and hit no bucket new to crashes ({j3}, type {t})")
     send_frame(c, CMP_INPUT, struct.pack(">QI", 43, len(NEAR_IN)) + NEAR_IN)
     t, p = recv_frame(c)
     check(t == CMPS, f"{tag}: CMPS comes before JUDGE (type {t})")
@@ -455,7 +455,11 @@ def havoc_checks(c, tag, msize, slow):
     good &= all(f[1] or (f[3] > 0 and f[6] == sorted(f[6]) and f[6]) for f in finds)
     good &= all(f[1] or (0 < f[8][1] and f[8][0] <= f[8][1] and f[8][2] == path_hash(f[6]))
                 for f in finds)
-    good &= all(not f[1] or f[8] == (0, 0, 0) for f in finds)
+    # a crash: no classes, no path; its new_buckets are the buckets no earlier crash hit,
+    # which is what made a FAULT known by its (reason, status) worth reporting again
+    good &= all(not f[1] or f[8][1:] == (0, 0) for f in finds)
+    good &= all(f[8][0] > 0 for f in faults)
+    good &= all(f[8][0] == 0 for f in finds if f[1] in (HANG, TIMEOUT))
     check(good, f"{tag}: FINDs well formed ({len(finds)})")
     used = sum(u for u, _ in done[5].values())
     check(used > 3000 and all(o in everything or o == 25 for o in done[5]),

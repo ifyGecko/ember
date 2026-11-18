@@ -11,9 +11,9 @@ on synthetic data: no ember, no sockets.
   - adaptive operator weights (toward the operators that find coverage, with a floor);
   - entry names, saving and resuming a queue with its state;
   - sync bookkeeping (a peer's new entries, its own imports left out, .synced/);
-  - crash triage (fuzz/tools/fuzz_crashes.py): every identity is kept, the first crash in a
-    function is minimized at once, the others later within a share of the runs, and a crash
-    another worker holds minimized is left as found.
+  - crash triage (fuzz/tools/fuzz_crashes.py): the first crash is minimized at once, the
+    others later within a share of the runs (most new code among crashes first), and a
+    crash another worker holds minimized is left as found.
 """
 import os
 import random
@@ -268,42 +268,32 @@ def test_sync_bookkeeping():
 
 
 def test_crash_triage():
-    F, G, O = 1, 2, 3                                    # FAULT, GUARD, ORACLE
-    fns = fc.Functions([0x1000, 0x2000, 0x1_0000_3000])
-    check(fns.find(0x0fff) is None and fns.find(0x1000) == 0x1000 and fns.find(0x1ffc) == 0x1000
-          and fns.find(0x2004) == 0x2000 and fns.find(0x3010) == 0x3000,
-          "a pc's function: the nearest start at or below it (low 32 bits)")
-    t = fc.Triage(fns, "w1")
-    check(t.group(F, 0x1010) == t.group(F, 0x1ff0) != t.group(F, 0x2000),
-          "faults in one function share a group")
-    check(t.group(F, 0x1010) != t.group(G, 0x1010), "another reason: another group")
-    check(t.group(O, 0x1010) != t.group(O, 0x1014), "a status that is no pc is its own group")
-    check(t.group(F, 0x10) != t.group(F, 0x14), "below every function: its own group")
-    check(t.decide(F, 0x1010)[0] == fc.NOW, "the first crash in a function: now")
-    check(t.decide(F, 0x1020)[0] == fc.LATER and t.decide(F, 0x1ff0)[0] == fc.LATER,
-          "others in that function: later")
-    check(t.decide(F, 0x2010)[0] == fc.NOW, "another function: now")
-    check(t.decide(G, 0x1010)[0] == fc.NOW, "another reason there: now")
-    check(t.decide(F, 0x3000, nested=True)[0] == fc.LATER
-          and t.decide(F, 0x3004)[0] == fc.NOW,
-          "met while minimizing: later, and it does not stand for its function")
-    check(len(t.groups) == 4, "the groups seen")
-    none = fc.Triage(None, "main")
-    check(none.decide(F, 0x1010)[0] == fc.NOW and none.decide(F, 0x1020)[0] == fc.NOW,
-          "no functions known: every identity is its own group")
-    # the queue of deferred ones and the share of runs it may take
-    check(not t.due(1000, 0, 2.0), "nothing deferred: nothing due")
-    t.defer("crash_a", b"aaaa", F, 0x1020)
-    check(t.due(1000, 0, 2.0) and t.due(10000, 199, 2.0) and not t.due(10000, 200, 2.0),
-          "due while deferred runs stay under the share")
-    check(not t.due(10**9, 0, 0.0), "a share of 0: never")
-    # what the other workers hold
+    F, G = 1, 2                                          # FAULT, GUARD
     S = fc.Saved
-    t = fc.Triage(fns, "w1")
+    t = fc.Triage("w1")
+    check(t.decide(F, 0x1010)[0] == fc.NOW, "the first crash: now")
+    check(t.decide(F, 0x1020)[0] == fc.LATER and t.decide(G, 0x9000)[0] == fc.LATER,
+          "every later one: later, wherever it is")
+    t = fc.Triage("w1")
+    check(t.decide(F, 0x3000, nested=True)[0] == fc.LATER and t.decide(F, 0x3004)[0] == fc.NOW,
+          "met while minimizing: later, and it is not the first")
+    # the queue: the most buckets new to crashes first, then the oldest; a share of the runs
+    check(not t.due(1000, 0, 2.0) and len(t) == 0, "nothing queued: nothing due")
+    t.defer("a", b"a", F, 1, fresh=2)
+    t.defer("b", b"b", F, 2, fresh=9)
+    t.defer("c", b"c", F, 3, fresh=2)
+    t.defer("d", b"d", F, 4)
+    check(len(t) == 4 and t.due(1000, 0, 2.0) and t.due(10000, 199, 2.0)
+          and not t.due(10000, 200, 2.0), "due while queued runs stay under the share")
+    check(not t.due(10**9, 0, 0.0), "a share of 0: never")
+    check([t.pop()[0] for _ in range(4)] == ["b", "a", "c", "d"] and len(t) == 0,
+          "the queue's order: most new buckets, then first come")
+    # what the other workers hold
+    t = fc.Triage("w1")
     check(t.decide(F, 0x1010, [S("main", F, 0x1010, True)])[0] == fc.PEER,
           "a peer holds it minimized: not minimized here")
     check(t.decide(F, 0x1020, [S("main", F, 0x1010, True)])[0] == fc.LATER,
-          "a peer holds a minimized crash in the function: later")
+          "the campaign already has a minimized crash: later")
     check(t.decide(F, 0x2010, [S("main", F, 0x2010, False)])[0] == fc.LATER,
           "a peer of a lower name saved it first: later")
     check(t.decide(G, 0x2010, [S("w2", G, 0x2010, False), S("w1", G, 0x2010, False)])[0] == fc.NOW,
@@ -325,11 +315,6 @@ def test_crash_triage():
                                        for w in ("main", "w2", "gone")]))
         check(got == [S("main", 1, 4112, True), S("main", 1, 4128, False), S("main", 3, 7, False)],
               "saved crashes read back from .info files (one without minimized= counts as not)")
-        sym = os.path.join(d, "fw.syms")
-        with open(sym, "w") as f:
-            f.write("# functions\n0x1000 parse\n00002000 T other\n")
-        check(fc.load_functions([sym]).starts == [0x1000, 0x2000], "functions from a symbols file")
-        check(len(fc.load_functions([])) == 0, "no file: no functions")
 
 
 def main():
