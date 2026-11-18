@@ -775,7 +775,8 @@ Start ember within `--accept-timeout` (15 s) of the brain; each reply is waited 
 `--io-timeout` (60 s). `--max-size` (65536) bounds an input's length, and mutations grow
 inputs up to it from seeds of any size; `--seed-rng` fixes the campaign's random sequence
 (each batch's mutator seed comes from it), `--status-file FILE` writes the feed for the status screen (anew
-each session, every `--status-interval` seconds) and `--quiet` drops the log lines. The
+each session, every `--status-interval` seconds; its `execs` include the runs of the batch
+still under way, from ember's PROGRESS frames) and `--quiet` drops the log lines. The
 brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 
 **The campaign.** ember keeps the one record of what has been seen (the campaign engine,
@@ -791,7 +792,9 @@ in cycles:
 
 - **Favored entries:** for every bucket, the entry that hits it with the smallest
   instructions × size, and the longest entry that hits it; each of the two sets covers
-  every bucket seen. The cheapest entries are the shortest ones, and mutations start from
+  every bucket seen. An entry whose instruction count is not known ranks after every
+  counted one there and scores as an average entry for its energy; trimming runs the
+  entry and fills the count in. The cheapest entries are the shortest ones, and mutations start from
   the entry's length, so working on those alone would keep a campaign at short inputs:
   the second set has every piece of code mutated from its longest form as well. While
   favored entries wait, 99% of the others are skipped (95% once fuzzed, 75% when new,
@@ -827,12 +830,14 @@ in cycles:
   ember finds one operand's bytes in the input (either byte order, at the
   compare's width and at the narrowest width that holds both values) and writes the other
   operand there, plus and minus one for ordered compares: at most `--cmplog-max` (256)
-  candidates per entry, run back to back like a batch of mutations, each kept if it is new
+  candidates per entry (proportionally fewer for an entry slower than the queue's average:
+  twice the instructions, half the candidates, 16 at least), run back to back like a batch of mutations, each kept if it is new
   coverage (`op:cmplog` in the queue). Constants of the code that the input lacks become
   dictionary integers (at most 64 from one stage, and the brain keeps up to 256 of them in a
   session).
   This finds what havoc cannot guess: a 32-bit magic value from `hello world!` in a few
-  thousand executions on every tested board. `--no-cmplog` turns it off; the candidates
+  thousand executions on every tested board. `--no-cmplog` turns it off (in a parallel
+  campaign only `main` runs the stage, see below); the candidates
   count as mutated executions for `--iters`, and the status counts `cmplog_execs` and
   `cmplog_finds`.
 - **Adaptive operators:** every `--reweight-every` (5000) mutated executions, the
@@ -920,7 +925,9 @@ once and keeps those that are new to it (`sync:` names; `.synced/PEER` records h
 read). Each worker gets a distinct RNG seed, derived from `--seed-rng` and its name
 (identical workers would only repeat each other), and the next schedule of `--schedules`, round robin (by default the five main ones; any of
 the nine can be listed); `--dict` and `--seeds` go to every worker, `--brain-arg`
-passes anything else. A worker whose brain or ember exits unexpectedly is restarted from
+passes anything else. Only `main` runs the compare-guided stage (every worker would derive
+the same candidates from the same entries; its finds reach the others through the sync):
+`--cmplog-workers N` gives it to the first N workers, `all` to every one, 0 to none. A worker whose brain or ember exits unexpectedly is restarted from
 its queue (`--max-restarts`, 5); Ctrl-C stops them all with BYE. The firmware boots once:
 the launcher gives every ember `--fuzz-snapshot DIR/begin.snap`, starts `main` first, and
 starts the others when `main` has saved the begin snapshot there, so they (and every

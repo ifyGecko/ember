@@ -11,6 +11,7 @@
 #     its queue (its log says so) and still ends cleanly;
 #   - the firmware boots once: main saves the begin snapshot, w1 (and its restart) starts
 #     from it (fuzz_launch's shared boot, --fuzz-snapshot);
+#   - only main runs the compare-guided stage (fuzz_launch's --cmplog-workers default);
 #   - status_tui.py --sync-dir shows both workers.
 set -eu
 run=$1
@@ -68,6 +69,10 @@ for w in main w1; do
     grep -q "^fuzz_launch: $w: finished (brain 0, ember 0)" "$tmp/launch.log" ||
         { cat "$tmp/launch.log" >&2; fail "$w did not end cleanly"; }
 done
+grep -q 'compare logging on' "$tmp/camp/main/brain.log" ||
+    fail "main does not run the compare-guided stage"
+! grep -q 'compare logging on' "$tmp/camp/w1/brain.log" ||
+    fail "w1 runs the compare-guided stage (only main does unless --cmplog-workers says so)"
 ls "$tmp/camp/main/queue" "$tmp/camp/w1/queue" | grep -q ',sync:' ||
     fail "no queue entry was imported from the other worker"
 for r in FAULT ORACLE; do

@@ -97,8 +97,11 @@ class Entry:
     def size(self) -> int:
         return len(self.data)
 
-    def cost(self) -> int:
-        return max(1, self.insns) * max(1, self.size)
+    def cost(self) -> Tuple[bool, int]:
+        """What picking the cheapest entry compares: instructions x bytes, with every
+        entry whose instruction count is unknown after every one that has a count (an
+        unknown count is not a cheap run; among themselves the shorter is cheaper)."""
+        return (not self.insns, max(1, self.insns) * max(1, self.size))
 
     def state(self) -> dict:
         """What a resumed campaign keeps (the rest is measured again)."""
@@ -193,7 +196,8 @@ class Queue:
                 self.dirty = True
 
     def rescore(self, e: Entry):
-        """An entry's cost changed (trimmed): it may now be top-rated for its buckets."""
+        """An entry's cost changed (trimmed, or its instruction count became known): it
+        may now be top-rated for its buckets."""
         cost = e.cost()
         for i in e.buckets:
             cur = self.top_rated.get(i)
@@ -247,15 +251,28 @@ class Queue:
 
     # -- energy -----------------------------------------------------------------------
     def averages(self) -> Tuple[float, float]:
+        """(instructions, buckets) of the average entry; the instructions over the entries
+        whose count is known."""
         n = len(self.entries) or 1
-        return (sum(max(1, e.insns) for e in self.entries) / n,
+        known = [e.insns for e in self.entries if e.insns]
+        return (sum(known) / len(known) if known else 1.0,
                 sum(len(e.buckets) for e in self.entries) / n)
+
+    def scaled_limit(self, e: Entry, limit: int, floor: int) -> int:
+        """A stage's run limit for e: `limit` for an entry of average cost or cheaper (and
+        for one of unknown cost), proportionally fewer for a slower one (twice the
+        average instructions, half the runs), never under `floor` (or `limit` if lower)."""
+        avg = self.averages()[0]
+        if not e.insns or e.insns <= avg:
+            return limit
+        return max(min(floor, limit), int(limit * avg / e.insns))
 
     def perf_score(self, e: Entry, avg_insns: float, avg_buckets: float) -> float:
         """AFL's performance score: cheaper and wider than average scores higher, late
         and deep entries get a bonus. seek leaves out the cost term (every entry scores
-        as if it ran in average time); mmopt adds a bonus for the deepest lineages."""
-        cost = max(1, e.insns)
+        as if it ran in average time), and so does an entry whose instruction count is
+        unknown; mmopt adds a bonus for the deepest lineages."""
+        cost = e.insns or avg_insns
         if self.schedule == "seek":
             score = 100.0
         elif cost * 0.1 > avg_insns:

@@ -5,7 +5,8 @@ on synthetic data: no ember, no sockets.
   - hit-count classes (ember keeps the coverage record: tests/fuzz/fake_brain.py);
   - path ids (same hits, same path; a count class change, a new path);
   - the favored set (the cheapest and the longest entry per bucket, greedy covers) and
-    AFL's skip rule;
+    AFL's skip rule; an entry of unknown cost ranking last and scoring as average;
+  - a stage's run limit shrinking with an entry's cost (the compare-guided stage);
   - every schedule's factor and energy behaving as specified;
   - adaptive operator weights (toward the operators that find coverage, with a floor);
   - entry names, saving and resuming a queue with its state;
@@ -78,6 +79,53 @@ def test_favored_and_skip():
     q.cull()
     check(big.favored, "a cheaper entry after rescore becomes favored")
     check(mid.favored, "and the next longest takes the place of one that got shorter")
+
+
+def test_unknown_cost():
+    # An entry whose instruction count is unknown (0) is not the cheapest one.
+    q = fq.Queue("explore")
+    slow = entry(0, [1, 2], insns=0, data=b"s")            # unknown, one byte
+    known = entry(1, [1, 2], insns=5000, data=b"k" * 40)   # counted, and the longest
+    for e in (slow, known):
+        q.add(e)
+    q.cull()
+    check(known.favored and not slow.favored,
+          "favored: an unknown cost ranks after every known one")
+    u2 = entry(2, [7], insns=0, data=b"uu")
+    u3 = entry(3, [7], insns=0, data=b"u")
+    q.add(u2)
+    q.add(u3)
+    check(q.top_rated[7] is u3, "among unknown costs the shorter entry is the cheaper")
+    check(q.top_rated[1] is known, "a later unknown entry does not displace a known one")
+    # scoring: unknown counts as average, and stays out of the average
+    check(q.averages()[0] == 5000, "the average cost is over the entries with a count")
+    avg_i, avg_b = q.averages()
+    same = entry(9, [1, 2], insns=5000)
+    check(q.perf_score(slow, avg_i, avg_b) == q.perf_score(same, avg_i, avg_b),
+          "perf score: an unknown cost scores as an average one (not as the cheapest)")
+    # the count arrives (trim's run of the entry): it competes on its real cost
+    slow.insns = 10
+    q.rescore(slow)
+    q.cull()
+    check(q.top_rated[1] is slow and slow.favored, "once counted, a cheap entry is top-rated")
+    empty = fq.Queue("explore")
+    empty.add(entry(0, [1], insns=0))
+    check(empty.averages()[0] == 1.0 and empty.energy(empty.entries[0]) > 0,
+          "a queue with no known cost still schedules")
+
+
+def test_scaled_limit():
+    q = fq.Queue("explore")
+    for i, n in enumerate((1000, 1000, 1000, 5000)):       # average 2000
+        q.add(entry(i, [i], insns=n))
+    a, _, _, slow = q.entries
+    check(q.scaled_limit(a, 256, 16) == 256, "an entry cheaper than average: the whole limit")
+    check(q.scaled_limit(slow, 256, 16) == 102, "2.5x the average cost: 1/2.5 of the limit")
+    very = entry(8, [8], insns=10 ** 9)
+    check(q.scaled_limit(very, 256, 16) == 16, "never under the floor")
+    check(q.scaled_limit(very, 8, 16) == 8, "nor above the limit asked for")
+    check(q.scaled_limit(entry(9, [9], insns=0), 256, 16) == 256,
+          "an unknown cost counts as average")
 
 
 def test_schedules():
@@ -223,8 +271,8 @@ def main():
         for f in failures:
             print("brain_unit: FAIL: " + f, file=sys.stderr)
         return 1
-    print("brain_unit: ok (coverage fold, paths, favored set, schedules, operator weights, "
-          "queue files, sync bookkeeping)")
+    print("brain_unit: ok (coverage fold, paths, favored set, unknown costs, stage limits, "
+          "schedules, operator weights, queue files, sync bookkeeping)")
     return 0
 
 

@@ -8,6 +8,9 @@ The workers import each other's queue entries through SYNC_DIR (fuzz_brain.py
 RNG seed (derived from --seed-rng and its name: identical workers would only repeat each
 other) and the next schedule of --schedules, round robin. A worker whose brain or ember
 exits unexpectedly is restarted (up to --max-restarts times); it resumes from its queue.
+The compare-guided stage (the brain's cmplog) runs in main only: every worker would derive
+the same candidates from the same entries, and main's finds reach the others through the
+sync. --cmplog-workers N|all gives it to the first N workers; the others get --no-cmplog.
 Ctrl-C / SIGTERM stops every worker cleanly (the brains say BYE).
 
   python3 fuzz/tools/fuzz_launch.py -n 8 --out camp --seeds seeds/ \\
@@ -61,8 +64,9 @@ def worker_seed(base, name):
 
 
 class Worker:
-    def __init__(self, name, role, schedule, seed, args, ember_cmd):
+    def __init__(self, name, role, schedule, seed, args, ember_cmd, cmplog=True):
         self.name, self.role, self.schedule, self.seed = name, role, schedule, seed
+        self.cmplog = cmplog                 # False: its brain runs with --no-cmplog
         self.args, self.ember_cmd = args, ember_cmd
         self.dir = os.path.join(args.out, name)
         self.brain = self.ember = None
@@ -85,6 +89,8 @@ class Worker:
             cmd += ["--iters", str(a.iters)]
         for d in a.dict:
             cmd += ["--dict", d]
+        if not self.cmplog:
+            cmd += ["--no-cmplog"]
         cmd += a.brain_arg
         mode = "ab" if self.restarts else "wb"
         blog_path = os.path.join(self.dir, "brain.log")
@@ -100,8 +106,9 @@ class Worker:
         self.ember = subprocess.Popen(self.ember_cmd + ["--fuzz-net", "127.0.0.1:%d" % port],
                                       stdin=subprocess.DEVNULL, stdout=self.elog,
                                       stderr=subprocess.STDOUT, start_new_session=True)
-        log("%s: started (%s, schedule %s, seed %d, port %d%s)"
-            % (self.name, self.role, self.schedule, self.seed, port,
+        log("%s: started (%s, schedule %s, %sseed %d, port %d%s)"
+            % (self.name, self.role, self.schedule, "" if self.cmplog else "no cmplog, ",
+               self.seed, port,
                ", restart %d" % self.restarts if self.restarts else ""))
 
     def poll(self):
@@ -161,6 +168,10 @@ def main():
                          "and saves the begin snapshot, the others start from it)")
     ap.add_argument("--boot-timeout", type=float, default=3600.0,
                     help="seconds to wait for the first worker's begin snapshot (default 3600)")
+    ap.add_argument("--cmplog-workers", default="1", metavar="N|all",
+                    help="how many workers run the compare-guided stage, main first "
+                         "(default 1: only main; its finds reach the others through the "
+                         "sync; 0: none)")
     ap.add_argument("--brain-arg", action="append", default=[],
                     help="extra fuzz_brain.py argument for every worker (repeatable)")
     if "--" not in sys.argv:
@@ -178,6 +189,12 @@ def main():
     bad = [s for s in scheds if s not in SCHEDULES]
     if not scheds or bad:
         ap.error("unknown schedule(s) %s (%s)" % (", ".join(bad) or "none", ", ".join(SCHEDULES)))
+    try:
+        n_cmplog = args.workers if args.cmplog_workers == "all" else int(args.cmplog_workers)
+    except ValueError:
+        n_cmplog = -1
+    if n_cmplog < 0:
+        ap.error("--cmplog-workers must be a number of workers (0 or more) or all")
     os.makedirs(args.out, exist_ok=True)
     snap = None
     if args.shared_boot and not any(a in ("--fuzz-snapshot", "--load-snapshot") for a in ember_cmd):
@@ -190,7 +207,8 @@ def main():
     for i in range(args.workers):
         name = "main" if i == 0 else "w%d" % i
         workers.append(Worker(name, "main" if i == 0 else "secondary", scheds[i % len(scheds)],
-                              worker_seed(args.seed_rng, name), args, ember_cmd))
+                              worker_seed(args.seed_rng, name), args, ember_cmd,
+                              cmplog=i < n_cmplog))
 
     stopping = {"flag": False}
 

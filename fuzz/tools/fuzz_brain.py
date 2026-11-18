@@ -27,8 +27,9 @@ The brain
   - with **compare logging** (ember announces it in HELLO; --no-cmplog turns it off):
     has ember run each queue entry once with its compares logged and then the
     **input-to-state** replacements it derives from them (uam/fuzz_i2s.h: one operand's
-    bytes found in the input, the other written there), and adds the code's constants
-    the input lacks to the dictionary;
+    bytes found in the input, the other written there; an entry slower than the queue's
+    average gets proportionally fewer of them, 16 at least), and adds the code's
+    constants the input lacks to the dictionary;
   - has ember **mutate** (fuzz/mutate.c: havoc + splice, inputs that grow up to
     --max-size), with an optional ember **dictionary** (--dict, fuzz/tools/fuzz_dict.py;
     integer tokens in the target's byte order, from HELLO), and operator weights it
@@ -113,6 +114,7 @@ STAGE_I2S_MAX, STAGE_TRIM_MAX = 4096, 65536   # most candidates / cuts in one ST
 STAGE_RESULT_HDR_LEN = 9
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
 COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 13, 25
+PROGRESS_LEN = 12
 HELLO_BIG_ENDIAN = 1 << 15               # HELLO flags: the target is big-endian
 HELLO_CMP = 1 << 14                      # HELLO flags: compare logging is understood
 HELLO_HAVOC = 1 << 13                    # HELLO flags: MUTATOR, CORPUS and HAVOC are understood
@@ -120,6 +122,7 @@ HELLO_STAGES = 1 << 12                   # HELLO flags: STAGE is understood
 OPT_SPARSE = 1 << 0                      # OPTIONS: reply with SPARSE, not COVERAGE
 OPT_CMP_LOG = 1 << 1                     # OPTIONS: instrument compares (input-to-state)
 CMPLOG_TOKENS_MAX = 256                  # dictionary tokens taken from compare logs
+CMPLOG_MIN = 16                          # candidates a slow entry still gets (--cmplog-max if lower)
 KIND_INIT, KIND_ITER = 1, 2
 
 # HELLO flags: the coverage scheme (the coverage region's flags, same bits).
@@ -463,6 +466,7 @@ def main():
     status_fp = open(args.status_file, "w", buffering=1) if args.status_file else None
     last_status = [0.0]
     stage = ["baseline"]
+    running = [0]             # runs of the batch in flight (PROGRESS); execs has the finished ones
     baseline_edges = [None]   # edges after the corpus replay; new_edges counts past it
     run_config = {"arch": arch, "scheme": scheme, "map_size": map_size,
                   "proto": ver, "ember": "%s:%d" % peer, "listen": listen_addr,
@@ -480,8 +484,8 @@ def main():
             return
         el = time.monotonic() - start
         status_fp.write(json.dumps({
-            "t": round(el, 1), "execs": execs,
-            "execs_per_sec": round(execs / el, 1) if el > 0 else 0.0,
+            "t": round(el, 1), "execs": execs + running[0],
+            "execs_per_sec": round((execs + running[0]) / el, 1) if el > 0 else 0.0,
             "corpus": len(queue.entries), "edges": edges[0], "map_size": map_size,
             "new_edges": edges[0] - baseline_edges[0] if baseline_edges[0] is not None else 0,
             "init_edges": init_edges[0],
@@ -631,6 +635,13 @@ def main():
                 finds.append((reason, status, insns, nb, nc, path.to_bytes(8, "big"), data, hits))
                 continue
             if ftype == PROGRESS:         # the batch is alive: the reply timeout starts anew
+                if len(payload) < PROGRESS_LEN:
+                    raise ProtocolError("PROGRESS payload is %d bytes (needs %d)"
+                                        % (len(payload), PROGRESS_LEN))
+                pid, sofar = struct.unpack(">QI", payload[:PROGRESS_LEN])
+                if pid != first:
+                    raise ProtocolError("PROGRESS for batch %d while batch %d runs" % (pid, first))
+                running[0] = sofar        # the status counts them before HAVOC_DONE does
                 maybe_status()
                 continue
             if ftype == STAGE_RESULT:
@@ -660,6 +671,7 @@ def main():
             raise ProtocolError("HAVOC_DONE is cut short (%d bytes)" % len(payload)) from None
         if done_id != first:
             raise ProtocolError("HAVOC_DONE for batch %d while batch %d runs" % (done_id, first))
+        running[0] = 0
         if st:
             raise ProtocolError("ember refused a batch for queue entry %s: %s"
                                 % (e.name, HAVOC_STATUS.get(st, "status %d" % st)))
@@ -1003,6 +1015,9 @@ def main():
             queue.rescore(e)
             corpus_put(e)
         else:
+            if ran and insns and not e.insns:
+                e.insns = insns           # its own run, counted: no longer an unknown cost
+                queue.rescore(e)
             save_state(queue_dir, e)
         take_finds(e, finds, op="trim")   # a cut that ran new code is an entry of its own
 
@@ -1026,7 +1041,7 @@ def main():
         nonlocal mutated, cmplog_execs, cmplog_finds
         cmplog_done.add(e.id)
         stage[0] = "cmplog %s" % e.name
-        limit = min(args.cmplog_max, STAGE_I2S_MAX)
+        limit = queue.scaled_limit(e, min(args.cmplog_max, STAGE_I2S_MAX), CMPLOG_MIN)
         if args.iters:
             limit = min(limit, args.iters - mutated)
         if limit <= 0:
