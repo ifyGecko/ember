@@ -9,7 +9,7 @@ pipeline every ember build goes through; the third is for later, once the emulat
 
 | Skill | Job |
 |---|---|
-| **`ember-dev-recon`** | Triage an unknown image: container members and flash layout, architecture/endianness and **whether ember can run it**, load address of each stage (with evidence), entry state, memory map, RTOS identity, an MMIO table with per-register offsets and owning functions; on PC firmware the flash descriptor, firmware volumes, I/O ports, PCI config and MSRs. Emits `RECON.md`. |
+| **`ember-dev-recon`** | Triage an unknown image: container members and flash layout, architecture/endianness and **whether ember can run it**, load address of each stage (with evidence), entry state, memory map, RTOS identity, an MMIO table with per-register offsets and owning functions, and what the image's own strings, tables and constants say about the hardware it was written for (chips, console path, waits, the expected boot log); on PC firmware the flash descriptor, firmware volumes, I/O ports, PCI config and MSRs. Emits `RECON.md`. |
 | **`ember-dev-build`** | Write an ember board for it and bring the firmware up **iteratively**, one blocker and one device at a time, with an `iter-XX.md` journal per iteration. The project is a separate tree that links against its own local ember clone, pinned to the latest ember commit; no emulation code ever lives in the ember tree, and any change ember itself needs is a `git format-patch` file in the project, applied to the clone as a commit and ready to `git am` upstream. Every device saves its own state, so the finished board snapshots and resumes bit-identically. |
 | **`ember-fuzz`** | *Later, when the emulation is functional.* Fuzz the firmware with ember's snapshot-based harness: pick a target handler and begin pc, publish the input route from the board, set crash oracles and guards (redzones, the return guard, a guarded heap behind the firmware's allocator), smoke-test with replay, check coverage (ember's own block coverage by default; site lists only when a target is worth them), run a campaign (ember's fuzz brain, with ember mutating), and triage crashes into firmware bugs or emulation gaps, journaled in `fuzz-XX.md`. |
 
@@ -69,7 +69,8 @@ splits runs with `--save-snapshot` / `--load-snapshot` across the interpreter an
 (every example device must save and restore its state exactly); replays fuzz inputs through
 the board's named input and summarizes them with ember-fuzz's `replay_summary.py` (oracle
 crashes, and crash-guard verdicts from a `--guard`); runs the recon tools on the fixture
-images; and checks the guardrails (layering, uncaptured ember edits, a dirty working copy).
+images, and `strings_scan.py` on a made-up image holding every kind of lead; and checks the
+guardrails (layering, uncaptured ember edits, a dirty working copy).
 Re-run it whenever the ember pin moves.
 
 ## Environment variables (all optional)
@@ -96,11 +97,11 @@ Re-run it whenever the ember pin moves.
 skills/
   install.sh
   ember-dev-recon/  SKILL.md
-                    scripts/  recon.sh, basefind.py, mmio_scan.py, flashmap_scan.py, uefi_scan.py,
-                              fwinfo.py, ghidra-query.sh,
+                    scripts/  recon.sh, basefind.py, strings_scan.py, mmio_scan.py, flashmap_scan.py,
+                              uefi_scan.py, fwinfo.py, ghidra-query.sh,
                               ghidra/{FirmwareRecon,FindMmio,FindX86Io,Decompile,SeedEntries}.java
-                    references/  arch-cheatsheet, mmio-discovery, recon-report-schema,
-                                 recon-pitfalls, uefi-recon, dynamic-recon
+                    references/  arch-cheatsheet, reading-firmware, mmio-discovery,
+                                 recon-report-schema, recon-pitfalls, uefi-recon, dynamic-recon
   ember-dev-build/  SKILL.md
                     scripts/  new-emulation.sh, build-ember.sh, rebuild.sh, regen-patches.sh, repin.sh,
                               check-layering.sh, _common.sh, log_summary.py, gdb_trace_calls.py

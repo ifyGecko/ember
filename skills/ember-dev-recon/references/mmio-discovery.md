@@ -149,7 +149,9 @@ the register must count. Many hot registers are written at init and never read a
 2. Note the semantics the code implies: bits polled (busy/ready), values compared (chip ID,
    revision), write-1-to-clear patterns in ISRs, fields used as divisors.
 3. Compare with the public register map of the SoC family named by the BSP strings, but keep
-   the firmware's behavior as the authority.
+   the firmware's behavior as the authority. No name yet: `reading-firmware.md` (what the
+   functions' strings say, `strings_scan.py --near` for their neighbours, and the table of
+   ID and magic constants that name a flash, PHY, EEPROM or UART from its numbers).
 4. Once any ember board runs the code (even a bare one with catch-all windows), confirm
    statically found registers at run time: the catch-all first-access lines name the
    instruction (`pc=... icount=N`), `uam-run --trace mmio --trace-mmio-range LO:HI` gives the

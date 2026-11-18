@@ -31,6 +31,7 @@ Tools (paths relative to this skill directory; all self-contained):
 |---|---|---|
 | `scripts/fwinfo.py` | python3 | **first look**: the container (ELF: e_machine and flags -> arch, ember ISA, board, Ghidra language; Intel HEX: ranges, `--bin` program memory as a raw binary; Espressif image or ESP32 flash dump: chip, entry, segments, partition table, `--elf` as an ELF), and for a raw image instruction fingerprints and the vector-table shapes of the 8-bit parts |
 | `scripts/basefind.py` | python3 | base address by string-pointer voting with paired-hit re-ranking; picks endianness; prints spot checks; `--word 2` for 16-bit address spaces |
+| `scripts/strings_scan.py` | python3 | the image's strings **sorted into leads** with their addresses: identity, chip names, source files, function-name log prefixes, waits and probes, self-checks, peripheral classes, shell, config; `--near` (the strings stored around one), `--ptrs` (data words pointing at a string: name + handler tables); any arch, ASCII and UTF-16 |
 | `scripts/mmio_scan.py` | python3 | raw MIPS32 register-access table (page, offsets, R/W, max offset, code sites) plus **polling loops** (what the code waits for); no Ghidra needed |
 | `scripts/flashmap_scan.py` | python3 | flash **partition-table candidates** (arrays of plain flash offsets) plus flash references grouped by 64 KiB block (MIPS32) |
 | `scripts/ghidra/FirmwareRecon.java` | Ghidra | segments, entry candidates, banner strings |
@@ -44,7 +45,8 @@ Tools (paths relative to this skill directory; all self-contained):
 Which tool decodes which arch: `fwinfo.py` reads any container and fingerprints MIPS, PowerPC,
 ARM/Thumb, RV32, Xtensa (both byte orders), AVR, PIC18 and x86 code, plus the AVR, PIC, 8051,
 Z80, 6502 and Cortex-M vector/word shapes. `basefind.py` is arch-neutral (pointer voting;
-`--word 8` for 64-bit, `--word 2` for 6502/Z80/8051 address spaces). `mmio_scan.py` and
+`--word 8` for 64-bit, `--word 2` for 6502/Z80/8051 address spaces), and so is
+`strings_scan.py`. `mmio_scan.py` and
 `flashmap_scan.py` decode the MIPS32 encoding only (not the MIPS16e or microMIPS functions of a
 PIC32 image). For every other arch the MMIO table comes from `FindMmio.java` (reference-based)
 and the Ghidra MCP tools. For x86, `FindX86Io.java` adds what memory references cannot show,
@@ -62,7 +64,9 @@ strings, program info) on the project `recon.sh` made, read-only (table in step 
 a Ghidra install and that project; if `recon.sh` has not run yet, run it first (it creates
 the project). **Stop and ask the user** only when neither works: no MCP and no Ghidra install,
 or a headless import that fails. Don't fall back to weaker methods (raw byte reading,
-guessing from strings) for questions Ghidra answers.
+guessing from a string alone) for questions Ghidra answers. Strings are where most
+answers start (*How to read the image*, below), but a string is a lead: the fact is the
+code that uses it, and finding that code needs Ghidra.
 
 ## Gate: can ember run this target?
 Ember lifts guest code into its own IR and ships exactly these ISA modules (check
@@ -100,6 +104,38 @@ bringing it up means extending ember itself (an ISA module), which is a differen
 from writing a board. Record any partial gap (e.g. "FPU present but only used by one
 benchmark task", "ESP32-S3 TIE vector instructions in the DSP library") in RECON.md under
 *Ember support*, so the build phase knows which traps to expect.
+
+## How to read the image: start from what is readable
+The firmware's authors left most of the answers in it as text. Use them before reading
+any code cold. `references/reading-firmware.md` has the full method, step by step; the
+short form:
+
+1. **List the leads**: `scripts/strings_scan.py <stage> --base <base>` (also in the
+   `recon.sh` draft). It groups the strings by the question each kind answers.
+2. **Go from a string to its function**: `list_strings` (with `filter`) then
+   `get_xrefs_to` and `decompile_function_by_address`, or `ghidra-query.sh strings` /
+   `xrefs` / `decompile`. A string nobody references has one of eight known causes, each
+   with a fix (the reference's table); a wrong base is the first to rule out.
+3. **Name what you identify** (`rename_function_by_address`), the print function first:
+   once it has a name, every function that logs describes itself.
+4. **Follow it**: callers give the init order, callees give the registers.
+
+| the question | look at |
+|---|---|
+| which SoC, board, vendor, RTOS | `identity` and `chip` strings; BSP paths in `source` strings |
+| what is this function | its strings: a `funcName:` log prefix, an assert's file name, its error messages; then its neighbours' strings (`--near`) |
+| what is this MMIO page | the strings of the functions that touch it; register-dump formats (`"GPIO_OE = %x"`) |
+| which external chips must the board model | `chip` strings, chip-support tables, and ID compares (SPI flash JEDEC ID, PHY ID, I2C addresses: the reference's constant table) |
+| where is the console UART | walk down from the print function to the routine that waits on a status bit and writes a data register |
+| what will block the boot | `wait` strings (`timeout`, `not found`, `not responding`): each marks a loop or probe that needs an answer |
+| what does the firmware validate | `error` strings (`checksum`, `magic`, `CRC`), and CRC/hash constants |
+| which function handles a command, a device, an interrupt | tables of {name, handler}: `strings_scan.py --ptrs` |
+| are function names already available | ELF symbols, a VxWorks symbol table, a device tree, vendor source for the named SoC |
+| what should a good boot print | the init sequence's strings in call order: record them as the expected console output |
+
+A chip name in a string is a *guess*, a driver whose strings and ID compares agree is
+*inferred*, and a code path on the boot path that selects it is *confirmed*: one image
+often carries drivers for parts that are not fitted.
 
 ## The pass
 
@@ -248,7 +284,10 @@ at their bus bases in ember (`references/arch-cheatsheet.md`). Write both forms 
 Combine `mmio_scan.py` (raw, fast; MIPS32) and `FindMmio.java` (analysis-aware). For each
 page, record the offsets touched, R/W counts and accessing functions, then **label it from the
 code**: read one or two of the listed functions and look for the device's strings, chip-ID
-compares, baud-rate math, polling loops. Note the hypotheses the build phase must verify.
+compares, baud-rate math, polling loops (`references/reading-firmware.md`: what each kind
+of string tells you, and the ID and magic constants that name a part when no string does).
+Put the string and its address in the row's evidence. Note the hypotheses the build phase
+must verify.
 Details, per architecture (SFRs, I/O ports, ESP peripheral windows), in
 `references/mmio-discovery.md`.
 
@@ -271,16 +310,22 @@ Do this for **every stage** (each run with its own `--report` and `--out`, above
   code computes (`references/dynamic-recon.md`).
 
 ### 6. RTOS / kernel identity
-Version banners, build strings, BSP/board names, task names, shell commands. These tell the
+Version banners, build strings, BSP/board names, task names, shell commands
+(`strings_scan.py`: the `identity`, `chip`, `source` and `shell` groups). These tell the
 build phase which subsystems will be exercised (console shell, network stack, WLAN, web
-server). Microcontroller images often carry no banner: name the toolchain and runtime instead
+server), and the BSP and chip names say which hardware the code was written for: follow
+each to the code that selects it. While here, name the print function, walk down to the
+console UART, and collect the expected console output of a good boot
+(`references/reading-firmware.md`). Microcontroller images often carry no banner: name the toolchain and runtime instead
 (avr-libc, XC8/MPLAB, SDCC, Keil C51, the ESP8266 NONOS/RTOS SDK, ESP-IDF, Arduino), from
 startup-code shapes, library strings and section names. For a PC: the `uefi_scan.py` identity
 line (BIOS ID, vendor hints), module names and PE debug paths, whether it is a debug build
 (DEBUG strings such as `Loading PEIM`).
 
 ### 7. Write `RECON.md` in the session project directory
-Run the checklist in `references/recon-pitfalls.md` first. Tag each claim **confirmed /
+Run the checklist in `references/recon-pitfalls.md` first, and the questions that close
+`references/reading-firmware.md` (console, first and last line of a boot, chips and their
+IDs, tick source, self-checks, waits). Tag each claim **confirmed /
 confirmed (run) / inferred / guess**. "Must count" or "must return X" is only *confirmed* when a code path
 (poll, divisor, compare) shows the dependency; access counts alone are *inferred*.
 

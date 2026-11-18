@@ -11,7 +11,7 @@
 #                               # replaced, its last content kept as FILE.prev)
 #            [--out DIR]        # working artifacts (default: ./.recon)
 #            [--no-ghidra]      # stop after the Python tools (fwinfo, binwalk, basefind,
-#                               # raw MMIO scan, uefi_scan)
+#                               # raw MMIO scan, strings_scan, uefi_scan)
 #            [--reuse]          # re-run the Ghidra scripts on an existing project (no re-import)
 #            [--uefi]           # PC firmware: force the UEFI flow (auto for x86 images that
 #                               # hold firmware volumes or a flash descriptor)
@@ -31,7 +31,8 @@
 #       (string-pointer voting, paired-hit re-rank; skipped for ELF and where the
 #       architecture fixes the base: AVR, PIC, 8051 and Z80 program memory at 0, 6502 from
 #       its vectors) -> mmio_scan.py (raw MIPS32 register-access table + polling loops) ->
-#       flashmap_scan.py (partition-table candidates + flash references) -> Ghidra headless
+#       flashmap_scan.py (partition-table candidates + flash references) -> strings_scan.py
+#       (the image's strings sorted into leads, with their addresses) -> Ghidra headless
 #       import (raw: at the chosen base; ELF: its own segments) + FirmwareRecon.java +
 #       FindMmio.java (+ FindX86Io.java on x86) -> draft RECON.md.
 # Flow (PC / UEFI images): uefi_scan.py (flash descriptor, BIOS window, reset vector, FIT,
@@ -356,6 +357,15 @@ EOF
     done
 fi
 
+# --- 3b. string leads -------------------------------------------------------------
+# the image's strings sorted by what each kind answers; addresses at the chosen base (ELF:
+# its segments). The full list of a kind: strings_scan.py ... --kind K --max 0
+SS=("$BLOB" --max 12)
+[[ "$IS_ELF" == 0 ]] && SS+=(--base "$BASE")
+echo "--- strings_scan.py (string leads: identity, chips, source files, waits, ...) ---"
+python3 "$HERE/strings_scan.py" "${SS[@]}" > "$OUT/strings.txt" || true
+sed -n '1,2p' "$OUT/strings.txt"
+
 # --- draft report ---------------------------------------------------------------
 {
   echo "# Recon fact sheet: $BLOBNAME (DRAFT - confirm and annotate; see recon-report-schema.md)"
@@ -381,6 +391,10 @@ fi
   fi
   if [[ -s "$OUT/flashmap.txt" ]]; then
       echo; echo "## Flash map evidence (flashmap_scan.py)"; echo '```'; cat "$OUT/flashmap.txt"; echo '```'
+  fi
+  if [[ -s "$OUT/strings.txt" ]]; then
+      echo; echo "## String leads (strings_scan.py; each is a lead until code confirms it: references/reading-firmware.md)"
+      echo '```'; cat "$OUT/strings.txt"; echo '```'
   fi
 } > "$REPORT"
 

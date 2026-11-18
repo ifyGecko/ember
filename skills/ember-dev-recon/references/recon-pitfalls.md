@@ -115,7 +115,17 @@ source) or **guess** (naming convention, public map of a sibling chip). The buil
 trusts confirmed claims and verifies the rest. A fact sheet that states inferred claims as
 confirmed costs a full debugging iteration each time one is wrong.
 
-## 12. Hours of reading for what one run shows
+## 12. A chip named in a string is not a chip on the board
+One image often serves several boards: it carries drivers, ID tables and messages for
+flash parts, PHYs and switches that this board does not have, and BSP paths inherited from
+an older SoC. A name is a *guess*; it becomes *confirmed* through the code that selects
+it on the boot path (an ID compare, a strap or board-type read). The opposite error is as
+common: skipping the strings and reverse engineering a block whose driver file name and
+register-dump formats were in the image all along. Run `strings_scan.py` on every
+decompressed stage and work its `chip`, `source` and `wait` groups before reading code
+cold (`reading-firmware.md`).
+
+## 13. Hours of reading for what one run shows
 Reimplementing a vendor decompressor, tracing a computed pointer through five functions,
 arguing from compares which CPU revision is expected: ember answers each with one bounded
 run on a bare board (`dynamic-recon.md`: dump the unpacked stage, `--watch` the address,

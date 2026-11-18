@@ -416,6 +416,31 @@ else
     echo "skip  FindX86Io.java (no Ghidra analyzeHeadless, or no fixture firmware)"
 fi
 
+# 4c. strings_scan.py (ember-dev-recon): a made-up big-endian image at 0x80001000 holding one
+# string of each kind and a {name, handler} table; kinds, addresses, --near and --ptrs
+python3 - "$T/strs.bin" <<'EOF'
+import struct, sys
+base, blob, at = 0x80001000, bytearray(b"\x00" * 0x100), {}
+for s in ["VxWorks 5.5.1", "AR9331: AP121 Board", "Assertion failed: mac, file target/config/ar9331/ag7240End.c, line 631",
+          "sysUartInit: baud %d", "PLL lock timeout", "bad image checksum 0x%x", "help", "bootdelay=3", "RedBoot> "]:
+    at[s] = base + len(blob); blob += s.encode() + b"\x00"
+blob += b"\x00" * (-len(blob) % 4)
+blob += struct.pack(">II", at["help"], base + 0x40)
+open(sys.argv[1], "wb").write(blob)
+EOF
+SSC=(python3 "$RS/strings_scan.py" "$T/strs.bin" --base 0x80001000)
+"${SSC[@]}" > "$T/strs.txt" 2>&1 || true
+k_has() { awk -v k="== $1:" -v w="$2" 'index($0, "== ") == 1 { on = index($0, k) == 1 } on && index($0, w) { f = 1 } END { exit !f }' "$T/strs.txt"; }
+k_has identity '0x80001100   "VxWorks 5.5.1"' && k_has chip "AR9331" && k_has source "ag7240End.c" \
+    && k_has func "sysUartInit: baud" && k_has wait "PLL lock timeout" && k_has error "bad image checksum" \
+    && k_has shell '"help"' && k_has config "bootdelay=3" && k_has device "uart / console" \
+    && ok "strings_scan.py: every kind of lead, with addresses" || { bad "strings_scan.py kinds"; cat "$T/strs.txt"; }
+"${SSC[@]}" --ptrs --grep '^help$' 2>&1 | grep -q "next word 0x80001040 is inside the image" \
+    && ok "strings_scan.py: --ptrs finds the {name, handler} table" || bad "strings_scan.py --ptrs"
+"${SSC[@]}" --near 0x80001100 --window 0x20 > "$T/strs-near.txt" 2>&1 || true
+grep -q "AR9331: AP121 Board" "$T/strs-near.txt" && ! grep -q "bootdelay" "$T/strs-near.txt" \
+    && ok "strings_scan.py: --near by address" || bad "strings_scan.py --near"
+
 # 5. layering and guardrails
 printf '#include "uam/state.h"\n#include "uam/blockdev.h"\nint ok_dev_x;\n' > "$P/emulation/ok_dev.c"
 check "device may include uam/state.h and uam/blockdev.h" "$P/scripts/check-layering.sh"

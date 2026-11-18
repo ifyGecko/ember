@@ -124,10 +124,26 @@ Flash partitions (one row per partition; label from the WRITER):
 ## Identity / config registers the code checks
 - <register> compared with <values> at <functions> (chip revision, bootstrap straps ...)
 
+## Named functions and console
+- Print function: <address, name>; levelled log / panic-assert: <addresses>
+- Console path: <print -> ... -> putc at address>; UART <base, type, register spacing>, waits
+  for <status offset, bit> before each character
+- Named functions worth a breakpoint: <address name: evidence string or symbol source>
+  (stage entries, hardware init, console init, panic)
+- Symbol source, if any: <ELF symbols | VxWorks symbol table at ... | vendor source ... | none>
+- External chips: <part: evidence string @address and/or ID compare @function; bus and
+  address; ID it must return; on the boot path? confidence>
+
 ## Suggested bring-up order
 1. Board: ISA descriptor + CPU model, RAM, image at base (or ELF segments), PC = entry (+ entry registers);
    on a Harvard part also the data space and its SRAM
 2. <devices in the order the boot path will need them, with the key semantics to provide>
+
+Expected console output of a good boot (strings in init-call order; the build phase's
+progress markers):
+1. "<first line>" from <function>; needs <device>
+2. ...
+N. "<banner or prompt>": the boot is done
 
 ## Open questions / risks
 - <aliases, unknown registers, data partitions to synthesize, subsystems likely to fail>
@@ -236,6 +252,10 @@ questions* and *Tooling notes* stay. Method: `uefi-recon.md`.
   it and as ember's bus sees it (AVR data 0xE0 = bus 0x8000E0; Z80 port 0x10 = bus 0x10010),
   and code addresses as byte addresses (Ghidra's AVR/PIC `code:` addresses are word addresses).
 - **Ember verdict.** The *Ember support* section is filled in before anything else is handed over.
+- **A string is evidence only with its address and its user.** Quote the string, give its
+  address and the function that references it. A chip or device named by a string alone is
+  *guess*; with a driver whose ID compares or register use agree, *inferred*; selected by
+  code on the boot path, *confirmed* (`reading-firmware.md`).
 - **Say what's missing.** List partitions or data the firmware reads that the image doesn't
   contain (NVRAM, calibration, MAC addresses). The build phase will need them blank or
   synthesized.
