@@ -149,7 +149,8 @@ Each worker's files are under `fuzz/camp/NAME/` (`main`, `w1`, ...: queue, crash
 `brain.log`, `ember.log`); entries imported from another worker are named `sync:PEER`.
 Crashes are deduplicated per worker: replay every `crashes/` directory, or group them with
 `scripts/replay_summary.py`. A worker does not minimize a crash another worker already holds
-minimized (its copy stays as found, `minimized=peer` in the `.info`).
+minimized (its copy stays as found, `minimized=peer` in the `.info`). A restarted worker
+takes up the crashes it had left for later (`minimized=later`) again.
 
 - Ember connects, boots to the begin pc, and only then sends HELLO and the INIT map, so a
   long boot is fine (the brain's `--hello-timeout`, 600 s by default; 0 waits forever). `-n`

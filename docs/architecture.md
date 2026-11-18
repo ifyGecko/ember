@@ -238,7 +238,7 @@ tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmwa
                   fuzz/tools' generators; rizin and, when found, headless Ghidra)
                   fuzz-net-check.sh fake_brain.py  (the fuzz protocol against a scripted brain)
                   brain-check.sh  (sessions with fuzz_brain.py: every schedule, a dictionary,
-                  compare logging)
+                  compare logging, which crash is minimized when)
                   parallel-check.sh  (a parallel campaign through fuzz_launch.py)
                   brain_unit.py  (the brain's campaign logic on synthetic data)
                   cov_blocks_check.py  (block coverage: block-size and interrupt-timing
@@ -949,7 +949,8 @@ Implemented (`meson test -C build`):
   `brain-check.sh` sessions with `fuzz_brain.py`
   (whose saved crash directory replays without its `.info` notes; one per power schedule; the
   planted crash found from a dictionary alone; the 32-bit magic value found by compare logging
-  from an unrelated seed and not without it), and `parallel-check.sh` a two-worker campaign
+  from an unrelated seed and not without it; the first crash minimized at once, a later one
+  within the brain's share of runs or after a restart), and `parallel-check.sh` a two-worker campaign
   through `fuzz_launch.py` (imports, both planted crashes, a killed ember restarted).
   `tests/fuzz/brain_unit.py` checks the brain's campaign logic on synthetic data (hit-count
   classes, path ids, the favored set and skip rule, every schedule, operator weights, queue

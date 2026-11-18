@@ -1008,10 +1008,11 @@ by frame against a scripted brain (`tests/fuzz/fake_brain.py`, SPARSE and CMPS i
 sessions with the brain (`tests/fuzz/brain-check.sh`: the planted crash is reported, saved
 with its reason, minimized, and the session ends with BYE; a session per schedule; the
 planted crash found from a dictionary alone; the magic value found by compare logging and
-not without it) and a parallel campaign
+not without it; of two crashing seeds the first minimized at once and the second later, or
+after a restart when `--minimize-share 0` left it as found) and a parallel campaign
 (`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
 crashes, and survive a killed ember). `meson test -C build --suite unit` runs `tests/fuzz/brain_unit.py` (the
-campaign logic on synthetic data), `test_mutate` (the mutator and the input-to-state
+campaign logic and the crash triage on synthetic data), `test_mutate` (the mutator and the input-to-state
 candidates), `test_fuzz`'s checks of the harness's hit lists, compare logging and the
 campaign engine's batches and stages, and
 `test_cov`'s of the compare pass and `CMPLOG` on every ISA and backend.
