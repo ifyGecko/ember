@@ -10,11 +10,14 @@
  *   131 an unmapped access under --unknown-mmio stop, 2 usage or setup error.
  * With --fuzz-replay, the most severe verdict of any input instead (uam/fuzz.h):
  *   0 ok, 20 crash (fault), 21 crash (oracle), 22 hang, 23 timeout, 24 rejected (the
- *   input route refused it), 25 crash (guard); of several crashes, the first one's.
+ *   input route refused it), 25 crash (guard), 26 an input whose run depended on memory
+ *   nothing wrote (--fuzz-uninit; below a timeout, above a rejection); of several
+ *   crashes, the first one's.
  * A fuzz run that stops on an error (an internal error of the executor, a lost
  * frontend) exits 2.
  */
 #include <getopt.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +36,7 @@
 
 #include "trace.h"
 #include "uam/snapshot.h"
+#include "uam/uninit.h"
 
 #define MAX_LIST 64
 
@@ -528,6 +532,19 @@ static void usage(FILE *out)
         "      --fuzz-crash-irq N  an interrupt from line N (as the board wires it to the\n"
         "                          CPU) is a crash (repeatable)\n"
         "      --fuzz-iter-insns N instruction budget per input (default 10000000; timeout)\n"
+        "      --fuzz-uninit[=PAT] opt in: find what depends on memory nothing wrote. An input that\n"
+        "                          found new coverage (every input, with --fuzz-replay) runs\n"
+        "                          again with the RAM pages the boot never wrote filled with PAT\n"
+        "                          (a 32-bit value, default 0x1337c0d3, laid out so a word reads\n"
+        "                          back as PAT) and the two runs are compared: verdict, length,\n"
+        "                          path, what the devices were sent. A difference is reported\n"
+        "                          (replay: exit 26). The boot runs on zeroed RAM as always.\n"
+        "                          Misses partly written pages and reads that change nothing\n"
+        "                          compared; a firmware that relies on RAM being zero outside\n"
+        "                          its own writes reports on every input (see the exclude\n"
+        "                          option). A snapshot made with it loads only with it\n"
+        "      --fuzz-uninit-exclude R  leave physical range R (LO-HI, LO+LEN) out of that\n"
+        "                          fill: RAM the hardware zeroes (repeatable)\n"
         "      --fuzz-snapshot F   start from the begin snapshot in F if it exists (no boot),\n"
         "                          else boot and save it to F: parallel workers boot once\n"
         "      --fuzz-replay PATH  run each input in FILE or DIR once and print the verdict;\n"
@@ -929,6 +946,8 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
     if (!xs->frontend && !(r = uam_fuzz_replay_create_ex(replay, f, stdout, xs->replay_sidecars,
                                                          xs->n_replay_sidecars)))
         goto out;
+    if (replay)
+        uam_fuzz_set_uninit_policy(f, UAM_FUZZ_UNINIT_ALL);   /* every input, not just new coverage */
     g_fuzz = f;
     trace_fe tfe = {
         .fe = xs->frontend ? xs->frontend : &uam_fuzz_replay_frontend,
@@ -962,6 +981,10 @@ static int run_fuzz(uam_machine *m, const uam_fuzz_config *fz, bool cov_blocks, 
             (unsigned long long)fs->by_verdict[UAM_FUZZ_HANG],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_TIMEOUT],
             (unsigned long long)fs->by_verdict[UAM_FUZZ_REJECTED]);
+    if (uam_machine_uninit_enabled(m))
+        fprintf(stderr, "uam-run: fuzz: uninit: %llu runs repeated with memory filled, %llu "
+                "differed\n", (unsigned long long)fs->uninit_checked,
+                (unsigned long long)fs->uninit_diverged);
     if (cov_out) {
         size_t n;
         const uint8_t *map = r ? uam_fuzz_replay_last_map(r, &n) : uam_fuzz_map(f, &n);
@@ -998,7 +1021,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
            OPT_FUZZ_ITER_INSNS, OPT_FUZZ_REPLAY, OPT_FUZZ_CRASH_IRQ, OPT_ENTRY, OPT_FUZZ_BEGIN_SKIP,
-           OPT_FUZZ_SNAPSHOT,
+           OPT_FUZZ_SNAPSHOT, OPT_FUZZ_UNINIT, OPT_FUZZ_UNINIT_EXCLUDE,
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
            OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_GUARD_RETURNS, OPT_RETURN_OK,
            OPT_BACKTRACE, OPT_EXT_BASE = 1000 };
@@ -1060,6 +1083,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "fuzz-iter-insns", required_argument, NULL, OPT_FUZZ_ITER_INSNS },
         { "fuzz-replay", required_argument, NULL, OPT_FUZZ_REPLAY },
         { "fuzz-snapshot", required_argument, NULL, OPT_FUZZ_SNAPSHOT },
+        { "fuzz-uninit", optional_argument, NULL, OPT_FUZZ_UNINIT },
+        { "fuzz-uninit-exclude", required_argument, NULL, OPT_FUZZ_UNINIT_EXCLUDE },
         { "fuzz-begin-skip", required_argument, NULL, OPT_FUZZ_BEGIN_SKIP },
         { "stats", no_argument, NULL, 's' },
         { "dump-state", no_argument, NULL, 'd' },
@@ -1113,6 +1138,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
     size_t n_fuzz_end = 0, n_more_begins = 0;
     bool have_begin = false, fuzz_opts = false;
     const char *fuzz_input = NULL, *fuzz_replay = NULL, *fuzz_snapshot = NULL;
+    bool fuzz_uninit = false;
+    uint32_t fuzz_uninit_pattern = UAM_UNINIT_DEFAULT_PATTERN;
+    struct { uint64_t lo, len; } uninit_excl[MAX_LIST];
+    unsigned n_uninit_excl = 0;
     unsigned trace = 0, block_insns = 0;
     static rtrace rt;   /* large (tables); static, one run per process */
     memset(&rt, 0, sizeof(rt));
@@ -1427,6 +1456,41 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_FUZZ_ITER_INSNS: fz.iter_insns = strtoull(optarg, NULL, 0); fuzz_opts = true; break;
         case OPT_FUZZ_REPLAY: fuzz_replay = optarg; fuzz_opts = true; break;
         case OPT_FUZZ_SNAPSHOT: fuzz_snapshot = optarg; fuzz_opts = true; break;
+        case OPT_FUZZ_UNINIT:
+            fuzz_uninit = true;
+            fuzz_opts = true;
+            if (optarg) {
+                char *end;
+                errno = 0;
+                unsigned long long v = strtoull(optarg, &end, 0);
+                if (!*optarg || *end || errno || v > UINT32_MAX) {
+                    fprintf(stderr, "uam-run: bad --fuzz-uninit '%s' (a 32-bit pattern)\n", optarg);
+                    return 2;
+                }
+                fuzz_uninit_pattern = (uint32_t)v;
+            }
+            break;
+        case OPT_FUZZ_UNINIT_EXCLUDE: {
+            char *end;
+            errno = 0;
+            const uint64_t lo = strtoull(optarg, &end, 0);
+            uint64_t len = 0;
+            if (!errno && end != optarg && (*end == '-' || *end == '+') && end[1]) {
+                char *e2;
+                const uint64_t v = strtoull(end + 1, &e2, 0);
+                if (!*e2 && !errno && (*end == '+' ? v : v > lo ? v - lo : 0))
+                    len = *end == '+' ? v : v - lo;
+            }
+            if (!len || n_uninit_excl == MAX_LIST) {
+                fprintf(stderr, "uam-run: bad --fuzz-uninit-exclude '%s' (LO-HI or LO+LEN, "
+                        "physical addresses; at most %d)\n", optarg, MAX_LIST);
+                return 2;
+            }
+            uninit_excl[n_uninit_excl].lo = lo;
+            uninit_excl[n_uninit_excl++].len = len;
+            fuzz_opts = true;
+            break;
+        }
         case OPT_FUZZ_BEGIN_SKIP: {
             char *end;
             unsigned long n = strtoul(optarg, &end, 0);
@@ -1472,6 +1536,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
     if ((have_begin || n_fuzz_end) && (provides & UAM_RUNNER_EXT_BEGIN)) {
         fprintf(stderr, "uam-run: --fuzz-begin/--fuzz-end and a boundary file both set the "
                 "iteration boundaries\n");
+        return 2;
+    }
+    if (n_uninit_excl && !fuzz_uninit) {
+        fprintf(stderr, "uam-run: --fuzz-uninit-exclude needs --fuzz-uninit\n");
         return 2;
     }
     if (fuzz_opts && !fuzzing) {
@@ -1596,6 +1664,18 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: building board '%s' failed: %s\n", board_name, uam_status_str(st));
         uam_machine_fini(&m);
         goto out_host;
+    }
+    if (fuzz_uninit) {
+        /* Before anything runs or a snapshot is loaded: the written-page record is part of a
+         * snapshot made with it, and the first stores to each page have to be seen. */
+        uam_status us = uam_machine_uninit_enable(&m, fuzz_uninit_pattern);
+        if (us != UAM_OK) {
+            fprintf(stderr, "uam-run: cannot turn --fuzz-uninit on: %s\n", uam_status_str(us));
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        for (unsigned i = 0; i < n_uninit_excl; i++)
+            uam_machine_uninit_exclude(&m, uninit_excl[i].lo, uninit_excl[i].len);
     }
     /* An option the board never asked for is a mistake (a misspelt key, one of another
      * board's): refuse it, as a run that ignores it would be taken for one that honours it. */

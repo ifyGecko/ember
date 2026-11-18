@@ -116,6 +116,7 @@ uam_status uam_machine_init_abi(uam_machine *m, const uam_isa *isa, const uam_ab
 
 void uam_machine_guards_fini(uam_machine *m);   /* guard.c */
 void uam_machine_frames_fini(uam_machine *m);   /* frames.c */
+void uam_machine_uninit_fini(uam_machine *m);   /* uninit.c */
 
 void uam_machine_fini(uam_machine *m)
 {
@@ -123,6 +124,7 @@ void uam_machine_fini(uam_machine *m)
         return;
     uam_machine_guards_fini(m);
     uam_machine_frames_fini(m);
+    uam_machine_uninit_fini(m);
     if (m->board_fini)
         m->board_fini(m);
     m->board_fini = NULL;

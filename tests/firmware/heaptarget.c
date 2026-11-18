@@ -10,6 +10,8 @@
  *
  * fuzz_iteration drains the UART; the first byte picks the case:
  *   'k'  a block allocated, filled, grown, read back and freed: nothing wrong
+ *   'm'  a read of a fresh block before anything wrote it (not a bug the oracles see: for
+ *        --fuzz-uninit, tests/fuzz/uninit-heap-check.sh)
  *   'o'  a write one byte past a block's end          'r'  a read there
  *   'u'  a write one byte before a block's start
  *   'f'  a read of a freed block                      'g'  a write through a pointer
@@ -162,6 +164,7 @@ static __attribute__((noinline)) void parse(const uint8_t *in, unsigned n)
         g_sink += q[47];
         fw_free((void *)q);
         return;
+    case 'm': if (p[0]) g_sink++; break;           /* a read of fresh memory (--fuzz-uninit) */
     case 'o': p[24] = 1; break;
     case 'r': g_sink += p[24]; break;
     case 'u': p[-1] = 1; break;

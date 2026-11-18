@@ -162,7 +162,8 @@ const uint8_t *uam_fuzz_replay_last_map(const uam_fuzz_replay *r, size_t *size)
 }
 
 /* The exit status is the most severe verdict of any input: a crash (the first one
- * seen), else a hang, else a timeout, else a rejected input, else ok. So replaying a
+ * seen), else a hang, else a timeout, else an input that depended on memory nothing wrote
+ * (with that check on), else a rejected input, else ok. So replaying a
  * directory fails when any input in it does, whatever else (or whatever order) the
  * directory holds. */
 static int verdict_rank(uam_fuzz_verdict v)
@@ -170,9 +171,9 @@ static int verdict_rank(uam_fuzz_verdict v)
     switch (v) {
     case UAM_FUZZ_CRASH_FAULT:
     case UAM_FUZZ_CRASH_ORACLE:
-    case UAM_FUZZ_CRASH_GUARD:  return 4;
-    case UAM_FUZZ_HANG:         return 3;
-    case UAM_FUZZ_TIMEOUT:      return 2;
+    case UAM_FUZZ_CRASH_GUARD:  return 5;
+    case UAM_FUZZ_HANG:         return 4;
+    case UAM_FUZZ_TIMEOUT:      return 3;
     case UAM_FUZZ_REJECTED:     return 1;
     case UAM_FUZZ_OK:           return 0;
     }
@@ -241,6 +242,40 @@ static void print_guard(FILE *out, const uam_guard_hit *h)
         fprintf(out, "+%llu into", (unsigned long long)rel);
     fprintf(out, " guard %s [0x%llx, 0x%llx))", h->name, (unsigned long long)h->start,
             (unsigned long long)(h->start + h->len));
+}
+
+#define UNINIT_RANK 2
+
+/* "replay: NAME: uninit differs=path,output (filled run: ok, insns=N); read before any write:
+ * pc=0x.. at 0x.. ..." */
+static void print_uninit(FILE *out, const char *name, const uam_fuzz_uninit_result *u)
+{
+    static const struct { unsigned bit; const char *name; } kinds[] = {
+        { UAM_FUZZ_UNINIT_VERDICT, "verdict" }, { UAM_FUZZ_UNINIT_DETAIL, "detail" },
+        { UAM_FUZZ_UNINIT_INSNS, "insns" },     { UAM_FUZZ_UNINIT_PATH, "path" },
+        { UAM_FUZZ_UNINIT_OUTPUT, "output" },
+    };
+    fprintf(out, "replay: %s: uninit differs=", name);
+    const char *sep = "";
+    for (size_t i = 0; i < UAM_ARRAY_LEN(kinds); i++)
+        if (u->kinds & kinds[i].bit) {
+            fprintf(out, "%s%s", sep, kinds[i].name);
+            sep = ",";
+        }
+    fprintf(out, " (filled run: %s, insns=%llu)", uam_fuzz_verdict_str(u->verdict),
+            (unsigned long long)u->insns);
+    if (u->n_touch) {
+        fputs("; read before any write:", out);
+        for (size_t i = 0; i < u->n_touch; i++)
+            fprintf(out, " pc=0x%llx at 0x%llx;", (unsigned long long)u->touch[i].pc,
+                    (unsigned long long)u->touch[i].paddr);
+        if (u->touch_total > u->n_touch)
+            fprintf(out, " and %llu more", (unsigned long long)(u->touch_total - u->n_touch));
+    } else {
+        fputs("; no page nothing had written was read first (a partly written page, or a "
+              "buffer's tail)", out);
+    }
+    fputc('\n', out);
 }
 
 static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_t detail,
@@ -330,6 +365,13 @@ static uam_status replay_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint
     if (verdict_rank(v) > r->rank) {
         r->rank = verdict_rank(v);
         r->exit_status = uam_fuzz_exit_status(v);
+    }
+    if (res->uninit.diverged) {
+        print_uninit(r->out, r->paths[id - 1], &res->uninit);
+        if (UNINIT_RANK > r->rank) {
+            r->rank = UNINIT_RANK;
+            r->exit_status = UAM_FUZZ_EXIT_UNINIT;
+        }
     }
     return UAM_OK;
 }

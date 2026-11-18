@@ -100,6 +100,8 @@ struct cf_net {
     uint8_t   stage;       /* the stage's kind (UAM_NET_STAGE_*); 0: a HAVOC batch */
     uint64_t  first_id, next_id;
     uint64_t  last_ns;     /* when the last frame of the batch went out (PROGRESS) */
+    const uint8_t *cur;    /* the INPUT being run (a batch's is the campaign's) */
+    size_t    cur_len;
 };
 
 /* ---- big-endian fields ---------------------------------------------------- */
@@ -652,6 +654,33 @@ static bool havoc_report(cf_net *z, uint64_t id, uam_fuzz_verdict v, uint64_t de
     return ok;
 }
 
+/* UNINIT: the run that just ended depended on memory nothing wrote (a second run from the
+ * same snapshot, with it filled, ended differently). The input goes along. */
+static bool send_uninit(cf_net *z, uint64_t id, const uint8_t *data, size_t len)
+{
+    const uam_fuzz_uninit_result *u = &uam_fuzz_last_result(z->fuzz)->uninit;
+    const size_t nt = u->n_touch;
+    if (!reserve(&z->out, &z->out_cap, 5 + UAM_NET_UNINIT_HDR_LEN + nt * UAM_NET_UNINIT_TOUCH_LEN + 4 + len)) {
+        z->broken = true;
+        return false;
+    }
+    uint8_t *p = put64(z->out + 5, id);
+    p = put32(p, u->kinds);
+    p = put64(p, u->detail);
+    *p++ = (uint8_t)u->verdict;
+    p = put64(p, u->insns);
+    p = put16(p, (uint16_t)nt);
+    for (size_t i = 0; i < nt; i++) {
+        p = put64(p, u->touch[i].pc);
+        p = put64(p, u->touch[i].paddr);
+    }
+    p = put32(p, (uint32_t)len);
+    if (len)
+        memcpy(p, data, len);
+    p += len;
+    return send_frame(z, UAM_NET_UNINIT, (size_t)(p - (z->out + 5)));
+}
+
 /* JUDGE: the campaign's judgement of an INPUT's run, right before its reply. */
 static bool send_judge(cf_net *z, uint64_t id, const uam_fuzz_judgement *j)
 {
@@ -767,6 +796,8 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             *id = get64(z->in);
             *len = dlen;
             *data = z->in + UAM_NET_INPUT_HDR_LEN;
+            z->cur = *data;
+            z->cur_len = dlen;
             z->cmp_pending = hdr[4] == UAM_NET_CMP_INPUT;
             if (z->cmp_pending && z->fuzz)
                 uam_fuzz_cmp_arm(z->fuzz);   /* false with logging off: an empty CMPS */
@@ -878,6 +909,14 @@ static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
 {
     cf_net *z = ctx;
     bool ok;
+    if (kind == UAM_FUZZ_KIND_ITER && z->fuzz) {
+        const uam_fuzz_uninit_result *u = &uam_fuzz_last_result(z->fuzz)->uninit;
+        if (u->diverged && u->novel) {
+            const uam_fuzz_batch *b = z->batch && z->camp ? uam_fuzz_campaign_batch(z->camp) : NULL;
+            if (!send_uninit(z, id, b ? b->data : z->cur, b ? b->len : z->cur_len))
+                return UAM_ERR_INVALID;
+        }
+    }
     if (kind == UAM_FUZZ_KIND_ITER && z->batch)
         return havoc_report(z, id, v, detail) ? UAM_OK : UAM_ERR_INVALID;
     /* Every run is judged, so that the campaign's record is whole: what an INPUT showed

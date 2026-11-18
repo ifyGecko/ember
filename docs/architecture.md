@@ -53,7 +53,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 |---|---|---|
 | `ir.h` | IR types, opcodes, block builder API, verifier, printer | the core (data only) |
 | `isa.h` | `lift`, register descriptor table (and register lookup by the gdb description's names, `uam_isa_reg_by_name`: `--log-pc ADDR,REG`), `take_exception`, `irq_take`/`irq_wakeup`/`irq_input`, `sysreg_read`/`sysreg_write`, `default_endian` (and `fetch_endian` when code and data differ: ARM BE8), optional `translate` (v->p, with fault sub-causes), optional `gdb` register view, `save`/`restore` of ISA-private state, optional `switch_in` (multiprocessor: state the platform keeps once for all processors follows the running one, such as a chipset's SMIACT# tracking), optional `irq_lines` (what an interrupt observer sees). An ISA must request an exit (`uam_cpu_request_exit`) on any change that can make `irq_take` newly succeed. The `gdb` view can name pc bits that select an instruction-set state (`pc_state_bits`: ARM Thumb) | `isa/riscv`, `isa/mips32`, `isa/arm`, `isa/x86`, `isa/ppc32`, `isa/avr8`, `isa/avr32`, `isa/pic8`, `isa/mcs51`, `isa/m6502`, `isa/z80`, `isa/xtensa` |
-| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), one observer of the accesses devices serve and one of DMA transfers (`uam_bus_set_dev_observer`, `uam_bus_set_dma_observer`: `--trace mmio`, `--trace dma`), dirty-page tracking for snapshots; a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on); the last device read (what a polling loop saw) | the core |
+| `bus.h` | Region map (RAM / ROM / MMIO / ROMD / alias) with priorities (real devices, then per-register stubs from `UAM_PRIO_STUB`, then catch-all windows at `UAM_PRIO_BACKGROUND`), software TLB, device byte order and access widths, watchpoints, fault reporting, DMA master access (`uam_bus_dma_read`/`_write`), one observer of the accesses devices serve and one of DMA transfers (`uam_bus_set_dev_observer`, `uam_bus_set_dma_observer`: `--trace mmio`, `--trace dma`), dirty-page tracking for snapshots, a record of the RAM pages ever written and pages that fill themselves with a pattern on first access (`uam_bus_written_*`, `uam_bus_lazy_arm`: `--fuzz-uninit`), a digest of what devices are sent (`uam_bus_set_digest`); a watch with `UAM_WATCH_FAULT` refuses the access instead of observing it (what guards are built on); the last device read (what a polling loop saw) | the core |
 | `device.h` | `read`, `write`, optional `write_masked`, `reset`, `destroy`, `save`/`restore` (or `UAM_DEVICE_STATELESS`), optional `peek` (a side-effect-free read for `--dump-mem` and gdb); declared `endian` and implemented access sizes (declarative register tables are planned) | one file per device |
 | `state.h` | State streams: how a component writes and reads back its state (fixed-width little-endian fields, byte arrays, timers with their tie order, signal levels; sticky errors) | the core |
 | `sched.h` | Instruction-count clock (saturating at a 2^62-tick horizon), event queue with a per-call firing budget, a kick when the earliest deadline moves (the machine turns it into an exit request), cancel-all, list consistency checks | the core |
@@ -73,6 +73,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `pass.h` | IR → IR transformations run on every new block, after the optimizer and before native compilation (instrumentation); block editing helpers | `analysis/*`; registered with `uam_exec_add_pass` |
 | `guard.h` | Guarded and watched guest memory: byte ranges (virtual or physical, around an anchor) whose data accesses stop the run at the instruction (`UAM_STOP_GUARD`), become a bus fault for the guest, or are logged; hit records and an observer; the text form `--guard`/`--watch` and fuzz redzones use | `src/machine` (on bus fault watches and `uam_exec_request_fault_stop`) |
 | `frames.h` | Call tracking: the frame pass (`UAM_OP_FRAME` before every exit a lifter marked a call, a return or an exception return), the per-processor stack of frames it keeps, the set of return addresses, and the machine-level switch and backtrace; the return guard on top is `guard.h`'s `uam_machine_guard_returns` | `analysis/frames.c` (the pass), `src/exec/frames.c` (the state), `src/machine/frames.c` (machines, snapshots, the guard) |
+| `uninit.h` | The check for reads of memory nothing wrote (`--fuzz-uninit`, opt-in): which RAM pages the boot wrote (a bitmap per RAM region on the bus, saved in snapshots as extra state `uninit`), exclusions, and arming the bus's lazily filled pages for a second run of an input; the fuzz harness does the comparison (`uam_fuzz_result.uninit`), the guarded heap fills fresh allocations while it is armed | `src/machine/uninit.c` (on `bus.h`: `uam_bus_written_*`, `uam_bus_lazy_arm`, and `uam_bus_set_digest` for what the devices were sent) |
 | `heap.h` | The guarded heap: an allocator for an arena of guest memory that a board runs in place of the firmware's own (the board hooks the firmware's functions; ember names none), with redzones, a quarantine and byte-exact checks of every guest access to the arena; hits are guard hits | `src/machine/heap.c` (on a checked bus watch, `uam_bus_add_check`) |
 | `fuzz.h` | The persistent-mode fuzz harness (boot to a begin pc, snapshot, one restore per input, verdicts) and its frontend interface; the replay frontend | `fuzz/` (see [`fuzzing.md`](fuzzing.md)) |
 | `cov.h` | The edge-coverage pass: `UAM_OP_COV` at a table of guest pcs (or at every block start), knowing nothing about where the table came from | `analysis/cov.c` |
@@ -145,7 +146,7 @@ Implemented:
 ```
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
                   loader.h machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
-                  state.h snapshot.h pass.h cov.h cmp.h blockdev.h guard.h frames.h heap.h
+                  state.h snapshot.h pass.h cov.h cmp.h blockdev.h guard.h frames.h heap.h uninit.h
                   fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
 include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.h unimp.h
                   mmio_stub.h virtio_net.h clock.h i8259.h i8254.h mc146818.h apic.h hpet.h
@@ -161,7 +162,8 @@ src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c covera
 analysis/         cov.c (the edge-coverage pass) cmp.c (the compare pass) frames.c (the frame pass)
 src/loader/       loader.c
 src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches) frames.c (call tracking
-                  and the return guard for a machine) heap.c (the guarded heap)
+                  and the return guard for a machine) heap.c (the guarded heap) uninit.c (the
+                  written-page record and the fill for --fuzz-uninit)
 src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.c
 src/debug/        gdbstub.c
 src/runner/       runner.c trace.c trace.h (the --trace kinds, --history, the summaries)
@@ -242,6 +244,10 @@ tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmwa
                   independence with tests/firmware/irqtarget.c, ranges, symbols)
                   oracle-check.sh  (the return guard, call stacks and the guarded heap, with
                   tests/firmware/heaptarget.c)
+                  uninit-check.sh  (--fuzz-uninit on a planted read of RAM nothing writes: every
+                  backend, the pattern, exclusions, bad options, a shared boot) uninit-heap-check.sh
+                  (the same with the guarded heap's allocation fill) uninit-net-check.sh (a brain
+                  session: the UNINIT frame, uninit/ saved and replayed)
                   throughput.py throughput.ref  (executions per second against recorded
                   figures: the fuzz-throughput suite)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)

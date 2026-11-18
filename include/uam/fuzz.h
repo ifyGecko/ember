@@ -41,6 +41,7 @@
 #include "uam/dev/mmio_stub.h"
 #include "uam/guard.h"
 #include "uam/machine.h"
+#include "uam/uninit.h"
 
 typedef enum uam_fuzz_verdict {
     UAM_FUZZ_OK,            /* the iteration ended normally */
@@ -113,6 +114,38 @@ typedef struct uam_fuzz_config {
 
 #define UAM_FUZZ_DEFAULT_ITER_INSNS UINT64_C(10000000)
 
+/*
+ * Reads of memory nothing wrote (uam/uninit.h). When the machine has it on
+ * (uam_machine_uninit_enable), an iteration that ended normally and ran code the harness
+ * had not seen before (or every one, uam_fuzz_set_uninit_policy) is run a second time from
+ * the same snapshot with the pages nothing wrote filled with the pattern, and the two
+ * runs are compared: the verdict, the instruction count, the path through the coverage
+ * map and everything the devices were sent. A difference means the input made the
+ * firmware depend on a byte it never wrote. The result is in uam_fuzz_result.uninit; the
+ * harness's own state (the map, the hit lists, the last result, the statistics) is as
+ * the first run left it.
+ */
+#define UAM_FUZZ_UNINIT_VERDICT (1u << 0)   /* the filled run ended another way */
+#define UAM_FUZZ_UNINIT_DETAIL  (1u << 1)   /* ... or at another pc, status or line */
+#define UAM_FUZZ_UNINIT_INSNS   (1u << 2)   /* it ran a different number of instructions */
+#define UAM_FUZZ_UNINIT_PATH    (1u << 3)   /* it took another path through the coverage map */
+#define UAM_FUZZ_UNINIT_OUTPUT  (1u << 4)   /* the devices were sent something else */
+
+typedef struct uam_fuzz_uninit_result {
+    bool     checked;     /* the iteration was run again with memory filled */
+    bool     diverged;    /* ... and ended differently (kinds says how) */
+    bool     novel;       /* diverged, and no earlier one had this detail */
+    unsigned kinds;       /* UAM_FUZZ_UNINIT_*: what differed */
+    uint64_t detail;      /* names the finding: the pc of the first read of a page nothing
+                           * had written when there was one, else the kinds above in the top
+                           * byte and the pc the filled run ended at below */
+    uam_fuzz_verdict verdict;   /* how the filled run ended */
+    uint64_t insns;             /* ... and how long it ran */
+    const uam_uninit_touch *touch;   /* its reads of pages nothing had written, first ones */
+    size_t   n_touch;
+    uint64_t touch_total;
+} uam_fuzz_uninit_result;
+
 /* Everything known about the last iteration (or the boot). */
 typedef struct uam_fuzz_result {
     uam_fuzz_verdict verdict;
@@ -128,6 +161,8 @@ typedef struct uam_fuzz_result {
     uam_interrupt    irq;
     bool             guard_valid; /* CRASH_GUARD, or a CRASH_FAULT a FAULT guard raised: */
     uam_guard_hit    guard;       /* the hit (its name is valid while the guard exists) */
+    uam_fuzz_uninit_result uninit;   /* with uam_machine_uninit_enable: see above; the touch
+                                   * list is valid until the next iteration */
 } uam_fuzz_result;
 
 /* uam_fuzz_frontend.report kind */
@@ -248,6 +283,12 @@ const uint32_t        *uam_fuzz_map_hits(uam_fuzz *f, size_t max, size_t *n);
 const uint32_t        *uam_fuzz_map_touched(const uam_fuzz *f, size_t *n);
 /* The per-iteration instruction budget, from now on (0: the default). */
 void                   uam_fuzz_set_iter_insns(uam_fuzz *f, uint64_t insns);
+/* Which iterations the uninitialised-read check re-runs (uam_machine_uninit_enable must
+ * have been called): UAM_FUZZ_UNINIT_NEW, the default, those that ended normally and hit a
+ * bucket no earlier one hit (what a campaign keeps; a second run costs as much as the
+ * first); UAM_FUZZ_UNINIT_ALL, every one that ended normally (replay). */
+enum { UAM_FUZZ_UNINIT_NEW, UAM_FUZZ_UNINIT_ALL };
+void                   uam_fuzz_set_uninit_policy(uam_fuzz *f, unsigned policy);
 const uam_fuzz_result *uam_fuzz_last_result(const uam_fuzz *f);
 
 /*
@@ -273,6 +314,8 @@ bool       uam_fuzz_aborted(const uam_fuzz *f);
 typedef struct uam_fuzz_stats {
     uint64_t iterations;
     uint64_t by_verdict[UAM_FUZZ_CRASH_GUARD + 1];
+    uint64_t uninit_checked;     /* iterations run again with memory filled */
+    uint64_t uninit_diverged;    /* ... and found to differ */
 } uam_fuzz_stats;
 const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 
@@ -281,8 +324,9 @@ const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 /*
  * Runs each input file once - FILE, or every regular file in DIR in name order - and
  * prints one line per input to `out`. Its exit status is the most severe verdict of
- * any input: a crash (the kind of the first one), else a hang, else a timeout, else a
- * rejected input, else ok.
+ * any input: a crash (the kind of the first one), else a hang, else a timeout, else an
+ * input whose run depended on memory nothing wrote (UAM_FUZZ_EXIT_UNINIT, only with that
+ * check on), else a rejected input, else ok.
  */
 #define UAM_FUZZ_EXIT_OK           0
 #define UAM_FUZZ_EXIT_CRASH_FAULT  20
@@ -291,6 +335,7 @@ const uam_fuzz_stats *uam_fuzz_get_stats(const uam_fuzz *f);
 #define UAM_FUZZ_EXIT_TIMEOUT      23
 #define UAM_FUZZ_EXIT_REJECTED     24
 #define UAM_FUZZ_EXIT_CRASH_GUARD  25
+#define UAM_FUZZ_EXIT_UNINIT       26   /* an input's run depended on memory nothing wrote */
 int uam_fuzz_exit_status(uam_fuzz_verdict v);
 
 typedef struct uam_fuzz_replay uam_fuzz_replay;

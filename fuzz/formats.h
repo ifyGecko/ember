@@ -213,7 +213,14 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * batch like HAVOC's: FIND and PROGRESS frames while it runs, then, when it ran, one
  * STAGE_RESULT with what the stage itself found (dictionary tokens; the entry as
  * trimmed), and HAVOC_DONE with the totals. Its inputs take the ids first_id .. first_id
- * + limit (the entry's own run first). */
+ * + limit (the entry's own run first).
+ *
+ * Uninitialised reads: an ember started with --fuzz-uninit (uam/uninit.h) runs some inputs a
+ * second time with the RAM nothing wrote filled, and compares the runs. When an input's two
+ * runs differ and no earlier one differed the same way, ember sends an UNINIT frame (with
+ * the input, so that it is saved whole) right before that input's usual reply or FIND. It
+ * is opt-in on ember's command line and needs no negotiation: a brain that does not know
+ * the frame ignores it, as every peer ignores unknown frame types. */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
 #define UAM_FUZZ_NET_VERSION   1u
@@ -240,6 +247,7 @@ enum uam_fuzz_net_frame {
     UAM_NET_PROGRESS = 17,  /* ember -> brain: a batch is running (no other frame for 1 s) */
     UAM_NET_STAGE    = 18,  /* brain -> ember: run a stage on one corpus entry */
     UAM_NET_STAGE_RESULT = 19, /* ember -> brain: what the stage found, before its HAVOC_DONE */
+    UAM_NET_UNINIT   = 20,  /* ember -> brain: an input whose run depended on memory nothing wrote */
 };
 
 /* HELLO flags beyond the UAM_COV_SCHEME* bits */
@@ -305,6 +313,14 @@ enum uam_fuzz_net_frame {
  *           nothing was cut), u64 insns, u64 path (of the entry as trimmed), u32 len,
  *           u8 data[len] (the entry as trimmed: the entry itself when nothing went).
  *
+ * UNINIT:  u64 id, u32 kinds (UAM_FUZZ_UNINIT_*: what differed between the two runs), u64 detail
+ *           (the pc of the first read of a page nothing had written when there was one; else
+ *           kinds in the top byte and the pc the filled run ended at), u8 verdict (how the
+ *           filled run ended: 0 ok, 1 fault, 2 oracle, 3 hang, 4 timeout, 5 rejected,
+ *           6 guard: uam_fuzz_verdict), u64 insns (the filled run's), u16 n_touch, then
+ *           n_touch x (u64 pc, u64 paddr) (its first reads of pages nothing had written),
+ *           u32 len, u8 data[len] (the input).
+ *
  * A path is named by its set of (index, class) pairs, whatever order they were hit in:
  * mix(sum of mix((index << 8 | class) + 1)) in 64-bit arithmetic, with the coverage
  * formula's mix (docs/fuzz-formats.md). A count's class is 1, 2, 4 (counts 1, 2, 3), 8
@@ -324,6 +340,8 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_HAVOC_LEN          28u
 #define UAM_NET_FIND_HDR_LEN       49u
 #define UAM_NET_JUDGE_LEN          25u
+#define UAM_NET_UNINIT_HDR_LEN     31u   /* up to the touch list */
+#define UAM_NET_UNINIT_TOUCH_LEN   16u
 #define UAM_NET_PROGRESS_LEN       12u
 #define UAM_NET_STAGE_LEN          21u
 #define UAM_NET_STAGE_RESULT_HDR_LEN 9u

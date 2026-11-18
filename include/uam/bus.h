@@ -79,6 +79,10 @@ typedef struct uam_region {
     uint64_t           n_code_pages; /* number of code_page entries set */
     uint64_t          *dirty;        /* RAM/ROM/ROMD: bitmap of pages written since the last
                                       * uam_bus_dirty_reset (snapshots) */
+    uint64_t          *written;      /* RAM: bitmap of pages written since the machine was
+                                      * built (uam_bus_written_*; NULL until asked for) */
+    uint64_t          *lazy;         /* RAM: pages whose first access fills them (uam_bus_lazy_arm;
+                                      * NULL when none is armed) */
     bool               rom_mode;     /* ROMD: reads and fetches use the backing store */
     struct uam_region *target;       /* ALIAS: the aliased region (never an alias) */
     uint64_t           target_off;   /* ALIAS: offset of `base` within the target */
@@ -169,6 +173,11 @@ typedef struct uam_bus {
                                             * translations need not recheck their pages */
     uint32_t           gen_seq;            /* source of page generations (unique bus-wide) */
     bool               track_dirty;        /* uam_bus_page_host withholds clean pages from writers */
+    bool               digest_on;          /* fold every device write into dev_digest */
+    uint64_t           dev_digest;         /* (uam_bus_set_digest) */
+    uint8_t            lazy_pat[4];        /* uam_bus_lazy_arm: the fill, tiled from a page's start */
+    void             (*lazy_obs)(void *ctx, const struct uam_region *r, uint64_t off, bool write);
+    void              *lazy_ctx;
     uam_dev_access_fn  dev_obs;            /* uam_bus_set_dev_observer */
     void              *dev_obs_ctx;
     uam_dma_access_fn  dma_obs;            /* uam_bus_set_dma_observer */
@@ -296,6 +305,43 @@ static inline bool uam_region_page_dirty(const uam_region *r, uint64_t page_inde
 }
 /* Report a direct write to the backing store at physical [addr, addr+len). */
 void       uam_bus_mark_dirty(uam_bus *bus, uint64_t addr, uint64_t len);
+
+/*
+ * Which RAM pages have ever been written, and pages that fill themselves on first access
+ * (the fuzz harness's uninitialised-read check, uam/uninit.h).
+ *
+ * uam_bus_written_track allocates every RAM region's `written` bitmap and turns dirty
+ * tracking on without clearing it, so that every write from now on (and every one before,
+ * which the dirty bits already hold: they are only cleared by a snapshot) is seen even on
+ * an executor's fast path. uam_bus_written_merge ORs the dirty pages into `written`, and
+ * every page holding a non-zero byte (written by someone, even round the dirty tracking):
+ * call it before the first snapshot is taken. uam_bus_written_mark adds a physical range
+ * (memory the firmware is to find untouched on purpose is marked this way, to leave it
+ * alone). All three report UAM_ERR_NOMEM only.
+ *
+ * uam_bus_lazy_arm makes every RAM page not in `written` fill itself with `pat` (four
+ * bytes, tiled from the page's start) when it is first read, fetched, written, or read
+ * by DMA: the access sees the fill, and the observer, if any, is told first where the access
+ * starts (an offset in the region, within the page) and whether it writes. The fill goes through the same bookkeeping as a
+ * write, so a restore of a snapshot takes it back. Executors lose their direct access to
+ * those pages until they are filled. uam_bus_lazy_disarm withdraws the rest. A direct
+ * write to a page that is still waiting (a device that reports it with
+ * uam_bus_mark_dirty) counts as the page's own fill and cancels the wait.
+ */
+typedef void (*uam_lazy_fn)(void *ctx, const uam_region *r, uint64_t off, bool write);
+uam_status uam_bus_written_track(uam_bus *bus);
+void       uam_bus_written_merge(uam_bus *bus);
+void       uam_bus_written_mark(uam_bus *bus, uint64_t addr, uint64_t len);
+uam_status uam_bus_lazy_arm(uam_bus *bus, const uint8_t pat[4], uam_lazy_fn obs, void *ctx);
+void       uam_bus_lazy_disarm(uam_bus *bus);
+/* Fold the writes devices receive (address, size, value, in order) into bus->dev_digest:
+ * two runs that program the hardware the same way end with the same number. Restarting
+ * it (`on` again) zeroes the number. */
+static inline void uam_bus_set_digest(uam_bus *bus, bool on)
+{
+    bus->digest_on = on;
+    bus->dev_digest = 0;
+}
 /* Copy `len` bytes into r's backing store at `off` (RAM, ROM or ROMD; ROM
  * protection does not apply), dropping code translated from those pages when
  * a written 64-byte line holds code (as a guest store would). */

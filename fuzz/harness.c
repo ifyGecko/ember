@@ -111,6 +111,16 @@ struct uam_fuzz {
     bool            cmp_armed;     /* log the next iteration's compares */
     bool            cmp_valid;     /* the log is the last iteration's */
 
+    /* uninitialised reads (uam/uninit.h): the machine has it on */
+    bool            uninit;
+    unsigned        uninit_policy;
+    uint8_t        *seen;          /* bitmap of the buckets any iteration hit (the NEW policy) */
+    uint8_t        *map_save;      /* the first run's map, while the filled run uses it */
+    uint32_t       *touched_save;
+    uam_uninit_touch touch_keep[UAM_UNINIT_TOUCHES];   /* the filled run's, for the result */
+    uint64_t       *uninit_seen;   /* details reported (open addressing, 0 = empty) */
+    size_t          uninit_cap, uninit_n;
+
     uam_fuzz_result last;
     uam_fuzz_stats  stats;
 };
@@ -395,6 +405,18 @@ uam_fuzz *uam_fuzz_create(uam_machine *m, const uam_fuzz_config *cfg, char *err,
         return NULL;
     }
     f->cov.touched = &f->touched;
+    f->uninit = uam_machine_uninit_enabled(m);
+    if (f->uninit) {
+        f->seen = calloc((map_size + 7) / 8, 1);
+        f->map_save = malloc(map_size);
+        f->touched_save = malloc(sizeof(uint32_t) * f->touched.cap);
+        if (!f->seen || !f->map_save || !f->touched_save) {
+            set_err(err, errlen, "out of memory");
+            uam_fuzz_destroy(f);
+            return NULL;
+        }
+        uam_bus_set_digest(&m->bus, true);
+    }
     f->ncpus = uam_machine_ncpus(m);
     f->snap_last_pc = malloc(sizeof(uint64_t) * f->ncpus);
     if (!f->snap_last_pc) {
@@ -467,6 +489,14 @@ void uam_fuzz_destroy(uam_fuzz *f)
     free(f->hits);
     free(f->touched.idx);
     free(f->map);
+    free(f->seen);
+    free(f->map_save);
+    free(f->touched_save);
+    free(f->uninit_seen);
+    if (f->uninit) {
+        uam_machine_uninit_disarm(m);
+        uam_bus_set_digest(&m->bus, false);
+    }
     free(f);
 }
 
@@ -913,6 +943,7 @@ uam_status uam_fuzz_boot(uam_fuzz *f, uam_fuzz_result *r)
     uam_status st = f->boot_fn ? f->boot_fn(f->boot_ctx, f, m) : UAM_OK;
     if (st != UAM_OK)
         return st;
+    uam_machine_uninit_boot_done(m);   /* every page written so far is the boot's */
     st = uam_snapshot_take(m, &f->snap);
     if (st != UAM_OK) {
         uam_log(UAM_LOG_ERROR, "fuzz", "cannot snapshot the machine at the begin pc");
@@ -1010,6 +1041,200 @@ static void classify(uam_fuzz *f, uam_fuzz_result *r)
     }
 }
 
+/* ---- uninitialised reads (uam/uninit.h) -------------------------------- */
+
+typedef struct uninit_fp {
+    uam_fuzz_verdict verdict;
+    uint64_t         detail, insns, path, output;
+} uninit_fp;
+
+static uint64_t fp_mix(uint64_t h, uint64_t v)
+{
+    h ^= v + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2);
+    h *= UINT64_C(0xbf58476d1ce4e5b9);
+    return h ^ (h >> 31);
+}
+
+/* What the run did that the comparison looks at. The path is the buckets it set, in the
+ * order it set them, with their counts. */
+static uninit_fp fingerprint(const uam_fuzz *f, const uam_fuzz_result *r)
+{
+    uninit_fp fp = { r->verdict, r->detail, r->insns, 0, f->m->bus.dev_digest };
+    uint64_t h = UINT64_C(0x1337c0d3);
+    if (!f->touched.overflow) {
+        for (uint32_t i = 0; i < f->touched.n; i++)
+            h = fp_mix(h, (uint64_t)f->touched.idx[i] << 8 | f->map[f->touched.idx[i]]);
+    } else {
+        for (size_t w = 0; w + 8 <= f->cfg.map_size; w += 8) {
+            uint64_t v;
+            memcpy(&v, f->map + w, 8);
+            if (v)
+                h = fp_mix(fp_mix(h, w), v);
+        }
+    }
+    fp.path = h;
+    return fp;
+}
+
+/* Does this iteration's map hold a bucket no earlier iteration set? (And remember them.) */
+static bool note_buckets(uam_fuzz *f)
+{
+    bool fresh = false;
+    if (!f->touched.overflow) {
+        for (uint32_t i = 0; i < f->touched.n; i++) {
+            const uint32_t b = f->touched.idx[i];
+            if (!(f->seen[b >> 3] & (1u << (b & 7)))) {
+                f->seen[b >> 3] |= (uint8_t)(1u << (b & 7));
+                fresh = true;
+            }
+        }
+        return fresh;
+    }
+    for (size_t b = 0; b < f->cfg.map_size; b++)
+        if (f->map[b] && !(f->seen[b >> 3] & (1u << (b & 7)))) {
+            f->seen[b >> 3] |= (uint8_t)(1u << (b & 7));
+            fresh = true;
+        }
+    return fresh;
+}
+
+/* Has this detail been reported before? Records it. */
+static bool detail_is_new(uam_fuzz *f, uint64_t detail)
+{
+    if (!detail)
+        detail = 1;
+    if (f->uninit_n * 2 >= f->uninit_cap) {
+        const size_t cap = f->uninit_cap ? f->uninit_cap * 2 : 1024;
+        if (cap > (1u << 16))
+            return true;   /* too many to keep: report each */
+        uint64_t *t = calloc(cap, sizeof(*t));
+        if (!t)
+            return true;
+        for (size_t i = 0; i < f->uninit_cap; i++)
+            if (f->uninit_seen[i]) {
+                size_t k = (size_t)(f->uninit_seen[i] * UINT64_C(0x9e3779b97f4a7c15)) & (cap - 1);
+                while (t[k])
+                    k = (k + 1) & (cap - 1);
+                t[k] = f->uninit_seen[i];
+            }
+        free(f->uninit_seen);
+        f->uninit_seen = t;
+        f->uninit_cap = cap;
+    }
+    size_t k = (size_t)(detail * UINT64_C(0x9e3779b97f4a7c15)) & (f->uninit_cap - 1);
+    while (f->uninit_seen[k]) {
+        if (f->uninit_seen[k] == detail)
+            return false;
+        k = (k + 1) & (f->uninit_cap - 1);
+    }
+    f->uninit_seen[k] = detail;
+    f->uninit_n++;
+    return true;
+}
+
+/*
+ * Run the iteration that just ended again, from the same snapshot, with the pages nothing
+ * wrote filled, and compare. `r` is the first run's result and gets .uninit; everything
+ * else the first run left in the harness (the map, the bucket record, the hit lists) is
+ * put back.
+ */
+static void uninit_check(uam_fuzz *f, const uint8_t *data, size_t len, uam_fuzz_result *r)
+{
+    uam_machine *m = f->m;
+    const uninit_fp base = fingerprint(f, r);
+    const bool fresh = note_buckets(f);
+    if (f->uninit_policy != UAM_FUZZ_UNINIT_ALL && !fresh)
+        return;
+    if (f->aborted)
+        return;
+
+    memcpy(f->map_save, f->map, f->cfg.map_size);
+    const uint32_t save_n = f->touched.n;
+    const bool save_over = f->touched.overflow;
+    if (!save_over)
+        memcpy(f->touched_save, f->touched.idx, sizeof(uint32_t) * save_n);
+    const bool save_hits_valid = f->hits_valid;
+
+    uam_fuzz_result r2;
+    memset(&r2, 0, sizeof(r2));
+    bool ran = false;
+    uam_machine_uninit_disarm(m);
+    if (uam_snapshot_restore(m, f->snap) == UAM_OK && uam_machine_uninit_arm(m) == UAM_OK) {
+        clear_map(f);
+        uam_cov_reset_prev(&f->cov);
+        f->cov.last_pc = f->snap_last_pc[0];
+        for (unsigned i = 1; i < f->ncpus; i++) {
+            uam_cov_state *cs = uam_machine_cov_state(m, i);
+            if (cs) {
+                uam_cov_reset_prev(cs);
+                cs->last_pc = f->snap_last_pc[i];
+            }
+        }
+        clear_flags(f);
+        uam_bus_set_digest(&m->bus, true);
+        if (f->deliver(f->deliver_ctx, m, data, len) == UAM_OK) {
+            const uint64_t ic0 = uam_machine_icount(m);
+            f->hit_cpu = &m->cpu;
+            f->guard_hits0 = uam_machine_guard_hits(m);
+            f->ph = PH_ITER;
+            r2.stop = uam_exec_run(&m->exec, f->cfg.iter_insns);
+            f->ph = PH_IDLE;
+            if (r2.stop == UAM_STOP_GUARD && uam_machine_guard_last_hit(m))
+                f->hit_cpu = uam_machine_cpu(m, uam_machine_guard_last_hit(m)->cpu);
+            r2.pc = f->hit_cpu->pc;
+            r2.insns = uam_machine_icount(m) - ic0;
+            ran = !f->aborted && r2.stop != UAM_STOP_ERROR;
+            if (ran)
+                classify(f, &r2);
+        }
+    }
+    uninit_fp fp2 = { 0 };
+    if (ran)
+        fp2 = fingerprint(f, &r2);
+    size_t n_touch = 0;
+    uint64_t total = 0;
+    const uam_uninit_touch *t = uam_machine_uninit_touches(m, &n_touch, &total);
+    if (t)
+        memcpy(f->touch_keep, t, sizeof(uam_uninit_touch) * n_touch);
+    uam_machine_uninit_disarm(m);
+
+    /* put back what the first run left */
+    memcpy(f->map, f->map_save, f->cfg.map_size);
+    f->touched.n = save_n;
+    f->touched.overflow = save_over;
+    if (!save_over)
+        memcpy(f->touched.idx, f->touched_save, sizeof(uint32_t) * save_n);
+    f->hits_valid = save_hits_valid;
+
+    uam_fuzz_uninit_result *u = &r->uninit;
+    memset(u, 0, sizeof(*u));
+    u->checked = ran;
+    if (!ran)
+        return;
+    f->stats.uninit_checked++;
+    u->verdict = r2.verdict;
+    u->insns = r2.insns;
+    u->touch = f->touch_keep;
+    u->n_touch = n_touch;
+    u->touch_total = total;
+    if (fp2.verdict != base.verdict)
+        u->kinds |= UAM_FUZZ_UNINIT_VERDICT;
+    if (fp2.detail != base.detail)
+        u->kinds |= UAM_FUZZ_UNINIT_DETAIL;
+    if (fp2.insns != base.insns)
+        u->kinds |= UAM_FUZZ_UNINIT_INSNS;
+    if (fp2.path != base.path)
+        u->kinds |= UAM_FUZZ_UNINIT_PATH;
+    if (fp2.output != base.output)
+        u->kinds |= UAM_FUZZ_UNINIT_OUTPUT;
+    if (!u->kinds)
+        return;
+    f->stats.uninit_diverged++;
+    u->diverged = true;
+    u->detail = n_touch ? t[0].pc : (uint64_t)u->kinds << 56 | (r2.pc & UINT64_C(0x00ffffffffffffff));
+    u->novel = detail_is_new(f, u->detail);
+}
+
 uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fuzz_result *r)
 {
     uam_machine *m = f->m;
@@ -1020,11 +1245,14 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
         uam_log(UAM_LOG_ERROR, "fuzz", "no input route selected");
         return UAM_ERR_INVALID;
     }
+    uam_machine_uninit_disarm(m);
     uam_status st = uam_snapshot_restore(m, f->snap);
     if (st != UAM_OK) {
         uam_log(UAM_LOG_ERROR, "fuzz", "restoring the begin snapshot failed");
         return st;
     }
+    if (f->uninit)
+        uam_bus_set_digest(&m->bus, true);   /* what the devices are sent, from here on */
     clear_map(f);
     uam_cov_reset_prev(&f->cov);
     f->cov.last_pc = f->snap_last_pc[0];
@@ -1091,6 +1319,8 @@ uam_status uam_fuzz_run_one(uam_fuzz *f, const uint8_t *data, size_t len, uam_fu
     classify(f, r);
     f->stats.iterations++;
     f->stats.by_verdict[r->verdict]++;
+    if (f->uninit && r->verdict == UAM_FUZZ_OK)
+        uninit_check(f, data, len, r);
     f->last = *r;
     return UAM_OK;
 }
@@ -1259,6 +1489,11 @@ const uint32_t *uam_fuzz_map_touched(const uam_fuzz *f, size_t *n)
         return NULL;
     *n = f->touched.n;
     return f->touched.idx;
+}
+
+void uam_fuzz_set_uninit_policy(uam_fuzz *f, unsigned policy)
+{
+    f->uninit_policy = policy == UAM_FUZZ_UNINIT_ALL ? UAM_FUZZ_UNINIT_ALL : UAM_FUZZ_UNINIT_NEW;
 }
 
 void uam_fuzz_set_iter_insns(uam_fuzz *f, uint64_t insns)

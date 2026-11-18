@@ -145,12 +145,13 @@ covs = []
 # [name, board, images (ELF, raw), environment, targets to build that are not among the images] (fuzz-check.sh)
 fuzzes = []
 # [name, board, image]: the fuzz target for the fuzz-lists checks named
-lists = {'formats': [], 'gen': [], 'brain': [], 'fuzz-net': [], 'parallel': []}
+lists = {'formats': [], 'gen': [], 'brain': [], 'fuzz-net': [], 'parallel': [], 'uninit-net': []}
 both = ['interp', 'jit']
 raw0 = ['--raw-base', '0', '--entry', '0']
 snapshot_check = files('snapshot/snapshot-check.sh')
 cov_check = files('cov/cov-check.sh')
 fuzz_check = files('fuzz/fuzz-check.sh')
+uninit_check = files('fuzz/uninit-check.sh')
 no_traps = {'FUZZ_CHECK_NO_TRAPS': '1'}
 
 if have_rv
@@ -179,12 +180,19 @@ if have_rv
   ]
   covs += [['rv32-selftest', 'rv32-ref', rv['selftest'], []]]
   fuzzes += [['rv32', 'rv32-ref', [rv['fuzztarget']], {}, []]]
-  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'parallel']
+  # --fuzz-uninit on the planted read of RAM nothing writes (uninit-check.sh): the last
+  # argument is the physical address the target reads.
+  test('uninit-rv32', sh, args: [uninit_check, uam_run, 'rv32-ref', rv['fuzztarget'], '0x80100000'],
+    suite: 'fuzz', kwargs: std)
+  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'parallel', 'uninit-net']
     lists += {k: lists[k] + [['rv32', 'rv32-ref', rv['fuzztarget']]]}
   endforeach
 
   # The memory oracles: the guarded heap and the return guard on planted bugs.
   test('oracles', sh, args: [files('fuzz/oracle-check.sh'), uam_test_run, rv['heaptarget']],
+    suite: 'fuzz', kwargs: std)
+  # --fuzz-uninit with the guarded heap: fresh allocations are filled in the filled run.
+  test('uninit-heap', sh, args: [files('fuzz/uninit-heap-check.sh'), uam_test_run, rv['heaptarget']],
     suite: 'fuzz', kwargs: std)
 
   # Fuzz throughput: what one execution costs (a HAVOC batch, the input-to-state and trim
@@ -227,6 +235,10 @@ if have_mips
     ['mips', 'mips-ref', [fw_mips['fuzztarget-be'], fw_mips['fuzztarget-be.bin']], {}, []],
     ['mipsel', 'mipsel-ref', [fw_mips['fuzztarget-el']], {}, []],
   ]
+  test('uninit-mips', sh, args: [uninit_check, uam_run, 'mips-ref', fw_mips['fuzztarget-be'], '0x800000'],
+    suite: 'fuzz', kwargs: std)
+  test('uninit-mipsel', sh, args: [uninit_check, uam_run, 'mipsel-ref', fw_mips['fuzztarget-el'], '0x800000'],
+    suite: 'fuzz', kwargs: std)
   foreach k : ['formats', 'gen', 'brain', 'fuzz-net']
     lists += {k: lists[k] + [['mips', 'mips-ref', fw_mips['fuzztarget-be']]]}
   endforeach
@@ -260,6 +272,10 @@ if have_arm
     ['arm', 'arm-ref', [fw_arm['fuzztarget'], fw_arm['fuzztarget.bin']], {}, []],
     ['armeb', 'armeb-ref', [fw_arm['fuzztarget-be'], fw_arm['fuzztarget-be.bin']], {}, []],
   ]
+  test('uninit-arm', sh, args: [uninit_check, uam_run, 'arm-ref', fw_arm['fuzztarget'], '0x800000'],
+    suite: 'fuzz', kwargs: std)
+  test('uninit-armeb', sh, args: [uninit_check, uam_run, 'armeb-ref', fw_arm['fuzztarget-be'], '0x800000'],
+    suite: 'fuzz', kwargs: std)
   foreach k : ['formats', 'gen', 'brain', 'fuzz-net']
     lists += {k: lists[k] + [['arm', 'arm-ref', fw_arm['fuzztarget']]]}
   endforeach
@@ -332,6 +348,8 @@ if have_ppc
     ['ppc-selftest-booke', 'ppc-ref', fw_ppc['selftest-booke'], ['--'] + booke],
   ]
   fuzzes += [['ppc', 'ppc-ref', [fw_ppc['fuzztarget'], fw_ppc['fuzztarget.bin']], {}, []]]
+  test('uninit-ppc', sh, args: [uninit_check, uam_run, 'ppc-ref', fw_ppc['fuzztarget'], '0x800000'],
+    suite: 'fuzz', kwargs: std)
   foreach k : ['formats', 'gen', 'brain', 'fuzz-net']
     lists += {k: lists[k] + [['ppc', 'ppc-ref', fw_ppc['fuzztarget']]]}
   endforeach

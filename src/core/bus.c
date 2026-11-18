@@ -30,11 +30,19 @@ void uam_bus_fini(uam_bus *bus)
         free(r->code_page);
         free(r->code_lines);
         free(r->dirty);
+        free(r->written);
+        free(r->lazy);
         free(r);
     }
     free(bus->regions);
     free(bus->watches);
     memset(bus, 0, sizeof(*bus));
+}
+
+/* Is page p of r waiting for its first access to fill it? (r->lazy is set.) */
+static inline bool lazy_page(const uam_region *r, uint64_t p)
+{
+    return (r->lazy[p >> 6] >> (p & 63)) & 1;
 }
 
 static void tlb_flush(uam_bus *bus)
@@ -394,6 +402,11 @@ static res_kind resolve(uam_bus *bus, uint64_t addr, unsigned size, hit *h)
     h->off = addr - origin;
     h->watched = bus->n_watches && watched(bus, addr, size);
 
+    /* A page that still has to fill itself is never cached: its first access must come
+     * through here, where the caller fills it. */
+    if (r->lazy && lazy_page(r, h->off >> UAM_PAGE_SHIFT))
+        return RES_ONE;
+
     /* Cache the page only if this region owns all of it and no watch is there. */
     if (page >= w->base && page + UAM_PAGE_SIZE - 1 <= w->base + w->size - 1
         && !shadowed(bus, idx, page, UAM_PAGE_SIZE)
@@ -591,8 +604,34 @@ static void note_code_change(uam_bus *bus, uam_region *r, uint64_t off)
 /* Mark the pages of r's backing store in [off, off+len) dirty (len > 0). */
 static void mark_dirty(uam_region *r, uint64_t off, uint64_t len)
 {
-    for (uint64_t p = off >> UAM_PAGE_SHIFT; p <= (off + len - 1) >> UAM_PAGE_SHIFT; p++)
+    for (uint64_t p = off >> UAM_PAGE_SHIFT; p <= (off + len - 1) >> UAM_PAGE_SHIFT; p++) {
         r->dirty[p >> 6] |= UINT64_C(1) << (p & 63);
+        if (r->lazy)
+            r->lazy[p >> 6] &= ~(UINT64_C(1) << (p & 63));   /* written: nothing left to fill */
+    }
+}
+
+/* Fill a waiting page, telling the observer first (`acc`: the offset of the access). */
+static void lazy_fill(uam_bus *bus, uam_region *r, uint64_t p, uint64_t acc, bool write)
+{
+    const uint64_t off = p << UAM_PAGE_SHIFT;
+    const uint64_t n = r->size - off < UAM_PAGE_SIZE ? r->size - off : UAM_PAGE_SIZE;
+    if (bus->lazy_obs)
+        bus->lazy_obs(bus->lazy_ctx, r, acc, write);
+    for (uint64_t i = 0; i < n; i++)
+        r->host[off + i] = bus->lazy_pat[i & 3];
+    note_write(bus, r, off, n);
+    mark_dirty(r, off, n);   /* the restore takes it back; the wait is over */
+}
+
+/* An access to [off, off+len) of r: fill the pages of it that are still waiting. */
+static inline void lazy_touch(uam_bus *bus, uam_region *r, uint64_t off, uint64_t len, bool write)
+{
+    if (!r->lazy || !len)
+        return;
+    for (uint64_t p = off >> UAM_PAGE_SHIFT; p <= (off + len - 1) >> UAM_PAGE_SHIFT; p++)
+        if (lazy_page(r, p))
+            lazy_fill(bus, r, p, off > (p << UAM_PAGE_SHIFT) ? off : p << UAM_PAGE_SHIFT, write);
 }
 
 static uam_status read_bytewise(uam_bus *bus, uint64_t addr, unsigned size, unsigned attrs,
@@ -662,6 +701,7 @@ uam_status uam_bus_read(uam_bus *bus, uint64_t addr, unsigned size, unsigned att
             __attribute__((fallthrough));
         case UAM_REGION_RAM:
         case UAM_REGION_ROM:
+            lazy_touch(bus, h.r, h.off, size, false);
             *val = bytes_to_val(h.r->host + h.off, size, be);
             st = UAM_OK;
             break;
@@ -700,6 +740,19 @@ static uam_status write_bytewise(uam_bus *bus, uint64_t addr, unsigned size, uns
     return UAM_OK;
 }
 
+/* What the machine has sent its devices, for the uninitialised-read check (bus.h): every
+ * device write folded in order, so two runs that program the hardware alike agree. */
+static inline void digest_dev_write(uam_bus *bus, uint64_t addr, unsigned size, uint64_t val)
+{
+    if (!bus->digest_on)
+        return;
+    uint64_t d = bus->dev_digest ^ addr;
+    d = (d ^ (d >> 29)) * UINT64_C(0xbf58476d1ce4e5b9);
+    d ^= size + (val << 4);
+    d = (d ^ (d >> 32)) * UINT64_C(0x94d049bb133111eb);
+    bus->dev_digest = d ^ (d >> 29);
+}
+
 uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned attrs, uint64_t val)
 {
     if (!valid_size(size))
@@ -722,6 +775,7 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
         if (!bus->unmapped || debug)
             return UAM_ERR_FAULT;
         st = dev_write(NULL, bus->unmapped, addr, size, be, val);
+        digest_dev_write(bus, addr, size, val);
         if (bus->dev_obs)
             bus->dev_obs(bus->dev_obs_ctx, NULL, addr, size, true, val, st);
         break;
@@ -733,6 +787,7 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
         case UAM_REGION_ROMD:
             if (!debug) {
                 st = dev_write(h.r, h.r->dev, h.off, size, be, val);
+                digest_dev_write(bus, addr, size, val);
                 if (bus->dev_obs)
                     bus->dev_obs(bus->dev_obs_ctx, h.r, addr, size, true, val, st);
                 break;
@@ -740,6 +795,7 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
             /* a debugger pokes the backing store */
             __attribute__((fallthrough));
         case UAM_REGION_RAM:
+            lazy_touch(bus, h.r, h.off, size, true);
             val_to_bytes(h.r->host + h.off, size, be, val);
             mark_dirty(h.r, h.off, size);
             if (h.r->n_code_pages)
@@ -750,6 +806,7 @@ uam_status uam_bus_write(uam_bus *bus, uint64_t addr, unsigned size, unsigned at
             if (debug)
                 return UAM_ERR_FAULT;
             st = dev_write(h.r, h.r->dev, h.off, size, be, val);
+                digest_dev_write(bus, addr, size, val);
             if (bus->dev_obs)
                 bus->dev_obs(bus->dev_obs_ctx, h.r, addr, size, true, val, st);
             break;
@@ -778,6 +835,7 @@ uam_status uam_bus_load_bytes(uam_bus *bus, uint64_t addr, const void *data, siz
         if (room > h.r->size - h.off)
             room = h.r->size - h.off;
         size_t n = (size_t)room < len ? (size_t)room : len;
+        lazy_touch(bus, h.r, h.off, n, true);
         memcpy(h.r->host + h.off, src, n);
         note_write(bus, h.r, h.off, n);
         mark_dirty(h.r, h.off, n);
@@ -818,6 +876,7 @@ static uam_status dma_read(uam_bus *bus, uint64_t addr, uint8_t *dst, size_t len
             return st;
         if (!*first)
             *first = h.r;
+        lazy_touch(bus, h.r, h.off, n, false);
         memcpy(dst, h.r->host + h.off, n);
         addr += n;
         dst += n;
@@ -837,6 +896,7 @@ static uam_status dma_write(uam_bus *bus, uint64_t addr, const uint8_t *src, siz
             return st;
         if (!*first)
             *first = h.r;
+        lazy_touch(bus, h.r, h.off, n, true);
         memcpy(h.r->host + h.off, src, n);
         note_write(bus, h.r, h.off, n);
         mark_dirty(h.r, h.off, n);
@@ -955,6 +1015,114 @@ void uam_bus_dirty_reset(uam_bus *bus)
     bus->write_gen++;    /* clean pages must lose their direct write access; reads keep theirs */
 }
 
+/* ---- written pages and lazily filled pages ----------------------------- */
+
+static uint64_t bitmap_words(const uam_region *r)
+{
+    return (((r->size + UAM_PAGE_SIZE - 1) >> UAM_PAGE_SHIFT) + 63) >> 6;
+}
+
+static bool is_ram(const uam_region *r)
+{
+    return r->kind == UAM_REGION_RAM && r->host;
+}
+
+uam_status uam_bus_written_track(uam_bus *bus)
+{
+    for (uint32_t i = 0; i < bus->n_regions; i++) {
+        uam_region *r = bus->regions[i];
+        if (!is_ram(r) || r->written)
+            continue;
+        r->written = calloc(bitmap_words(r), sizeof(uint64_t));
+        if (!r->written)
+            return UAM_ERR_NOMEM;
+    }
+    if (!bus->track_dirty) {
+        bus->track_dirty = true;
+        bus->write_gen++;    /* a clean page must now be reported by its first write */
+    }
+    return UAM_OK;
+}
+
+void uam_bus_written_merge(uam_bus *bus)
+{
+    for (uint32_t i = 0; i < bus->n_regions; i++) {
+        uam_region *r = bus->regions[i];
+        if (!r->written)
+            continue;
+        for (uint64_t w = 0; w < bitmap_words(r); w++)
+            r->written[w] |= r->dirty[w];
+        /* A page whose bytes are not all zero was written by someone, even if it went
+         * round the dirty tracking (a board that copies an image into the backing store). */
+        const uint64_t pages = (r->size + UAM_PAGE_SIZE - 1) >> UAM_PAGE_SHIFT;
+        for (uint64_t p = 0; p < pages; p++) {
+            if ((r->written[p >> 6] >> (p & 63)) & 1)
+                continue;
+            const uint64_t off = p << UAM_PAGE_SHIFT;
+            const uint64_t n = r->size - off < UAM_PAGE_SIZE ? r->size - off : UAM_PAGE_SIZE;
+            const uint8_t *q = r->host + off;
+            for (uint64_t k = 0; k < n; k += 8) {
+                uint64_t v;
+                memcpy(&v, q + k, n - k < 8 ? n - k : 8);
+                if (v) {
+                    r->written[p >> 6] |= UINT64_C(1) << (p & 63);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void uam_bus_written_mark(uam_bus *bus, uint64_t addr, uint64_t len)
+{
+    for (uint32_t i = 0; i < bus->n_regions && len; i++) {
+        uam_region *r = bus->regions[i];
+        if (!r->written || addr + len <= r->base || addr >= r->base + r->size)
+            continue;
+        const uint64_t lo = addr > r->base ? addr - r->base : 0;
+        const uint64_t hi = addr + len < r->base + r->size ? addr + len - r->base : r->size;
+        for (uint64_t p = lo >> UAM_PAGE_SHIFT; p <= (hi - 1) >> UAM_PAGE_SHIFT; p++)
+            r->written[p >> 6] |= UINT64_C(1) << (p & 63);
+    }
+}
+
+uam_status uam_bus_lazy_arm(uam_bus *bus, const uint8_t pat[4], uam_lazy_fn obs, void *ctx)
+{
+    for (uint32_t i = 0; i < bus->n_regions; i++) {
+        uam_region *r = bus->regions[i];
+        if (!is_ram(r) || !r->written)
+            continue;
+        if (!r->lazy) {
+            r->lazy = calloc(bitmap_words(r), sizeof(uint64_t));
+            if (!r->lazy)
+                return UAM_ERR_NOMEM;
+        }
+        const uint64_t pages = (r->size + UAM_PAGE_SIZE - 1) >> UAM_PAGE_SHIFT;
+        for (uint64_t w = 0; w < bitmap_words(r); w++) {
+            uint64_t bits = ~r->written[w];
+            if ((w + 1) * 64 > pages)   /* the tail of the last word is no page */
+                bits &= pages > w * 64 ? (UINT64_C(1) << (pages - w * 64)) - 1 : 0;
+            r->lazy[w] = bits;
+        }
+    }
+    memcpy(bus->lazy_pat, pat, 4);
+    bus->lazy_obs = obs;
+    bus->lazy_ctx = ctx;
+    tlb_flush(bus);   /* nothing cached may let an access to a waiting page by */
+    return UAM_OK;
+}
+
+void uam_bus_lazy_disarm(uam_bus *bus)
+{
+    for (uint32_t i = 0; i < bus->n_regions; i++) {
+        free(bus->regions[i]->lazy);
+        bus->regions[i]->lazy = NULL;
+    }
+    bus->lazy_obs = NULL;
+    bus->lazy_ctx = NULL;
+    tlb_flush(bus);
+}
+
 void uam_bus_mark_dirty(uam_bus *bus, uint64_t addr, uint64_t len)
 {
     while (len) {
@@ -976,6 +1144,7 @@ void uam_bus_region_store(uam_bus *bus, uam_region *r, uint64_t off, const void 
         return;
     if (len > r->size - off)
         len = r->size - off;
+    lazy_touch(bus, r, off, len, true);
     memcpy(r->host + off, src, len);
     drop_code_pages(bus, r, off, len);
     mark_dirty(r, off, len);
@@ -1026,6 +1195,8 @@ static uint8_t *page_host(uam_bus *bus, uint64_t paddr, bool write, const uint64
     }
     switch (r->kind) {
     case UAM_REGION_RAM:
+        if (r->lazy && lazy_page(r, off >> UAM_PAGE_SHIFT))
+            return NULL;   /* the first access fills it, on the slow path */
         if (!write)
             break;
         if (bus->track_dirty && !uam_region_page_dirty(r, off >> UAM_PAGE_SHIFT))

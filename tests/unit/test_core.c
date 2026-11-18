@@ -202,6 +202,90 @@ static void test_device_endian(void)
 /* #6 overlapping regions and priority                                       */
 /* ------------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------------ */
+/* Written pages and lazily filled pages (the uninitialised-read check)      */
+/* ------------------------------------------------------------------------ */
+
+typedef struct lazy_log { unsigned n; uint64_t off[8]; bool write[8]; } lazy_log;
+
+static void lazy_note(void *ctx, const uam_region *r, uint64_t off, bool write)
+{
+    lazy_log *l = ctx;
+    (void)r;
+    if (l->n < 8) {
+        l->off[l->n] = off;
+        l->write[l->n] = write;
+    }
+    l->n++;
+}
+
+static void test_lazy_pages(void)
+{
+    uam_bus bus;
+    uam_bus_init(&bus);
+    const unsigned L = UAM_ACC_LE;
+    const uint64_t base = 0x40000;
+    CHECK(uam_bus_map_ram(&bus, "ram", base, 8 * UAM_PAGE_SIZE) == UAM_OK, "map ram");
+    /* page 1 is written before tracking starts (a loader), page 2 afterwards, with a store
+     * of zero (a bss clear: zero or not, a write); page 3 holds a byte nobody reported */
+    wr(&bus, base + UAM_PAGE_SIZE + 8, 4, L, 0x11223344);
+    CHECK(uam_bus_written_track(&bus) == UAM_OK, "track written pages");
+    wr(&bus, base + 2 * UAM_PAGE_SIZE + 16, 4, L, 0);
+    uint8_t *raw = (uint8_t *)uam_bus_find(&bus, base)->host;
+    raw[3 * UAM_PAGE_SIZE + 100] = 0x5a;
+    uam_bus_written_merge(&bus);
+    uam_bus_written_mark(&bus, base + 5 * UAM_PAGE_SIZE + 123, 1);   /* an excluded byte: its page */
+
+    static const uint8_t pat[4] = { 0xd3, 0xc0, 0x37, 0x13 };   /* 0x1337c0d3, little-endian */
+    lazy_log lg = { 0 };
+    CHECK(uam_bus_lazy_arm(&bus, pat, lazy_note, &lg) == UAM_OK, "arm");
+
+    EQ64(rd(&bus, base + UAM_PAGE_SIZE + 8, 4, L), 0x11223344, "a written page is left alone");
+    EQ64(rd(&bus, base + 2 * UAM_PAGE_SIZE + 16, 4, L), 0, "a page written with zeros too");
+    EQ64(rd(&bus, base + 3 * UAM_PAGE_SIZE + 100, 1, L), 0x5a, "a page with a byte in it counts as written");
+    EQ64(rd(&bus, base + 5 * UAM_PAGE_SIZE, 4, L), 0, "an excluded page");
+    CHECK(lg.n == 0, "no observer call for written pages");
+
+    EQ64(rd(&bus, base + 4 * UAM_PAGE_SIZE + 12, 4, L), 0x1337c0d3, "an unwritten page reads as the pattern");
+    CHECK(lg.n == 1 && !lg.write[0] && lg.off[0] == 4 * UAM_PAGE_SIZE + 12,
+          "the observer is told of the first read: %u calls", lg.n);
+    EQ64(rd(&bus, base + 4 * UAM_PAGE_SIZE + 12, 4, L), 0x1337c0d3, "the same read again");
+    CHECK(lg.n == 1, "a filled page is not reported again");
+    EQ64(rd(&bus, base + 4 * UAM_PAGE_SIZE + 4093, 1, L), 0xc0, "the pattern is tiled from the page's start");
+    EQ64(rd(&bus, base + 4 * UAM_PAGE_SIZE + 4095, 1, L), 0x13, "... to its last byte");
+
+    /* a write is the page's first access: the rest of the page is the pattern */
+    wr(&bus, base + 6 * UAM_PAGE_SIZE + 40, 4, L, 0xabcdef01);
+    CHECK(lg.n == 2 && lg.write[1], "the observer is told of the first write");
+    EQ64(rd(&bus, base + 6 * UAM_PAGE_SIZE + 40, 4, L), 0xabcdef01, "what was written stays");
+    EQ64(rd(&bus, base + 6 * UAM_PAGE_SIZE + 44, 4, L), 0x1337c0d3, "the rest of that page is the pattern");
+    CHECK(lg.n == 2, "that read is of a page already filled");
+
+    /* DMA reads fill too, and the direct page answer is withheld until then */
+    CHECK(uam_bus_page_host(&bus, base + 7 * UAM_PAGE_SIZE, false) == NULL,
+          "no direct access to a page that is waiting");
+    uint8_t buf[4];
+    CHECK(uam_bus_dma_read(&bus, base + 7 * UAM_PAGE_SIZE, buf, 4) == UAM_OK, "dma read");
+    CHECK(buf[0] == 0xd3 && buf[3] == 0x13, "a DMA read sees the fill");
+    CHECK(uam_bus_page_host(&bus, base + 7 * UAM_PAGE_SIZE, false) != NULL,
+          "direct access once it is filled");
+
+    uam_bus_lazy_disarm(&bus);
+    EQ64(rd(&bus, base + 4 * UAM_PAGE_SIZE + 12, 4, L), 0x1337c0d3, "a filled page stays filled after disarm");
+
+    /* armed again: a page nothing wrote is waiting again, and a direct writer that reports
+     * itself (a device) cancels the wait rather than being overwritten by it */
+    lg.n = 0;
+    uam_bus_dirty_reset(&bus);
+    CHECK(uam_bus_lazy_arm(&bus, pat, lazy_note, &lg) == UAM_OK, "arm again");
+    raw[0] = 0x77;
+    uam_bus_mark_dirty(&bus, base, 1);
+    EQ64(rd(&bus, base, 1, L), 0x77, "a reported direct write is not overwritten by the fill");
+    CHECK(lg.n == 0, "... and no fill happened");
+    uam_bus_lazy_disarm(&bus);
+    uam_bus_fini(&bus);
+}
+
 static void test_priority(void)
 {
     uam_bus bus;
@@ -2140,6 +2224,7 @@ int main(void)
 {
     test_device_endian();
     test_priority();
+    test_lazy_pages();
     test_romd_alias();
     test_watch();
     test_guard_parse();

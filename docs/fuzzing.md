@@ -453,6 +453,97 @@ Both oracles report through the guard machinery (`uam_guard_hit.kind`,
 `uam_machine_guard_last_hit`, the guard observer), so the harness, the fuzz protocol and the
 brain treat their hits like any guard crash: reason "guard", status the pc.
 
+### Reads of memory nothing wrote (`--fuzz-uninit`)
+
+**Off unless asked for, and read this first.** A firmware that reads a RAM byte nobody has
+written gets zero here and, on hardware, whatever the RAM powered up with, so the bug hides in
+plain sight. `--fuzz-uninit` finds it by comparing two runs of one input: the ordinary one, and
+one from the same snapshot in which the RAM pages that nothing wrote are filled with a pattern.
+Anything that differs depends on a byte the firmware never wrote. It is a *differential* check,
+not a shadow memory: that makes it cheap and quiet about benign reads (a padding byte that is
+copied, a bitfield update, a word-wide `strlen` reading past a string's end change nothing), and
+it also means it is blind to some things. The list of what it misses is below; a result of "no
+differences" is not "no uninitialised reads".
+
+```
+uam-run ... --fuzz-begin PC --fuzz-input ROUTE --fuzz-uninit[=PATTERN] [--fuzz-uninit-exclude R]...
+```
+
+- **The pattern** is a 32-bit value, `0x1337c0d3` by default (`--fuzz-uninit=0x...` for another),
+  laid down in the guest's data byte order from the start of each page, so an aligned word of it
+  reads back as that number on any ISA. A pattern of 0 finds nothing (it is what the boot left).
+- **What is filled.** The boot runs on ordinary zeroed RAM, so a firmware that relies on zeros
+  during its own start-up is undisturbed. At the begin snapshot the machine knows which RAM
+  pages were written during the boot (the loader's and DMA's writes count, a store of zero
+  counts, and so does any page that holds a non-zero byte). Every other page of RAM is *unwritten*,
+  and in the filled run it fills itself with the pattern the first time anything touches it, so
+  RAM the run never reaches costs nothing, and the restore at the next input puts the zeros back.
+  A page whose first access is a write is filled first: the rest of it is the pattern.
+- **Which inputs are re-run.** Only an input that ended normally. In a campaign, one that hit a
+  coverage bucket no earlier input hit (a second run costs as much as the first, so this is the
+  inputs a campaign keeps, not all of them); under `--fuzz-replay`, every one. The first run's
+  results are what the campaign, the replay and the brain see: the map, the hit lists, the
+  statistics and the last result are put back after the second run.
+- **What is compared.** The verdict and its detail, the instruction count, the path through the
+  coverage map (the buckets in the order they were first set, with their counts), and everything
+  the devices were sent (every device write, address, size and value, in order: console bytes,
+  register programming, DMA addresses). Because execution is deterministic, any difference is
+  caused by the fill, with no flakiness to filter. Output the firmware builds from memory it
+  never wrote shows up in the last item, so an information leak into a response is found too.
+- **The report.** Replay prints a second line for the input, and exits 26 (below a crash, a
+  hang and a timeout; above a rejected input):
+
+  ```
+  replay: in/3-U: ok insns=104 buckets=23
+  replay: in/3-U: uninit differs=insns,path (filled run: ok, insns=110); read before any write: pc=0x80000244 at 0x80100000;
+  ```
+
+  `differs` lists what changed (`verdict`, `detail`, `insns`, `path`, `output`). *read before any
+  write* lists, from the filled run, the pages whose first access was a read (the pc of the
+  instruction, and the first address read; physical, like `--fuzz-uninit-exclude`), the first
+  sixteen. That is where to look: it names a page, not a byte, and a page that is read first is
+  not always the culprit (a harmless read of unwritten memory comes first, then the one that
+  matters). With no such page, the difference came from a page the boot had partly written, or
+  from the tail of the input's own buffer (the input is written into a page whose rest is then
+  the pattern, so a firmware that reads past its input shows up).
+  The runner's last lines count the runs repeated and those that differed.
+- **In a campaign** (`--fuzz-net`) ember sends an `UNINIT` frame for the first input to differ
+  in a given way (deduplicated by the first unwritten read's pc, else by how it differed), and
+  the brain saves the input under `uninit/` with a `.info` (what differed, the filled run's
+  verdict and length, the reads). These are findings of their own: they are not crashes, and the
+  input's coverage still counts, so the queue grows as it would without the option.
+  Frame in [`fuzz-formats.md`](fuzz-formats.md).
+- **The guarded heap** (`uam/heap.h`) fills each fresh allocation with the pattern in the filled
+  run, which reaches heap memory the boot had already written (a firmware's heap usually sits in
+  `.bss`, which the loader zeroes and so counts as written). Without the heap hooks nothing says
+  where a block starts, and a read of a fresh allocation is only found if its page was unwritten.
+- **Exclusions.** `--fuzz-uninit-exclude LO-HI` or `LO+LEN` (physical, repeatable) leaves a range
+  out of the fill: RAM the hardware zeroes, or that the firmware reads on purpose before writing.
+  A firmware that relies on RAM being zero outside its own writes, and never says so, makes
+  *every* input differ; the first symptom is a finding on the very first input, with a read at
+  the same address each time. Exclude that range and run again.
+
+Costs: nothing while it is off. When on, each RAM page takes one slow-path store before the
+executor can write it directly (so the first store to each page is slower), the machine keeps one
+bit per RAM page, and a snapshot carries them. A snapshot made with it loads only with it:
+`--fuzz-snapshot` notices (the command line differs) and boots again; `--load-snapshot` of one
+made the other way fails with a message.
+
+What it misses, so that a clean result is read for what it is:
+
+- A **partly written page**. Granularity is the page: a page the boot wrote even once keeps its
+  other bytes zero in both runs. A heap object the boot allocated and half filled, a structure
+  in `.data`, the stack slot below the live frame in a page the boot used.
+- **Stale values.** Memory the firmware wrote earlier in the same input and then freed or popped
+  holds the same bytes in both runs; only fresh memory differs. (The guarded heap's allocation
+  fill covers the heap; stack frames are not poisoned on return.)
+- **Reads that change nothing compared.** A value read and discarded, or used on a path that
+  ends the same way, and where the pattern and zero take the same branch (a test of one bit
+  that both patterns happen to share). A second pattern (`--fuzz-uninit=...` on another run)
+  helps with the last.
+- **Memory the loader zeroes.** An ELF's `.bss` and any other memory past a segment's file size
+  is written by the loader, so it counts as written.
+
 ### Replay (`--fuzz-replay FILE|DIR`)
 
 Runs each input once (a directory in name order) and prints one line per input:
@@ -466,7 +557,8 @@ replay: crashes//2-store: crash-fault pc=0x8000038c (store-fault cause 0x0 tval 
 (`fuzz_iteration` and `fuzz_panic` are symbols of the ELF image; with a raw image give the
 addresses. The pcs printed move with the toolchain. `crashes/2-store` holds `FUZ!`, the
 input of one of the target's planted bugs.) The exit status is the most severe verdict of any input: a crash (the first
-one's kind: 20 fault, 21 oracle, 25 guard), else a hang, else a timeout, else a rejected input (24), else 0. So a directory of crashes fails however
+one's kind: 20 fault, 21 oracle, 25 guard), else a hang, else a timeout, else (with `--fuzz-uninit`) an input
+whose run depended on memory nothing wrote (26), else a rejected input (24), else 0. So a directory of crashes fails however
 it is ordered and whatever other files it holds. Every regular file runs as an input, except
 those whose name starts with a `.`, and a fuzzer's notes saved beside an input: a runner extension can name their suffixes, and a
 file X plus that suffix is then skipped when X is in the directory too. The stock extension
@@ -543,6 +635,8 @@ as STAGE.
   from the input in other ways than a constant offset (a parsed number, a checksum) is not
   found in the input. Compares in a block whose operands the optimizer knows are constants
   are folded away and not logged (they do not depend on the input).
+- `--fuzz-uninit` is a differential check at page granularity, not a shadow memory: see its
+  section for what it cannot see.
 - The fuzz protocol's CRASH frame carries a guard crash's pc, not its kind: the brain names
   a heap or return crash "guard" like any other, and a replay of the saved input says which
   it is.

@@ -98,6 +98,10 @@ NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
 JUDGE, PROGRESS, STAGE, STAGE_RESULT = 16, 17, 18, 19
+UNINIT = 20                              # ember -> brain: a run that depended on memory nothing wrote
+UNINIT_HDR_LEN, UNINIT_TOUCH_LEN = 31, 16
+UNINIT_KINDS = ((1, "verdict"), (2, "detail"), (4, "insns"), (8, "path"), (16, "output"))
+UNINIT_VERDICTS = ("ok", "fault", "oracle", "hang", "timeout", "rejected", "guard")
 FIND_HDR_LEN, JUDGE_LEN = 49, 25
 OPT_JUDGE = 1 << 2                       # OPTIONS: a JUDGE frame before each INPUT's reply
 HAVOC_EDGES = 1 << 0                     # HAVOC flags: HAVOC_DONE lists executions per bucket
@@ -439,6 +443,8 @@ def main():
     weights = {}           # op -> the weight in use (adapted by maybe_reweight)
 
     execs = mutated = new_cov = crashes = hangs = rejected = 0
+    uninit_n = 0           # inputs saved under uninit/ (ember started with --fuzz-uninit)
+    uninit_details = set()
     unstable = imported = trimmed_bytes = 0
     cmplog_execs = cmplog_finds = cmplog_tokens = 0
     cmplog_done = set()    # queue entry ids already through the input-to-state stage
@@ -479,7 +485,7 @@ def main():
             "corpus": len(queue.entries), "edges": edges[0], "map_size": map_size,
             "new_edges": edges[0] - baseline_edges[0] if baseline_edges[0] is not None else 0,
             "init_edges": init_edges[0],
-            "crashes": crashes, "crashes_unique": len(crash_sigs),
+            "crashes": crashes, "crashes_unique": len(crash_sigs), "uninit": uninit_n,
             "hangs": hangs, "hangs_unique": len(hang_sigs),
             "hangs_saved": len(hang_inputs), "rejected": rejected,
             "cycles": queue.cycle, "favored": queue.favored_count(),
@@ -504,12 +510,55 @@ def main():
             emit_status()
             last_status[0] = now
 
+    def save_uninit(payload):
+        """An UNINIT frame (ember runs inputs a second time with the memory nothing wrote
+        filled, started with --fuzz-uninit): the input and what is known about it go to
+        uninit/. These are findings of their own: neither crashes nor coverage."""
+        nonlocal uninit_n
+        try:
+            (uid, kinds, detail, verdict, insns, nt) = struct.unpack(">QIQBQH", payload[:UNINIT_HDR_LEN])
+            p = UNINIT_HDR_LEN
+            touches = list(struct.iter_unpack(">QQ", payload[p:p + UNINIT_TOUCH_LEN * nt]))
+            p += UNINIT_TOUCH_LEN * nt
+            (dlen,) = struct.unpack(">I", payload[p:p + 4])
+            data = payload[p + 4:p + 4 + dlen]
+        except struct.error:
+            raise ProtocolError("UNINIT is cut short (%d bytes)" % len(payload)) from None
+        if len(touches) != nt or len(data) != dlen or len(payload) != p + 4 + dlen:
+            raise ProtocolError("UNINIT's lengths do not add up (%d bytes)" % len(payload))
+        if detail in uninit_details:
+            return
+        uninit_details.add(detail)
+        uninit_n += 1
+        uninit_dir = os.path.join(out, "uninit")
+        os.makedirs(uninit_dir, exist_ok=True)
+        fname = "uninit_d%x_%s" % (detail, hashlib.sha1(data).hexdigest()[:12])
+        with open(os.path.join(uninit_dir, fname), "wb") as f:
+            f.write(data)
+        what = ",".join(n for bit, n in UNINIT_KINDS if kinds & bit) or "?"
+        vname = UNINIT_VERDICTS[verdict] if verdict < len(UNINIT_VERDICTS) else "v%d" % verdict
+        with open(os.path.join(uninit_dir, fname + ".info"), "w") as f:
+            f.write("detail=0x%x\ndiffers=%s\nfilled_verdict=%s\nfilled_insns=%d\n"
+                    % (detail, what, vname, insns))
+            for pc, pa in touches:
+                f.write("read_before_write=pc 0x%x at 0x%x\n" % (pc, pa))
+            f.write("len=%d\nhex=%s\n" % (len(data), data.hex()))
+        log("UNINIT #%d differs=%s (filled run: %s) %s %s"
+            % (uninit_n, what, vname,
+               "first read pc 0x%x at 0x%x" % touches[0] if touches else "no page read first",
+               fname))
+        emit_event("uninit", "differs=%s %s" % (what, fname))
+
     def next_frame():
-        """The next frame from ember, past its unsolicited INIT map (noted) and BYE (raised)."""
+        """The next frame from ember, past its unsolicited INIT map (noted), UNINIT findings
+        (saved) and BYE (raised)."""
         while True:
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
                 raise EmberBye()
+            if ftype == UNINIT:
+                save_uninit(payload)
+                continue
             if (ftype in (COVERAGE, SPARSE) and len(payload) >= 9
                     and payload[8] == KIND_INIT and payload[:8] == bytes(8)):
                 if ftype == SPARSE and len(payload) >= SPARSE_HDR_LEN:
@@ -685,6 +734,9 @@ def main():
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
                 raise EmberBye()
+            if ftype == UNINIT:
+                save_uninit(payload)
+                continue
             if ftype == JUDGE:
                 if len(payload) < JUDGE_LEN:
                     raise ProtocolError("JUDGE payload is %d bytes (needs %d)"

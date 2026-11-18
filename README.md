@@ -50,7 +50,7 @@ boards have one processor) takes `-o cpus=N`:
 the processors run interleaved deterministically, so snapshots, coverage, fuzzing and the gdb
 stub (one thread per processor) work on multiprocessor machines too. Machine snapshots (boot
 once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--guard`,
-`--watch`), a return guard and call stacks (`--guard-returns`, `--backtrace`), a guarded heap
+`--watch`), an opt-in check for reads of memory nothing wrote (`--fuzz-uninit`), a return guard and call stacks (`--guard-returns`, `--backtrace`), a guarded heap
 a board puts behind a firmware's allocator, bring-up traces that are off until asked for (device accesses, system registers,
 interrupt lines, the register and value a polling loop waits for, stamped console lines), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
 pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
@@ -303,7 +303,17 @@ snapshots there and runs every input from the snapshot, delivered through `--fuz
 rejected when the route refuses an input. The `mem:` route can put read and/or write redzones
 in front of its buffer and past the input in it (`before=N`, `after`). `--fuzz-replay
 FILE|DIR` runs saved inputs once each and exits with the most severe verdict of any input
-(20/21/25 crash, else 22 hang, else 23 timeout, else 24 rejected, else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
+(20/21/25 crash, else 22 hang, else 23 timeout, else 26 an input that depended on memory nothing
+wrote (`--fuzz-uninit`, below), else 24 rejected, else 0). See [`docs/fuzzing.md`](docs/fuzzing.md).
+
+`--fuzz-uninit[=PATTERN]` is opt-in and off by default: it re-runs the inputs that found new
+coverage (every input under `--fuzz-replay`) from the same snapshot with the RAM pages no write
+had reached filled with a pattern (default `0x1337c0d3`), and reports an input whose run differs
+(its verdict, length, path or what the devices were sent): a read of memory the firmware never
+wrote, which is zero here and garbage on hardware. It is a differential check at page
+granularity, not a shadow memory, so a clean result is not a proof; `--fuzz-uninit-exclude
+LO-HI` leaves RAM the hardware zeroes out of the fill. Read "Reads of memory nothing wrote" in
+[`docs/fuzzing.md`](docs/fuzzing.md) before relying on it.
 
 Begin, end and crash pcs are addresses or ELF symbols (`--fuzz-begin net_rx`). **Site lists
 are opt-in**, for targets that are worth the static-analysis pass (instrumenting chosen points

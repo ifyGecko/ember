@@ -9,5 +9,6 @@
 #define UART_THR REG8(UART0 + 0)
 #define UART_LSR REG8(UART0 + 5)
 #define BAD_ADDR 0xe0000000u   /* nothing is mapped there: a machine check */
+#define UNWRITTEN_ADDR 0x00800000u   /* RAM nothing writes (--fuzz-uninit) */
 
 #include "../fuzz/fuzztarget.h"

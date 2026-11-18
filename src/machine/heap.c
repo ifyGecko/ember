@@ -18,6 +18,7 @@
 
 #include "uam/heap.h"
 #include "uam/state.h"
+#include "uam/uninit.h"
 
 typedef struct blk {
     uint64_t addr, size;
@@ -196,6 +197,22 @@ static void fill(uam_heap *h, uint64_t addr, uint64_t len, int byte)
     }
 }
 
+/* A fresh allocation in a run the uninitialised-read check has filled (uam/uninit.h):
+ * the pattern, not what the block's memory held before, so a read of it before any write
+ * shows. This also reaches memory the boot had already written, which the page fill
+ * cannot. */
+static void fill_uninit(uam_heap *h, uint64_t addr, uint64_t len)
+{
+    uint8_t buf[4096];
+    while (len) {
+        const uint64_t chunk = len < sizeof(buf) ? len : sizeof(buf);
+        uam_machine_uninit_bytes(h->m, addr, buf, (size_t)chunk);
+        arena_rw(h, addr, buf, chunk, true);
+        addr += chunk;
+        len -= chunk;
+    }
+}
+
 /* ---- reports -------------------------------------------------------------- */
 
 static void report(uam_heap *h, uam_guard_kind kind, const blk *b, uint64_t addr, uint64_t paddr,
@@ -350,6 +367,8 @@ uint64_t uam_heap_alloc(uam_heap *h, uint64_t size, uint64_t align, uint64_t sit
         h->st.peak_bytes = h->live_bytes;
     if (h->fill_alloc >= 0 && size)
         fill(h, addr, size, h->fill_alloc);
+    if (size && uam_machine_uninit_armed(h->m))
+        fill_uninit(h, addr, size);
     return addr;
 }
 

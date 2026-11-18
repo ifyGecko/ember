@@ -199,7 +199,11 @@ Crashes are deduplicated per worker: replay every `crashes/` directory, or group
   `--crashes-per-sig` (4) more, as found, when a crash at that pc ran code no earlier crash
   ran: look at those too, they may be other bugs), as
   `crash_r<reason>_s<status>_<sha1>` plus an `.info` note (`reason=`, `reason_name=`,
-  `status=`, `status_hex=`, `len=`, `sig=`, `hex=`). Hangs and timeouts go under `hangs/`:
+  `status=`, `status_hex=`, `len=`, `sig=`, `hex=`). With `--fuzz-uninit` on ember's side (an
+  opt-in check, `references/harness.md`) the inputs whose run depended on memory nothing wrote go
+  under `uninit/`, one per distinct finding, with a `.info` (`differs=`, the filled run's verdict
+  and length, and its `read_before_write=` lines); they are not crashes and the input's coverage
+  still counts. Hangs and timeouts go under `hangs/`:
   every distinct input, up to `--max-hangs` (64), not minimized unless
   `--minimize-timeouts`. Both directories replay directly (`--fuzz-replay fuzz/run/crashes/`, the `.info` notes are
   skipped), so triage follows `harness.md`. A malformed INPUT gets CRASH `MALFORMED` (7).

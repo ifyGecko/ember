@@ -412,6 +412,55 @@ A snapshot (`--fuzz-snapshot`, `--save-snapshot`) carries both oracles' state an
 loaded with the same oracles on; `fuzz_launch.py`'s shared boot does that by itself as long
 as every worker gets the same options.
 
+## Reads of memory nothing wrote (`--fuzz-uninit`)
+
+Opt-in, off by default, and a differential check, not a shadow memory: **a clean result is not
+a proof that nothing reads uninitialised memory.** Use it when the handler's bugs could be of
+that kind (a field of a request struct left unset, a buffer used before its fill, a heap block
+read before a write) and the board runs on ember RAM that the boot leaves zeroed.
+
+What it does: an input that found new coverage (every input under `--fuzz-replay`) runs a
+second time from the same snapshot with the RAM pages that no write reached during the boot
+filled with a pattern (`0x1337c0d3` unless `--fuzz-uninit=PATTERN`), each filling itself on its
+first touch. The runs are compared: verdict, instruction count, path through the coverage map,
+and everything the devices were sent. A difference means the input made the firmware depend on
+a byte it never wrote. The boot itself runs on zeros as always.
+
+```bash
+./fuzz.sh --fuzz-uninit --fuzz-replay fuzz/smoke/          # replay: every input is checked
+./fuzz.sh --fuzz-uninit --fuzz-net 127.0.0.1:7000          # campaign: new-coverage inputs are checked
+```
+
+Reading a replay result (exit 26, a second line for the input):
+
+```
+replay: in/3-U: uninit differs=insns,path (filled run: ok, insns=110); read before any write: pc=0x80000244 at 0x80100000;
+```
+
+`differs=` lists what changed (`verdict`, `detail`, `insns`, `path`, `output`). The reads are the
+filled run's first reads of pages nothing had written, as a pc and a physical address: decompile
+that pc. It names a page, not a byte, and the first such read is not always the one that
+matters (a harmless read of unwritten memory can come first). With no read listed, the page was
+partly written by the boot, or the input's own buffer tail was read (the input is written into a
+page whose rest is then the pattern). In a campaign the brain saves the input under `uninit/`
+with a `.info`, once per distinct finding; it is not a crash, and the input's coverage still
+counts.
+
+Know before relying on it:
+- A page the boot wrote even once is left alone (page granularity): half-filled structures,
+  the stack below the live frame in a used page, `.bss` and `.data` (the loader's zero fill is
+  a write). Fresh heap blocks are covered only with the guarded heap hooked
+  (`board-skeleton.md`), which then fills each allocation with the pattern in the second run.
+- Stale values (memory written earlier in the same input, then freed or popped) are the same in
+  both runs. A read that changes nothing compared, or where the pattern and zero take the same
+  branch, is invisible; a second run of the same inputs with another pattern helps with the
+  last.
+- Hardware that zeroes RAM the firmware relies on makes *every* input differ, with the same read
+  each time: name that range with `--fuzz-uninit-exclude LO-HI` (physical) and run again.
+- A snapshot made with it loads only with it. Costs nothing while off; on, the first store to
+  each RAM page takes the bus's slow path once, and a second run costs as much as the
+  first, so a campaign does it only for inputs that found new coverage.
+
 ## Verdicts and replay
 
 `--fuzz-replay FILE|DIR` runs each input once (a directory in name order) and prints one line
@@ -433,7 +482,8 @@ as given to `--fuzz-replay`, and stderr ends with a count per verdict (`uam-run:
 inputs: ...`).
 
 Exit status: the most severe verdict of any input: a crash (the first one's kind: 20 fault,
-21 oracle, 25 guard), else 22 hang, else 23 timeout, else 24 rejected, else 0. Exit 2 means
+21 oracle, 25 guard), else 22 hang, else 23 timeout, else 26 depended on memory nothing wrote
+(`--fuzz-uninit`, below), else 24 rejected, else 0. Exit 2 means
 no verdict at all: a bad option, or a campaign that stopped, most often because the boot
 never reached the begin pc (`fuzz: boot did not reach the begin pc 0x..: <why> (N
 arrivals)` on stderr: `-n` ran out, a `--guard` the boot touched, a crash during boot), a

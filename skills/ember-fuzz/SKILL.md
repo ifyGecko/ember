@@ -93,6 +93,13 @@ own: the harness is part of ember's library, which the project already links.
    allocator (`-o guard-heap=1` once ember-dev-build's `board-skeleton.md` recipe is in the
    board): overflows by one byte, use after free, double frees
    (`references/harness.md`, "Return guard and guarded heap").
+   **Optional, and only knowingly: `--fuzz-uninit`** re-runs inputs with the RAM no boot write
+   reached filled with a pattern and reports a run that differs, i.e. one that depends on memory
+   the firmware never wrote (replay exit 26; the brain saves them under `uninit/`). It is a
+   differential check at page granularity, so a clean result proves nothing, and firmware that
+   relies on RAM being zero outside its own writes makes every input differ until that range is
+   named with `--fuzz-uninit-exclude`. Leave it out unless you want it and have read
+   `references/harness.md`, "Reads of memory nothing wrote".
    **An x86 SMM handler** also wants SMM code-fetch confinement (`uam_x86_set_smm_confine`,
    `-o smm-confine=1` on the PC template and `x86_64-ref`): a call-out of SMRAM becomes a `fetch` crash at its
    first instruction; a `--guard` in SMRAM decoded through the SMM view takes

@@ -56,6 +56,21 @@ static __attribute__((noinline)) void magic_fault(uint32_t v)
     *(volatile uint32_t *)(uintptr_t)(BAD_ADDR + 8) = v;
 }
 
+#ifdef UNWRITTEN_ADDR
+/* The planted bug of --fuzz-uninit, on the targets that define an address in RAM nothing
+ * ever writes: a branch on a byte read from it. The boot leaves it zero, a filled run finds
+ * the pattern there, and the two take different paths. (The stack and .bss do not do for
+ * this: the loader zero-fills them, which counts as writing them.) */
+static __attribute__((noinline)) uint32_t read_unwritten(void)
+{
+    if (*(volatile uint8_t *)UNWRITTEN_ADDR) {
+        g_sink++;
+        return 0x11;
+    }
+    return 0x22;
+}
+#endif
+
 static __attribute__((noinline)) uint32_t parse(const uint8_t *p, unsigned n)
 {
     uint32_t sum = 0;
@@ -80,6 +95,12 @@ static __attribute__((noinline)) uint32_t parse(const uint8_t *p, unsigned n)
         if (v == FUZZ_MAGIC)
             magic_fault(v);
     }
+#ifdef UNWRITTEN_ADDR
+    if (n >= 1 && p[0] == 'U')
+        sum ^= read_unwritten();                               /* planted bug: unwritten read */
+    /* (after the other cases, where it leaves the epilogue's layout alone: rizin and Ghidra
+     * must agree on the sites of this file, tests/fuzz/gen-check.sh) */
+#endif
     return sum;
 }
 

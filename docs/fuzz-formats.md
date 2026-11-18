@@ -186,6 +186,13 @@ Every integer is big-endian, and maps are raw u8 counters.
 | 17 PROGRESS | ember → brain, in a batch silent for 1 s | u64 first_id, u32 execs (runs so far) |
 | 18 STAGE | brain → ember | u64 first_id, u32 entry, u8 kind (1 input-to-state, 2 trimming), u32 limit (inputs derived at most: 1 .. 4096 candidates, 1 .. 65536 cuts), u32 flags (bit 0 EDGES) |
 | 19 STAGE_RESULT | ember → brain, before the HAVOC_DONE of a stage that ran | u64 first_id, u8 kind, then for input-to-state: u32 compares, u32 dropped, u32 candidates, u16 n, then n × (u8 width (bytes: 2, 4 or 8), u64 value); for trimming: u8 ran, u64 insns, u64 path, u32 len, data |
+| 20 UNINIT | ember → brain, right before the input's usual reply or FIND (only from an ember started with `--fuzz-uninit`) | u64 id, u32 kinds (bit 0 verdict, 1 detail, 2 insns, 3 path, 4 output: what differed between the input's two runs), u64 detail (the pc of the first read of a page nothing had written, else kinds in the top byte and the pc the filled run ended at), u8 verdict (the filled run's: 0 ok, 1 fault, 2 oracle, 3 hang, 4 timeout, 5 rejected, 6 guard), u64 insns (the filled run's), u16 n, then n × (u64 pc, u64 paddr) (its first reads of pages nothing had written), u32 len, data (the input) |
+
+**UNINIT** needs no negotiation: ember sends it only when started with `--fuzz-uninit`, and a
+brain that does not know frame 20 ignores it (unknown frames are ignored on both sides). It
+is sent once per distinct `detail`, with the input, so that the finding is saved whole, and it
+does not replace the input's reply: the run's coverage is reported as usual. `docs/fuzzing.md`,
+"Reads of memory nothing wrote", says what the two runs are and what the check cannot see.
 
 **Lockstep.** After HELLO, ember sends the boot's map once, unsolicited, as COVERAGE id 0,
 kind INIT. Every INPUT then gets exactly one reply with its id: COVERAGE (or SPARSE) kind
