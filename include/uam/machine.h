@@ -61,9 +61,15 @@ typedef struct uam_board_config {
     size_t                  n_images;
     const uam_board_netdev *netdevs;
     size_t                  n_netdevs;
+    bool                   *option_read;   /* optional, n_options entries: uam_board_config_option
+                                            * sets entry i when it looks up options[i]'s key, so
+                                            * the caller can tell which options the board never
+                                            * asked for (the runner refuses them). NULL: not kept. */
 } uam_board_config;
 
-/* Lookups for boards: the last matching entry, or NULL. */
+/* Lookups for boards: the last matching entry, or NULL. Looking a key up marks every option
+ * of that key as read (option_read), found or not, so a board reads each key it accepts
+ * whether or not it is given. */
 const char *uam_board_config_option(const uam_board_config *cfg, const char *key);
 const char *uam_board_config_image(const uam_board_config *cfg, const char *name);
 uam_netdev *uam_board_config_netdev(const uam_board_config *cfg, const char *name);

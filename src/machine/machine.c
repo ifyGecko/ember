@@ -575,8 +575,11 @@ const char *uam_board_config_option(const uam_board_config *cfg, const char *key
 {
     const char *v = NULL;
     for (size_t i = 0; cfg && i < cfg->n_options; i++)
-        if (strcmp(cfg->options[i].key, key) == 0)
+        if (strcmp(cfg->options[i].key, key) == 0) {
             v = cfg->options[i].value;
+            if (cfg->option_read)
+                cfg->option_read[i] = true;
+        }
     return v;
 }
 

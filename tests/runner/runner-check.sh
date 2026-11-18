@@ -2,7 +2,8 @@
 # runner-check.sh RUNNER X86_SELFTEST_BIN - checks of uam-run's debugging options on
 # x86_64-test (RUNNER is build/tests/uam-test-run) with the raw x86 self-test (loaded at 0,
 # entered at 0):
-#   bad board options  a setup error (exit 2), not a crash, however early the board refuses
+#   bad board options  a setup error (exit 2), not a crash, however early the board refuses;
+#                an option no board code reads is refused too, by name
 #   --log-pc     more than 64 addresses all take effect
 #   --dump-mem   at --break: the bytes are the image's (raw file and hex dump, virtual and
 #                p: physical); an unreadable range is reported with the reason (unmapped,
@@ -33,6 +34,21 @@ for bad in "avr-ref -o model=none" "avr-ref -o cpus=2" "pic-ref -o cpus=2" "mcs5
     [ "$rc" -eq 2 ] || fail "-b $bad: exit $rc, expected 2"
     grep -q "building board" "$T/bad" || fail "-b $bad: no build failure reported"
 done
+
+# an option the board never reads is refused the same way, naming the key, also when it is
+# one of a board that takes it (cpus on pic32-ref and avr32-ref, which have one processor)
+for bad in "rv32-ref -o bogus=1" "x86_64-test -o cpus=2 -o typo=1" "pic32-ref -o cpus=2" "avr32-ref -o cpus=2"; do
+    rc=0
+    # shellcheck disable=SC2086
+    $RUN -b $bad -n 10 </dev/null >/dev/null 2>"$T/bad" || rc=$?
+    [ "$rc" -eq 2 ] || fail "-b $bad: exit $rc, expected 2"
+    grep -q "has no option" "$T/bad" || fail "-b $bad: the unknown option is not named"
+done
+# ... and a key that is read is not refused, given or not
+rc=0
+$RUN -b x86_64-test -o cpus=2 --raw-base 0 --entry 0 -n 100 "$FW" </dev/null >/dev/null 2>"$T/ok" || rc=$?
+[ "$rc" -eq 124 ] || fail "-o cpus=2 on x86_64-test: exit $rc, expected 124"
+! grep -q "has no option" "$T/ok" || fail "-o cpus=2 on x86_64-test: refused"
 
 # --log-pc: the 100 block starts the trace reports first, all of them reached
 $X -t blocks -n 20000 "$FW" </dev/null 2>"$T/tr" >/dev/null || true

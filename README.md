@@ -216,8 +216,10 @@ build/uam-run --help
 
 Boards take options (`-o KEY=VALUE`) and named images (`--image NAME=PATH`); `--board list`
 names the boards. The keys and image names are each board's own (the ones of the reference
-boards are in this section); a key the board does not read is ignored without a message,
-so check the spelling of one that seems to have no effect. Every reference board takes `--ram SIZE` and, but `avr-ref`, `avr32-ref`, `pic-ref`,
+boards are in this section); a key the board never looks up (a misspelling, another board's option, `-o cpus=2` on a
+one-processor board) is a setup error: `uam-run: board 'rv32-ref' has no option 'bogus'`,
+exit 2, after the board is built and before anything runs. A board's source says which keys
+it reads (`uam_board_config_option`). Every reference board takes `--ram SIZE` and, but `avr-ref`, `avr32-ref`, `pic-ref`,
 `pic32-ref`, `mcs51-ref`, `6502-ref` and `z80-ref`,
 `-o cpus=N` (up to 8; `x86_64-ref` 64, Xtensa 4)
 (`--quantum N`: instructions each processor runs before the next, default 4096); `ppc-ref` takes

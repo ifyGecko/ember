@@ -1117,11 +1117,12 @@ static int run_main(int argc, char **argv, const ext_set *es)
     static rtrace rt;   /* large (tables); static, one run per process */
     memset(&rt, 0, sizeof(rt));
     uam_board_option options[MAX_LIST];
+    bool opt_read[MAX_LIST] = { false };
     uam_board_image images[MAX_LIST];
     uam_board_netdev nics[MAX_LIST];
     const char *nic_specs[MAX_LIST];
     uam_board_config cfg = { .unknown_mmio = UAM_UNKNOWN_FAULT, .options = options, .images = images,
-                             .netdevs = nics };
+                             .netdevs = nics, .option_read = opt_read };
 
     /* The option table: ours, then each extension's. */
     enum { MAX_EXT_OPTS = 64 };
@@ -1596,6 +1597,16 @@ static int run_main(int argc, char **argv, const ext_set *es)
         uam_machine_fini(&m);
         goto out_host;
     }
+    /* An option the board never asked for is a mistake (a misspelt key, one of another
+     * board's): refuse it, as a run that ignores it would be taken for one that honours it. */
+    for (size_t i = 0; i < cfg.n_options; i++)
+        if (!opt_read[i]) {
+            fprintf(stderr, "uam-run: board '%s' has no option '%s' (-o %s=%s)\n", board_name,
+                    options[i].key, options[i].key, options[i].value);
+            uam_machine_fini(&m);
+            rc = 2;
+            goto out_host;
+        }
     for (size_t i = 0; i < cfg.n_netdevs; i++)
         if (!nics[i].nd->receive)
             fprintf(stderr, "uam-run: board '%s' has no network port '%s'; --nic %s=... is unused\n",
