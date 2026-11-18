@@ -28,6 +28,48 @@ to use them; this page says *which* and *how*.
   a start (`--trace-after N`, or `+N` from the run's start), a summary instead of a stream
   (`mmio-summary`), a bounded run (`-n`).
 
+## Who touches this address? (look here first)
+
+"What reads or writes address X, or anything in a range" is one switch, and which one
+depends on what kind of address X is. All of them name the pc and the icount of each access.
+
+| X is | you want | use |
+|---|---|---|
+| a device register, a block of them, an x86 I/O port (`0x10000000000 + port`) | every access in order, with values | `-t mmio --trace-mmio-range LO:HI` |
+| the same | one line per register: counts, the value reads return, the first pc | `-t mmio-summary` (every register of the run). `--trace-mmio-range` narrows it but also turns the per-access stream on: add `--trace-file F` and read the summary at its end |
+| RAM, ROM or flash data (a variable, a buffer, a table, a flash partition), or a register when you want one tool for both | every read and write by the processors | `--watch [p:]ADDR+LEN` (`:r` reads only, `:w` writes only) |
+| the same | to stop at the first one, before it happens, with the state intact | `--guard [p:]ADDR+LEN[:r\|w]` (exit 129), then `-d`, `--history N`, `--backtrace` |
+| memory a device fills or reads by itself (a DMA ring, a receive buffer) | what the device moved, and for which instruction | `-t dma` (`--watch` does not see DMA) |
+| code | every arrival, with registers | `--log-pc ADDR[,REG...]`; `--break ADDR -d` to stop there; `-t blocks --trace-range LO:HI` for a region |
+| an address nothing decodes | the first access, stopped before it happens | `--unknown-mmio stop` (exit 131); `zero` logs each first access and goes on |
+| a system register (CSR, CP0, CP15, SPR, MSR) | who reads or writes it, and what | `-t sysreg` (first of each) or `-t sysreg-all` |
+
+What `--watch` and `--guard` cover: data accesses of the processors, on any kind of
+region (RAM, ROM, a ROM device, a device's registers). They do not see instruction
+fetches (use `--log-pc` or `-t blocks`), DMA by a device (`-t dma`), or gdb and
+`--dump-mem` reads. A virtual ADDR is translated once, as processor 0 maps data when the
+run starts; give `p:ADDR` for a physical address, and always for one the firmware maps
+later. The watch sits on that bus address: the same memory seen through another window
+(a flash mirror, an alias) is another address and needs its own.
+
+## Do not take the hard route
+
+Each of these has been done the slow way. The switch on the right already exists.
+
+| instead of | use |
+|---|---|
+| adding prints to a device model to see how the firmware drives it | `-t mmio --trace-mmio-range` on its window |
+| writing a logging stub device to find out which registers a block has | a catch-all `unimp` window (the board template has them) and `-t mmio-summary` |
+| single-stepping in gdb to find how the run reached a fault or a loop | `--history N` at the stop; `--backtrace` for the call chain |
+| bisecting with `-n` to find when a variable goes wrong | `--guard ADDR+LEN:w` (stops before the first write) or `--watch` (logs every one) |
+| a gdb script that prints registers at a function | `--log-pc ADDR,REG,...` |
+| reading the decompiler to guess whether a function ever runs | `--log-pc ADDR`, or `-t blocks --trace-range` over it |
+| rebuilding the board to try a register value | `--mmio-rule ADDR=fixed:V` |
+| re-running a long boot for every experiment | `--snapshot-at PC --save-snapshot F`, then `--load-snapshot F` |
+| guessing which interrupt is missing from the firmware's tables | `-t irq,exc`: which lines rose, what is pending and enabled at the stop |
+| capturing a guest's network traffic with host tools | `--nic PORT=SPEC,pcap=FILE` |
+| patching ember to print something | section 7: the board can log, hook a pc and watch the bus itself |
+
 ## 1. Always on: the catch-all logs and the stop line
 
 These come from the board's fallbacks and need no switch. Each first access names the
@@ -66,7 +108,8 @@ instruction that made it (`pc=0x.. icount=N`): decompile that pc.
 An unknown name is an error (exit 2) and lists the valid ones. `--trace-after N` holds
 back every trace but `ir` until icount N, and the summaries and sysreg's "first" count
 from there. `--trace-mmio-range LO:HI` limits `mmio` and its summary to physical
-addresses in [LO, HI).
+addresses in [LO, HI), and turns the `mmio` stream on by itself, also next to
+`mmio-summary`.
 
 ## 3. Probes
 
@@ -77,16 +120,24 @@ addresses in [LO, HI).
 | `--history N` | keeps each processor's last N events (blocks entered, exceptions taken, interrupt handlers entered) and prints them at the stop: `history: cpuN: the last K events ...` then `history:   blk\|exc\|irq ...` | "how did it get here": the path into a fault loop, a deadlock, a guard or unmapped stop, a breakpoint, or simply the stop at `-n`. Far cheaper than `--trace blocks` |
 | `--backtrace` | tracks calls and returns and prints the calls each processor is inside at the stop, innermost first, named from the ELF's symbols: `backtrace: #0 0x.. <parse+0x1c> called, returns to 0x.. <rx_task+0x40>` (`interrupted at` for an interrupt or exception taken on the way) | "who called this": the call chain into a crash, a guard stop, a breakpoint. A best-effort history (tasks are not told apart; a function left without returning stays until an older frame's return drops it). A snapshot taken with it is loaded with it |
 | `--log-pc ADDR[,REG...]` | `RUNNER: pc 0xADDR reached (hit H, icount N) a0=0x.. ra=0x..` at each arrival | a function's calls and arguments; a loop's iteration count. Register names as the ISA's gdb description has them (`a0`, `ra` on RISC-V; `r4`, `r31` on MIPS, not `a0`, `ra`; `r0`, `lr` on ARM; `rdi` on x86-64; `r3` on PowerPC); an unknown name lists them. (Board code is the other namespace: `board_entry_regs` and an HLE hook's `reg()` use the ISA module's own register table, where MIPS has `a0`, `v0`, `ra`.) |
-| `--break ADDR` (+ `-d`) | stop when ADDR is reached (exit 127) and dump the processors | the state at a point of interest |
+| `--break ADDR` (+ `-d`) | stop when ADDR is reached (exit 127) and dump the processors. ADDR must be the first byte of an instruction: a breakpoint inside one never fires (Thumb, RVC, MIPS16e, x86: take the address from the disassembly) | the state at a point of interest |
 | `-n N -d` | stop at exactly instruction N and dump every processor | the state at an icount from any trace line |
 | `--dump-mem [p:]ADDR+LEN[=FILE]` | hex-dump (or save) guest memory when the run stops | a descriptor ring, a buffer, a structure the firmware built |
-| `--watch [p:]ADDR+LEN` | log every data access to those bytes: `guard ... (log): cpu N pc .. read\|write S at .. value .. icount=N` | who writes this variable, and with what |
-| `--guard [p:]ADDR+LEN[:w]` | stop *before* the first access there (exit 129) | the instruction that corrupts memory |
+| `--watch [p:]ADDR+LEN[:r\|w]` | log every data access of the processors to those bytes, reads and writes, in RAM, ROM or a device: `guard ... (log): cpu N pc .. read\|write S at .. (+OFF) value .. icount=N` | who reads or writes this variable, buffer, flash range or register, and with what ("Who touches this address?" above has what it does not see) |
+| `--guard [p:]ADDR[-BEFORE][+AFTER][:r\|w\|rw][,stop\|,fault\|,log][,name=NAME]` | the range [ADDR-BEFORE, ADDR+AFTER); a bare ADDR is one byte. `stop` (default): the run stops *before* the first access there (exit 129). `fault`: the guest takes a bus fault instead. `log`: what `--watch` does. `name=` labels the hit line | the instruction that corrupts memory; `ADDR-16+16:w` catches a write near an address; `fault` to see how the firmware's own handler reacts |
+| `--guard-returns[=log]` | stop (exit 129) when a return goes to an address no call instruction returns to; `=log` reports each such address once and goes on. `--return-ok ADDR` (or `SYMBOL[+OFF]`) accepts a target the firmware uses on purpose (a scheduler starting a task by returning into it) | a run that "returns into garbage": the smashed return address is caught at the return, not thousands of instructions later at the fault. Run `=log` first to collect the deliberate ones, and add `--backtrace` for the chain |
 | `--mmio-rule ADDR=POLICY` (+ `-v`) | answer one register with a fixed value, an echo, a set/clear mask, ... | test a register hypothesis in one run before writing C |
 | `--map` | print the bus map the board built | is the window where you think it is |
 | `--snapshot-at PC --save-snapshot F` / `--load-snapshot F` | bookmark a state and start later runs there | skip a long boot; trace only the part you are working on |
-| `--gdb PORT` (`scripts/gdb_trace_calls.py`) | a gdb remote stub (breakpoints, watchpoints) | interactive digging, call tracing without stopping the guest |
-| `-v` / `-v -v` | more logging (`mmio-stub` first accesses; POST codes on a PC) | |
+| `--dump-mem ...=FILE` | the same bytes written raw to FILE | code or data the firmware built in RAM (a stage it decompressed or relocated), to load into Ghidra at that address |
+| `--nic PORT=SPEC,pcap=FILE` | records every frame of that network port in a pcap file | what the guest sent and received, read with any pcap tool |
+| `--gdb PORT` (`scripts/gdb_trace_calls.py`) | a gdb remote stub: breakpoints, `watch`/`rwatch`/`awatch` (on RAM and on device registers), single-step, reading **and writing** registers and memory, one gdb thread per processor | interactive digging; call tracing without stopping the guest; changing a register or a RAM word by hand to test "would it get past if this were V" |
+| `-v` / `-v -v` | more logging: `-v` shows `info` lines (`mmio-stub` first accesses), `-v -v` `debug` lines (POST codes on a PC); your own `uam_log` lines follow the same levels (section 7) | |
+
+**Symbols.** With an ELF image, `--break`, `--snapshot-at` and `--return-ok` take
+`SYMBOL[+OFFSET]` as well as a number. Every other address is a number: `--log-pc`,
+`--watch`, `--guard`, `--dump-mem` and the trace ranges do not take names, so look the
+address up first (`nm`, Ghidra). `--backtrace` names its frames from the same symbols.
 
 ## 4. Recipes: which tool for which bring-up question
 
@@ -105,7 +156,8 @@ addresses in [LO, HI).
   access to the block in order with values and pcs: the init sequence, the reset values it
   expects (reads), the configuration it writes, and the pcs of the driver's functions
   (decompile them for the bit meanings).
-- `-t mmio-summary` over the same range gives one line per register: which ones matter at
+- The summary that ends that trace (or `-t mmio-summary` alone, for the whole run without
+  the stream) gives one line per register: which ones matter at
   all (model those), which are write-only configuration (a stub that stores them), which are
   read in loops.
 - Test the semantics with `--mmio-rule` (`fixed:V`, `echo,set=0x1`, ...) and `-v` before
@@ -137,7 +189,27 @@ addresses in [LO, HI).
 
 **A wrong value in memory (a size, a pointer, a status):** `--watch ADDR+LEN` (every
 access, with pc and value) or `--guard ADDR+LEN:w` (stop before the first write), then
-decompile the writer. gdb `watch` does the same interactively.
+decompile the writer. gdb `watch` does the same interactively. If no processor writes it,
+a device did, by DMA: `-t dma`.
+
+**Who reads this table or flash range:** `--watch p:ADDR+LEN:r` on the bus address of the
+data (a configuration partition, a calibration block, a descriptor table) lists the
+readers by pc. That names the code that parses it, which is faster than hunting for
+cross-references to an address the firmware computes.
+
+**A return into garbage, a crash far from its cause:** `--guard-returns=log` once, to see
+which unusual returns the firmware makes on purpose; then `--guard-returns --return-ok
+ADDR ... --backtrace`: the run stops at the return whose address was overwritten, with
+the call chain. `--guard` the stack slot or the buffer next to it to find the writer.
+
+**Does this code run at all, and what runs in this region:** `--log-pc ADDR` for one
+function (the hit count and the icount of each arrival), or `-t blocks --trace-range
+LO:HI --trace-file build/blocks.txt` for every block executed in a region, in order.
+(`--cov-blocks` is not for this: it fills a hashed coverage map for fuzzing and prints
+only how many buckets were hit.)
+
+**Network:** `--nic PORT=SPEC,pcap=build/lan.pcap` records the frames; `-t dma,mmio` on
+the controller shows the descriptors behind each one (below).
 
 **Which function fails:** `--log-pc` on the candidates with their argument and return
 registers (`--log-pc 0x80012340,a0,a1,ra` on RISC-V; `r4,r5,r31` on MIPS), or `scripts/gdb_trace_calls.py`; a call that
@@ -183,3 +255,31 @@ offsets, unmapped pages, exceptions by kind and pc, and, when the run had them, 
 `mmio` register summary (with likely polls marked), the `exc` summary, `irq` lines, `dma`
 per region, the `--history` tail and `--log-pc` registers. Read it top-down; the first
 event is usually the blocker.
+
+## 7. When no switch answers it: diagnostics in your own board
+
+Reach for these only after the tables above. They are ember's public API, so none of
+them needs a patch to ember.
+
+- **A device's own log line**: `uam_log(UAM_LOG_INFO, "mydev", "...")` (`uam/common.h`).
+  `error` and `warn` always print, `info` needs `-v`, `debug` needs `-v -v`, and
+  `--log-stamp` prefixes the icount. To say which code touched the device, append
+  `uam_origin_format(buf, sizeof buf)`: it gives `" pc=0x... icount=N"` in the form the
+  traces use, so your line sorts into the same timeline. A device never asks for the
+  processor itself (layering).
+- **A probe at a code address**: `uam_machine_add_pc_hook(m, pc, fn, ctx)` in a
+  board-level file. The hook runs before the instruction at `pc` with the state precise
+  and may read registers and memory: use it to print a structure the firmware just
+  built, or to decode arguments `--log-pc` can only show as numbers.
+- **A watch of your own**: `uam_bus_add_watch(&m->bus, base, size, UAM_WATCH_READ |
+  UAM_WATCH_WRITE, fn, ctx)` (`uam/bus.h`), in a board-level file, calls `fn` on every
+  matching access, for a check `--watch` cannot express (only values with a bit set,
+  only after some event).
+- **Guarded heap**: `uam/heap.h` behind a board option (`board-skeleton.md`) for heap
+  overflows and use-after-free in the firmware.
+
+Rules for all of them: **off unless asked**. Put each behind a board option
+(`uam_board_config_option(cfg, "trace-foo")`, turned on with `-o trace-foo=1`) or a log
+level below `warn`, so a normal run stays quiet and pays nothing. Print to stderr through
+`uam_log`, never to stdout (the guest console). Do not read host time. A probe kept past
+the iteration that needed it is journaled, like an HLE hook.

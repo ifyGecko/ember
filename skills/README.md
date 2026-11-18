@@ -31,7 +31,7 @@ checkout a project pins is the authority on options and APIs; the skills say whe
 
 | for | needs |
 |---|---|
-| recon | python3 (stdlib only); optional `binwalk`; Ghidra for the analysis pass (headless `analyzeHeadless`, or a Ghidra MCP server for interactive work) |
+| recon | python3 (stdlib only); optional `binwalk`; Ghidra for the analysis pass (headless `analyzeHeadless`, or a Ghidra MCP server for interactive work); for facts settled by running the image (`references/dynamic-recon.md`), what build needs |
 | build | git, a C11 compiler, meson (1.1 or newer) and ninja, python3, an ember git checkout or URL; `gdb-multiarch` for debugging (see ember-dev-build for which ISAs it can drive) |
 | fuzz | a working ember-dev-build project. Nothing else by default (ember collects coverage itself). Only for opt-in site lists: one of the two tools ember's list generators run on, rizin with python3's `rzpipe` or headless Ghidra with the Jython extension (the Ghidra recon already uses) |
 | tests | the build requirements; `mips-linux-gnu-gcc` (fixture firmware) and gcc with `-m32` (the PC fixture); ember's own test firmware (`meson setup build && meson compile -C build firmware` in the ember checkout; `EMBER_BUILD` names another build directory) for the bare-board runs. Optional: gdb-multiarch, OVMF, Ghidra. Parts whose tools are missing are skipped |
@@ -100,7 +100,7 @@ skills/
                               fwinfo.py, ghidra-query.sh,
                               ghidra/{FirmwareRecon,FindMmio,FindX86Io,Decompile,SeedEntries}.java
                     references/  arch-cheatsheet, mmio-discovery, recon-report-schema,
-                                 recon-pitfalls, uefi-recon
+                                 recon-pitfalls, uefi-recon, dynamic-recon
   ember-dev-build/  SKILL.md
                     scripts/  new-emulation.sh, build-ember.sh, rebuild.sh, regen-patches.sh, repin.sh,
                               check-layering.sh, _common.sh, log_summary.py, gdb_trace_calls.py

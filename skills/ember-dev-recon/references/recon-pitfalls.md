@@ -114,3 +114,12 @@ Tag claims as **confirmed** (code path + cross-check), **inferred** (static evid
 source) or **guess** (naming convention, public map of a sibling chip). The build phase
 trusts confirmed claims and verifies the rest. A fact sheet that states inferred claims as
 confirmed costs a full debugging iteration each time one is wrong.
+
+## 12. Hours of reading for what one run shows
+Reimplementing a vendor decompressor, tracing a computed pointer through five functions,
+arguing from compares which CPU revision is expected: ember answers each with one bounded
+run on a bare board (`dynamic-recon.md`: dump the unpacked stage, `--watch` the address,
+`-t sysreg`). Before a long static dig, ask whether a run would show the fact. The
+opposite error is as real: a run covers one path, with unmodelled registers reading 0, so
+"the run never touched it" is *inferred* at best. Tag run evidence **confirmed (run)**
+and keep the command line with it.

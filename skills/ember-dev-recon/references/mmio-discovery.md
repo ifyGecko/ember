@@ -157,7 +157,10 @@ the register must count. Many hot registers are written at init and never read a
    `--trace mmio-summary` the whole register map a run used (one line per register: reads,
    writes, the value reads always returned, the first pc). Static polls this table misses
    (computed addresses) show up there; `--unknown-mmio stop` stops at the first address no
-   window covers, naming its pc (ember-dev-build's `references/diagnostics.md`).
+   window covers, naming its pc (ember-dev-build's `references/diagnostics.md`). To learn
+   who reads or writes one address or a range: `--watch p:ADDR+LEN[:r|w]` for memory and
+   flash data, `--trace mmio --trace-mmio-range` for device registers. `dynamic-recon.md`
+   has the bare-board setup and the limits of what a run proves.
 
 The **interrupt routing** is part of the MMIO picture. Find the RTOS's interrupt table (VxWorks
 `intPrioTable`-style `{cause bit, vector or demux, mask}` entries; Linux irq-domain setup) and

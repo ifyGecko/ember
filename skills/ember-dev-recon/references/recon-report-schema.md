@@ -134,6 +134,7 @@ Flash partitions (one row per partition; label from the WRITER):
 
 ## Tooling notes (audit trail)
 - Commands run, tool versions, Ghidra project name/path, anything that failed and why.
+- Ember runs behind every *confirmed (run)* claim: board, full command line, exit status and icount.
 ```
 
 ## PC firmware (x86-64: UEFI, coreboot, legacy BIOS)
@@ -241,6 +242,10 @@ questions* and *Tooling notes* stay. Method: `uefi-recon.md`.
 - **Confidence tags.** Mark claims *confirmed* (code path + cross-check), *inferred* (static,
   one source) or *guess*. A requirement ("must count", "must return X") is *confirmed* only
   with a poll, divisor or compare that depends on it. Access counts alone give *inferred*.
+  *confirmed (run)* is a fact an ember run showed (`dynamic-recon.md`): its evidence is the
+  command line (board, `-n`, options, `--mmio-rule`s), the stop line's status and icount,
+  and the quoted trace or log line. It holds for the path that run took; "not seen in a
+  run" confirms nothing.
 - **All stages.** MMIO, polls, window sizes and ID compares are merged across every code
   stage, including an XIP bootstrap. A device window covers the highest offset any stage uses.
 - **PC rows.** Each module row says whether its addresses are run addresses (XIP, rebased) or

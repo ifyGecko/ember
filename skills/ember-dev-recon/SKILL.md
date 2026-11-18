@@ -125,7 +125,8 @@ the architecture.
 - **raw**: `binwalk <image>` and look at the head of the file (`xxd | head`). Record every
   member with offset and size: headers, bootloader, compressed streams (LZMA/gzip/xz),
   filesystems, config and calibration partitions. Then extract the compressed members (e.g.
-  `binwalk -e`).
+  `binwalk -e`). A member in a vendor format no tool unpacks need not be reversed: let its
+  loader unpack it in ember and dump the result (*When reading is the hard route*, below).
 - **Verify each member, don't assume.** A large decompressed blob might be the main OS, a
   filesystem or a data archive. Check: does it disassemble cleanly from offset 0? Does
   `basefind.py` find a corroborated base? What strings does it hold (task names, shell
@@ -265,6 +266,9 @@ Do this for **every stage** (each run with its own `--report` and `--out`, above
   known to be safe.
 - Pages that are only stored to and loaded from (magics, counters) may be **on-chip SRAM**,
   not a peripheral.
+- **Check the table against a run** when a bare board can execute the stage: `-t
+  mmio-summary` lists the registers the boot path really touches, including addresses the
+  code computes (`references/dynamic-recon.md`).
 
 ### 6. RTOS / kernel identity
 Version banners, build strings, BSP/board names, task names, shell commands. These tell the
@@ -277,7 +281,7 @@ line (BIOS ID, vendor hints), module names and PE debug paths, whether it is a d
 
 ### 7. Write `RECON.md` in the session project directory
 Run the checklist in `references/recon-pitfalls.md` first. Tag each claim **confirmed /
-inferred / guess**. "Must count" or "must return X" is only *confirmed* when a code path
+confirmed (run) / inferred / guess**. "Must count" or "must return X" is only *confirmed* when a code path
 (poll, divisor, compare) shows the dependency; access counts alone are *inferred*.
 
 Rewrite the draft into the shape in `references/recon-report-schema.md`, including the
@@ -289,6 +293,31 @@ The build phase turns this directory into the board project: a meson project wit
 its pinned subproject, in a fixed layout (`emulation/`, `firmware/`, `tests/`). The image
 you analysed goes into its `firmware/`, unmodified, with the origin and SHA-256 you
 recorded.
+
+## When reading is the hard route: run it
+Ember runs the image deterministically and reports what it does, so some facts are
+cheaper to observe than to derive. Once the architecture, the *Ember support* verdict and
+the reset-stage base are known, a run on a bare board (ember-dev-build's
+`new-emulation.sh` makes one in minutes; a stock `uam-run -b <arch>-ref` when the image
+fits its fixed map) settles these directly. `references/dynamic-recon.md` has the
+commands, what each proves and what it does not.
+
+| instead of | run |
+|---|---|
+| reversing a vendor decompressor to get the main OS out of the image | let the loader unpack it, then `--break ENTRY --dump-mem p:DST+LEN=stage.bin` and import that |
+| arguing where a loader jumps and with which registers | `--break ENTRY -d` (the registers handed over); `--history 32` (the path there) |
+| trusting a static MMIO table that misses computed addresses | `-t mmio-summary` with `--unknown-mmio zero`: every register the boot path touched, with its first pc |
+| guessing what ends a polling loop | the summary's "reads always 0xV" on the hot register, then `--mmio-rule ADDR=fixed:V` to see if the run gets past |
+| inferring the CPU model from compares | `-t sysreg`: each identity and configuration register read, with its pc |
+| searching for cross-references to a flash partition or a table the code reaches by computed address | `--watch p:ADDR+LEN:r`: the pc of every reader (`:w` for the writers of a RAM location) |
+| wondering whether a function is on the boot path | `--log-pc ADDR`, or `-t blocks --trace-range LO:HI` |
+
+Rules: bound every run (`-n`, `timeout`, stdin from `/dev/null`). A run shows **one
+path**, and unmodelled registers read as 0, which can steer it onto the failure path:
+absence in a run is not absence in the firmware. Tag what a run established **confirmed
+(run)** with the command line and the quoted line. Answer a register with an
+`--mmio-rule` to get further, but stop where a device model is needed: that is
+ember-dev-build.
 
 ## PC firmware (x86-64: UEFI, coreboot, legacy BIOS)
 The BIOS region is decoded to end at 4 GiB, the processor starts at 0xFFFFFFF0, and every

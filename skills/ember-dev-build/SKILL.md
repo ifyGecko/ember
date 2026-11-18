@@ -180,8 +180,20 @@ built, not the project's `subprojects/ember`).
      as gdb names them (RISC-V `a0,a1,ra`; MIPS `r4,r5,r31`; ARM `r0,r1,lr`; an unknown name
      lists them all), `--break ADDR -d`, `-n N -d`, `--dump-mem`, gdb (`--gdb`,
      `scripts/gdb_trace_calls.py`); *who called this?* `--backtrace` (the call chain at the
-     stop; names need an ELF image, a raw image gets addresses); *who writes this
-     memory?* `--watch` / `--guard ADDR+LEN:w`.
+     stop; names need an ELF image, a raw image gets addresses);
+   - *what reads or writes this address or range?* a device register or x86 port:
+     `-t mmio --trace-mmio-range LO:HI`; RAM, ROM or flash data (or a register):
+     `--watch [p:]ADDR+LEN[:r|w]` logs every access with pc and value, `--guard
+     ADDR+LEN:w` stops before the first write (exit 129); memory a device fills by
+     itself: `-t dma`; code: `--log-pc`, or `-t blocks --trace-range LO:HI` for
+     everything that ran in a region. The table "Who touches this address?" in
+     `references/diagnostics.md` has each case and what each switch does not see;
+   - *a return into garbage, a crash far from its cause?* `--guard-returns` with
+     `--backtrace`; *network traffic?* `--nic PORT=SPEC,pcap=FILE`.
+   Ember answers these directly: before scripting gdb, adding prints to a device or
+   bisecting with `-n`, check "Do not take the hard route" in that file. When no switch
+   fits, its section 7 covers diagnostics in the board itself (`uam_log`,
+   `uam_origin_format`, a PC hook, a bus watch), always behind an option.
    Turn on one or two for the question at hand, not `-t all` on a long boot; narrow with
    `--trace-mmio-range`, `--trace-after N` and `--trace-range`. Test a register hypothesis
    with `--mmio-rule ADDR=fixed:V` before writing C (an x86 I/O port is
