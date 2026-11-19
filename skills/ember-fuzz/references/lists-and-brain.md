@@ -198,8 +198,9 @@ takes up the crashes it had left for later (`minimized=later`) again.
 - Verdicts become CRASH frames: `FAULT` 1, `GUARD` 2 (a redzone or `--guard`, with the pc of
   the access), `ORACLE` 3, `HANG` 4, `TIMEOUT` 5. The brain saves one input per distinct
   `(reason, status)` of a session under `--out/crashes/` (and up to
-  `--crashes-per-sig` (4) more, as found, when a crash at that pc ran code no earlier crash
-  ran: look at those too, they may be other bugs), as
+  `--crashes-per-sig` (4) in all, as found, when a crash at that pc hit a bucket no earlier
+  crash at it had: look at those too, they may be other bugs; a crash met while minimizing
+  another is saved as found the same way), as
   `crash_r<reason>_s<status>_<sha1>` plus an `.info` note (`reason=`, `reason_name=`,
   `status=`, `status_hex=`, `minimized=`, `len=`, `sig=`, `hex=`). Only the first crash is
   minimized at once: one bug often faults at many instructions, each a `(reason, status)`

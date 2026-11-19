@@ -26,7 +26,8 @@
 # is minimized at once, the second is saved as found and minimized later; with
 # --minimize-share 0 it stays as found, until a later session on the same output directory
 # takes the queue up again. Both are saved in either case, and each .info says
-# whether it was minimized.
+# whether it was minimized. A crash met while minimizing another (a cut of the seed
+# FUZ?FUZ!) is saved as found.
 set -eu
 run=$1
 board=$2
@@ -256,5 +257,21 @@ else
     fail=1
 fi
 
-[ $fail -eq 0 ] && echo "brain-check: $board: $(basename "$fw"): the brain saved and minimized the crash; every schedule; a dictionary find; compare logging; later crashes minimized later"
+# A crash met while minimizing another: the seed FUZ?FUZ! is the assertion, and its first cut,
+# FUZ!, the bad store. The cuts go to ember as PROBE_INPUTs; this one is another (reason,
+# status), so the brain saves it as found (to be minimized later) and has ember record it.
+mkdir "$tmp/nest"
+printf 'FUZ?FUZ!' > "$tmp/nest/a"
+if session nest 300 --seeds "$tmp/nest" --no-cmplog; then
+    if [ "$(faults "$tmp/nest")" -ne 1 ] \
+       || ! grep -q 'as found: found while minimizing another crash' "$tmp/nest.log"; then
+        echo "brain-check: $board: a crash met while minimizing was not saved:" >&2
+        grep CRASH "$tmp/nest.log" >&2
+        fail=1
+    fi
+else
+    fail=1
+fi
+
+[ $fail -eq 0 ] && echo "brain-check: $board: $(basename "$fw"): the brain saved and minimized the crash; every schedule; a dictionary find; compare logging; later crashes minimized later; a crash met while minimizing"
 exit $fail

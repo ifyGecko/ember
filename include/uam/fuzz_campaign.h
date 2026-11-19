@@ -9,9 +9,12 @@
  *   - paths: a 64-bit name for a run's set of (bucket, class) pairs, the same whatever
  *     order they were hit in: mix(sum of mix(index << 8 | class)), with the coverage
  *     formula's mix (docs/fuzz-formats.md);
- *   - crashes: novel when their (verdict, detail) is new or when they ran code no earlier
- *     crash ran (a bucket no crash has hit), so that two bugs at one pc are told apart;
- *     how many such buckets a crash hit is its judgement's new_buckets.
+ *   - crashes: (verdict, detail) is a crash's identity. A crash is novel when its identity
+ *     is new or when it hit a bucket no earlier crash of that identity hit, so that two
+ *     ways into one pc are told apart. Each identity keeps the buckets of its own crashes:
+ *     what a crash at one pc ran does not hide a new way into another. Apart from that,
+ *     how many buckets a crash hit that no earlier crash of any identity had is its
+ *     judgement's new_buckets.
  * It owns a mutator (fuzz_mutate.h) and runs batches with it: n mutations of one corpus
  * entry, each fixed up by the route's fix-up (uam_fuzz_fixup), with the batch's totals.
  * Two more kinds of batch derive their inputs from a corpus entry and from what their own
@@ -45,7 +48,7 @@ typedef struct uam_fuzz_judgement {
                                      * earlier crash had hit) */
     uint32_t         new_classes;   /* (bucket, class) pairs never seen before (>= new_buckets) */
     uint64_t         path;          /* the path's name */
-    /* a crash (fault, oracle, guard) */
+    /* a crash (fault, oracle, guard): a new identity, or a bucket new to that identity */
     bool             novel_crash;
     /* in a batch: worth reporting - new coverage, a novel crash, or a hang or timeout
      * while the campaign has reported fewer than its cap (uam_fuzz_campaign_set_hang_cap) */
@@ -63,6 +66,12 @@ uint64_t           uam_fuzz_campaign_edges(const uam_fuzz_campaign *c);
 /* Judge the run the harness just finished (not one of a batch) and fold it into the
  * record. UAM_ERR_NOMEM only. */
 uam_status uam_fuzz_campaign_judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail,
+                                   uam_fuzz_judgement *j);
+/* Judge it the same way and leave the record as it was: for a run whose input will not be
+ * kept as it is (a minimizer's cut), so that what it ran stays new to the runs after it.
+ * Whoever keeps such an input after all runs it again through uam_fuzz_campaign_judge.
+ * UAM_ERR_NOMEM only. */
+uam_status uam_fuzz_campaign_probe(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail,
                                    uam_fuzz_judgement *j);
 
 /* ---- batches ------------------------------------------------------------ */

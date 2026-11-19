@@ -204,7 +204,8 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * MUTATOR's cap), sends PROGRESS when a batch has been silent for a second, and closes the
  * batch with one HAVOC_DONE. ember is the one owner of what has been seen: with
  * UAM_NET_OPT_JUDGE it tells the brain, in a JUDGE frame before each INPUT's reply, what
- * that run added. Plain INPUTs keep working alongside (seeds, minimizing).
+ * that run added. Plain INPUTs keep working alongside (seeds), and PROBE_INPUTs
+ * (minimizing).
  *
  * Stages in ember: an ember whose HELLO has UAM_NET_HELLO_STAGES also derives inputs
  * itself. STAGE asks for one stage on one corpus entry: input-to-state (the entry's run
@@ -223,7 +224,7 @@ _Static_assert(sizeof(struct uam_cov_slot) == 24, "slot header is 24 bytes");
  * the frame ignores it, as every peer ignores unknown frame types. */
 
 #define UAM_FUZZ_NET_MAGIC     "UAMF"
-#define UAM_FUZZ_NET_VERSION   1u
+#define UAM_FUZZ_NET_VERSION   2u     /* 2: 64-bit crash status, PROBE_INPUT */
 #define UAM_FUZZ_NET_FRAME_MAX (64u << 20)     /* bytes in one frame, type included */
 
 enum uam_fuzz_net_frame {
@@ -248,6 +249,7 @@ enum uam_fuzz_net_frame {
     UAM_NET_STAGE    = 18,  /* brain -> ember: run a stage on one corpus entry */
     UAM_NET_STAGE_RESULT = 19, /* ember -> brain: what the stage found, before its HAVOC_DONE */
     UAM_NET_UNINIT   = 20,  /* ember -> brain: an input whose run depended on memory nothing wrote */
+    UAM_NET_PROBE_INPUT = 21, /* brain -> ember: an input judged without adding to the record */
 };
 
 /* HELLO flags beyond the UAM_COV_SCHEME* bits */
@@ -265,7 +267,7 @@ enum uam_fuzz_net_frame {
  *           u16 arch_len (<= UAM_NET_ARCH_MAX), u8 arch[arch_len] (the ISA's name)
  * INPUT:    u64 id (non-zero), u32 len, u8 data[len]
  * COVERAGE: u64 id (0: the INIT map), u8 kind (UAM_COV_KIND_*), u32 map_size, u8 map[]
- * CRASH:    u64 id, u8 reason (enum uam_fuzz_net_reason), u32 status
+ * CRASH:    u64 id, u8 reason (enum uam_fuzz_net_reason), u64 status
  * OPTIONS:  u32 flags (UAM_NET_OPT_*), then optionally u64 iter_insns (the per-input
  *           instruction budget from now on; 0 or absent: unchanged); more fields may
  *           follow, to be ignored
@@ -273,6 +275,10 @@ enum uam_fuzz_net_frame {
  *           u32 map_size, u32 n, then n x (u32 index, u8 count), indices ascending. A map
  *           with too many set buckets for the list to be smaller goes as COVERAGE instead.
  * CMP_INPUT: as INPUT
+ * PROBE_INPUT: as INPUT. Its run is judged (JUDGE, reply) as an INPUT's would be, but adds
+ *           nothing to the record: what it ran stays new to later runs. For inputs the
+ *           brain will not keep as they are (a minimizer's cuts); one it keeps after all
+ *           it sends again as an INPUT.
  * CMPS:     u64 id, u32 n, u32 dropped (records left out: the log or a site was full),
  *           then n x (u32 site, u8 width (bits), u8 kind (UAM_NET_CMP_*), u64 a, u64 b),
  *           in the order first seen; each distinct (site, a, b) once, at most 8 per site.
@@ -290,7 +296,7 @@ enum uam_fuzz_net_frame {
  * CORPUS:   u32 entry, u32 len, u8 data[len]
  * HAVOC:    u64 first_id (the batch's inputs are first_id .. first_id + n - 1), u32 entry,
  *           u32 n, u64 seed, u32 flags (UAM_NET_HAVOC_*)
- * FIND:     u64 id, u8 reason (0: new coverage; else enum uam_fuzz_net_reason), u32 status,
+ * FIND:     u64 id, u8 reason (0: new coverage; else enum uam_fuzz_net_reason), u64 status,
  *           u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets,
  *           u32 new_classes, u64 path (0 unless reason 0; new_buckets of a crash: the
  *           buckets no earlier crash had hit), u32 len, u8 data[len],
@@ -298,7 +304,8 @@ enum uam_fuzz_net_frame {
  * JUDGE:    u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally:
  *           buckets and (bucket, class) pairs never seen before, the path's name; a crash:
  *           new_buckets is the buckets no earlier crash had hit, the others 0),
- *           u8 novel_crash (a crash with a new (reason, status) or in code no crash reached)
+ *           u8 novel_crash (a crash with a new (reason, status), or one that hit a bucket no
+ *           earlier crash with its (reason, status) hit)
  * PROGRESS: u64 first_id (the batch), u32 execs (runs so far)
  * HAVOC_DONE: u64 first_id, u8 status (UAM_NET_HAVOC_*), u32 execs,
  *           u32 by_reason[7] (index 0: ended normally, else the CRASH reason), u32 finds,
@@ -331,7 +338,7 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_ARCH_MAX           64u
 #define UAM_NET_INPUT_HDR_LEN      12u
 #define UAM_NET_COVERAGE_HDR_LEN   13u
-#define UAM_NET_CRASH_LEN          13u
+#define UAM_NET_CRASH_LEN          17u
 #define UAM_NET_OPTIONS_MIN_LEN    4u
 #define UAM_NET_SPARSE_HDR_LEN     25u
 #define UAM_NET_SPARSE_ENTRY_LEN   5u
@@ -340,7 +347,7 @@ enum uam_fuzz_net_frame {
 #define UAM_NET_MUTATOR_MIN_LEN    20u
 #define UAM_NET_CORPUS_HDR_LEN     8u
 #define UAM_NET_HAVOC_LEN          28u
-#define UAM_NET_FIND_HDR_LEN       49u
+#define UAM_NET_FIND_HDR_LEN       53u
 #define UAM_NET_JUDGE_LEN          25u
 #define UAM_NET_UNINIT_HDR_LEN     31u   /* up to the touch list */
 #define UAM_NET_UNINIT_TOUCH_LEN   16u
@@ -381,9 +388,9 @@ enum uam_fuzz_net_stage {
 #define UAM_NET_CMP_SIGNED 0x4u   /* signed ordering */
 #define UAM_NET_CMP_IMM    0x8u   /* b is a constant */
 
-/* (reason, status) is a crash's identity for deduplication. */
+/* (reason, status) is a crash's identity for deduplication; status is 64 bits, all kept. */
 enum uam_fuzz_net_reason {
-    UAM_NET_FAULT     = 1,  /* a guest exception;        status = faulting pc (low 32 bits) */
+    UAM_NET_FAULT     = 1,  /* a guest exception;        status = faulting pc */
     UAM_NET_GUARD     = 2,  /* a redzone or --guard hit; status = pc of the access */
     UAM_NET_ORACLE    = 3,  /* a crash pc, halt status or interrupt fired; status = detail */
     UAM_NET_HANG      = 4,  /* no forward progress;      status = the stop reason */

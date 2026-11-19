@@ -1470,6 +1470,60 @@ static void test_campaign(const target *t, backend bk)
     CHECK(r.verdict == UAM_FUZZ_TIMEOUT && !j1.novel_crash && !j1.new_classes && !j1.new_buckets,
           "a timeout adds nothing");
 
+    /* Identities keep buckets of their own. The judgement takes the identity from its
+     * caller and the buckets from the run just made, so one identity can be given two
+     * routes: 'B's, then 'O's. Every bucket of 'O' was hit by a crash already (its own
+     * run above), none by a crash of this identity: a new way in, and novel. */
+    const uint64_t id_a = UINT64_C(0x1234567800000010);
+    uam_fuzz_run_one(f, (const uint8_t *)"B", 1, &r);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_FAULT, id_a, &j1);
+    uam_fuzz_run_one(f, (const uint8_t *)"O", 1, &r);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_FAULT, id_a, &j2);
+    CHECK(j1.novel_crash && j2.novel_crash && j2.new_buckets == 0,
+          "%s %s: another identity's buckets do not hide a new way into this one (%d %d, %u)",
+          t->name, bk_name[bk], j1.novel_crash, j2.novel_crash, j2.new_buckets);
+    uam_fuzz_run_one(f, (const uint8_t *)"O", 1, &r);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_FAULT, id_a, &j2);
+    CHECK(!j2.novel_crash, "%s: the same way in again is not novel", t->name);
+    /* All 64 bits of the detail are the identity, and the verdict is apart from it: the
+     * identities differ from id_a in the upper half, or in the verdict alone. */
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_FAULT, id_a & UINT32_MAX, &j1);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_ORACLE, id_a, &j2);
+    CHECK(j1.novel_crash && j2.novel_crash, "%s: 64-bit identities, apart by verdict", t->name);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_GUARD,
+                            id_a ^ ((uint64_t)(UAM_FUZZ_CRASH_GUARD ^ UAM_FUZZ_CRASH_FAULT) << 56),
+                            &j1);
+    CHECK(j1.novel_crash, "%s: no identity aliases another through its top byte", t->name);
+
+    /* A probe is judged as a run would be and changes nothing: the same crash judged next
+     * is novel still, and so is the same probe again. */
+    const uint64_t id_b = UINT64_C(0xfeedf00d00000020);
+    uam_fuzz_run_one(f, (const uint8_t *)"B", 1, &r);
+    CHECK(uam_fuzz_campaign_probe(c, UAM_FUZZ_CRASH_FAULT, id_b, &j1) == UAM_OK
+          && uam_fuzz_campaign_probe(c, UAM_FUZZ_CRASH_FAULT, id_b, &j2) == UAM_OK, "probe");
+    CHECK(j1.novel_crash && j2.novel_crash && j1.new_buckets == j2.new_buckets,
+          "%s %s: a probe records nothing", t->name, bk_name[bk]);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_FAULT, id_b, &j1);
+    uam_fuzz_campaign_judge(c, UAM_FUZZ_CRASH_FAULT, id_b, &j2);
+    CHECK(j1.novel_crash && !j2.novel_crash, "%s: judged after the probe: novel once", t->name);
+    uam_fuzz_campaign_probe(c, UAM_FUZZ_CRASH_FAULT, id_b, &j1);
+    CHECK(!j1.novel_crash, "%s: a probe sees the record", t->name);
+    {
+        const uint64_t edges = uam_fuzz_campaign_edges(c);
+        uam_fuzz_campaign *c2 = uam_fuzz_campaign_create(f);
+        CHECK(c2 != NULL, "a second campaign");
+        uam_fuzz_run_one(f, (const uint8_t *)"AA", 2, &r);
+        uam_fuzz_campaign_probe(c2, r.verdict, r.detail, &j1);
+        uam_fuzz_campaign_judge(c2, r.verdict, r.detail, &j2);
+        CHECK(j1.new_buckets > 0 && j2.new_buckets == j1.new_buckets
+              && j2.new_classes == j1.new_classes && j2.path == j1.path
+              && uam_fuzz_campaign_edges(c2) == j2.new_buckets
+              && uam_fuzz_campaign_edges(c) == edges,
+              "%s %s: a probe of a normal run is judged in full and leaves coverage new",
+              t->name, bk_name[bk]);
+        uam_fuzz_campaign_destroy(c2);
+    }
+
     /* Batches: counted, reproducible, fixed up. */
     uam_mutator *mut = uam_fuzz_campaign_mutator(c);
     uam_mutator_set_max_size(mut, 64);

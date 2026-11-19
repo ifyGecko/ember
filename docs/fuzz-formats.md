@@ -167,22 +167,23 @@ Every integer is big-endian, and maps are raw u8 counters.
 
 | Type | Direction | Payload |
 |---|---|---|
-| 1 HELLO | ember → brain, once | u16 version (1), u16 flags (the region's scheme bits, bit 3 the block model; bit 12: stages in ember are understood (STAGE); bit 13: mutation in ember is understood (MUTATOR, CORPUS, HAVOC); bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
+| 1 HELLO | ember → brain, once | u16 version (2; a peer refuses any other), u16 flags (the region's scheme bits, bit 3 the block model; bit 12: stages in ember are understood (STAGE); bit 13: mutation in ember is understood (MUTATOR, CORPUS, HAVOC); bit 14: compare logging is understood (OPTIONS bit 1, CMP_INPUT); bit 15: the target's data byte order is big-endian), u32 map_size, u16 arch_len (≤ 64), arch (the ISA's name, e.g. `rv32imac`, `mips32be`) |
 | 2 INPUT | brain → ember | u64 id (non-zero), u32 len, data |
 | 3 COVERAGE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u32 map_size, map |
-| 4 CRASH | ember → brain | u64 id, u8 reason, u32 status |
+| 4 CRASH | ember → brain | u64 id, u8 reason, u64 status |
 | 5 BYE | either way | none |
 | 6 OPTIONS | brain → ember, optional, after HELLO (normally once, before the first INPUT; each one replaces the last) | u32 flags: bit 0 SPARSE (reply with SPARSE instead of COVERAGE), bit 1 CMP_LOG (instrument the target's compares, for CMP_INPUT), bit 2 JUDGE (a JUDGE frame before each reply; needs HELLO bit 13); then optionally u64 iter_insns (the per-input instruction budget from now on; 0 or absent: unchanged); later fields, if any, are ignored |
 | 7 SPARSE | ember → brain | u64 id, u8 kind (1 INIT, 2 ITER), u64 insns (instructions the iteration ran; 0 for INIT), u32 map_size, u32 n, then n × (u32 index, u8 count), indices ascending |
 | 8 CMP_INPUT | brain → ember | as INPUT; the run also logs what its compares saw |
+| 21 PROBE_INPUT | brain → ember | as INPUT, answered as one (JUDGE, reply); its run is judged but adds nothing to ember's record, so what it ran stays new to later runs. For inputs the brain will not keep as they are (a minimizer's cuts); one it keeps after all it sends again as an INPUT |
 | 9 CMPS | ember → brain, right before a CMP_INPUT's reply | u64 id, u32 n, u32 dropped, then n × (u32 site, u8 width (bits), u8 kind, u64 a, u64 b) |
 | 10 MUTATOR | brain → ember | u32 max_size, u16 stack_lo, u16 stack_hi, u16 splice (per mille), u32 max_hang_finds, u16 n, then n × (u8 op, u16 weight), u32 n_tokens, then each token: u8 0, u16 len, bytes; or u8 1, u8 width (1, 2, 4, 8), u8 big_endian, u64 value |
 | 11 MUTATOR_INFO | ember → brain, the reply to each MUTATOR | u8 status (0 accepted, 1 refused), u16 msg_len, msg (why, when refused), u16 n, then n × (u8 op, u16 default weight, u16 weight, u8 name_len, name) |
 | 12 CORPUS | brain → ember | u32 entry, u32 len, data |
 | 13 HAVOC | brain → ember | u64 first_id, u32 entry, u32 n, u64 seed, u32 flags (bit 0 EDGES) |
-| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u32 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (new_classes, path and insns 0 unless reason 0; new_buckets of a crash: the buckets no earlier crash had hit), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
+| 14 FIND | ember → brain, during a batch | u64 id, u8 reason (0: new coverage, else a CRASH reason), u64 status, u64 insns, u64 ops (bit k: operator k was applied), u32 new_buckets, u32 new_classes, u64 path (new_classes, path and insns 0 unless reason 0; new_buckets of a crash: the buckets no earlier crash had hit), u32 len, data, u32 n, then n × (u32 index, u8 count), indices ascending (n = 0 unless reason 0) |
 | 15 HAVOC_DONE | ember → brain, closes a batch | u64 first_id, u8 status (0 ok, 1 no accepted MUTATOR, 2 no such CORPUS entry, 3 n (a stage's limit) is 0 or over its maximum (HAVOC: 2^20), first_id is 0, or the stage's kind is unknown, 4 input-to-state without compare logging), u32 execs, 7 × u32 (executions per reason: index 0 ended normally, 1-6 the CRASH reasons), u32 finds, u16 n, then n × (u8 op, u32 used, u32 found), u32 n_paths, then n × (u64 path, u32 execs), u32 n_edges (always there; 0 without EDGES), then n_edges × (u32 index, u32 execs) |
-| 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0, but for a crash's new_buckets: the buckets no earlier crash had hit), u8 novel_crash |
+| 16 JUDGE | ember → brain, before an INPUT's or CMP_INPUT's reply (OPTIONS bit 2) | u64 id, u32 new_buckets, u32 new_classes, u64 path (a run that ended normally; else 0, but for a crash's new_buckets: the buckets no earlier crash had hit), u8 novel_crash (a new (reason, status), or a bucket no earlier crash with its (reason, status) had hit) |
 | 17 PROGRESS | ember → brain, in a batch silent for 1 s | u64 first_id, u32 execs (runs so far) |
 | 18 STAGE | brain → ember | u64 first_id, u32 entry, u8 kind (1 input-to-state, 2 trimming), u32 limit (inputs derived at most: 1 .. 4096 candidates, 1 .. 65536 cuts), u32 flags (bit 0 EDGES) |
 | 19 STAGE_RESULT | ember → brain, before the HAVOC_DONE of a stage that ran | u64 first_id, u8 kind, then for input-to-state: u32 compares, u32 dropped, u32 candidates, u16 n, then n × (u8 width (bytes: 2, 4 or 8), u64 value); for trimming: u8 ran, u64 insns, u64 path, u32 len, data |
@@ -248,9 +249,12 @@ judges every run, of a batch or of an INPUT, against one record, and the brain k
 A run that ended normally is new when it sets a bucket never hit or a count class a bucket
 never had (the class of a count is 1, 2 or 4 for 1, 2 or 3, then 8 (4-7), 16 (8-15), 32
 (16-31), 64 (32-127) and 128 (128-255)). A crash is novel when its (reason, status) is new
-or when it ran code no earlier crash ran (a bucket no crash had hit), which tells two bugs
-at one pc apart; how many such buckets it hit is the crash's new_buckets, a rough measure
-of how unlike the earlier crashes its way was. A path is named by its set of (index, class) pairs, whatever order they
+or when it hit a bucket no earlier crash with that (reason, status) had hit, which tells two
+ways into one pc apart. Each (reason, status) keeps the buckets of its own crashes, so what
+a crash at one pc ran does not hide a new way into another. Apart from that, how many
+buckets a crash hit that no earlier crash of any (reason, status) had is its new_buckets, a
+rough measure of how unlike the earlier crashes its way was. A PROBE_INPUT's run is judged
+the same way and folded into nothing. A path is named by its set of (index, class) pairs, whatever order they
 were hit in: `mix(sum of mix((index << 8 | class) + 1))` in 64-bit arithmetic, with the
 coverage formula's `mix`. With OPTIONS bit 2 (JUDGE), every INPUT and CMP_INPUT reply is
 preceded by a JUDGE frame (after CMPS, if there is one) with what the run added.
@@ -294,13 +298,15 @@ The session ends with BYE from either side. EOF before a BYE is an error. ember 
 vanished brain host through TCP keepalive, and a brain that stops answering through
 `--fuzz-net-timeout`.
 
-**Crash reasons.** `(reason, status)` identifies a crash for deduplication.
+**Crash reasons.** `(reason, status)` identifies a crash for deduplication; status is 64
+bits, as ember has it (version 1 carried the low 32 bits only, so pcs 4 GiB apart, or
+interrupt lines 32-63 and a reset, were one crash).
 
 | Reason | Verdict | status |
 |---|---|---|
-| 1 FAULT | a guest exception (`crash-fault`) | the faulting pc, low 32 bits |
-| 2 GUARD | a redzone or `--guard` hit (`crash-guard`) | the pc of the access, low 32 bits |
-| 3 ORACLE | a crash pc, halt status or interrupt (`crash-oracle`) | the detail, low 32 bits |
+| 1 FAULT | a guest exception (`crash-fault`) | the faulting pc |
+| 2 GUARD | a redzone or `--guard` hit (`crash-guard`) | the pc of the access |
+| 3 ORACLE | a crash pc, halt status or interrupt (`crash-oracle`) | the detail: the crash pc, a halt status, the interrupt lines |
 | 4 HANG | no forward progress (`hang`) | the stop reason |
 | 5 TIMEOUT | the per-input budget ran out (`timeout`) | 0 |
 | 6 REJECTED | the input route refused the input; nothing ran | 0 |

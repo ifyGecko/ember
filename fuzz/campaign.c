@@ -16,6 +16,19 @@ typedef struct counts {
     size_t    cap_out;
 } counts;
 
+/* A set of bucket indices: open addressing, index + 1 per slot (0: the slot is free). */
+typedef struct bset {
+    uint32_t *slot;
+    size_t    cap, used;
+} bset;
+
+/* A crash identity, (verdict, detail), and every bucket its crashes have hit. */
+typedef struct ident {
+    uam_fuzz_verdict verdict;
+    uint64_t         detail;
+    bset             routes;
+} ident;
+
 struct uam_fuzz_campaign {
     uam_fuzz    *f;
     uam_mutator *mut;
@@ -23,8 +36,10 @@ struct uam_fuzz_campaign {
     uint8_t     *virgin;        /* the count classes seen per bucket (runs that ended normally) */
     uint8_t     *crash_seen;    /* 1: some crash hit this bucket */
     uint64_t     edges;
-    uint64_t    *sigs;          /* (verdict << 56 ^ detail) of every crash seen */
-    size_t       n_sigs, cap_sigs;
+    ident       *ids;           /* every crash identity seen */
+    size_t       n_ids, cap_ids;
+    uint32_t    *id_slot;       /* open addressing over ids: index + 1 (0: free) */
+    size_t       id_cap;
     uint32_t     hang_cap, hang_reports;
     /* the batch */
     uam_fuzz_batch b;
@@ -180,7 +195,10 @@ void uam_fuzz_campaign_destroy(uam_fuzz_campaign *c)
     uam_mutator_destroy(c->mut);
     free(c->virgin);
     free(c->crash_seen);
-    free(c->sigs);
+    for (size_t i = 0; i < c->n_ids; i++)
+        free(c->ids[i].routes.slot);
+    free(c->ids);
+    free(c->id_slot);
     counts_free(&c->paths);
     counts_free(&c->edge_runs);
     free(c->sbuf);
@@ -204,22 +222,106 @@ static const uint32_t *run_hits(uam_fuzz_campaign *c, size_t *n)
     return h ? h : uam_fuzz_map_hits(c->f, c->map_size, n);
 }
 
-static bool sig_new(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail)
+/* ---- bucket sets and crash identities --------------------------------------- */
+
+static size_t bset_home(uint32_t ix, size_t cap) { return (size_t)mix64(ix) & (cap - 1); }
+
+static bool bset_has(const bset *s, uint32_t ix)
 {
-    const uint64_t sig = (uint64_t)v << 56 ^ detail;
-    for (size_t i = 0; i < c->n_sigs; i++)
-        if (c->sigs[i] == sig)
-            return false;
-    if (c->n_sigs == c->cap_sigs) {
-        size_t cap = c->cap_sigs ? 2 * c->cap_sigs : 64;
-        uint64_t *p = realloc(c->sigs, cap * sizeof(*p));
-        if (!p)
-            return true;   /* novel; the set stays as it is */
-        c->sigs = p;
-        c->cap_sigs = cap;
+    if (!s->cap)
+        return false;
+    for (size_t k = bset_home(ix, s->cap); s->slot[k]; k = (k + 1) & (s->cap - 1))
+        if (s->slot[k] == ix + 1)
+            return true;
+    return false;
+}
+
+static bool bset_grow(bset *s)
+{
+    size_t cap = s->cap ? 2 * s->cap : 64;
+    uint32_t *slot = calloc(cap, sizeof(*slot));
+    if (!slot)
+        return false;
+    for (size_t i = 0; i < s->cap; i++) {
+        if (!s->slot[i])
+            continue;
+        size_t k = bset_home(s->slot[i] - 1, cap);
+        while (slot[k])
+            k = (k + 1) & (cap - 1);
+        slot[k] = s->slot[i];
     }
-    c->sigs[c->n_sigs++] = sig;
+    free(s->slot);
+    s->slot = slot;
+    s->cap = cap;
     return true;
+}
+
+/* 1: added, 0: already there, -1: out of memory. */
+static int bset_add(bset *s, uint32_t ix)
+{
+    if (2 * (s->used + 1) > s->cap && !bset_grow(s))
+        return -1;
+    size_t k = bset_home(ix, s->cap);
+    while (s->slot[k]) {
+        if (s->slot[k] == ix + 1)
+            return 0;
+        k = (k + 1) & (s->cap - 1);
+    }
+    s->slot[k] = ix + 1;
+    s->used++;
+    return 1;
+}
+
+static size_t ident_home(uam_fuzz_verdict v, uint64_t detail, size_t cap)
+{
+    return (size_t)mix64(detail ^ mix64((uint64_t)v + 1)) & (cap - 1);
+}
+
+/* The identity's index in c->ids, or -1 when no crash has had it. */
+static long ident_find(const uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail)
+{
+    if (!c->id_cap)
+        return -1;
+    for (size_t k = ident_home(v, detail, c->id_cap); c->id_slot[k]; k = (k + 1) & (c->id_cap - 1)) {
+        const ident *d = &c->ids[c->id_slot[k] - 1];
+        if (d->verdict == v && d->detail == detail)
+            return (long)(c->id_slot[k] - 1);
+    }
+    return -1;
+}
+
+/* A new identity, with no buckets yet: its index, or -1 when out of memory. */
+static long ident_add(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail)
+{
+    if (c->n_ids == c->cap_ids) {
+        size_t cap = c->cap_ids ? 2 * c->cap_ids : 64;
+        ident *p = realloc(c->ids, cap * sizeof(*p));
+        if (!p)
+            return -1;
+        c->ids = p;
+        c->cap_ids = cap;
+    }
+    if (2 * (c->n_ids + 1) > c->id_cap) {
+        size_t cap = c->id_cap ? 2 * c->id_cap : 128;
+        uint32_t *slot = calloc(cap, sizeof(*slot));
+        if (!slot)
+            return -1;
+        for (size_t i = 0; i < c->n_ids; i++) {
+            size_t k = ident_home(c->ids[i].verdict, c->ids[i].detail, cap);
+            while (slot[k])
+                k = (k + 1) & (cap - 1);
+            slot[k] = (uint32_t)(i + 1);
+        }
+        free(c->id_slot);
+        c->id_slot = slot;
+        c->id_cap = cap;
+    }
+    size_t k = ident_home(v, detail, c->id_cap);
+    while (c->id_slot[k])
+        k = (k + 1) & (c->id_cap - 1);
+    c->ids[c->n_ids] = (ident){ .verdict = v, .detail = detail };
+    c->id_slot[k] = (uint32_t)(c->n_ids + 1);
+    return (long)c->n_ids++;
 }
 
 static bool is_crash(uam_fuzz_verdict v)
@@ -227,9 +329,11 @@ static bool is_crash(uam_fuzz_verdict v)
     return v == UAM_FUZZ_CRASH_FAULT || v == UAM_FUZZ_CRASH_ORACLE || v == UAM_FUZZ_CRASH_GUARD;
 }
 
-/* Judge and fold; *hits (optional) gets the run's bucket list for the caller's counting. */
+/* Judge, and fold the run into the record unless `probe`; *hits (optional) gets the run's
+ * bucket list for the caller's counting. */
 static uam_status judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail,
-                        uam_fuzz_judgement *j, const uint32_t **hits_out, size_t *n_out)
+                        uam_fuzz_judgement *j, const uint32_t **hits_out, size_t *n_out,
+                        bool probe)
 {
     *j = (uam_fuzz_judgement){ .verdict = v, .detail = detail };
     if (hits_out)
@@ -248,22 +352,49 @@ static uam_status judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detai
             const uint8_t cl = uam_fuzz_count_class(map[ix]), old = c->virgin[ix];
             sum += uam_fuzz_path_term(ix, map[ix]);
             if (!(old & cl)) {
-                c->virgin[ix] = old | cl;
+                if (!probe)
+                    c->virgin[ix] = old | cl;
                 j->new_classes++;
                 j->new_buckets += !old;
             }
         }
-        c->edges += j->new_buckets;
+        if (!probe)
+            c->edges += j->new_buckets;
         j->path = uam_fuzz_path_end(sum);
     } else {
-        /* new_buckets of a crash: the buckets no earlier crash had hit */
+        /* new_buckets of a crash: the buckets no earlier crash had hit (any identity) */
         for (size_t i = 0; i < n; i++) {
             if (!c->crash_seen[hits[i]]) {
-                c->crash_seen[hits[i]] = 1;
+                if (!probe)
+                    c->crash_seen[hits[i]] = 1;
                 j->new_buckets++;
             }
         }
-        j->novel_crash = sig_new(c, v, detail) || j->new_buckets != 0;
+        /* novel: a new identity, or a bucket no earlier crash of this identity hit. Each
+         * identity has buckets of its own, so that what a crash at one pc ran does not hide
+         * a new way into another. */
+        long k = ident_find(c, v, detail);
+        if (k < 0) {
+            j->novel_crash = true;
+            if (!probe && (k = ident_add(c, v, detail)) < 0)
+                return UAM_ERR_NOMEM;
+        }
+        if (k >= 0) {
+            bset *s = &c->ids[k].routes;
+            for (size_t i = 0; i < n; i++) {
+                if (probe) {
+                    if (!bset_has(s, hits[i])) {
+                        j->novel_crash = true;
+                        break;
+                    }
+                    continue;
+                }
+                const int added = bset_add(s, hits[i]);
+                if (added < 0)
+                    return UAM_ERR_NOMEM;
+                j->novel_crash |= added != 0;
+            }
+        }
     }
     if (hits_out) {
         *hits_out = hits;
@@ -275,7 +406,13 @@ static uam_status judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detai
 uam_status uam_fuzz_campaign_judge(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail,
                                    uam_fuzz_judgement *j)
 {
-    return judge(c, v, detail, j, NULL, NULL);
+    return judge(c, v, detail, j, NULL, NULL, false);
+}
+
+uam_status uam_fuzz_campaign_probe(uam_fuzz_campaign *c, uam_fuzz_verdict v, uint64_t detail,
+                                   uam_fuzz_judgement *j)
+{
+    return judge(c, v, detail, j, NULL, NULL, true);
 }
 
 /* ---- stages ---------------------------------------------------------------- */
@@ -504,7 +641,7 @@ uam_status uam_fuzz_campaign_batch_judge(uam_fuzz_campaign *c, uam_fuzz_verdict 
 {
     const uint32_t *hits;
     size_t n = 0;
-    uam_status st = judge(c, v, detail, j, &hits, &n);
+    uam_status st = judge(c, v, detail, j, &hits, &n, false);
     if (st != UAM_OK)
         return st;
     uam_fuzz_batch *b = &c->b;

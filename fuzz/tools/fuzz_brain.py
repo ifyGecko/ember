@@ -7,8 +7,9 @@ seconds): ember dials in, boots its firmware and says HELLO. The brain mirrors i
 into ember (CORPUS) and asks for batches of mutations of one entry (HAVOC): ember
 mutates, runs and judges them itself and reports only what is worth keeping (FIND) and
 the batch's totals (HAVOC_DONE). Trimming and input-to-state are stages ember runs the
-same way (STAGE). Single inputs (seeds, calibration, minimizing, imports) go as INPUT and
-get one COVERAGE (or SPARSE) map or CRASH verdict. The protocol (UAMF) is specified in
+same way (STAGE). Single inputs (seeds, calibration, imports) go as INPUT, the minimizer's
+cuts as PROBE_INPUT (judged, not recorded), and each gets one COVERAGE (or SPARSE) map or
+CRASH verdict. The protocol (UAMF) is specified in
 docs/fuzz-formats.md; its constants are in fuzz/formats.h. The design of the campaign is docs/fuzz-ideas.md; its
 logic lives in fuzz/tools/fuzz_queue.py.
 
@@ -105,16 +106,17 @@ from fuzz_queue import (SCHEDULES, Entry, OpStats, Queue, entry_name,  # noqa: E
 
 # ---- the fuzz protocol (fuzz/formats.h, docs/fuzz-formats.md) ----------
 NET_MAGIC = b"UAMF"
-NET_VERSION = 1
+NET_VERSION = 2                          # 2: 64-bit crash status, PROBE_INPUT
 NET_FRAME_MAX = 64 << 20                 # bytes in one frame, type included
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
 JUDGE, PROGRESS, STAGE, STAGE_RESULT = 16, 17, 18, 19
 UNINIT = 20                              # ember -> brain: a run that depended on memory nothing wrote
+PROBE_INPUT = 21                         # an INPUT judged without adding to ember's record
 UNINIT_HDR_LEN, UNINIT_TOUCH_LEN = 31, 16
 UNINIT_KINDS = ((1, "verdict"), (2, "detail"), (4, "insns"), (8, "path"), (16, "output"))
 UNINIT_VERDICTS = ("ok", "fault", "oracle", "hang", "timeout", "rejected", "guard")
-FIND_HDR_LEN, JUDGE_LEN = 49, 25
+FIND_HDR_LEN, JUDGE_LEN = 53, 25
 OPT_JUDGE = 1 << 2                       # OPTIONS: a JUDGE frame before each INPUT's reply
 HAVOC_EDGES = 1 << 0                     # HAVOC flags: HAVOC_DONE lists executions per bucket
 HAVOC_STATUS = {1: "no accepted MUTATOR", 2: "no such corpus entry", 3: "a bad batch size",
@@ -124,7 +126,7 @@ STAGE_I2S, STAGE_TRIM = 1, 2             # STAGE kinds
 STAGE_I2S_MAX, STAGE_TRIM_MAX = 4096, 65536   # most candidates / cuts in one STAGE
 STAGE_RESULT_HDR_LEN = 9
 HELLO_FIXED_LEN, ARCH_MAX = 10, 64
-COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 13, 25
+COVERAGE_HDR_LEN, CRASH_LEN, SPARSE_HDR_LEN = 13, 17, 25
 PROGRESS_LEN = 12
 HELLO_BIG_ENDIAN = 1 << 15               # HELLO flags: the target is big-endian
 HELLO_CMP = 1 << 14                      # HELLO flags: compare logging is understood
@@ -269,7 +271,8 @@ def main():
                          "found)")
     ap.add_argument("--crashes-per-sig", type=int, default=4,
                     help="save at most N crashes with one (reason, status): the first, "
-                         "minimized, then those that ran code no earlier crash ran (default 4)")
+                         "minimized, then those that hit a bucket no earlier crash with it had "
+                         "hit (default 4)")
     ap.add_argument("--iter-insns", default=None,
                     help="set ember's per-input instruction budget: N, or auto for 5x the "
                          "slowest queue entry after the baseline (default: ember's own "
@@ -646,7 +649,7 @@ def main():
             if ftype == FIND:
                 try:
                     (fid, reason, status, insns, ops, nb, nc, path,
-                     dlen) = struct.unpack(">QBIQQIIQI", payload[:FIND_HDR_LEN])
+                     dlen) = struct.unpack(">QBQQQIIQI", payload[:FIND_HDR_LEN])
                     data = payload[FIND_HDR_LEN:FIND_HDR_LEN + dlen]
                     p = FIND_HDR_LEN + dlen
                     (nh,) = struct.unpack(">I", payload[p:p + 4])
@@ -760,14 +763,17 @@ def main():
             emit_event("find", "queue=%d %s" % (len(queue.entries), c.name), edges=nb)
         return kept
 
-    def probe(data):
+    def probe(data, record=True):
         """Send one input and return ember's verdict, with no accounting:
         ('crash', reason, status) | ('iter', hits, insns) | ('other', None, None).
-        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map."""
+        hits: (index, count) pairs, ascending; insns 0 when ember sent a whole map.
+        record=False: a PROBE_INPUT, judged by ember without adding to its record (an
+        input that is not kept as it is: what it ran stays new to the runs after it)."""
         ident = next_id[0]
         next_id[0] += 1
         last_judge[0] = None
-        send_frame(conn, INPUT, struct.pack(">QI", ident, len(data)) + data)
+        send_frame(conn, INPUT if record else PROBE_INPUT,
+                   struct.pack(">QI", ident, len(data)) + data)
         while True:
             ftype, payload = recv_frame(conn)
             if ftype == BYE:
@@ -790,7 +796,7 @@ def main():
                 if len(payload) < CRASH_LEN:
                     raise ProtocolError("CRASH payload is %d bytes (needs %d)"
                                         % (len(payload), CRASH_LEN))
-                cid, reason, status = struct.unpack(">QBI", payload[:CRASH_LEN])
+                cid, reason, status = struct.unpack(">QBQ", payload[:CRASH_LEN])
                 if reason == MALFORMED:
                     # ember could not parse our INPUT frame: a bug on this side.
                     raise ProtocolError("ember reports input id=%d as MALFORMED "
@@ -846,7 +852,14 @@ def main():
         Its runs are runs like any other: each one counts in execs (and in minimize_execs,
         which tells them apart), and the status is written while it works. The totals of
         crashes and hangs stay what fuzzing found: a probe that fails the same way again is
-        this finding once more, not another one."""
+        this finding once more, not another one.
+
+        The cuts go as PROBE_INPUTs: ember judges them without adding them to its record,
+        so a cut that is thrown away does not make what it ran look old to later crashes.
+        A cut that crashes elsewhere is a find like any other: a new (reason, status), or
+        a known one reached through buckets no crash of it had hit (ember's novel_crash),
+        goes to save_crash, and once saved it runs again as an INPUT to be recorded. So
+        does the result."""
         nonlocal execs, minimize_execs
         if not args.minimize or len(data) <= 1:
             return data
@@ -868,7 +881,7 @@ def main():
                     announced = True
                     emit_status()         # the stage shows at once, not an interval later
                     last_status[0] = time.monotonic()
-                r = probe(cand) if cand else None
+                r = probe(cand, record=False) if cand else None
                 if r:
                     execs += 1
                     minimize_execs += 1
@@ -876,14 +889,31 @@ def main():
                 if r == ("crash", reason, status):
                     best = cand           # the drop kept the crash
                     continue
-                if (r and r[0] == "crash" and r[1] not in HANG_REASONS and r[1] != REJECTED
-                        and (r[1], r[2]) not in crash_sigs):
-                    # Another bug on the way: keep it as found; its turn comes later.
-                    save_crash(cand, r[1], r[2], nested=True, fresh=last_judge[0][0])
+                if r and r[0] == "crash" and r[1] not in HANG_REASONS and r[1] != REJECTED:
+                    # Another bug on the way, or another way into a known one: keep it as
+                    # found (its turn to be minimized comes later), and have ember record it.
+                    # (A known one past --crashes-per-sig is left alone: a cut is not a
+                    # crash fuzzing found, so it is neither saved nor counted.)
+                    nb, _, _, novel = last_judge[0]
+                    sig = (r[1], r[2])
+                    if ((sig not in crash_sigs
+                         or novel and saved_per_sig.get(sig, 0) < args.crashes_per_sig)
+                            and save_crash(cand, r[1], r[2], novel=novel, nested=True, fresh=nb)):
+                        record(cand)
                 i += chunk
             chunk //= 2
         stage[0] = was
+        if best is not data and reason not in HANG_REASONS:
+            record(best)                  # kept: ember's record takes what it ran
         return best
+
+    def record(data):
+        """Run a kept input again as an INPUT, so that ember's record holds what it ran
+        (it ran first as a PROBE_INPUT). Counted as a minimizing run."""
+        nonlocal execs, minimize_execs
+        probe(data)
+        execs += 1
+        minimize_execs += 1
 
     def write_finding(where, prefix, data, reason, status, minimized="no"):
         """Write one finding plus its .info sidecar; return the file name. minimized: yes |
@@ -948,13 +978,14 @@ def main():
 
     def save_crash(data, reason, status, counted=False, novel=False, nested=False, fresh=0):
         """counted: a HAVOC batch's totals already counted it. novel: ember judged that the
-        crash ran code no earlier crash ran (or has a new (reason, status)). nested: met
-        while minimizing another crash. fresh: how many buckets it hit that no earlier
-        crash had (ember's count)."""
+        crash has a new (reason, status) or hit a bucket no earlier crash with its (reason,
+        status) hit. nested: met while minimizing another crash. fresh: how many buckets it
+        hit that no earlier crash of any (reason, status) had (ember's count). Returns
+        whether it was saved."""
         nonlocal crashes, hangs, rejected
         if reason == REJECTED:            # the input route refused it: no bug
             rejected += 0 if counted else 1
-            return
+            return False
         is_hang = reason in HANG_REASONS
         if is_hang:
             hangs += 0 if counted else 1
@@ -975,12 +1006,12 @@ def main():
                     % (label, nth, rname, st,
                        "already saved" if h in hang_inputs
                        else "--max-hangs %d reached" % args.max_hangs))
-                return
+                return False
             hang_inputs.add(h)
         elif n > 1 and not (novel and saved_per_sig.get(sig, 0) < args.crashes_per_sig):
             log("%s #%d %s status=%s dup (count=%d, not saved)"   # this bug again: don't flood
                 % (label, nth, rname, st, n))
-            return
+            return False
         variant = not is_hang and n > 1   # the same (reason, status) through other code
         if not is_hang:
             saved_per_sig[sig] = saved_per_sig.get(sig, 0) + 1
@@ -1014,6 +1045,7 @@ def main():
         log("%s #%d %s status=%s NEW len=%d (saved %s%s)"
             % (label, nth, rname, st, len(data), fname, note))
         emit_event(ev, "%s status=%s %s" % (rname, st, fname))
+        return True
 
     def run(data):
         """Run one input and account for it: ('crash', ...) after saving it, or

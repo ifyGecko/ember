@@ -3,7 +3,7 @@
 
 FIRMWARE is a build of tests/fuzz/fuzztarget.h. The brain listens on a free port, starts
 uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz protocol"):
-  - the magic and HELLO (version 1, the arch, map size, scheme flags: the block model N=2
+  - the magic and HELLO (version 2, the arch, map size, scheme flags: the block model N=2
     with --cov-blocks, the site-id N=2 scheme with SITES/BOUNDARY from mk_lists.py);
   - the unsolicited INIT snapshot (id 0, kind INIT) before any reply;
   - COVERAGE kind ITER for a good input, and the same map for the same input;
@@ -28,6 +28,9 @@ uam-run with --fuzz-net, and checks, frame by frame (docs/fuzz-formats.md "Fuzz 
   - JUDGE (OPTIONS bit 2): before each INPUT's reply, what the run added (new buckets and
     classes, zero the second time), its path (Python's path_hash of the reply) and whether a
     crash is novel; CMPS comes before it;
+  - PROBE_INPUT: judged and answered as an INPUT, and recorded not at all: the same input
+    again, as a PROBE_INPUT and then as an INPUT, is new each time, and only after the
+    INPUT is it not;
   - OPTIONS' budget: a batch of long timeouts sends PROGRESS while it is silent;
   - mutation in ember: HELLO announces it; HAVOC before an accepted MUTATOR, for an unknown
     corpus entry or of 0 mutations gets HAVOC_DONE with that status and nothing runs; a bad
@@ -57,6 +60,7 @@ import time
 HELLO, INPUT, COVERAGE, CRASH, BYE, OPTIONS, SPARSE, CMP_INPUT, CMPS = 1, 2, 3, 4, 5, 6, 7, 8, 9
 MUTATOR, MUTATOR_INFO, CORPUS, HAVOC, FIND, HAVOC_DONE = 10, 11, 12, 13, 14, 15
 JUDGE, PROGRESS, STAGE, STAGE_RESULT = 16, 17, 18, 19
+PROBE_INPUT = 21
 STAGE_I2S, STAGE_TRIM = 1, 2
 OPT_JUDGE = 4
 FLAG_BIG_ENDIAN = 1 << 15
@@ -171,11 +175,11 @@ def mutator_info(p):
 
 def find(p):
     """(id, reason, status, insns, ops, data, hits, exact layout, (new_buckets, new_classes, path))."""
-    fid, reason, status, insns, ops, nb, nc, path, dlen = struct.unpack(">QBIQQIIQI", p[:49])
-    data = p[49:49 + dlen]
-    (n,) = struct.unpack(">I", p[49 + dlen:53 + dlen])
-    hits = list(struct.iter_unpack(">IB", p[53 + dlen:53 + dlen + 5 * n]))
-    return fid, reason, status, insns, ops, data, hits, len(p) == 53 + dlen + 5 * n, (nb, nc, path)
+    fid, reason, status, insns, ops, nb, nc, path, dlen = struct.unpack(">QBQQQIIQI", p[:53])
+    data = p[53:53 + dlen]
+    (n,) = struct.unpack(">I", p[53 + dlen:57 + dlen])
+    hits = list(struct.iter_unpack(">IB", p[57 + dlen:57 + dlen + 5 * n]))
+    return fid, reason, status, insns, ops, data, hits, len(p) == 57 + dlen + 5 * n, (nb, nc, path)
 
 
 def judged(c):
@@ -343,8 +347,19 @@ def havoc_checks(c, tag, msize, slow):
     # JUDGE: ember's judgement of an INPUT's run, before its reply.
     send_frame(c, OPTIONS, struct.pack(">I", OPT_SPARSE | OPT_CMP_LOG | OPT_JUDGE))
     fresh = b"zzzz novel input for judge"
+    # PROBE_INPUT: judged as an INPUT is, recorded not at all: twice as a probe, then as an
+    # INPUT, the same judgement (which shows something only where the input is new: with
+    # block coverage; a site list has seen it all by now)
+    probes = []
+    for pid in (38, 39):
+        send_frame(c, PROBE_INPUT, struct.pack(">QI", pid, len(fresh)) + fresh)
+        pj, pt, _ = judged(c)
+        probes.append((pj, pt))
     send_input(c, 40, fresh)
     j, t, p = judged(c)
+    check(all(pt == SPARSE for _, pt in probes) and [pj[0] for pj, _ in probes] == [38, 39]
+          and all(pj[1:4] == j[1:4] for pj, _ in probes),
+          f"{tag}: a PROBE_INPUT is judged and recorded not at all ({probes} then {j})")
     hits = None
     if check(t == SPARSE and j[0] == 40, f"{tag}: JUDGE then SPARSE (type {t}, id {j[0]})"):
         _, _, _, m, _, idx, _ = sparse(p)
@@ -488,7 +503,7 @@ def main():
             t, p = recv_frame(c)
             check(t == HELLO, f"{tag}: first frame is HELLO")
             ver, flags, msize, alen = struct.unpack(">HHIH", p[:10])
-            check(ver == 1 and len(p) == 10 + alen, f"{tag}: HELLO version {ver}, {len(p)} bytes")
+            check(ver == 2 and len(p) == 10 + alen, f"{tag}: HELLO version {ver}, {len(p)} bytes")
             check(p[10:10 + alen].decode() == arch, f"{tag}: HELLO arch {p[10:10 + alen]!r}")
             want = want_flags | FLAG_CMP | FLAG_HAVOC | FLAG_STAGES | (FLAG_BIG_ENDIAN if board in BIG_ENDIAN_BOARDS else 0)
             check(flags == want, f"{tag}: HELLO flags {flags:#x}, expected {want:#x}")
@@ -514,9 +529,9 @@ def main():
             def crash(iid, data, reason, status=None):
                 send_input(c, iid, data)
                 t, p = recv_frame(c)
-                if not check(t == CRASH and len(p) == 13, f"{tag}: input {iid}: CRASH (type {t})"):
+                if not check(t == CRASH and len(p) == 17, f"{tag}: input {iid}: CRASH (type {t})"):
                     return None
-                rid, rsn, sts = struct.unpack(">QBI", p)
+                rid, rsn, sts = struct.unpack(">QBQ", p)
                 check(rid == iid and rsn == reason, f"{tag}: input {iid}: id {rid} reason {rsn}")
                 if status is not None:
                     check(sts == status, f"{tag}: input {iid}: status {sts:#x}, expected {status:#x}")
@@ -530,10 +545,10 @@ def main():
 
             send_frame(c, INPUT, b"\0\0\0\0\0")                    # < 8 bytes: id 0
             t, p = recv_frame(c)
-            check(t == CRASH and p == struct.pack(">QBI", 0, MALFORMED, 0), f"{tag}: short INPUT")
+            check(t == CRASH and p == struct.pack(">QBQ", 0, MALFORMED, 0), f"{tag}: short INPUT")
             send_frame(c, INPUT, struct.pack(">QI", 7, 100) + b"abc")   # len overruns
             t, p = recv_frame(c)
-            check(t == CRASH and p == struct.pack(">QBI", 7, MALFORMED, 0), f"{tag}: overrun INPUT")
+            check(t == CRASH and p == struct.pack(">QBQ", 7, MALFORMED, 0), f"{tag}: overrun INPUT")
 
             send_input(c, 8, b"ok")                                # still in lockstep
             t, p = recv_frame(c)
@@ -598,7 +613,7 @@ def main():
             t, p = recv_frame(c)
             check(t == CMPS and cmps(p)[0] == 15, f"{tag}: CMPS before a crash (type {t})")
             t, p = recv_frame(c)
-            check(t == CRASH and len(p) == 13 and struct.unpack(">QBI", p)[:2] == (15, FAULT),
+            check(t == CRASH and len(p) == 17 and struct.unpack(">QBQ", p)[:2] == (15, FAULT),
                   f"{tag}: the magic value: CRASH FAULT (type {t})")
 
             havoc_checks(c, tag, msize, slow=mode == "blocks" and not st.get("eof"))
@@ -636,7 +651,7 @@ def main():
         handshake(c, tag)
         send_input(c, 1, b"0123456789")
         t, p = recv_frame(c)
-        check(t == CRASH and p == struct.pack(">QBI", 1, REJECTED, 0),
+        check(t == CRASH and p == struct.pack(">QBQ", 1, REJECTED, 0),
               f"{tag}: over max: CRASH REJECTED status 0 (type {t}, {p.hex()})")
         send_input(c, 2, b"ok")
         t, p = recv_frame(c)
@@ -659,7 +674,7 @@ def main():
         for iid in (1, 2):
             send_input(c, iid, b"hello")
             t, p = recv_frame(c)
-            rid, rsn, sts = struct.unpack(">QBI", p) if t == CRASH and len(p) == 13 else (None,) * 3
+            rid, rsn, sts = struct.unpack(">QBQ", p) if t == CRASH and len(p) == 17 else (None,) * 3
             check(rid == iid and rsn == GUARD and sts, f"{tag}: input {iid}: CRASH GUARD with a pc "
                   f"(type {t}, id {rid}, reason {rsn}, status {sts})")
             pcs.append(sts)

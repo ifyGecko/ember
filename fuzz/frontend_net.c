@@ -8,10 +8,10 @@
  * normally, CRASH otherwise:
  *
  *   UAM_FUZZ_OK            COVERAGE, kind ITER
- *   UAM_FUZZ_CRASH_FAULT   CRASH FAULT,    status = faulting pc (low 32 bits)
- *   UAM_FUZZ_CRASH_GUARD   CRASH GUARD,    status = pc of the guarded access (low 32 bits)
- *   UAM_FUZZ_CRASH_ORACLE  CRASH ORACLE,   status = detail (low 32 bits): the crash pc, a
- *                                          halt status or interrupt lines
+ *   UAM_FUZZ_CRASH_FAULT   CRASH FAULT,    status = faulting pc
+ *   UAM_FUZZ_CRASH_GUARD   CRASH GUARD,    status = pc of the guarded access
+ *   UAM_FUZZ_CRASH_ORACLE  CRASH ORACLE,   status = detail: the crash pc, a halt status
+ *                                          or interrupt lines
  *   UAM_FUZZ_HANG          CRASH HANG,     status = the uam_stop_reason
  *   UAM_FUZZ_TIMEOUT       CRASH TIMEOUT,  status 0
  *   UAM_FUZZ_REJECTED      CRASH REJECTED, status 0: the route refused the input
@@ -28,7 +28,9 @@
  * The boot map goes out once, unsolicited, as COVERAGE id 0 kind INIT. A malformed INPUT
  * is answered with CRASH MALFORMED and nothing runs. A BYE from the brain ends the run;
  * ember sends BYE when it stops first (an error, an interrupt). EOF before a BYE is an
- * error. Unknown frame types are ignored.
+ * error. Unknown frame types are ignored. A PROBE_INPUT runs and is answered like an
+ * INPUT, but its run is judged without adding to the campaign's record
+ * (uam_fuzz_campaign_probe).
  *
  * A brain that sends MUTATOR, CORPUS and HAVOC (HELLO says UAM_NET_HELLO_HAVOC) has ember
  * mutate: a HAVOC batch hands the harness n mutations of a corpus entry, one after
@@ -83,6 +85,7 @@ struct cf_net {
     bool      big_endian;  /* the target's data byte order (HELLO) */
     bool      sparse;      /* OPTIONS asked for SPARSE replies */
     bool      cmp_pending; /* the input being run is a CMP_INPUT: CMPS before its reply */
+    bool      probe;       /* the input being run is a PROBE_INPUT: judged, not recorded */
     uam_fuzz *fuzz;        /* cf_net_attach: the harness (results, hit lists) */
     unsigned  timeout_s;   /* per-frame wait for the brain; 0: none */
     uint8_t  *in;          /* the last frame's payload */
@@ -196,11 +199,11 @@ static bool send_frame(cf_net *z, uint8_t type, size_t payload_len)
     return write_all(z, z->out, 5 + payload_len);
 }
 
-static bool send_crash(cf_net *z, uint64_t id, uint8_t reason, uint32_t status)
+static bool send_crash(cf_net *z, uint64_t id, uint8_t reason, uint64_t status)
 {
     uint8_t *p = put64(z->out + 5, id);
     *p++ = reason;
-    put32(p, status);
+    put64(p, status);
     return send_frame(z, UAM_NET_CRASH, UAM_NET_CRASH_LEN);
 }
 
@@ -311,9 +314,9 @@ static uint64_t now_ns(void)
 }
 
 /* The protocol's crash reason (0: ended normally) and status of a verdict. */
-static uint8_t verdict_reason(uam_fuzz_verdict v, uint64_t detail, uint32_t *status)
+static uint8_t verdict_reason(uam_fuzz_verdict v, uint64_t detail, uint64_t *status)
 {
-    *status = (uint32_t)detail;
+    *status = detail;
     switch (v) {
     case UAM_FUZZ_OK:           *status = 0; return 0;
     case UAM_FUZZ_CRASH_FAULT:  return UAM_NET_FAULT;
@@ -589,7 +592,7 @@ static bool send_stage_result(cf_net *z)
 static bool send_find(cf_net *z, uint64_t id, const uam_fuzz_judgement *j)
 {
     const uam_fuzz_batch *b = uam_fuzz_campaign_batch(z->camp);
-    uint32_t status;
+    uint64_t status;
     const uint8_t reason = verdict_reason(j->verdict, j->detail, &status);
     size_t n = 0, map_size;
     const uint32_t *hits = NULL;
@@ -605,7 +608,7 @@ static bool send_find(cf_net *z, uint64_t id, const uam_fuzz_judgement *j)
     const uam_fuzz_result *r = uam_fuzz_last_result(z->fuzz);
     uint8_t *p = put64(z->out + 5, id);
     *p++ = reason;
-    p = put32(p, status);
+    p = put64(p, status);
     p = put64(p, !reason && r ? r->insns : 0);
     p = put64(p, b->ops);
     p = put32(p, j->new_buckets);
@@ -783,7 +786,8 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             }
             continue;
         case UAM_NET_INPUT:
-        case UAM_NET_CMP_INPUT: {
+        case UAM_NET_CMP_INPUT:
+        case UAM_NET_PROBE_INPUT: {
             uint32_t dlen = plen >= UAM_NET_INPUT_HDR_LEN ? get32(z->in + 8) : 0;
             if (plen < UAM_NET_INPUT_HDR_LEN || dlen > plen - UAM_NET_INPUT_HDR_LEN) {
                 uint64_t bad = plen >= 8 ? get64(z->in) : 0;
@@ -799,6 +803,7 @@ static int net_next_input(void *ctx, uint8_t **data, size_t *len, uint64_t *id)
             z->cur = *data;
             z->cur_len = dlen;
             z->cmp_pending = hdr[4] == UAM_NET_CMP_INPUT;
+            z->probe = hdr[4] == UAM_NET_PROBE_INPUT;
             if (z->cmp_pending && z->fuzz)
                 uam_fuzz_cmp_arm(z->fuzz);   /* false with logging off: an empty CMPS */
             return 1;
@@ -920,10 +925,11 @@ static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
     if (kind == UAM_FUZZ_KIND_ITER && z->batch)
         return havoc_report(z, id, v, detail) ? UAM_OK : UAM_ERR_INVALID;
     /* Every run is judged, so that the campaign's record is whole: what an INPUT showed
-     * is not new to the batches either. */
+     * is not new to the batches either. A PROBE_INPUT's is judged and not recorded. */
     uam_fuzz_judgement j = { 0 };
     if (kind == UAM_FUZZ_KIND_ITER && z->camp
-        && uam_fuzz_campaign_judge(z->camp, v, detail, &j) != UAM_OK) {
+        && (z->probe ? uam_fuzz_campaign_probe(z->camp, v, detail, &j)
+                     : uam_fuzz_campaign_judge(z->camp, v, detail, &j)) != UAM_OK) {
         uam_log(UAM_LOG_ERROR, "fuzz-net", "out of memory judging a run");
         return UAM_ERR_NOMEM;
     }
@@ -944,16 +950,8 @@ static uam_status net_report(void *ctx, uint64_t id, uam_fuzz_verdict v, uint64_
         memcpy(p, map, map_size);
         ok = send_frame(z, UAM_NET_COVERAGE, UAM_NET_COVERAGE_HDR_LEN + map_size);
     } else {
-        uint8_t reason;
-        uint32_t status = (uint32_t)detail;
-        switch (v) {
-        case UAM_FUZZ_CRASH_FAULT:  reason = UAM_NET_FAULT; break;
-        case UAM_FUZZ_CRASH_GUARD:  reason = UAM_NET_GUARD; break;
-        case UAM_FUZZ_CRASH_ORACLE: reason = UAM_NET_ORACLE; break;
-        case UAM_FUZZ_HANG:         reason = UAM_NET_HANG; break;
-        case UAM_FUZZ_REJECTED:     reason = UAM_NET_REJECTED; status = 0; break;
-        default:                    reason = UAM_NET_TIMEOUT; status = 0; break;
-        }
+        uint64_t status;
+        const uint8_t reason = verdict_reason(v, detail, &status);
         ok = send_crash(z, id, reason, status);
     }
     return ok ? UAM_OK : UAM_ERR_INVALID;

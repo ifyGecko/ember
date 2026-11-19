@@ -787,8 +787,14 @@ brain listens on IPv4 and exits 0 after a clean session, 1 on a protocol error.
 `fuzz-formats.md`); the brain keeps none. An input is interesting when it sets a bucket
 never hit or reaches a hit-count class (1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+) that bucket
 never had. A crash is saved when its `(reason, status)` is new, and up to
-`--crashes-per-sig` (4) times when it ran code no earlier crash ran (as found: another way
-into that pc, or another bug there); a different crash met while minimizing is saved too.
+`--crashes-per-sig` (4) times in all when it hit a bucket no earlier crash with that
+`(reason, status)` had hit (as found: another way into that pc, or another bug there).
+Each `(reason, status)` keeps the buckets of its own crashes, so a crash elsewhere that ran
+the same code does not hide a new way in. The minimizer's cuts go as PROBE_INPUTs, judged
+without being recorded: a cut that is thrown away hides nothing either. A cut that crashes
+elsewhere is a find like any other: a new `(reason, status)`, or a known one reached a new
+way while it has saves left, is saved as found and sent again as an INPUT, so that ember
+records it.
 
 **Which crash is minimized, and when.** What is saved and what is minimized are decided
 apart (`fuzz/tools/fuzz_crashes.py`). Every `(reason, status)` is saved, always, and the
@@ -915,8 +921,8 @@ thrown out at that check.
 weights (MUTATOR_INFO), so the two never disagree. Trimming and input-to-state run in ember
 as well, as stages of the campaign engine (`uam/fuzz_campaign.h`): the brain names the
 entry and a limit, ember derives the inputs, runs them with no frame in between and
-reports as it does for a batch. Seeds, calibration, crash minimization and imports from
-other workers still go as single INPUTs.
+reports as it does for a batch. Seeds, calibration and imports from other workers still go
+as single INPUTs, crash minimization as PROBE_INPUTs.
 `build/tests/test_mutate` checks the mutator, including the growth figures above, and the
 input-to-state candidates.
 
@@ -973,9 +979,9 @@ is the ISA's name (`rv32imac`, `mips32be`, `armv7`, ...).
 | Verdict | Reply | `status` |
 |---|---|---|
 | ok | COVERAGE (or SPARSE), kind ITER | |
-| crash (fault) | CRASH `FAULT` (1) | the faulting pc, low 32 bits |
-| crash (guard) | CRASH `GUARD` (2) | the pc of the guarded access, low 32 bits |
-| crash (oracle) | CRASH `ORACLE` (3) | the detail, low 32 bits: the crash pc, a halt status, the interrupt lines |
+| crash (fault) | CRASH `FAULT` (1) | the faulting pc (64 bits, as all statuses) |
+| crash (guard) | CRASH `GUARD` (2) | the pc of the guarded access |
+| crash (oracle) | CRASH `ORACLE` (3) | the detail: the crash pc, a halt status, the interrupt lines |
 | hang | CRASH `HANG` (4) | the stop reason (ember's `uam_stop_reason` number) |
 | timeout | CRASH `TIMEOUT` (5) | 0 |
 | rejected | CRASH `REJECTED` (6) | 0 (the brain counts it, and saves nothing) |
@@ -1009,7 +1015,8 @@ sessions with the brain (`tests/fuzz/brain-check.sh`: the planted crash is repor
 with its reason, minimized, and the session ends with BYE; a session per schedule; the
 planted crash found from a dictionary alone; the magic value found by compare logging and
 not without it; of two crashing seeds the first minimized at once and the second later, or
-after a restart when `--minimize-share 0` left it as found) and a parallel campaign
+after a restart when `--minimize-share 0` left it as found; a crash met while minimizing
+another saved as found) and a parallel campaign
 (`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
 crashes, and survive a killed ember). `meson test -C build --suite unit` runs `tests/fuzz/brain_unit.py` (the
 campaign logic and the crash triage on synthetic data), `test_mutate` (the mutator and the input-to-state
