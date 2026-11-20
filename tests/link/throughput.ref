@@ -1,0 +1,12 @@
+# What a message between two emulations costs, in guest instructions at the host's
+# plain JIT speed; for exact-busy-*, lockstep's slowdown times 1000 (tests/link/
+# throughput.py; `meson compile -C build link-throughput-record` rewrites it).
+# host-arch run figure
+x86_64 bytes 527032
+x86_64 exact 137119
+x86_64 exact-busy-500us 7362
+x86_64 exact-busy-50us 22446
+x86_64 exact-busy-5us 205277
+x86_64 free 184209
+x86_64 loose 115862
+x86_64 udp 115417

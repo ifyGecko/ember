@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "uam/host.h"
@@ -231,6 +232,33 @@ static bool write_all(int fd, const uint8_t *p, size_t len)
     return true;
 }
 
+/*
+ * An answer from the other process usually comes within a few microseconds;
+ * going to sleep for it and being woken costs several times that. So before
+ * blocking, look for this long: lockstep is a round trip per grant, and this
+ * is most of what one costs.
+ */
+#define SPIN_NS 30000
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+/* Is there something to read on fd within SPIN_NS? */
+static bool spin_readable(int fd)
+{
+    uint64_t end = mono_ns() + SPIN_NS;
+    do {
+        struct pollfd pf = { .fd = fd, .events = POLLIN };
+        if (poll(&pf, 1, 0) != 0)
+            return true;
+    } while (mono_ns() < end);
+    return false;
+}
+
 /* Read what is there without blocking. False: closed or broken. */
 static bool read_some(int fd, buf *b)
 {
@@ -370,7 +398,7 @@ static bool wire_poll(void *ctx, int timeout_ms)
         return false;
     if (w->in_poll)         /* a delivery made the guest send: nothing to read twice */
         return true;
-    if (timeout_ms) {
+    if (timeout_ms && !spin_readable(w->fd)) {
         struct pollfd pf = { .fd = w->fd, .events = POLLIN };
         int rc = poll(&pf, 1, timeout_ms);
         if (rc < 0 && errno != EINTR)
@@ -780,7 +808,14 @@ bool uam_link_server_step(uam_link_server *s, int timeout_ms)
         pf[i + 1] = (struct pollfd){ .fd = s->clients[i]->fd,
                                      .events = (short)(POLLIN | (s->clients[i]->out.len ? POLLOUT : 0)) };
     unsigned n = s->n_clients;
-    int rc = poll(pf, n + 1, timeout_ms);
+    int rc = 0;
+    if (timeout_ms && uam_link_hub_get_config(s->hub)->sync != UAM_LINK_FREE) {
+        uint64_t end = mono_ns() + SPIN_NS;     /* see spin_readable */
+        while ((rc = poll(pf, n + 1, 0)) == 0 && mono_ns() < end)
+            ;
+    }
+    if (rc == 0)
+        rc = poll(pf, n + 1, timeout_ms);
     if (rc > 0 && (pf[0].revents & POLLIN)) {
         int fd = accept(s->lfd, NULL, NULL);
         client *c = fd >= 0 ? calloc(1, sizeof(*c)) : NULL;

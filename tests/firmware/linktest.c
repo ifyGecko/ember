@@ -8,6 +8,8 @@
  *                 1 = bytes through the UART (the console is the link)
  *          bit 1: 1 = poll for input in a busy loop instead of sleeping in WFI
  *                 (frames only; the UART is always polled)
+ *          bit 2: 1 = frames of 60 bytes, the Ethernet minimum, instead of 17
+ *                 (for a backend that pads short frames)
  *   ROLE   1 = sends the first message; anything else answers
  *
  * Each message carries a number; whoever receives n answers n + 1, and both
@@ -216,13 +218,13 @@ uint32_t trap_handler(uint32_t *frame)
 
 /* ---- frames --------------------------------------------------------------- */
 
-#define FRAME_LEN 17u
-
+static unsigned frame_len = 17;
 static unsigned rounds, wrong_len, wrong_seq, done;
 
 static void send_num(unsigned n)
 {
-    uint8_t f[FRAME_LEN];
+    uint8_t f[60];
+    memset(f, 0, sizeof(f));
     memset(f, 0xff, 6);
     memcpy(f + 6, my_mac, 6);
     f[12] = 0x88;
@@ -230,14 +232,14 @@ static void send_num(unsigned n)
     f[14] = (uint8_t)n;
     f[15] = (uint8_t)(n >> 8);
     f[16] = 0x5a;
-    net_send(f, FRAME_LEN);
+    net_send(f, frame_len);
 }
 
 static unsigned expect_num;
 
 static void handle(const uint8_t *f, unsigned len)
 {
-    if (len != FRAME_LEN) {
+    if (len != frame_len) {
         wrong_len = 1;
         done = 1;
         return;
@@ -311,6 +313,8 @@ int main(void)
     int mode = my_mac[4], first = my_mac[5] == 1;
     if (mode & 1)
         return uart_bytes(first);
+    if (mode & 4)
+        frame_len = 60;
     expect_num = first ? 1 : 0;
     if (first)
         send_num(0);

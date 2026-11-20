@@ -18,6 +18,8 @@
 #                 in the free, loose and exact modes (tests/link/link-check.sh)
 #   bench         the cross-ISA benchmark's correctness run (tools/xbench.sh --check)
 #   fuzz-throughput  what a fuzz execution costs, against tests/fuzz/throughput.ref
+#   link-throughput  what a message between two emulations costs in each of a hub's modes,
+#                    against tests/link/throughput.ref
 #
 # Targets outside the test run (`meson compile -C build NAME`):
 #   firmware                 every test firmware image
@@ -25,6 +27,7 @@
 #                            interface (rootless: in a user+network namespace)
 #   jitdiff-soak             the JIT differential test at length (-Djitdiff_blocks=N)
 #   fuzz-throughput-record   rewrite tests/fuzz/throughput.ref (on a quiet machine)
+#   link-throughput-record   rewrite tests/link/throughput.ref (on a quiet machine)
 #   xbench                   time the cross-ISA benchmark (-Dxbench_args="--per-kernel")
 #
 # The firmware is built with each guest's toolchain (meson_options.txt); a toolchain that is
@@ -211,6 +214,18 @@ if have_rv
   run_target('fuzz-throughput-record',
     command: [python, throughput, '--ref', src_root / 'tests/fuzz/throughput.ref', '--record',
               '--runs', '7'])
+
+  # What a message between two emulations costs (tests/link/throughput.py): two linktest
+  # guests through a hub in each mode, and over --nic udp: for comparison. A figure more
+  # than twice the one recorded for this host fails. -Dlink_throughput_ref= only reports.
+  link_throughput = [files('link/throughput.py'), uam_link_hub, uam_test_run, rv['linktest']]
+  link_throughput_ref = get_option('link_throughput_ref')
+  test('link-throughput', python,
+    args: link_throughput + (link_throughput_ref != '' ? ['--ref', src_root / link_throughput_ref] : []),
+    suite: 'link-throughput', kwargs: alone)
+  run_target('link-throughput-record',
+    command: [python, link_throughput, '--ref', src_root / 'tests/link/throughput.ref', '--record',
+              '--runs', '5'])
 
   run_target('net-check',
     command: [sh, files('net/net-check.sh'), uam_test_run, rv['nettest'], 'both'])

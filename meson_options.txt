@@ -37,6 +37,8 @@ option('sdldz80', type: 'string', value: 'sdldz80', description: 'SDCC\'s Z80 li
 
 option('throughput_ref', type: 'string', value: 'tests/fuzz/throughput.ref',
   description: 'Figures the fuzz-throughput test checks against, relative to the source tree (empty: only report)')
+option('link_throughput_ref', type: 'string', value: 'tests/link/throughput.ref',
+  description: 'Figures the link-throughput test checks against, relative to the source tree (empty: only report)')
 option('jitdiff_blocks', type: 'integer', value: 200000, min: 1,
   description: 'Random blocks per seed of the jitdiff-soak target')
 option('xbench_args', type: 'string', value: '',
