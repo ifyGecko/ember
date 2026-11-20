@@ -457,6 +457,38 @@ no device claims reads all ones (master abort), as on hardware; an unclaimed I/O
 `x86_64-ref` reads as zero and ignores writes. The first access at each memory page or port is
 logged as a warning, and the most frequent are listed at the end of the run.
 
+`--on RULE` checks a condition and acts each time a processor arrives at a pc:
+`pc=ADDR[,cpu=N][,if COND][,count=N][,name=NAME],ACTION[,ACTION...]`. The actions are
+`set DST=EXPR` (store into a register or into memory, `[ADDR]`), `log [EXPR...]` (a line with
+each value: `rule NAME: cpu 0 pc 0x.. a0=0x1 [sp+8]:4=0x20 icount=N`) and `stop` (exit 127,
+as `--break`). Expressions are C's on unsigned 64-bit values: numbers, registers as the
+ISA's gdb description names them (and `pc`), the ELF image's symbols, and memory as
+`[ADDR]` or `[ADDR]:1|2|4|8` (virtual, as the arriving processor maps it, in its byte
+order; `[p:ADDR]` is physical), with `( ) - ~ ! * + - << >> < <= > >= == != & ^ | && ||`.
+`if COND` fires the rule only when COND is not zero, `count=N` at most N times, `cpu=N` for
+that processor only. One mechanism gives conditional breakpoints, value logs and injected
+results, and it can stand in for something the machine does not model: a firmware that
+spins until a coprocessor stores the value it expects, through a pointer it holds, gets
+that value where it looks, and its own code runs on unchanged:
+
+```bash
+build/uam-run --on 'pc=0x9a144b2,set [[rsp+0x30]:4]:4=[rsp+0x38]:4' ...  # the word a wait loop polls
+build/uam-run --on 'pc=parse,if a1>0x400,log a0 a1 [a0]:4,stop' fw.elf   # a conditional breakpoint
+build/uam-run --on 'pc=0x8000456c,count=1,set a0=-1' fw.elf              # one call fails, once
+build/uam-run --on-file board.rules fw.elf                               # one rule per line, # comments
+```
+
+Rules read and write memory as a debugger does: reads see RAM, ROM and what a device shows
+without side effects, stores reach RAM only, and no device, watch or guard sees either. An
+operand that cannot be read makes its condition or action fail without stopping the run;
+the stop line says how many failed, `-v` names the first, and `--stats` prints each rule's
+arrivals and firings. Rules are configuration, like breakpoints, with one exception: how
+often a `count=N` rule has fired is machine state, so a snapshot keeps it (a fuzz iteration
+sees the rule exactly as the first one did), and a snapshot taken with counted rules loads
+only with the same counted rules. A hooked pc ends its block and is not skipped as a spin
+loop, so a rule on a wait loop is checked on every pass. `uam/rules.h` is the same in a
+program: a board can carry the rules its firmware needs instead of a command line.
+
 `--guard [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log][,name=NAME]` guards the bytes
 `[ADDR-BEFORE, ADDR+AFTER)` (a bare ADDR is one byte; ADDR is virtual unless `p:`). A data access
 that touches them in the given directions (default both) is refused and stops the run at that
@@ -817,7 +849,7 @@ into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agen
 include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.h signal.h sched.h
                    cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h cmp.h guard.h
-                   frames.h heap.h fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
+                   rules.h frames.h heap.h fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
                    pic.h mcs51.h m6502.h z80.h xtensa.h)
@@ -966,7 +998,8 @@ tests/fuzz/        also site lists, boundary files, the coverage region, the fuz
 tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
 tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch;
                    trace-check.sh: --trace exc/mmio/mmio-summary/sysreg/irq/console/dma,
-                   --history, --trace-file, --log-pc registers, --unknown-mmio stop, --log-stamp
+                   --history, --trace-file, --log-pc registers, --unknown-mmio stop, --log-stamp;
+                   rules-check.sh: --on / --on-file rules (set, log, if, stop, count, snapshots)
 tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC, a meson project of
                    its own (meson test -C build --suite bench, meson compile -C build xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces

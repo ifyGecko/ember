@@ -13,7 +13,7 @@
 #   fuzz-lists    site lists, boundary files, the coverage region, the fuzz brain, the
 #                 network frontend, a parallel campaign
 #   gdb           the gdb stub over the remote protocol
-#   runner        uam-run's debugging options and traces
+#   runner        uam-run's debugging options, traces and --on rules
 #   bench         the cross-ISA benchmark's correctness run (tools/xbench.sh --check)
 #   fuzz-throughput  what a fuzz execution costs, against tests/fuzz/throughput.ref
 #
@@ -87,7 +87,7 @@ uam_test_run = executable('uam-test-run',
 # ---------------------------------------------------------------------------------------
 foreach n : ['ir', 'core', 'host', 'snapshot', 'jit', 'spin', 'codestore', 'mmio', 'cov', 'fuzz',
              'mutate', 'oracles', 'smp', 'ppc', 'avr', 'pic', 'mcs51', 'm6502', 'z80', 'xtensa',
-             'arm', 'riscv', 'x86', 'mips', 'avr32', 'f80']
+             'arm', 'riscv', 'x86', 'mips', 'avr32', 'f80', 'rules']
   test(n, executable('test_' + n, 'unit/test_' + n + '.c', dependencies: uam_dep),
     suite: 'unit', kwargs: std)
 endforeach
@@ -326,6 +326,10 @@ if have_rv
   test('runner-traces', sh,
     args: [files('runner/trace-check.sh'), uam_run, fw_rv['selftest'], fw_rv['smptest'],
            fw_rv['fuzztarget'], uam_test_run, fw_rv['nettest']],
+    suite: 'runner', kwargs: std)
+  # ... and its --on rules (set, log, if, stop, count and snapshots, --on-file, with fuzzing)
+  test('runner-rules', sh,
+    args: [files('runner/rules-check.sh'), uam_run, fw_rv['selftest'], fw_rv['fuzztarget']],
     suite: 'runner', kwargs: std)
 endif
 

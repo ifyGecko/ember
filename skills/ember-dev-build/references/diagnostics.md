@@ -120,6 +120,7 @@ addresses in [LO, HI); given without either, it turns the `mmio` trace on.
 | `--backtrace` | tracks calls and returns and prints the calls each processor is inside at the stop, innermost first, named from the ELF's symbols: `backtrace: #0 0x.. <parse+0x1c> called, returns to 0x.. <rx_task+0x40>` (`interrupted at` for an interrupt or exception taken on the way) | "who called this": the call chain into a crash, a guard stop, a breakpoint. A best-effort history (tasks are not told apart; a function left without returning stays until an older frame's return drops it). A snapshot taken with it is loaded with it |
 | `--log-pc ADDR[,REG...]` | `RUNNER: pc 0xADDR reached (hit H, icount N) a0=0x.. ra=0x..` at each arrival | a function's calls and arguments; a loop's iteration count. Register names as the ISA's gdb description has them (`a0`, `ra` on RISC-V; `r4`, `r31` on MIPS, not `a0`, `ra`; `r0`, `lr` on ARM; `rdi` on x86-64; `r3` on PowerPC); an unknown name lists them. (Board code is the other namespace: `board_entry_regs` and an HLE hook's `reg()` use the ISA module's own register table, where MIPS has `a0`, `v0`, `ra`.) |
 | `--break ADDR` (+ `-d`) | stop when ADDR is reached (exit 127) and dump the processors. ADDR must be the first byte of an instruction: a breakpoint inside one never fires (Thumb, RVC, MIPS16e, x86: take the address from the disassembly) | the state at a point of interest |
+| `--on 'pc=ADDR[,cpu=N][,if COND][,count=N][,name=NAME],ACTION...'` (`--on-file FILE`: one per line) | at each arrival at ADDR, when COND is not 0: `set DST=EXPR` (a register, or memory `[ADDR]`), `log [EXPR...]` (`rule NAME: cpu N pc 0x.. a0=0x.. [sp+8]:4=0x.. icount=N`), `stop` (exit 127). EXPR is C's: numbers, registers by their gdb names (and `pc`), ELF symbols, `[ADDR]`/`[ADDR]:1\|2\|4\|8` (virtual; `[p:ADDR]` physical), operators. `count=N`: at most N firings | a conditional breakpoint (`pc=parse,if a1>0x400,stop`); memory and registers at a point, not just registers (`log a0 [a0]:4`); testing a hypothesis about a value before writing C: store what the firmware waits for (`set [[sp+8]]=[sp+12]`), force a result once (`count=1,set a0=-1`). Stores reach RAM only and nothing touches a device; an unreadable operand is counted (`--stats`, the stop line; `-v` names the first), not fatal. ADDR must be the first byte of an instruction, as for `--break` |
 | `-n N -d` | stop at exactly instruction N and dump every processor | the state at an icount from any trace line |
 | `--dump-mem [p:]ADDR+LEN[=FILE]` | hex-dump (or save) guest memory when the run stops | a descriptor ring, a buffer, a structure the firmware built |
 | `--watch [p:]ADDR+LEN[:r\|w]` | log every data access of the processors to those bytes, reads and writes, in RAM, ROM or a device: `guard ... (log): cpu N pc .. read\|write S at .. (+OFF) value .. icount=N` | who reads or writes this variable, buffer, flash range or register, and with what ("Who touches this address?" above has what it does not see) |
@@ -134,7 +135,8 @@ addresses in [LO, HI); given without either, it turns the `mmio` trace on.
 | `-v` / `-v -v` | more logging: `-v` shows `info` lines (`mmio-stub` first accesses), `-v -v` `debug` lines (POST codes on a PC); your own `uam_log` lines follow the same levels (section 7) | |
 
 **Symbols.** With an ELF image, `--break`, `--snapshot-at` and `--return-ok` take
-`SYMBOL[+OFFSET]` as well as a number. Every other address is a number: `--log-pc`,
+`SYMBOL[+OFFSET]` as well as a number, and an `--on` rule takes symbols anywhere in its
+expressions (`pc=main+0x10`, `[rx_count]:4`). Every other address is a number: `--log-pc`,
 `--watch`, `--guard`, `--dump-mem` and the trace ranges do not take names, so look the
 address up first (`nm`, Ghidra). `--backtrace` names its frames from the same symbols.
 
@@ -169,6 +171,15 @@ address up first (`nm`, Ghidra). `--backtrace` names its frames from the same sy
 - No hot register: the loop spins on RAM or on a timer that never moves. `--history 64`
   shows the loop's blocks; `--log-pc LOOP_PC,REG` shows the counter or pointer it checks;
   `--watch` the RAM word it reads to see who should have written it.
+
+- The loop waits for a value that something you do not model would store (a coprocessor's
+  acknowledge in shared RAM, a counter another core bumps): confirm it with a rule that
+  stores the value where the loop looks, taking both from the loop's own registers and
+  frame, e.g. `--on 'pc=LOOP_PC,set [[rsp+0x30]:4]:4=[rsp+0x38]:4'`. The firmware's own
+  code then runs on unchanged, which patching the loop or moving the pc does not give you.
+  If the boot goes on, decide what it becomes: a device model when the value depends on
+  what the firmware sent, or the same rules in the board (`uam/rules.h`, or a `--on-file`
+  next to it) when one fixed handshake is all there is.
 
 **Deadlock (125) or livelock (128): interrupts.**
 - `-t irq,exc`: does any CPU input line rise (`irq-in:` lines), and at the stop is an

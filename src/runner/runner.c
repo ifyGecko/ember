@@ -32,6 +32,7 @@
 #include "uam/host.h"
 #include "uam/loader.h"
 #include "uam/machine.h"
+#include "uam/rules.h"
 #include "uam/runner.h"
 
 #include "trace.h"
@@ -150,8 +151,14 @@ static uint64_t fp_file(uint64_t h, const char *path)
  * run's inputs and outputs are. A snapshot saved under another fingerprint (the firmware
  * was rebuilt, an option changed) is not used.
  */
+typedef struct rule_arg {
+    const char *text;   /* --on: the rule; --on-file: the path */
+    bool        file;
+} rule_arg;
+
 static uint64_t fuzz_fingerprint(int argc, char **argv, const char *image,
-                                 const uam_board_image *images, uint32_t n_images)
+                                 const uam_board_image *images, uint32_t n_images,
+                                 const rule_arg *rules, unsigned n_rules)
 {
     static const char *const skip[] = { "--fuzz-net", "--fuzz-net-timeout", "--fuzz-replay",
                                         "--fuzz-snapshot", "--cov-out", "--cov-shm",
@@ -175,6 +182,9 @@ static uint64_t fuzz_fingerprint(int argc, char **argv, const char *image,
     h = fp_file(h, image);
     for (uint32_t i = 0; i < n_images; i++)
         h = fp_file(h, images[i].path);
+    for (unsigned i = 0; i < n_rules; i++)   /* rules shape the boot */
+        if (rules[i].file)
+            h = fp_file(h, rules[i].text);
     return h;
 }
 
@@ -440,7 +450,8 @@ static void usage(FILE *out)
         "                          dma     every DMA transfer a device makes (address,\n"
         "                                  length, direction)\n"
         "                          all     exc, mmio, sysreg, irq, console, dma\n"
-        "      --trace-file FILE   write the traces (and --watch, --history) to FILE, not stderr\n"
+        "      --trace-file FILE   write the traces (and --watch, --history, the log lines of\n"
+        "                          --on rules) to FILE, not stderr\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
         "      --trace-mmio-range LO:HI  trace mmio only for physical addresses in [LO, HI);\n"
         "                          with mmio-summary, the summary of that range alone\n"
@@ -461,6 +472,24 @@ static void usage(FILE *out)
         "                          stack at the stop (fuzzing: for each input that is not ok),\n"
         "                          innermost first, named from the ELF image's symbols\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
+        "      --on RULE           at a pc, check a condition and act (repeatable):\n"
+        "                          pc=ADDR[,cpu=N][,if COND][,count=N][,name=NAME],ACTION...\n"
+        "                          ACTION: set DST=EXPR (DST a register or [ADDR]), log [EXPR...]\n"
+        "                          (operands separated by spaces), stop (exit 127, as --break).\n"
+        "                          EXPR is C's, unsigned: numbers, registers (as gdb names them,\n"
+        "                          and pc), ELF symbols, memory as [ADDR] or [ADDR]:1|2|4|8\n"
+        "                          (virtual, as the arriving processor maps it; x86: linear;\n"
+        "                          [p:ADDR]: physical), and the operators\n"
+        "                          ( ) - ~ ! * + - << >> < <= > >= == != & ^ | && ||.\n"
+        "                          if: fire only when COND is not 0; count=N: at most N times\n"
+        "                          (a snapshot keeps the count: it loads only with the counted\n"
+        "                          rules it was saved with); cpu=N: that processor only.\n"
+        "                          Stores reach RAM only; nothing touches a device. E.g.\n"
+        "                          --on 'pc=0x8000123c,set [[sp+8]]=[sp+12]' puts the value\n"
+        "                          a firmware waits for where it looks, standing in for a\n"
+        "                          coprocessor the machine does not model;\n"
+        "                          --on 'pc=parse,if a1>0x400,log a0 a1,stop'\n"
+        "      --on-file FILE      rules from FILE, one per line (# starts a comment line)\n"
         "      --guard SPEC        guard guest memory (repeatable): a data access that\n"
         "                          touches it stops the run before it happens (exit 129).\n"
         "                          SPEC: [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log]\n"
@@ -806,6 +835,14 @@ static void print_backtrace(uam_machine *m, FILE *out)
     }
 }
 
+/* --on: a rule's symbols are the ELF image's. */
+static bool rule_symbol(void *ctx, const char *name, uint64_t *value)
+{
+    uint64_t size;
+    const char *why;
+    return uam_elf_symbol(ctx, name, value, &size, &why) == UAM_OK;
+}
+
 /* --snapshot-at: save once, on the first arrival. */
 typedef struct snap_at {
     uam_machine *m;
@@ -1025,7 +1062,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_FUZZ_SNAPSHOT, OPT_FUZZ_UNINIT, OPT_FUZZ_UNINIT_EXCLUDE,
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
            OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_GUARD_RETURNS, OPT_RETURN_OK,
-           OPT_BACKTRACE, OPT_EXT_BASE = 1000 };
+           OPT_BACKTRACE, OPT_ON, OPT_ON_FILE, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -1058,6 +1095,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "backtrace", no_argument, NULL, OPT_BACKTRACE },
         { "log-pc", required_argument, NULL, OPT_LOG_PC },
         { "break", required_argument, NULL, OPT_BREAK },
+        { "on", required_argument, NULL, OPT_ON },
+        { "on-file", required_argument, NULL, OPT_ON_FILE },
         { "guard", required_argument, NULL, OPT_GUARD },
         { "watch", required_argument, NULL, OPT_WATCH },
         { "gdb", required_argument, NULL, OPT_GDB },
@@ -1113,6 +1152,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     log_pc_ctx *log_hits = NULL;
     pc_list log_pcs = { 0 }, break_pcs = { 0 };
     char **log_pc_regs_text = NULL;   /* per --log-pc: its ",REG..." (NULL: none) */
+    rule_arg *rule_args = NULL;       /* --on and --on-file, in the order given */
+    unsigned n_rule_args = 0, cap_rule_args = 0;
+    uam_rules *rules = NULL;
     const char *trace_file = NULL;
     FILE *trace_fp = NULL;
     uint32_t history = 0;
@@ -1307,6 +1349,20 @@ static int run_main(int argc, char **argv, const ext_set *es)
             }
             break;
         }
+        case OPT_ON:
+        case OPT_ON_FILE:
+            if (n_rule_args == cap_rule_args) {
+                const unsigned ncap = cap_rule_args ? 2 * cap_rule_args : 16;
+                rule_arg *na = realloc(rule_args, sizeof(*na) * ncap);
+                if (!na) {
+                    fprintf(stderr, "uam-run: out of memory\n");
+                    return 2;
+                }
+                rule_args = na;
+                cap_rule_args = ncap;
+            }
+            rule_args[n_rule_args++] = (rule_arg){ .text = optarg, .file = c == OPT_ON_FILE };
+            break;
         case OPT_TRACE_FILE: trace_file = optarg; break;
         case OPT_HISTORY: {
             char *end;
@@ -1595,7 +1651,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
             fprintf(stderr, "uam-run: --fuzz-snapshot: the path is too long\n");
             return 2;
         }
-        const uint64_t fp = fuzz_fingerprint(argc, argv, image, images, cfg.n_images);
+        const uint64_t fp = fuzz_fingerprint(argc, argv, image, images, cfg.n_images, rule_args,
+                                             n_rule_args);
         const bool have = access(fuzz_snapshot, F_OK) == 0;
         if (have && read_key(keypath) == fp) {
             load_snap = fuzz_snapshot;
@@ -1753,6 +1810,30 @@ static int run_main(int argc, char **argv, const ext_set *es)
         uam_machine_fini(&m);
         goto out_host;
     }
+    /* The --on rules, before a snapshot is loaded: it may hold their counts. */
+    if (n_rule_args) {
+        char rerr[768];
+        bool ok = (rules = uam_rules_create(&m, "run")) != NULL;
+        if (!ok)
+            fprintf(stderr, "uam-run: out of memory\n");
+        if (ok && image)
+            uam_rules_set_symbols(rules, rule_symbol, (void *)image);
+        for (unsigned i = 0; ok && i < n_rule_args; i++) {
+            if (rule_args[i].file) {
+                ok = uam_rules_add_file(rules, rule_args[i].text, rerr, sizeof(rerr)) == UAM_OK;
+                if (!ok)
+                    fprintf(stderr, "uam-run: --on-file: %s\n", rerr);
+            } else {
+                ok = uam_rules_add(rules, rule_args[i].text, rerr, sizeof(rerr)) >= 0;
+                if (!ok)
+                    fprintf(stderr, "uam-run: bad --on '%s': %s\n", rule_args[i].text, rerr);
+            }
+        }
+        if (!ok) {
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+    }
     /* Call tracking is machine state: it must be on before a snapshot is loaded or taken. */
     if (n_return_ok && !guard_returns)
         fprintf(stderr, "uam-run: --return-ok does nothing without --guard-returns\n");
@@ -1786,6 +1867,13 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         if (st != UAM_OK) {
             fprintf(stderr, "uam-run: cannot resume from snapshot %s\n", load_snap);
+            uam_rule_info ri;
+            for (size_t i = 0; rules && uam_rules_get(rules, i, &ri); i++)
+                if (ri.limit) {
+                    fprintf(stderr, "uam-run: (rules with count=N keep their counts in snapshots: "
+                            "one loads only with the counted rules it was saved with)\n");
+                    break;
+                }
             uam_machine_fini(&m);
             goto out_host;
         }
@@ -1794,6 +1882,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     if (trace_fp) {
         m.exec.trace_out = trace_fp;
         uam_machine_set_guard_log(&m, trace_fp);
+        if (rules)
+            uam_rules_set_log(rules, trace_fp);
     }
     if (history && uam_machine_set_history(&m, history) != UAM_OK) {
         fprintf(stderr, "uam-run: out of memory for --history %u\n", (unsigned)history);
@@ -2032,6 +2122,20 @@ static int run_main(int argc, char **argv, const ext_set *es)
                     (unsigned long long)su->at.pc, (unsigned long long)su->at.icount);
         fprintf(stderr, ": nothing decodes it; the access did not happen\n");
     }
+    uam_rule_stop rstop;
+    if (!fuzzing && why == UAM_STOP_HOOK && rules && uam_rules_last_stop(rules, &rstop)) {
+        char tag[24] = "";
+        if (rstop.cpu)
+            snprintf(tag, sizeof(tag), ", cpu %u", rstop.cpu);
+        fprintf(stderr, "uam-run: rule %s stopped the run at 0x%llx (icount %llu%s)\n", rstop.name,
+                (unsigned long long)rstop.pc, (unsigned long long)rstop.icount, tag);
+    }
+    uam_rule_info rinfo;
+    for (size_t i = 0; rules && uam_rules_get(rules, i, &rinfo); i++)
+        if (rinfo.failed)
+            fprintf(stderr, "uam-run: rule %s: %llu of its conditions and actions could not be "
+                    "carried out (-v names the first)\n", rinfo.name,
+                    (unsigned long long)rinfo.failed);
     if (!fuzzing)
         fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
                 uam_stop_reason_str(why), (long long)m.exec.stop_status,
@@ -2069,6 +2173,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
         if (n_guards)
             fprintf(stderr, "stats: guard hits=%llu\n",
                     (unsigned long long)uam_machine_guard_hits(&m));
+        for (size_t i = 0; rules && uam_rules_get(rules, i, &rinfo); i++)
+            fprintf(stderr, "stats: rule %s: arrivals=%llu fired=%llu failed=%llu\n", rinfo.name,
+                    (unsigned long long)rinfo.arrivals, (unsigned long long)rinfo.fired,
+                    (unsigned long long)rinfo.failed);
         if (s->blocks_compiled)
             fprintf(stderr, "stats: jit calls eval=%llu load=%llu store=%llu\n",
                     (unsigned long long)s->jit_eval_calls, (unsigned long long)s->jit_load_calls,
@@ -2146,6 +2254,8 @@ out_host:
     free(break_pcs.pc);
     free(syms.r);
     free(log_hits);   /* after the machine: the log hooks counted into it */
+    uam_rules_free(rules);   /* after the machine: its hooks pointed into it */
+    free(rule_args);
     free(su);         /* after the machine: it was the bus's unmapped device */
     if (trace_fp && fclose(trace_fp) != 0 && rc == 0) {
         fprintf(stderr, "uam-run: writing --trace-file %s failed\n", trace_file);

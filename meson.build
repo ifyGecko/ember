@@ -58,7 +58,7 @@ exec_src = files('src/exec/interp.c', 'src/exec/tcache.c', 'src/exec/run.c', 'sr
 analysis_src = files('analysis/cov.c', 'analysis/cmp.c', 'analysis/frames.c')
 loader_src = files('src/loader/loader.c')
 machine_src = files('src/machine/machine.c', 'src/machine/snapshot.c', 'src/machine/guard.c',
-  'src/machine/frames.c', 'src/machine/heap.c', 'src/machine/uninit.c')
+  'src/machine/frames.c', 'src/machine/heap.c', 'src/machine/uninit.c', 'src/machine/rules.c')
 
 modules = {
   'core': ir_src + core_src + exec_src + analysis_src + loader_src + machine_src,

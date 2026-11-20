@@ -276,6 +276,14 @@ scope (a radio calibration that needs real RF, a cryptographic co-processor self
 to skip a device you could model. List every hook in the journal and in the board header:
 each one is a place where the emulation does not behave like the hardware.
 
+**Supplying a value is gentler than replacing code.** When the firmware only waits for
+something an unmodelled part would store in RAM (a coprocessor's acknowledge, a counter
+another agent bumps), a rule (`uam/rules.h`; `--on` on the command line, see
+diagnostics.md) stores that value where the firmware looks, taking the address and the value
+from the firmware's own registers and frame, and every instruction of the firmware still
+runs. Try it with `--on` first; once it holds, the board adds the same text with
+`uam_rules_add`, so the run needs no extra options. Journal each rule like a hook.
+
 **When a blocker shows RECON.md was wrong** (a mislabeled region, a missing memory, a
 requirement that didn't hold), fix RECON.md in place, tagged `*[build: iter-XX]*` with the
 evidence, as well as journaling it. The fact sheet stays the single source of truth, and the
