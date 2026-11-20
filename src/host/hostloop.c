@@ -17,6 +17,8 @@ struct uam_host {
     unsigned     n_cds;
     uam_netdev  *nds[MAX_SOURCES];
     unsigned     n_nds;
+    uam_link_node *links[MAX_SOURCES];
+    unsigned     n_links;
     uam_pacing   pacing;
     uint64_t     ticks_per_sec;
     uint64_t     max_ahead;    /* ticks */
@@ -55,6 +57,8 @@ void uam_host_destroy(uam_host *h)
 {
     if (h && h->x)
         uam_exec_set_host(h->x, NULL);
+    for (unsigned i = 0; h && i < h->n_links; i++)
+        uam_link_node_set_waiter(h->links[i], NULL, NULL);
     free(h);
 }
 
@@ -78,6 +82,27 @@ uam_status uam_host_add_netdev(uam_host *h, uam_netdev *nd)
     return UAM_OK;
 }
 
+/* A node waits for its hub: keep the other sources serviced meanwhile, and
+ * give up when the run is asked to stop. */
+static bool link_wait(void *ctx, uam_link_node *n)
+{
+    uam_host *h = ctx;
+    (void)n;
+    uam_host_poll(h, 1000);
+    return !(h->x && h->x->stop_request);
+}
+
+uam_status uam_host_add_link(uam_host *h, uam_link_node *n)
+{
+    if (!n)
+        return UAM_ERR_INVALID;
+    if (h->n_links == MAX_SOURCES)
+        return UAM_ERR_NOMEM;
+    h->links[h->n_links++] = n;
+    uam_link_node_set_waiter(n, link_wait, h);
+    return UAM_OK;
+}
+
 void uam_host_set_pacing(uam_host *h, uam_pacing pacing, uint64_t ticks_per_sec,
                          uint64_t max_ahead_ticks)
 {
@@ -89,8 +114,23 @@ void uam_host_set_pacing(uam_host *h, uam_pacing pacing, uint64_t ticks_per_sec,
     h->started = false;
 }
 
+/* Host input that can wake the machine by itself (not a hub's messages). */
+static bool has_input_fds(uam_host *h)
+{
+    for (unsigned i = 0; i < h->n_cds; i++)
+        if (uam_chardev_fd(h->cds[i]) >= 0)
+            return true;
+    for (unsigned i = 0; i < h->n_nds; i++)
+        if (uam_netdev_fd(h->nds[i]) >= 0)
+            return true;
+    return false;
+}
+
 static bool has_fds(uam_host *h)
 {
+    for (unsigned i = 0; i < h->n_links; i++)
+        if (uam_link_node_fd(h->links[i]) >= 0)
+            return true;
     for (unsigned i = 0; i < h->n_cds; i++)
         if (uam_chardev_fd(h->cds[i]) >= 0)
             return true;
@@ -103,7 +143,7 @@ static bool has_fds(uam_host *h)
 /* Service every source; wait up to timeout_ms for one with a host fd. */
 void uam_host_poll(uam_host *h, int timeout_ms)
 {
-    struct pollfd pfd[2 * MAX_SOURCES];
+    struct pollfd pfd[3 * MAX_SOURCES];
     unsigned n = 0;
     for (unsigned i = 0; i < h->n_cds; i++) {
         int fd = uam_chardev_fd(h->cds[i]);
@@ -117,6 +157,11 @@ void uam_host_poll(uam_host *h, int timeout_ms)
         if (fd >= 0 && uam_netdev_can_input(h->nds[i]))
             pfd[n++] = (struct pollfd){ .fd = fd, .events = POLLIN };
     }
+    for (unsigned i = 0; i < h->n_links; i++) {
+        int fd = uam_link_node_fd(h->links[i]);
+        if (fd >= 0)
+            pfd[n++] = (struct pollfd){ .fd = fd, .events = POLLIN };
+    }
     if (!n && timeout_ms < 0 && has_fds(h))
         timeout_ms = 100;   /* every source is held back: wait without spinning */
     if (n || timeout_ms > 0) {
@@ -128,6 +173,8 @@ void uam_host_poll(uam_host *h, int timeout_ms)
         uam_chardev_poll(h->cds[i]);
     for (unsigned i = 0; i < h->n_nds; i++)
         uam_netdev_poll(h->nds[i]);
+    for (unsigned i = 0; i < h->n_links; i++)
+        uam_link_node_poll(h->links[i]);
 }
 
 /* ---- real-time pacing ------------------------------------------------------ */
@@ -180,6 +227,31 @@ static void bridge_poll(void *ctx)
 static bool bridge_idle(void *ctx, uint64_t ticks, uint64_t *skip)
 {
     uam_host *h = ctx;
+    /* A node whose hub keeps time: wait for the grant here, where an idle
+     * machine can tell the hub how long it stays quiet. Nothing but a message
+     * or a timer wakes it unless host input can. */
+    bool timed = false;
+    for (unsigned i = 0; i < h->n_links; i++) {
+        if (!uam_link_node_timed(h->links[i]))
+            continue;
+        timed = true;
+        uint64_t limit = h->x->max_time && h->x->max_time < UAM_SCHED_TIME_MAX ? h->x->max_time
+                                                                               : UAM_SCHED_TIME_MAX;
+        int r = uam_link_node_idle(h->links[i], limit, !has_input_fds(h));
+        if (r < 0)
+            return false;            /* every node is quiet: nothing will ever happen */
+        if (r > 0) {
+            *skip = 0;
+            return true;
+        }
+    }
+    /* Asked to wait for host input alone (the executor gave up on the timers)
+     * while timers are armed: the other nodes wait for this one's time to
+     * move, so let it. */
+    if (timed && ticks == UINT64_MAX && uam_sched_next(h->x->sched) != UINT64_MAX) {
+        *skip = 0;
+        return true;
+    }
     if (h->pacing != UAM_PACE_REALTIME) {
         if (ticks != UINT64_MAX) {
             if (++h->idle_skips >= IDLE_POLL_EVERY) {

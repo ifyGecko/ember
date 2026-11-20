@@ -122,6 +122,10 @@ void uam_machine_fini(uam_machine *m)
 {
     if (!m->cpu.isa)        /* zeroed and never initialized: a board that failed early */
         return;
+    /* Nothing fires any more. Disarm every timer while its owner is still there,
+     * so that an owner outside the machine (a link node, a host backend) can
+     * let go of its own afterwards without walking a list of freed ones. */
+    uam_sched_cancel_all(&m->sched);
     uam_machine_guards_fini(m);
     uam_machine_frames_fini(m);
     uam_machine_uninit_fini(m);
@@ -601,6 +605,15 @@ uam_netdev *uam_board_config_netdev(const uam_board_config *cfg, const char *nam
         if (strcmp(cfg->netdevs[i].name, name) == 0)
             nd = cfg->netdevs[i].nd;
     return nd;
+}
+
+struct uam_link_port *uam_board_config_link(const uam_board_config *cfg, const char *name)
+{
+    struct uam_link_port *p = NULL;
+    for (size_t i = 0; cfg && i < cfg->n_links; i++)
+        if (strcmp(cfg->links[i].name, name) == 0)
+            p = cfg->links[i].port;
+    return p;
 }
 
 /* ---- board registry ---------------------------------------------------- */

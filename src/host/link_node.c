@@ -3,6 +3,7 @@
  * the machine's snapshots, and a named input per port.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "uam/host.h"
@@ -59,4 +60,24 @@ uam_status uam_link_node_bind(uam_link_node *n, uam_machine *m, uint64_t tick_hz
             st = uam_machine_add_input(m, uam_link_port_name(p), uam_link_input_deliver, p);
     }
     return st;
+}
+
+bool uam_link_parse_time(const char *text, uint64_t *ps)
+{
+    static const struct { const char *unit; uint64_t mul; } units[] = {
+        { "ps", 1 }, { "ns", 1000 }, { "us", 1000000 }, { "ms", 1000000000 },
+        { "s", UINT64_C(1000000000000) },
+    };
+    char *end;
+    unsigned long long v = strtoull(text, &end, 10);
+    if (end == text)
+        return false;
+    for (size_t i = 0; i < UAM_ARRAY_LEN(units); i++)
+        if (!strcmp(end, units[i].unit)) {
+            if (v > UINT64_MAX / units[i].mul)
+                return false;
+            *ps = v * units[i].mul;
+            return true;
+        }
+    return false;
 }

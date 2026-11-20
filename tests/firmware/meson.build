@@ -25,7 +25,7 @@ if have_rv
   foreach name, start : {
     'selftest': 'start.S', 'nettest': 'start.S', 'fuzztarget': 'start.S',
     'irqtarget': 'start.S', 'heaptarget': 'start.S', 'consoletest': 'start.S',
-    'smptest': 'smpstart.S',
+    'smptest': 'smpstart.S', 'linktest': 'start.S',
   }
     fw_rv += {name: custom_target('rv32-' + name,
       output: name + '.elf',

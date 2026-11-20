@@ -22,6 +22,7 @@ enum {
     RT_MMIO_SUM   = 1u << 5,   /* a per-register summary of device accesses at the stop */
     RT_EXC_SUM    = 1u << 6,   /* exceptions and interrupt entries counted, summed at the stop */
     RT_DMA        = 1u << 7,   /* every DMA transfer a device makes */
+    RT_LINK       = 1u << 8,   /* every message a link port sends or hands to its device */
 };
 
 #define RT_SYSREG_SLOTS 1024u
@@ -101,6 +102,10 @@ void     rtrace_finish(rtrace *t);
  * partial console line and forgets the first accesses and the counts, so that what
  * follows, and the next rtrace_finish, is this input's alone. */
 void     rtrace_restart(rtrace *t);
+/* A uam_link_tap_fn (uam/link.h; ctx is the rtrace): one line per message. */
+struct uam_link_port;
+struct uam_link_msg;
+void     rtrace_link(void *ctx, const struct uam_link_port *p, const struct uam_link_msg *m, bool out);
 /* Remove the observers (before the machine goes). */
 void     rtrace_detach(rtrace *t);
 

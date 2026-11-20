@@ -116,6 +116,22 @@ uam_status uam_link_node_bind(uam_link_node *n, struct uam_machine *m, uint64_t 
 uam_status uam_link_input_deliver(void *ctx, struct uam_machine *m, const uint8_t *data,
                                   size_t len);
 
+/*
+ * A link port as a chardev or a netdev, for a device model that knows only
+ * those interfaces. Chardev: the bytes of one write are one message, and a
+ * message's bytes are input. Netdev: a frame is a message at its exact length
+ * (no padding to an Ethernet minimum); the line is up while the port reaches a
+ * hub. What the device has no room for waits in the port. The adapter takes
+ * the port's frontend and saves the chardev's / netdev's queue with the port;
+ * destroy it before the node. In a spec: --console link:PORT, --nic P=link:PORT.
+ */
+uam_chardev *uam_chardev_link_create(uam_link_port *port);
+uam_netdev  *uam_netdev_link_create(uam_link_port *port);
+
+/* A time as written on a command line - a number with ps, ns, us, ms or s -
+ * in picoseconds. False: not a time. */
+bool uam_link_parse_time(const char *text, uint64_t *ps);
+
 /* How a bus shares its medium. */
 typedef enum uam_link_medium {
     UAM_LINK_BROADCAST,        /* every other port on the bus gets every message */
@@ -177,8 +193,41 @@ uam_status    uam_link_hub_add_port(uam_link_hub *h, unsigned member, unsigned p
 void          uam_link_hub_leave(uam_link_hub *h, unsigned member);
 bool          uam_link_hub_msg(uam_link_hub *h, unsigned member, unsigned port,
                                const uam_link_msg *m);
+/* `received`: how many messages the member had taken from the hub when it said
+ * so (UINT64_MAX: all of them). */
 void          uam_link_hub_report(uam_link_hub *h, unsigned member, uint64_t reached,
-                                  uint64_t quiet);
+                                  uint64_t quiet, uint64_t received);
+
+/*
+ * Between processes. A hub serves connections on "unix:PATH" or
+ * "tcp:[HOST:]PORT" (uam_link_server; the uam-link-hub tool is this and a
+ * command line), and a node connects to it: the hub tells it how time is kept,
+ * the node declares its ports. The node's name identifies it on the hub and
+ * must be unique there; ties between messages are broken by it, so a run does
+ * not depend on the order the nodes connected in. Add the ports first.
+ * UAM_ERR_FAULT: no hub there; UAM_ERR_REJECTED: the hub refused a port (the
+ * reason is in err).
+ */
+uam_status uam_link_node_connect(uam_link_node *n, const char *spec, char *err, size_t errlen);
+/*
+ * For a snapshot of every node at the same moment (exact mode): each node runs
+ * to `time`, then calls this, which tells the hub and returns once every node
+ * stands there and everything sent before has been handed over. A snapshot
+ * taken then, on each node, is one consistent state of the whole; the hub holds
+ * nothing and needs no file. False: the hub went away. A node that is not
+ * connected to another process returns true at once.
+ */
+bool       uam_link_node_barrier(uam_link_node *n, uint64_t time);
+
+typedef struct uam_link_server uam_link_server;
+uam_link_server *uam_link_server_create(uam_link_hub *hub, const char *spec);
+void             uam_link_server_destroy(uam_link_server *s);
+/* Serve for up to timeout_ms (<0: until something happens). False once every
+ * node that joined has left. */
+bool             uam_link_server_step(uam_link_server *s, int timeout_ms);
+/* Log joins, leaves and every message routed, one line each (NULL: nothing). */
+void             uam_link_server_set_log(uam_link_server *s, FILE *log);
+uint64_t         uam_link_server_messages(const uam_link_server *s);
 
 /*
  * Several machines in one process, one thread: each has a node attached to the
@@ -211,6 +260,10 @@ uam_host  *uam_host_create(void);
 void       uam_host_destroy(uam_host *h);
 uam_status uam_host_add_chardev(uam_host *h, uam_chardev *cd);
 uam_status uam_host_add_netdev(uam_host *h, uam_netdev *nd);
+/* Service a link node's connection to its hub: messages are taken as they
+ * arrive and, where the hub keeps time, the machine waits for its grants here
+ * (an idle machine without blocking the others). Add it before the run. */
+uam_status uam_host_add_link(uam_host *h, uam_link_node *n);
 void       uam_host_set_pacing(uam_host *h, uam_pacing pacing, uint64_t ticks_per_sec,
                                uint64_t max_ahead_ticks);
 /* Install the host loop as the executor's host bridge (uam_exec_set_host). */

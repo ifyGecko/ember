@@ -27,8 +27,12 @@ struct uam_link_port {
     qmsg          *ready;          /* due, waiting for the frontend: [r_head, r_head + r_len) */
     size_t         r_head, r_len, r_cap;
     bool           delivering;
+    uam_timer      retry_t;
     uint32_t       seq;
     uam_link_stats st;
+    void         (*save)(void *ctx, uam_state_writer *w);
+    void         (*restore)(void *ctx, uam_state_reader *r);
+    void          *state_ctx;
 };
 
 struct uam_link_node {
@@ -277,7 +281,8 @@ bool uam_link_send(uam_link_port *p, uint64_t key, uint32_t flags, uint32_t kind
         return false;
     uam_link_node *n = p->node;
     uint64_t now = uam_link_node_time(n);
-    uam_link_msg m = { .time = now > UINT64_MAX - p->latency ? UINT64_MAX : now + p->latency,
+    uint64_t lat = uam_link_port_latency_units(p);
+    uam_link_msg m = { .time = now > UINT64_MAX - lat ? UINT64_MAX : now + lat,
                        .key = key, .flags = flags, .kind = kind, .seq = p->seq++,
                        .len = (uint32_t)len, .data = data };
     if (n->tap)
@@ -305,9 +310,38 @@ void uam_link_accept_input(uam_link_port *p)
         deliver(p);
 }
 
+static void retry_fire(void *ctx)
+{
+    deliver(ctx);
+}
+
+void uam_link_port_retry(uam_link_port *p, uint64_t ticks)
+{
+    uam_sched *s = p->node->sched;
+    if (s && !p->retry_t.armed)
+        uam_timer_arm(s, &p->retry_t, uam_sched_now(s) + (ticks ? ticks : 1));
+}
+
+bool uam_link_port_attached(const uam_link_port *p) { return p->receive != NULL; }
+
 const char *uam_link_port_name(const uam_link_port *p) { return p->name; }
 const char *uam_link_port_bus(const uam_link_port *p) { return p->bus; }
 uint64_t uam_link_port_latency(const uam_link_port *p) { return p->latency; }
+
+uint64_t uam_link_port_latency_units(const uam_link_port *p)
+{
+    unsigned __int128 u = ((unsigned __int128)p->latency * p->node->unit_hz + UAM_LINK_UNIT_HZ - 1)
+                        / UAM_LINK_UNIT_HZ;
+    return u > UINT64_MAX ? UINT64_MAX : (uint64_t)u;
+}
+
+void uam_link_port_set_state(uam_link_port *p, void (*save)(void *ctx, uam_state_writer *w),
+                             void (*restore)(void *ctx, uam_state_reader *r), void *ctx)
+{
+    p->save = save;
+    p->restore = restore;
+    p->state_ctx = ctx;
+}
 unsigned uam_link_port_index(const uam_link_port *p) { return p->index; }
 uam_link_node *uam_link_port_node(const uam_link_port *p) { return p->node; }
 const uam_link_stats *uam_link_port_stats(const uam_link_port *p) { return &p->st; }
@@ -362,10 +396,7 @@ void uam_link_node_destroy(uam_link_node *n)
 {
     if (!n)
         return;
-    if (n->sched) {
-        uam_timer_cancel(n->sched, &n->deliver_t);
-        uam_timer_cancel(n->sched, &n->grant_t);
-    }
+    uam_link_node_clear_clock(n);
     if (n->ops && n->ops->close)
         n->ops->close(n->ops_ctx);
     drop_queues(n);
@@ -399,6 +430,7 @@ uam_link_port *uam_link_node_add_port(uam_link_node *n, const char *name, const 
     set_name(p->bus, bus && *bus ? bus : name);
     p->latency = latency;
     p->index = n->n_ports;
+    uam_timer_init(&p->retry_t, retry_fire, p);
     n->ports[n->n_ports++] = p;
     return p;
 }
@@ -441,6 +473,18 @@ uam_status uam_link_node_set_clock(uam_link_node *n, uam_sched *sched, uint64_t 
 }
 
 uam_sched *uam_link_node_sched(const uam_link_node *n) { return n->sched; }
+
+void uam_link_node_clear_clock(uam_link_node *n)
+{
+    if (!n || !n->sched)
+        return;
+    uam_timer_cancel(n->sched, &n->deliver_t);
+    uam_timer_cancel(n->sched, &n->grant_t);
+    for (unsigned i = 0; i < n->n_ports; i++)
+        uam_timer_cancel(n->sched, &n->ports[i]->retry_t);
+    n->sched = NULL;
+    n->tick_hz = 0;
+}
 
 uam_status uam_link_port_inject(uam_link_port *p, const uam_link_msg *m, uint64_t at_tick)
 {
@@ -494,6 +538,13 @@ void uam_link_node_set_transport(uam_link_node *n, const uam_link_transport *ops
 
 bool uam_link_node_connected(const uam_link_node *n) { return n->ops && !n->lost; }
 
+const uam_link_transport *uam_link_node_transport(const uam_link_node *n, void **ctx)
+{
+    if (ctx)
+        *ctx = n->ops_ctx;
+    return n->ops;
+}
+
 void uam_link_node_set_sync(uam_link_node *n, uam_link_sync sync, uint64_t unit_hz)
 {
     n->sync = sync;
@@ -508,10 +559,10 @@ uint64_t uam_link_node_unit_hz(const uam_link_node *n) { return n->unit_hz; }
 
 void uam_link_node_input(uam_link_node *n, unsigned port, const uam_link_msg *m)
 {
+    n->received++;          /* counted whatever it is: the hub counts what it sent */
     if (port >= n->n_ports || m->kind >= UAM_LINK_KIND_RESERVED)
         return;
     n->quiescent = false;
-    n->received++;
     uint64_t tick = 0;
     if (stamped(n)) {
         tick = uam_link_node_to_ticks(n, m->time);
@@ -560,7 +611,7 @@ uint64_t uam_link_node_next_delivery(const uam_link_node *n)
 void uam_link_node_report(uam_link_node *n, uint64_t reached, uint64_t quiet)
 {
     if (n->ops && !n->lost && n->ops->report)
-        n->ops->report(n->ops_ctx, reached, quiet);
+        n->ops->report(n->ops_ctx, reached, quiet, n->received);
 }
 
 uint64_t uam_link_node_received(const uam_link_node *n) { return n->received; }
@@ -612,7 +663,7 @@ static void grant_fire(void *ctx)
         return;
     }
     uint64_t t = uam_link_node_from_ticks(n, now);
-    n->ops->report(n->ops_ctx, t, t);
+    n->ops->report(n->ops_ctx, t, t, n->received);
     bool ok = true;
     while (ok && n->grant_tick <= now)
         ok = wait_once(n);
@@ -654,12 +705,13 @@ int uam_link_node_idle(uam_link_node *n, uint64_t limit, bool promise)
     uint64_t t = uam_link_node_from_ticks(n, now);
     uint64_t quiet = !promise ? t : event == UINT64_MAX ? UAM_LINK_NEVER
                                                          : uam_link_node_from_ticks(n, event);
-    n->ops->report(n->ops_ctx, t, quiet);
+    n->ops->report(n->ops_ctx, t, quiet, n->received);
     /* Having promised, stay put until the grant covers the next thing that can
      * happen here (a message that arrives meanwhile is one). Without a promise
      * the others wait for this node, so follow every grant. */
     bool ok = true;
-    while (ok && !n->quiescent
+    uint64_t had = n->received;      /* a message handed over at once may have woken a processor */
+    while (ok && !n->quiescent && n->received == had
            && (promise ? n->grant_tick < next_own_event(n) : n->grant_tick <= now))
         ok = wait_once(n);
     if (!uam_link_node_timed(n))
@@ -732,6 +784,12 @@ void uam_link_node_save(uam_link_node *n, uam_state_writer *w)
     uam_state_put_timer(w, &n->deliver_t);
     uam_state_put_bool(w, n->grant_t.armed);
     uam_state_put_timer(w, &n->grant_t);
+    for (unsigned i = 0; i < n->n_ports; i++) {
+        uam_state_put_timer(w, &n->ports[i]->retry_t);
+        uam_state_put_bool(w, n->ports[i]->save != NULL);
+        if (n->ports[i]->save)
+            n->ports[i]->save(n->ports[i]->state_ctx, w);
+    }
 }
 
 void uam_link_node_restore(uam_link_node *n, uam_state_reader *r)
@@ -758,6 +816,14 @@ void uam_link_node_restore(uam_link_node *n, uam_state_reader *r)
     uam_state_get_timer(r, &n->deliver_t);
     bool grant_armed = uam_state_get_bool(r);
     uam_state_get_timer(r, &n->grant_t);
+    for (unsigned i = 0; i < n->n_ports && uam_state_ok(r); i++) {
+        uam_link_port *p = n->ports[i];
+        uam_state_get_timer(r, &p->retry_t);
+        if (uam_state_get_bool(r) != (p->restore != NULL))
+            uam_state_fail(r, "link %s: port %s is used differently", n->name, p->name);
+        else if (p->restore)
+            p->restore(p->state_ctx, r);
+    }
     if (!uam_state_ok(r))
         return;
     n->quiescent = false;

@@ -424,6 +424,22 @@ static void usage(FILE *out)
         "                          are the board's) to a backend: tap:[IFNAME], tun:[IFNAME],\n"
         "                          tap-fd:FD, tun-fd:FD, udp:LPORT:RHOST:RPORT, null;\n"
         "                          append ,pcap=FILE to capture. Ports left out are unplugged\n"
+        "      --link PORT=HUB[,bus=BUS][,latency=TIME]\n"
+        "                          a link port PORT (repeatable) connected to the hub at HUB\n"
+        "                          (unix:PATH or tcp:HOST:PORT, see uam-link-hub; none: not\n"
+        "                          connected, for --fuzz-input PORT) on bus BUS (default: the\n"
+        "                          port's name). Its messages take TIME (a number with ps, ns,\n"
+        "                          us, ms, s; default 0) to arrive; a hub that keeps time needs\n"
+        "                          one. Use the port as --console link:PORT or --nic P=link:PORT,\n"
+        "                          or the board takes it by name. The hub decides how time is\n"
+        "                          kept; exit 132 when it goes away\n"
+        "      --link-name NAME    this emulation's name on its hubs (default: the board's);\n"
+        "                          each emulation on a hub needs its own\n"
+        "      --link-tick-hz N    what a tick is worth on a link: ticks per emulated second\n"
+        "                          (default: --realtime's TPS, else 100M)\n"
+        "      --link-stop-at TIME stop when the links' time reaches TIME (exit 0), once every\n"
+        "                          emulation on the hub stands there: with --save-snapshot on\n"
+        "                          each, one consistent snapshot of them all (an exact hub)\n"
         "      --realtime[=TPS]    pace virtual time to the host clock (TPS ticks/s, default 100M);\n"
         "                          implied by a --nic with a host interface\n"
         "      --virtual-time      keep virtual pacing even with host network interfaces\n"
@@ -633,11 +649,11 @@ static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
          * src/exec/spin.c). */
         else if (!strcmp(tok, "all"))   { *t |= UAM_TRACE_EXC;
                                           *rt |= RT_EXC_SUM | RT_MMIO | RT_SYSREG | RT_IRQ
-                                               | RT_CONSOLE | RT_DMA; }
+                                               | RT_CONSOLE | RT_DMA | RT_LINK; }
         else if (rtrace_flag(tok))      *rt |= rtrace_flag(tok);
         else {
             fprintf(stderr, "uam-run: unknown trace '%s' (traces: blocks, ir, exc, mmio, "
-                    "mmio-summary, sysreg, sysreg-all, irq, console, dma, all)\n", tok);
+                    "mmio-summary, sysreg, sysreg-all, irq, console, dma, link, all)\n", tok);
             ok = false;
         }
     }
@@ -646,6 +662,51 @@ static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
 }
 
 /* Split "KEY=VALUE" in place. */
+/* --link's HUB[,bus=BUS][,latency=TIME]. */
+static bool parse_link_spec(const char *spec, char *hub, size_t hublen, char *bus, size_t buslen,
+                            uint64_t *latency_ps)
+{
+    char copy[256];
+    if (strlen(spec) >= sizeof(copy))
+        return false;
+    strcpy(copy, spec);
+    bus[0] = 0;
+    char *save = NULL, *tok = strtok_r(copy, ",", &save);
+    if (!tok || strlen(tok) >= hublen
+        || (strcmp(tok, "none") && strncmp(tok, "unix:", 5) && strncmp(tok, "tcp:", 4)))
+        return false;
+    strcpy(hub, tok);
+    while ((tok = strtok_r(NULL, ",", &save))) {
+        if (!strncmp(tok, "bus=", 4) && tok[4] && strlen(tok + 4) < buslen)
+            strcpy(bus, tok + 4);
+        else if (!strncmp(tok, "latency=", 8) && uam_link_parse_time(tok + 8, latency_ps))
+            ;
+        else
+            return false;
+    }
+    return true;
+}
+
+static uam_link_port *find_link(const uam_board_link *links, size_t n, const char *name)
+{
+    for (size_t i = 0; i < n; i++)
+        if (!strcmp(links[i].name, name))
+            return links[i].port;
+    return NULL;
+}
+
+static uint64_t ps_to_units(uint64_t ps, uint64_t unit_hz)
+{
+    unsigned __int128 u = ((unsigned __int128)ps * unit_hz + UAM_LINK_UNIT_HZ - 1) / UAM_LINK_UNIT_HZ;
+    return u > UINT64_MAX ? UINT64_MAX : (uint64_t)u;
+}
+
+static void on_link_lost(void *ctx)
+{
+    uam_machine *m = ctx;
+    uam_exec_stop(&m->exec, 0);
+}
+
 static bool split_kv(char *s, const char **k, const char **v)
 {
     char *eq = strchr(s, '=');
@@ -1066,7 +1127,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
            OPT_IMAGE, OPT_CONSOLE, OPT_REALTIME, OPT_TRACE_RANGE, OPT_TRACE_AFTER, OPT_LOG_PC,
-           OPT_BREAK, OPT_GUARD, OPT_WATCH, OPT_GDB, OPT_MAP, OPT_NIC, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL, OPT_QUANTUM,
+           OPT_BREAK, OPT_GUARD, OPT_WATCH, OPT_GDB, OPT_MAP, OPT_NIC, OPT_LINK, OPT_LINK_NAME, OPT_LINK_TICK_HZ, OPT_LINK_STOP_AT, OPT_VIRTUAL_TIME, OPT_MAX_TICKS, OPT_MAX_STALL, OPT_QUANTUM,
            OPT_LOAD_SNAP, OPT_SAVE_SNAP, OPT_SNAP_AT, OPT_MMIO_RULE, OPT_MMIO_INPUT,
            OPT_COV_BLOCKS, OPT_COV_OUT, OPT_COV_MAP_SIZE,
            OPT_FUZZ_BEGIN, OPT_FUZZ_END, OPT_FUZZ_INPUT, OPT_FUZZ_CRASH_PC, OPT_FUZZ_CRASH_EXC,
@@ -1093,6 +1154,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "uart-input", required_argument, NULL, OPT_UART_IN },
         { "realtime", optional_argument, NULL, OPT_REALTIME },
         { "nic", required_argument, NULL, OPT_NIC },
+        { "link", required_argument, NULL, OPT_LINK },
+        { "link-name", required_argument, NULL, OPT_LINK_NAME },
+        { "link-tick-hz", required_argument, NULL, OPT_LINK_TICK_HZ },
+        { "link-stop-at", required_argument, NULL, OPT_LINK_STOP_AT },
         { "virtual-time", no_argument, NULL, OPT_VIRTUAL_TIME },
         { "block-insns", required_argument, NULL, OPT_BLOCK_INSNS },
         { "trace", required_argument, NULL, 't' },
@@ -1205,8 +1270,17 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uam_board_image images[MAX_LIST];
     uam_board_netdev nics[MAX_LIST];
     const char *nic_specs[MAX_LIST];
+    uam_board_link links[MAX_LIST];
+    const char *link_specs[MAX_LIST];
+    uam_link_node *link_nodes[MAX_LIST] = { NULL };
+    char link_hubs[MAX_LIST][160];
+    unsigned n_link_nodes = 0;
+    const char *link_name = NULL;
+    uint64_t link_tick_hz = 0, link_stop_ps = 0, link_stop_tick = 0;
+    bool have_link_stop = false;
     uam_board_config cfg = { .unknown_mmio = UAM_UNKNOWN_FAULT, .options = options, .images = images,
-                             .netdevs = nics, .option_read = opt_read };
+                             .netdevs = nics, .option_read = opt_read,
+                             .links = links };
 
     /* The option table: ours, then each extension's. */
     enum { MAX_EXT_OPTS = 64 };
@@ -1293,6 +1367,34 @@ static int run_main(int argc, char **argv, const ext_set *es)
             nics[cfg.n_netdevs++].nd = NULL;
             break;
         }
+        case OPT_LINK: {
+            const char *spec;
+            if (cfg.n_links == MAX_LIST || !split_kv(optarg, &links[cfg.n_links].name, &spec)
+                || strlen(links[cfg.n_links].name) >= UAM_LINK_NAME_MAX) {
+                fprintf(stderr, "uam-run: bad --link '%s' (expected PORT=HUB[,bus=BUS]"
+                        "[,latency=TIME], PORT up to %u characters)\n", optarg, UAM_LINK_NAME_MAX - 1);
+                return 2;
+            }
+            for (size_t i = 0; i < cfg.n_links; i++) {
+                if (!strcmp(links[i].name, links[cfg.n_links].name)) {
+                    fprintf(stderr, "uam-run: link port '%s' given twice\n", links[i].name);
+                    return 2;
+                }
+            }
+            link_specs[cfg.n_links] = spec;
+            links[cfg.n_links++].port = NULL;
+            break;
+        }
+        case OPT_LINK_NAME: link_name = optarg; break;
+        case OPT_LINK_TICK_HZ: link_tick_hz = parse_size(optarg); break;
+        case OPT_LINK_STOP_AT:
+            if (!uam_link_parse_time(optarg, &link_stop_ps)) {
+                fprintf(stderr, "uam-run: bad --link-stop-at '%s' (a number with ps, ns, us, ms "
+                        "or s)\n", optarg);
+                return 2;
+            }
+            have_link_stop = true;
+            break;
         case OPT_VIRTUAL_TIME: virtual_time = true; break;
         case OPT_MAX_TICKS: max_ticks = strtoull(optarg, NULL, 0); break;
         case OPT_MAX_STALL: max_stall = strtoull(optarg, NULL, 0); break;
@@ -1705,8 +1807,56 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
 
     int rc = 2;
-    uam_chardev *console = uam_chardev_open(console_spec);
+    uam_chardev *console = NULL;
     uam_host *host = uam_host_create();
+    /* Link ports first: the console and the network ports may sit on them. Ports
+     * that name the same hub share one connection (one node). */
+    if (have_link_stop && !cfg.n_links) {
+        fprintf(stderr, "uam-run: --link-stop-at needs a --link\n");
+        goto out_host;
+    }
+    for (size_t i = 0; host && i < cfg.n_links; i++) {
+        char hub[160], bus[UAM_LINK_NAME_MAX];
+        uint64_t latency = 0;
+        if (!parse_link_spec(link_specs[i], hub, sizeof(hub), bus, sizeof(bus), &latency)) {
+            fprintf(stderr, "uam-run: bad --link %s=%s (expected HUB[,bus=BUS][,latency=TIME]; "
+                    "HUB: unix:PATH, tcp:HOST:PORT or none)\n", links[i].name, link_specs[i]);
+            goto out_host;
+        }
+        unsigned k = 0;
+        while (k < n_link_nodes && strcmp(link_hubs[k], hub))
+            k++;
+        if (k == n_link_nodes) {
+            link_nodes[k] = uam_link_node_create(link_name ? link_name : board_name);
+            if (!link_nodes[k])
+                goto out_host;
+            strcpy(link_hubs[k], hub);
+            n_link_nodes++;
+        }
+        links[i].port = uam_link_node_add_port(link_nodes[k], links[i].name, bus[0] ? bus : NULL,
+                                               latency);
+        if (!links[i].port)
+            goto out_host;
+    }
+    for (unsigned k = 0; host && k < n_link_nodes; k++) {
+        char err[200] = "";
+        if (strcmp(link_hubs[k], "none")
+            && uam_link_node_connect(link_nodes[k], link_hubs[k], err, sizeof(err)) != UAM_OK) {
+            fprintf(stderr, "uam-run: --link: %s\n", err);
+            goto out_host;
+        }
+        uam_host_add_link(host, link_nodes[k]);
+    }
+    if (host && !strncmp(console_spec, "link:", 5)) {
+        uam_link_port *lp = find_link(links, cfg.n_links, console_spec + 5);
+        if (!lp) {
+            fprintf(stderr, "uam-run: --console %s: no --link port of that name\n", console_spec);
+            goto out_host;
+        }
+        console = uam_chardev_link_create(lp);
+    } else {
+        console = uam_chardev_open(console_spec);
+    }
     if (!console || !host) {
         fprintf(stderr, "uam-run: cannot open console '%s'\n", console_spec);
         goto out_host;
@@ -1719,7 +1869,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uam_chardev_hold(console, true);
     bool host_net = false;   /* a port is wired to a host interface */
     for (size_t i = 0; i < cfg.n_netdevs; i++) {
-        nics[i].nd = uam_netdev_open(nic_specs[i]);
+        if (!strncmp(nic_specs[i], "link:", 5)) {
+            uam_link_port *lp = find_link(links, cfg.n_links, nic_specs[i] + 5);
+            if (!lp)
+                fprintf(stderr, "uam-run: --nic %s=%s: no --link port of that name\n",
+                        nics[i].name, nic_specs[i]);
+            nics[i].nd = lp ? uam_netdev_link_create(lp) : NULL;
+        } else {
+            nics[i].nd = uam_netdev_open(nic_specs[i]);
+        }
         if (!nics[i].nd) {
             fprintf(stderr, "uam-run: cannot open network backend '%s' for port '%s'\n",
                     nic_specs[i], nics[i].name);
@@ -1737,6 +1895,19 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: building board '%s' failed: %s\n", board_name, uam_status_str(st));
         uam_machine_fini(&m);
         goto out_host;
+    }
+    /* The nodes get the machine's clock, and their state a place in its snapshots,
+     * before anything runs or a snapshot is loaded. */
+    for (unsigned k = 0; k < n_link_nodes; k++) {
+        uam_status ls = uam_link_node_bind(link_nodes[k], &m, link_tick_hz ? link_tick_hz
+                                                                           : realtime_tps);
+        if (ls != UAM_OK) {
+            fprintf(stderr, "uam-run: cannot set up link node %s: %s\n",
+                    uam_link_node_name(link_nodes[k]), uam_status_str(ls));
+            uam_machine_fini(&m);
+            goto out_host;
+        }
+        uam_link_node_set_lost_handler(link_nodes[k], on_link_lost, &m);
     }
     if (fuzz_uninit) {
         /* Before anything runs or a snapshot is loaded: the written-page record is part of a
@@ -1760,6 +1931,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
             rc = 2;
             goto out_host;
         }
+    for (size_t i = 0; i < cfg.n_links; i++)
+        if (!uam_link_port_attached(links[i].port))
+            fprintf(stderr, "uam-run: nothing uses link port '%s' (board '%s' has no such port, "
+                    "and no --console link:%s or --nic P=link:%s takes it)\n", links[i].name,
+                    board_name, links[i].name, links[i].name);
     for (size_t i = 0; i < cfg.n_netdevs; i++)
         if (!nics[i].nd->receive)
             fprintf(stderr, "uam-run: board '%s' has no network port '%s'; --nic %s=... is unused\n",
@@ -1920,6 +2096,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     m.exec.trace_after = trace_after;
     rt.after = (trace_after || trace_after_rel) ? trace_after : 0;
     rtrace_attach(&rt, &m, console, m.exec.trace_out);
+    if (rt.flags & RT_LINK)
+        for (unsigned k = 0; k < n_link_nodes; k++)
+            uam_link_node_set_tap(link_nodes[k], rtrace_link, &rt);
     m.exec.verify = verify;
     m.exec.optimize = optimize;
     m.exec.chain = chain;
@@ -2062,6 +2241,28 @@ static int run_main(int argc, char **argv, const ext_set *es)
         uint64_t now = uam_sched_now(&m.sched);
         m.exec.max_time = max_ticks < UAM_SCHED_TIME_MAX - now ? now + max_ticks : UAM_SCHED_TIME_MAX;
     }
+    if (have_link_stop) {
+        const uam_link_node *ln = link_nodes[0];
+        link_stop_tick = uam_link_node_to_ticks(ln, ps_to_units(link_stop_ps, uam_link_node_unit_hz(ln)));
+        if (link_stop_tick && (!m.exec.max_time || link_stop_tick < m.exec.max_time))
+            m.exec.max_time = link_stop_tick;
+    }
+    /* Each input starts from the snapshot, and what is at the other end of a hub does
+     * not go back with it: a run that fuzzes has its link ports unconnected, and the
+     * input comes in through one of them. */
+    for (unsigned k = 0; fuzzing && k < n_link_nodes; k++)
+        if (uam_link_node_connected(link_nodes[k])) {
+            fprintf(stderr, "uam-run: a fuzz run cannot be connected to a link hub (%s): the other "
+                    "end does not go back to the snapshot with each input. Leave the port "
+                    "unconnected (--link PORT=none) and feed it with --fuzz-input PORT\n",
+                    link_hubs[k]);
+            uam_host_destroy(host);
+            host = NULL;
+            rtrace_detach(&rt);
+            uam_machine_fini(&m);
+            rc = 2;
+            goto out_host;
+        }
     uam_host_attach(host, &m.exec);
     uam_chardev_set_quit_handler(console, on_console_quit, &m);
 
@@ -2104,7 +2305,21 @@ static int run_main(int argc, char **argv, const ext_set *es)
     sigaction(SIGTERM, &old_term, NULL);
     g_machine = NULL;
 
-    switch (fuzzing ? UAM_STOP_NONE : why) {
+    /* --link-stop-at: wait until every emulation on the hub stands at that time; the
+     * snapshot saved below is then one state of them all. */
+    bool link_stopped = false;
+    if (!fuzzing && have_link_stop && why == UAM_STOP_TIME_LIMIT
+        && uam_sched_now(&m.sched) >= link_stop_tick) {
+        link_stopped = true;
+        for (unsigned k = 0; k < n_link_nodes; k++)
+            link_stopped &= uam_link_node_barrier(link_nodes[k],
+                ps_to_units(link_stop_ps, uam_link_node_unit_hz(link_nodes[k])));
+    }
+    bool link_lost = false;
+    for (unsigned k = 0; k < n_link_nodes; k++)
+        link_lost |= uam_link_node_lost(link_nodes[k]);
+
+    switch (fuzzing ? UAM_STOP_NONE : link_lost ? UAM_STOP_ERROR : why) {
     case UAM_STOP_NONE:
         break;   /* fuzzing: rc is the harness's */
     case UAM_STOP_REQUEST:
@@ -2120,15 +2335,17 @@ static int run_main(int argc, char **argv, const ext_set *es)
             rc = 1;
         break;
     case UAM_STOP_INSN_LIMIT:
-    case UAM_STOP_TIME_LIMIT: rc = 124; break;
+    case UAM_STOP_TIME_LIMIT: rc = link_stopped ? 0 : 124; break;
     case UAM_STOP_DEADLOCK:   rc = 125; break;
     case UAM_STOP_LIVELOCK:   rc = 128; break;
     case UAM_STOP_DEBUG:
     case UAM_STOP_HOOK:       rc = 127; break;
     case UAM_STOP_GUARD:      rc = 129; break;
     case UAM_STOP_UNMAPPED:   rc = 131; break;
-    default:                  rc = 126; break;
+    default:                  rc = link_lost ? 132 : 126; break;
     }
+    if (link_lost)
+        fprintf(stderr, "uam-run: the link hub went away\n");
 
     if (!fuzzing && why == UAM_STOP_GUARD && uam_machine_guard_last_hit(&m)) {
         char line[320];
@@ -2269,6 +2486,8 @@ out_host:
     for (size_t i = 0; i < cfg.n_netdevs; i++)
         uam_netdev_destroy(nics[i].nd);   /* after the machine: devices detach first */
     uam_chardev_destroy(console);
+    for (unsigned k = 0; k < n_link_nodes; k++)
+        uam_link_node_destroy(link_nodes[k]);   /* after what sits on their ports */
     uam_mmio_input_free(mmio_input);   /* after the machine: its stubs read it */
     free(mmio_input_data);
     free(cov_map);   /* after the machine: the hart pointed at it */

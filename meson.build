@@ -100,7 +100,7 @@ modules = {
     'fuzz/cov_region.c', 'fuzz/mutate.c', 'fuzz/campaign.c', 'fuzz/i2s.c'),
   'host': files('src/host/chardev_backends.c', 'src/host/netdev_backends.c',
     'src/host/blockdev_file.c', 'src/host/hostloop.c', 'src/host/link_node.c',
-    'src/host/link_hub.c', 'src/debug/gdbstub.c',
+    'src/host/link_hub.c', 'src/host/link_adapters.c', 'src/host/link_wire.c', 'src/debug/gdbstub.c',
     'src/runner/runner.c', 'src/runner/trace.c'),
 }
 
@@ -129,6 +129,10 @@ uam_dep = declare_dependency(
 meson.override_dependency('uam', uam_dep)
 
 uam_run = executable('uam-run', 'tools/uam-run.c',
+  dependencies: uam_dep,
+  install: true)
+
+uam_link_hub = executable('uam-link-hub', 'tools/uam-link-hub.c',
   dependencies: uam_dep,
   install: true)
 

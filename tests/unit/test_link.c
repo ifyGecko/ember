@@ -93,8 +93,9 @@ static bool fh_send(void *ctx, unsigned port, const uam_link_msg *m)
     return true;
 }
 
-static void fh_report(void *ctx, uint64_t reached, uint64_t quiet)
+static void fh_report(void *ctx, uint64_t reached, uint64_t quiet, uint64_t received)
 {
+    (void)received;
     fake_hub *h = ctx;
     h->reports++;
     h->reached = reached;
@@ -586,22 +587,22 @@ static void test_hub_grants(void)
     uam_link_hub_join(h, "a", &rec_ops, &a, 0);
     CHECK(uam_link_hub_add_port(h, 0, 0, "bus", 0) == UAM_ERR_REJECTED, "exact: latency 0 refused");
     uam_link_hub_add_port(h, 0, 0, "bus", 1000);
-    uam_link_hub_report(h, 0, 0, 0);
+    uam_link_hub_report(h, 0, 0, 0, UINT64_MAX);
     CHECK(a.grants == 0, "nothing is granted before everyone has joined");
     uam_link_hub_join(h, "b", &rec_ops, &b, 0);
     uam_link_hub_add_port(h, 1, 0, "bus", 3000);
-    uam_link_hub_report(h, 1, 0, 0);
+    uam_link_hub_report(h, 1, 0, 0, UINT64_MAX);
     /* Each may run to where the other's next message could take effect. */
     CHECK(a.grant == 3000 && b.grant == 1000, "grants: a %llu b %llu",
           (unsigned long long)a.grant, (unsigned long long)b.grant);
-    uam_link_hub_report(h, 1, 1000, 1000);
+    uam_link_hub_report(h, 1, 1000, 1000, UINT64_MAX);
     CHECK(a.grant == 4000, "a follows b: %llu", (unsigned long long)a.grant);
-    uam_link_hub_report(h, 0, 3000, 3000);
+    uam_link_hub_report(h, 0, 3000, 3000, UINT64_MAX);
     CHECK(b.grant == 4000, "b follows a: %llu", (unsigned long long)b.grant);
 
     /* b idle with nothing armed: a is held only by its own echo path
      * (a's message reaches b one latency later, b's answer another). */
-    uam_link_hub_report(h, 1, 4000, UAM_LINK_NEVER);
+    uam_link_hub_report(h, 1, 4000, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.grant == 3000 + 1000 + 3000, "a runs ahead of a quiet b: %llu",
           (unsigned long long)a.grant);
     CHECK(a.quiets == 0 && b.quiets == 0, "not quiescent while a runs");
@@ -609,16 +610,27 @@ static void test_hub_grants(void)
     unsigned grants = a.grants;
     uam_link_msg m = { .time = 5000, .len = 1, .data = (const uint8_t *)"x" };
     uam_link_hub_msg(h, 0, 0, &m);
-    uam_link_hub_report(h, 0, 6000, 6000);
+    uam_link_hub_report(h, 0, 6000, 6000, UINT64_MAX);
     CHECK(b.n == 1 && a.grant == 5000 + 3000, "a is held by b's wake-up at 5000: %llu",
           (unsigned long long)a.grant);
     CHECK(a.grants == grants + 1, "one new grant");
 
+    /* A report made before the member read a message does not cancel the
+     * wake-up: b says "quiet for ever" having taken none of the two sent. */
+    m.time = 7000;
+    uam_link_hub_msg(h, 0, 0, &m);
+    uam_link_hub_report(h, 1, 6000, UAM_LINK_NEVER, 1);
+    uam_link_hub_report(h, 0, 7500, UAM_LINK_NEVER, UINT64_MAX);
+    CHECK(a.quiets == 0 && b.quiets == 0, "a message under way: not quiescent");
+    CHECK(a.grant == 7000 + 3000, "a is still held by b's wake-up at 7000: %llu",
+          (unsigned long long)a.grant);
+    uam_link_hub_report(h, 1, 7000, 7000, 2);
+
     /* Everyone quiet: told once. */
-    uam_link_hub_report(h, 1, 8000, UAM_LINK_NEVER);
-    uam_link_hub_report(h, 0, 8000, UAM_LINK_NEVER);
+    uam_link_hub_report(h, 1, 8000, UAM_LINK_NEVER, UINT64_MAX);
+    uam_link_hub_report(h, 0, 8000, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.quiets == 1 && b.quiets == 1, "quiescent");
-    uam_link_hub_report(h, 0, 8000, UAM_LINK_NEVER);
+    uam_link_hub_report(h, 0, 8000, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.quiets == 1, "only once");
 
     /* The one left alone has no limit. */
@@ -634,7 +646,7 @@ static void test_hub_grants(void)
     uam_link_hub_join(h, "d", &rec_ops, &d, 0);
     uam_link_hub_add_port(h, 0, 0, "bus", 1000);
     uam_link_hub_add_port(h, 1, 0, "bus", 1000);
-    uam_link_hub_report(h, 0, 0, 0);
+    uam_link_hub_report(h, 0, 0, 0, UINT64_MAX);
     CHECK(c.grant == 51000 && d.grant == 51000, "loose: lookahead + skew");
     uam_link_hub_destroy(h);
 }
@@ -649,7 +661,7 @@ static void test_hub_arbitration(void)
     for (unsigned i = 0; i < 3; i++) {
         uam_link_hub_join(h, "m", &rec_ops, &r[i], 0);
         uam_link_hub_add_port(h, i, 0, "bus", 500);
-        uam_link_hub_report(h, i, 2000, 2000);
+        uam_link_hub_report(h, i, 2000, 2000, UINT64_MAX);
     }
     uam_link_msg m = { .time = 2600, .key = 5, .len = 1, .data = (const uint8_t *)"A" };
     uam_link_hub_msg(h, 0, 0, &m);
@@ -660,14 +672,14 @@ static void test_hub_arbitration(void)
     CHECK(r[0].n + r[1].n + r[2].n == 0, "held: someone could still send for that slot");
     CHECK(r[2].grant == 2500, "granted up to what could still be sent: %llu",
           (unsigned long long)r[2].grant);
-    uam_link_hub_report(h, 0, 2500, 2500);
-    uam_link_hub_report(h, 1, 2500, 2500);
-    uam_link_hub_report(h, 2, 2500, 2500);
+    uam_link_hub_report(h, 0, 2500, 2500, UINT64_MAX);
+    uam_link_hub_report(h, 1, 2500, 2500, UINT64_MAX);
+    uam_link_hub_report(h, 2, 2500, 2500, UINT64_MAX);
     CHECK(r[2].grant == 3000 && r[2].n == 0, "then up to the slot, still held");
-    uam_link_hub_report(h, 0, 3000, 3000);
-    uam_link_hub_report(h, 1, 3000, 3000);
+    uam_link_hub_report(h, 0, 3000, 3000, UINT64_MAX);
+    uam_link_hub_report(h, 1, 3000, 3000, UINT64_MAX);
     CHECK(r[2].n == 0, "one member has not passed the slot yet");
-    uam_link_hub_report(h, 2, 3000, 3000);
+    uam_link_hub_report(h, 2, 3000, 3000, UINT64_MAX);
     CHECK(r[2].n == 1 && r[2].data[0] == 'B' && r[2].last.time == 3000, "the lowest key won");
     CHECK(r[0].n == 2, "the loser hears the winner and gets its own back");
     CHECK(r[0].lost == 1 && r[2].lost == 0, "marked lost");

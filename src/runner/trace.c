@@ -6,6 +6,7 @@
 
 #include "uam/exec.h"
 #include "uam/isa.h"
+#include "uam/link.h"
 
 #include "trace.h"
 
@@ -18,6 +19,7 @@ unsigned rtrace_flag(const char *tok)
     if (!strcmp(tok, "console"))    return RT_CONSOLE;
     if (!strcmp(tok, "mmio-summary")) return RT_MMIO_SUM;
     if (!strcmp(tok, "dma"))        return RT_DMA;
+    if (!strcmp(tok, "link"))       return RT_LINK;
     return 0;
 }
 
@@ -296,6 +298,31 @@ static void on_console(void *ctx, const uint8_t *buf, size_t len)
         if (t->len == sizeof(t->line))
             console_flush(t);
     }
+}
+
+/* ---- links --------------------------------------------------------------------- */
+
+void rtrace_link(void *ctx, const uam_link_port *p, const uam_link_msg *m, bool out)
+{
+    rtrace *t = ctx;
+    bool ok;
+    uam_origin o;
+    if (!in_window(t, &ok, &o))
+        return;
+    fprintf(t->out, "link %s %s time=%llu key=0x%llx flags=0x%x kind=%u len=%u", uam_link_port_name(p),
+            out ? "tx" : "rx", (unsigned long long)m->time, (unsigned long long)m->key, m->flags,
+            m->kind, m->len);
+    if (m->len) {
+        fputs(" data=", t->out);
+        for (uint32_t i = 0; i < m->len && i < 16; i++)
+            fprintf(t->out, "%02x", m->data[i]);
+        if (m->len > 16)
+            fputs("..", t->out);
+    }
+    if (!out)       /* where the node's clock stands when the device gets it */
+        fprintf(t->out, " at=%llu", (unsigned long long)uam_link_node_time(uam_link_port_node(p)));
+    put_origin(t->out, ok, &o);
+    fputc('\n', t->out);
 }
 
 /* ---- life cycle ---------------------------------------------------------------- */

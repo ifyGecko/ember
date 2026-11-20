@@ -26,7 +26,7 @@
  * Time. Every message carries a time in the hub's unit (unit_hz units per
  * emulated second, picoseconds unless the hub says otherwise): the moment it
  * takes effect at the receiver, which is the sender's time plus the port's
- * latency. A node converts between that unit and its machine's ticks
+ * latency (given in picoseconds whatever the unit). A node converts between that unit and its machine's ticks
  * (uam/sched.h) with the tick rate it was bound with. Three ways of keeping
  * time, chosen on the hub:
  *   UAM_LINK_FREE   (default) time is not kept: a message is delivered when it
@@ -118,10 +118,17 @@ bool uam_link_send(uam_link_port *p, uint64_t key, uint32_t flags, uint32_t kind
                    const void *data, size_t len);
 /* The frontend can take messages again. */
 void uam_link_accept_input(uam_link_port *p);
+/* For a frontend that is not told when it has room again: offer it the waiting
+ * messages once more `ticks` from now (a timer, so the same guest time in
+ * every run; saved with the node). Nothing happens without a clock. */
+void uam_link_port_retry(uam_link_port *p, uint64_t ticks);
+/* Whether a frontend has taken the port. */
+bool uam_link_port_attached(const uam_link_port *p);
 
 const char           *uam_link_port_name(const uam_link_port *p);
 const char           *uam_link_port_bus(const uam_link_port *p);
-uint64_t              uam_link_port_latency(const uam_link_port *p);
+uint64_t              uam_link_port_latency(const uam_link_port *p);         /* picoseconds */
+uint64_t              uam_link_port_latency_units(const uam_link_port *p);   /* the hub's unit */
 unsigned              uam_link_port_index(const uam_link_port *p);
 uam_link_node        *uam_link_port_node(const uam_link_port *p);
 bool                  uam_link_port_up(const uam_link_port *p);
@@ -135,8 +142,9 @@ uam_link_node *uam_link_node_create(const char *name);
 void           uam_link_node_destroy(uam_link_node *n);
 const char    *uam_link_node_name(const uam_link_node *n);
 
-/* A port on bus `bus`, whose messages take `latency` (in the hub's unit) to
- * reach the far end. Ports are added before the node is connected or saved. */
+/* A port on bus `bus`, whose messages take `latency` picoseconds to reach the
+ * far end (rounded up to the hub's unit). Ports are added before the node is
+ * connected or saved. */
 uam_link_port *uam_link_node_add_port(uam_link_node *n, const char *name, const char *bus,
                                       uint64_t latency);
 uam_link_port *uam_link_node_find_port(const uam_link_node *n, const char *name);
@@ -147,6 +155,9 @@ uam_link_port *uam_link_node_port(const uam_link_node *n, unsigned index);
  * (ticks per emulated second). Until then messages are delivered on arrival. */
 uam_status     uam_link_node_set_clock(uam_link_node *n, uam_sched *sched, uint64_t tick_hz);
 uam_sched     *uam_link_node_sched(const uam_link_node *n);
+/* Let go of the clock (disarm the node's timers) before the machine that owns
+ * the scheduler is taken down. */
+void           uam_link_node_clear_clock(uam_link_node *n);
 /* The node's time now, and conversions (0 / saturating without a clock). */
 uint64_t       uam_link_node_time(const uam_link_node *n);
 uint64_t       uam_link_node_from_ticks(const uam_link_node *n, uint64_t ticks);   /* rounds down */
@@ -154,6 +165,12 @@ uint64_t       uam_link_node_to_ticks(const uam_link_node *n, uint64_t time);   
 
 void           uam_link_node_save(uam_link_node *n, uam_state_writer *w);
 void           uam_link_node_restore(uam_link_node *n, uam_state_reader *r);
+
+/* State that belongs with a port - what a device or an adapter holds of the
+ * messages it has taken - saved and restored with the node, after the node's
+ * own. Set before the first snapshot. */
+void           uam_link_port_set_state(uam_link_port *p, void (*save)(void *ctx, uam_state_writer *w),
+                                       void (*restore)(void *ctx, uam_state_reader *r), void *ctx);
 
 /* Hand a message to a port as if it had come over the link: at tick `at_tick`
  * of the node's clock, or at once when at_tick is 0 or already past. For input
@@ -177,8 +194,10 @@ typedef struct uam_link_transport {
     /* A message leaves the node on port `port`. False: not taken. */
     bool (*send)(void *ctx, unsigned port, const uam_link_msg *m);
     /* Timed modes: the node stands at `reached` and, left alone, does nothing
-     * before `quiet` (>= reached; UAM_LINK_NEVER: nothing at all). */
-    void (*report)(void *ctx, uint64_t reached, uint64_t quiet);
+     * before `quiet` (>= reached; UAM_LINK_NEVER: nothing at all). It says so
+     * having taken `received` messages: one the hub sent that the node had not
+     * yet read can still wake it earlier. */
+    void (*report)(void *ctx, uint64_t reached, uint64_t quiet, uint64_t received);
     /* Host file descriptor that becomes readable when the hub has something, or -1. */
     int  (*fd)(void *ctx);
     /* Take what has arrived, waiting up to timeout_ms for something (0: do not
@@ -193,6 +212,8 @@ typedef struct uam_link_transport {
  * when it is destroyed or reconnected. */
 void uam_link_node_set_transport(uam_link_node *n, const uam_link_transport *ops, void *ctx);
 bool uam_link_node_connected(const uam_link_node *n);
+/* The node's transport and its context (NULL: none). */
+const uam_link_transport *uam_link_node_transport(const uam_link_node *n, void **ctx);
 /* What the hub decided: how time is kept and in which unit. */
 void uam_link_node_set_sync(uam_link_node *n, uam_link_sync sync, uint64_t unit_hz);
 uam_link_sync uam_link_node_sync(const uam_link_node *n);

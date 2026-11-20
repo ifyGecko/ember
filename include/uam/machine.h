@@ -50,6 +50,18 @@ typedef struct uam_board_netdev {
     uam_netdev *nd;
 } uam_board_netdev;
 
+/*
+ * A link port for one of the board's own devices ("--link can0=unix:hub.sock",
+ * uam/link.h): the device takes it with uam_link_port_set_frontend. Looked up
+ * by the board's own names (uam_board_config_link); a port left out is not
+ * connected. Owned by the caller, like the netdevs.
+ */
+struct uam_link_port;
+typedef struct uam_board_link {
+    const char           *name;
+    struct uam_link_port *port;
+} uam_board_link;
+
 typedef struct uam_board_config {
     uint64_t                ram_size;      /* 0 = board default */
     uam_unknown_mmio_policy unknown_mmio;
@@ -65,6 +77,8 @@ typedef struct uam_board_config {
                                             * sets entry i when it looks up options[i]'s key, so
                                             * the caller can tell which options the board never
                                             * asked for (the runner refuses them). NULL: not kept. */
+    const uam_board_link   *links;
+    size_t                  n_links;
 } uam_board_config;
 
 /* Lookups for boards: the last matching entry, or NULL. Looking a key up marks every option
@@ -73,6 +87,7 @@ typedef struct uam_board_config {
 const char *uam_board_config_option(const uam_board_config *cfg, const char *key);
 const char *uam_board_config_image(const uam_board_config *cfg, const char *name);
 uam_netdev *uam_board_config_netdev(const uam_board_config *cfg, const char *name);
+struct uam_link_port *uam_board_config_link(const uam_board_config *cfg, const char *name);
 
 typedef struct uam_machine uam_machine;
 

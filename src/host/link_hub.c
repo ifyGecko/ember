@@ -51,6 +51,11 @@ typedef struct member {
     void    *ctx;
     uint64_t reached, quiet, latency, granted;
     uint64_t act;            /* scratch: the relaxation's result */
+    /* Messages sent to it that it has not yet said it took: a report made
+     * without having seen them does not cancel the wake-up they are. */
+    uint64_t  n_sent;
+    struct unseen { uint64_t index, time; } *unseen;
+    unsigned  n_unseen, cap_unseen;
 } member;
 
 struct uam_link_hub {
@@ -90,6 +95,8 @@ void uam_link_hub_destroy(uam_link_hub *h)
         return;
     for (unsigned i = 0; i < h->n_held; i++)
         free((uint8_t *)(uintptr_t)h->held[i].m.data);
+    for (unsigned i = 0; i < h->n_members; i++)
+        free(h->members[i].unseen);
     free(h->held);
     free(h->members);
     free(h->ports);
@@ -182,6 +189,19 @@ static void send_to(uam_link_hub *h, unsigned mem, unsigned port, const uam_link
     if (m->time < d->quiet)
         d->quiet = m->time;          /* it may act from then on */
     d->told_quiet = false;
+    d->n_sent++;
+    if (h->cfg.sync != UAM_LINK_FREE) {
+        if (d->n_unseen == d->cap_unseen) {
+            unsigned cap = d->cap_unseen ? d->cap_unseen * 2 : 16;
+            struct unseen *nu = realloc(d->unseen, cap * sizeof(*nu));
+            if (nu) {
+                d->unseen = nu;
+                d->cap_unseen = cap;
+            }
+        }
+        if (d->n_unseen < d->cap_unseen)
+            d->unseen[d->n_unseen++] = (struct unseen){ d->n_sent, m->time };
+    }
     d->ops->msg(d->ctx, port, m);
 }
 
@@ -459,7 +479,15 @@ bool uam_link_hub_msg(uam_link_hub *h, unsigned member_id, unsigned port, const 
     if (!from || in->len > UAM_LINK_MAX_MSG)
         return false;
     uam_link_msg m = *in;
-    m.src = member_id * 256u + port + 1;
+    /* Sources are numbered by member name (then by order of joining), so that
+     * ties come out the same whatever order the members connected in. */
+    unsigned rank = 0;
+    for (unsigned i = 0; i < h->n_members; i++) {
+        int c = strcmp(h->members[i].name, h->members[member_id].name);
+        if (c < 0 || (c == 0 && i < member_id))
+            rank++;
+    }
+    m.src = rank * 256u + port + 1;
     unsigned bus = from->bus;
     const hbus *b = &h->buses[bus];
     bool ok = true;
@@ -478,7 +506,8 @@ bool uam_link_hub_msg(uam_link_hub *h, unsigned member_id, unsigned port, const 
     return ok;
 }
 
-void uam_link_hub_report(uam_link_hub *h, unsigned member_id, uint64_t reached, uint64_t quiet)
+void uam_link_hub_report(uam_link_hub *h, unsigned member_id, uint64_t reached, uint64_t quiet,
+                         uint64_t received)
 {
     if (member_id >= h->n_members || !h->members[member_id].alive)
         return;
@@ -486,6 +515,15 @@ void uam_link_hub_report(uam_link_hub *h, unsigned member_id, uint64_t reached, 
     if (reached > m->reached)
         m->reached = reached;
     m->quiet = quiet < m->reached ? m->reached : quiet;
+    unsigned kept = 0;
+    for (unsigned i = 0; i < m->n_unseen; i++) {
+        if (m->unseen[i].index <= received)
+            continue;
+        if (m->unseen[i].time < m->quiet)
+            m->quiet = m->unseen[i].time;
+        m->unseen[kept++] = m->unseen[i];
+    }
+    m->n_unseen = kept;
     if (m->quiet != UAM_LINK_NEVER)
         for (unsigned i = 0; i < h->n_members; i++)
             h->members[i].told_quiet = false;
@@ -530,10 +568,10 @@ static bool local_send(void *ctx, unsigned port, const uam_link_msg *m)
     return uam_link_hub_msg(l->hub, l->id, port, m);
 }
 
-static void local_report(void *ctx, uint64_t reached, uint64_t quiet)
+static void local_report(void *ctx, uint64_t reached, uint64_t quiet, uint64_t received)
 {
     local *l = ctx;
-    uam_link_hub_report(l->hub, l->id, reached, quiet);
+    uam_link_hub_report(l->hub, l->id, reached, quiet, received);
 }
 
 static void local_close(void *ctx)
@@ -564,7 +602,7 @@ uam_status uam_link_hub_attach(uam_link_hub *h, uam_link_node *n)
     for (unsigned i = 0; i < uam_link_node_ports(n); i++) {
         const uam_link_port *p = uam_link_node_port(n, i);
         uam_status st = uam_link_hub_add_port(h, l->id, i, uam_link_port_bus(p),
-                                              uam_link_port_latency(p));
+                                              uam_link_port_latency_units(p));
         if (st != UAM_OK) {
             uam_log(UAM_LOG_ERROR, "link", "%s: port %s cannot join bus %s%s",
                     uam_link_node_name(n), uam_link_port_name(p), uam_link_port_bus(p),
