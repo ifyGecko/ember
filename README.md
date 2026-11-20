@@ -457,37 +457,54 @@ no device claims reads all ones (master abort), as on hardware; an unclaimed I/O
 `x86_64-ref` reads as zero and ignores writes. The first access at each memory page or port is
 logged as a warning, and the most frequent are listed at the end of the run.
 
-`--on RULE` checks a condition and acts each time a processor arrives at a pc:
-`pc=ADDR[,cpu=N][,if COND][,count=N][,name=NAME],ACTION[,ACTION...]`. The actions are
-`set DST=EXPR` (store into a register or into memory, `[ADDR]`), `log [EXPR...]` (a line with
-each value: `rule NAME: cpu 0 pc 0x.. a0=0x1 [sp+8]:4=0x20 icount=N`) and `stop` (exit 127,
-as `--break`). Expressions are C's on unsigned 64-bit values: numbers, registers as the
-ISA's gdb description names them (and `pc`), the ELF image's symbols, and memory as
-`[ADDR]` or `[ADDR]:1|2|4|8` (virtual, as the arriving processor maps it, in its byte
-order; `[p:ADDR]` is physical), with `( ) - ~ ! * + - << >> < <= > >= == != & ^ | && ||`.
-`if COND` fires the rule only when COND is not zero, `count=N` at most N times, `cpu=N` for
-that processor only. One mechanism gives conditional breakpoints, value logs and injected
-results, and it can stand in for something the machine does not model: a firmware that
-spins until a coprocessor stores the value it expects, through a pointer it holds, gets
-that value where it looks, and its own code runs on unchanged:
+`--on RULE` checks a condition and acts at a place in the guest's run:
+`WHERE[,cpu=N][,if COND][,count=N][,delay=N][,name=NAME],ACTION[,ACTION...]`. WHERE is
+`pc=ADDR` (each arrival there, before that instruction), or `write=`, `read=` or
+`access=[p:]ADDR[,len=N]`: each instruction that stores to, loads from, or touches those N
+bytes (1 unless given; virtual as processor 0 maps them when the run starts, `p:` physical),
+once that instruction has completed. The actions are `set DST=EXPR` (store into a register or
+into memory, `[ADDR]`), `log [EXPR...]` (a line with each value:
+`rule NAME: cpu 0 pc 0x.. a0=0x1 [sp+8]:4=0x20 icount=N`; an access rule's line also says
+`write 4 at 0x.. value 0x..` and names the accessing instruction), `dump [p:]ADDR LEN` (a hex
+dump of up to 64K bytes) and `stop` (exit 127, as `--break`). Expressions are C's on unsigned
+64-bit values: numbers, registers as the ISA's gdb description names them (and `pc`), the
+ELF image's symbols, memory as `[ADDR]` or `[ADDR]:1|2|4|8` (virtual, as the processor maps
+it, in its byte order; `[p:ADDR]` is physical), in an access rule `addr` and `value` (the
+address touched, the value stored or loaded), with
+`( ) - ~ ! * + - << >> < <= > >= == != & ^ | && ||`. `if COND` fires the rule only when COND
+is not zero, `count=N` at most N times, `cpu=N` for that processor only. `delay=N` makes the
+rule's stores happen N ticks of virtual time after it fires, with the values and addresses
+worked out when it fired, and the rule does not fire again before: something that answers a
+request after a while. One mechanism gives conditional breakpoints, value logs, "who writes
+this" and injected results, and it can stand in for something the machine does not model: a
+firmware that spins until a coprocessor stores the value it expects, through a pointer it
+holds, gets that value where it looks, and its own code runs on unchanged:
 
 ```bash
 build/uam-run --on 'pc=0x9a144b2,set [[rsp+0x30]:4]:4=[rsp+0x38]:4' ...  # the word a wait loop polls
+build/uam-run --on 'write=p:0x7f000,len=4,if value==1,delay=2000,set [p:0x7f010]:4=0x80000001' ...
+                                                                         # a doorbell answered a while later
 build/uam-run --on 'pc=parse,if a1>0x400,log a0 a1 [a0]:4,stop' fw.elf   # a conditional breakpoint
+build/uam-run --on 'write=rx_count,len=4,log value' fw.elf               # who writes a variable, and what
+build/uam-run --on 'pc=send,dump a0 a1' fw.elf                           # a buffer each time it is sent
 build/uam-run --on 'pc=0x8000456c,count=1,set a0=-1' fw.elf              # one call fails, once
 build/uam-run --on-file board.rules fw.elf                               # one rule per line, # comments
 ```
 
 Rules read and write memory as a debugger does: reads see RAM, ROM and what a device shows
-without side effects, stores reach RAM only, and no device, watch or guard sees either. An
-operand that cannot be read makes its condition or action fail without stopping the run;
-the stop line says how many failed, `-v` names the first, and `--stats` prints each rule's
-arrivals and firings. Rules are configuration, like breakpoints, with one exception: how
-often a `count=N` rule has fired is machine state, so a snapshot keeps it (a fuzz iteration
-sees the rule exactly as the first one did), and a snapshot taken with counted rules loads
-only with the same counted rules. A hooked pc ends its block and is not skipped as a spin
-loop, so a rule on a wait loop is checked on every pass. `uam/rules.h` is the same in a
-program: a board can carry the rules its firmware needs instead of a command line.
+without side effects, stores reach RAM only, and no device, watch, guard or other rule sees
+either. An access rule sees the processors' data accesses to RAM, ROM and devices alike (not
+fetches, gdb or DMA), and an instruction that touches its range more than once fires it
+once. An operand that cannot be read makes its condition or action fail without stopping the
+run; the stop line says how many failed, `-v` names the first, and `--stats` prints each
+rule's arrivals and firings. Rules are configuration, like breakpoints, with one exception:
+how often a `count=N` rule has fired, and the stores of a `delay=N` rule that are on their
+way, are machine state, so a snapshot keeps them (a fuzz iteration sees the rule exactly as
+the first one did), and a snapshot taken with rules that have a count or a delay loads only
+with the same such rules. A hooked pc ends its block and is not skipped as a spin loop, so a
+rule on a wait loop is checked on every pass; a watched range takes its pages off the fast
+memory path. `uam/rules.h` is the same in a program: a board can carry the rules its
+firmware needs instead of a command line.
 
 `--guard [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log][,name=NAME]` guards the bytes
 `[ADDR-BEFORE, ADDR+AFTER)` (a bare ADDR is one byte; ADDR is virtual unless `p:`). A data access
@@ -999,7 +1016,8 @@ tests/gdb/         gdb-check.py: the gdb stub over the remote protocol
 tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard/--watch;
                    trace-check.sh: --trace exc/mmio/mmio-summary/sysreg/irq/console/dma,
                    --history, --trace-file, --log-pc registers, --unknown-mmio stop, --log-stamp;
-                   rules-check.sh: --on / --on-file rules (set, log, if, stop, count, snapshots)
+                   rules-check.sh: --on / --on-file rules (pc and access rules, set, log, dump,
+                   if, stop, count, delay, snapshots)
 tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC, a meson project of
                    its own (meson test -C build --suite bench, meson compile -C build xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces

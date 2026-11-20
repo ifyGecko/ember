@@ -25,9 +25,14 @@
  * snapshot keeps that count (and fits only a machine with the same counted rules); log
  * prints registers, memory and C's operators with C's precedence, also at a pc inside a
  * block; an operand that cannot be read fails its condition or action without stopping
- * the run; cpu=N picks one of two processors; a detached set no longer runs. A MIPS32
- * big-endian guest checks the byte order and virtual addresses (kseg0, kseg1). Malformed
- * rules are refused with a reason.
+ * the run; cpu=N picks one of two processors; a detached set no longer runs. Access rules
+ * (write=, read=, access=) run when the accessing instruction has completed, with the
+ * address and the value, on a range an access only overlaps, for one processor of two,
+ * and only once armed; delay=N carries a rule's stores out that many ticks after it
+ * fired, with the values of then, at the same instruction on both backends, never firing
+ * again in between, and a snapshot keeps stores that are on their way; dump prints memory.
+ * A MIPS32 big-endian guest checks the byte order and virtual addresses (kseg0, kseg1),
+ * also of an access rule's range. Malformed rules are refused with a reason.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -436,6 +441,278 @@ static void test_smp(bool jit)
     uam_rules_free(rs);
 }
 
+/* ---- access rules ------------------------------------------------------------------ */
+
+static size_t slurp(FILE *out, char *text, size_t cap)
+{
+    rewind(out);
+    const size_t n = fread(text, 1, cap - 1, out);
+    text[n] = '\0';
+    fclose(out);
+    return n;
+}
+
+static void test_access(bool jit)
+{
+    const char *md = mode_name(jit);
+    uam_machine m;
+    char text[2048];
+
+    /* The guest's store of the value it expects is the request; the rule answers it. */
+    build(&m, jit, 0);
+    uam_rules *rs = rules_new(&m);
+    FILE *out = tmpfile();
+    uam_rules_set_log(rs, out);
+    int r = add(rs, "write=p:0x8004,len=4,name=req,set [[sp]]=value,log pc addr value [addr]");
+    run(&m, 5000, "write rule", jit);
+    CHECK(reg(&m, 0, "s2") == 1 && word(&m, WORD_PA, 4) == 0x55, "%s: write rule", md);
+    uam_rule_info ri = info(rs, r);
+    CHECK(ri.arrivals == 1 && ri.fired == 1 && ri.failed == 0 && ri.addr == 0x8004 && ri.len == 4,
+          "%s: write rule arrivals=%llu fired=%llu", md, (unsigned long long)ri.arrivals,
+          (unsigned long long)ri.fired);
+    slurp(out, text, sizeof(text));
+    /* after the storing instruction: pc is the next one, memory holds the value */
+    CHECK(!strcmp(text, "rule req: cpu 0 pc 0x10 write 4 at 0x8004 value 0x55 pc=0x14 addr=0x8004 "
+                        "value=0x55 [addr]=0x55 icount=5\n"), "%s: write rule's line: %s", md, text);
+    CHECK(m.bus.n_watches == 1, "%s: %u watches", md, (unsigned)m.bus.n_watches);
+    uam_rules_detach(rs);
+    CHECK(m.bus.n_watches == 0, "%s: a detached access rule still watches", md);
+    uam_rules_free(rs);
+    uam_machine_fini(&m);
+
+    /* A read rule: the value appears after the first load of the word, for the second. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    out = tmpfile();
+    uam_rules_set_log(rs, out);
+    r = add(rs, "read=p:0x10000,len=4,count=1,set [addr]:4=0x55,log t3");
+    run(&m, 5000, "read rule", jit);
+    CHECK(reg(&m, 0, "s2") == 1 && info(rs, r).fired == 1 && info(rs, r).arrivals == 2,
+          "%s: read rule fired=%llu arrivals=%llu", md, (unsigned long long)info(rs, r).fired,
+          (unsigned long long)info(rs, r).arrivals);
+    slurp(out, text, sizeof(text));
+    CHECK(!strcmp(text, "rule read=p:0x10000: cpu 0 pc 0x18 read 4 at 0x10000 value 0x0 t3=0x0 "
+                        "icount=7\n"), "%s: read rule's line: %s", md, text);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* A range that accesses only overlap, in both directions, with a condition. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    out = tmpfile();
+    uam_rules_set_log(rs, out);
+    add(rs, "access = p:0x8002 , len = 4 , count=3, name=any, log");
+    add(rs, "access=p:0x8002,len=4,if value==0x55,count=2,name=v,log");
+    add(rs, "pc=0x14,set [[sp]]=[sp+4]");
+    run(&m, 5000, "access rule", jit);
+    slurp(out, text, sizeof(text));
+    CHECK(!strcmp(text, "rule any: cpu 0 pc 0x8 write 4 at 0x8000 value 0x10000 icount=3\n"
+                        "rule any: cpu 0 pc 0x10 write 4 at 0x8004 value 0x55 icount=5\n"
+                        "rule v: cpu 0 pc 0x10 write 4 at 0x8004 value 0x55 icount=5\n"
+                        "rule any: cpu 0 pc 0x14 read 4 at 0x8000 value 0x10000 icount=6\n"
+                        "rule v: cpu 0 pc 0x1c read 4 at 0x8004 value 0x55 icount=8\n"),
+          "%s: access rules' lines:\n%s", md, text);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* stop: the run ends after the accessing instruction, which the record names. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    add(rs, "write=p:0x8004,len=4,name=halt,stop");
+    uam_stop_reason why = uam_exec_run(&m.exec, 5000);
+    uam_rule_stop rsn = { 0 };
+    CHECK(why == UAM_STOP_HOOK && m.cpu.pc == WAIT && m.cpu.icount == 5, "%s: access stop: %s at "
+          "0x%llx", md, uam_stop_reason_str(why), (unsigned long long)m.cpu.pc);
+    CHECK(uam_rules_last_stop(rs, &rsn) && !strcmp(rsn.name, "halt") && rsn.pc == 0x10
+          && rsn.icount == 5, "%s: access stop's record", md);
+    run(&m, 100, "after the access stop", jit);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* Two sets (a board's, a tool's) with rules on the same store both run, and a run that
+     * ends with that instruction has run them before it returns. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    uam_rules *other = uam_rules_create(&m, "other");
+    char oerr[256] = "";
+    r = add(rs, "write=p:0x8004,len=4,set t6=value");
+    const int o = uam_rules_add(other, "access=p:0x8006,set [[sp]]=value", oerr, sizeof(oerr));
+    CHECK(o >= 0, "second set: %s", oerr);
+    run(&m, 5, "to the store", jit);
+    uam_rule_info oi = { 0 };
+    CHECK(info(rs, r).fired == 1 && uam_rules_get(other, (size_t)o, &oi) && oi.fired == 1
+          && reg(&m, 0, "t6") == 0x55 && word(&m, WORD_PA, 4) == 0x55,
+          "%s: two sets on one store fired %llu and %llu times", md,
+          (unsigned long long)info(rs, r).fired, (unsigned long long)oi.fired);
+    uam_rules_detach(other);
+    uam_rules_free(other);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* Armed later: nothing is watched until then. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    uam_rules_arm_later(rs);
+    r = add(rs, "write=p:0x8004,len=4,set [[sp]]=value");
+    CHECK(m.bus.n_watches == 0, "%s: armed at once despite arm_later", md);
+    run(&m, 5000, "unarmed", jit);
+    CHECK(reg(&m, 0, "s2") == 0 && info(rs, r).arrivals == 0, "%s: an unarmed rule ran", md);
+    char err[256] = "";
+    CHECK(uam_rules_arm(rs, err, sizeof(err)) == UAM_OK && m.bus.n_watches == 1, "%s: arm: %s", md, err);
+    CHECK(uam_rules_arm(rs, err, sizeof(err)) == UAM_OK && m.bus.n_watches == 1, "%s: arm again", md);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* Two processors run the same code: cpu=1 takes only the second one's store. */
+    build(&m, jit, 1);
+    rs = rules_new(&m);
+    add(rs, "pc=0x14,set [[sp]]=[sp+4]");
+    r = add(rs, "write=p:0x8004,len=4,cpu=1,set t6=7");
+    const int all = add(rs, "write=p:0x8004,len=4,set s2=s2+2");
+    run(&m, 20000, "access rule, two processors", jit);
+    CHECK(reg(&m, 0, "t6") == 0 && reg(&m, 1, "t6") == 7 && info(rs, r).arrivals == 1,
+          "%s: cpu=1 access rule: t6 %llu and %llu", md, (unsigned long long)reg(&m, 0, "t6"),
+          (unsigned long long)reg(&m, 1, "t6"));
+    CHECK(reg(&m, 0, "s2") == 1 && reg(&m, 1, "s2") == 1 && info(rs, all).fired == 2,
+          "%s: an access rule for both processors fired %llu times", md,
+          (unsigned long long)info(rs, all).fired);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+}
+
+/* ---- delay -------------------------------------------------------------------------- */
+
+static void test_delay(bool jit)
+{
+    const char *md = mode_name(jit);
+    static uint64_t done_at[2];
+    uam_machine m;
+
+    /* The answer comes 100 ticks after the wait began (at instruction 5). */
+    build(&m, jit, 0);
+    uam_rules *rs = rules_new(&m);
+    int r = add(rs, "pc=0x14,count=1,delay=100,set [[sp]]=[sp+4]");
+    run(&m, 100, "before the delay is over", jit);
+    uam_rule_info ri = info(rs, r);
+    CHECK(reg(&m, 0, "s2") == 0 && word(&m, WORD_PA, 4) == 0 && ri.waiting && ri.fired == 1
+          && ri.delay == 100 && ri.arrivals > 10, "%s: early: fired=%llu waiting=%d", md,
+          (unsigned long long)ri.fired, ri.waiting);
+    while (reg(&m, 0, "s2") == 0 && m.cpu.icount < 200)
+        uam_exec_run(&m.exec, 1);
+    done_at[jit] = m.cpu.icount;
+    CHECK(m.cpu.icount > 105 && m.cpu.icount <= 112 && word(&m, WORD_PA, 4) == 0x55,
+          "%s: the wait ended at instruction %llu", md, (unsigned long long)m.cpu.icount);
+    CHECK(!jit || done_at[0] == done_at[1], "the delay ends at instruction %llu on the "
+          "interpreter and %llu on the JIT", (unsigned long long)done_at[0],
+          (unsigned long long)done_at[1]);
+    CHECK(!info(rs, r).waiting, "%s: still waiting", md);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* The value is the one of when the rule fired; it does not fire again before its
+     * stores have happened. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    add(rs, "pc=0x14,set [[sp]]=[sp+4]");
+    r = add(rs, "pc=0x28,count=1,delay=50,set t6=a0+100,set [p:0x20000]:4=a0+7");
+    const int rep = add(rs, "pc=0x28,delay=40,set s2=s2+1");
+    run(&m, 1000, "delayed values", jit);
+    CHECK(reg(&m, 0, "t6") == 100 && word(&m, 0x20000, 4) == 7, "%s: delayed values: t6=%llu "
+          "word=%llu", md, (unsigned long long)reg(&m, 0, "t6"),
+          (unsigned long long)word(&m, 0x20000, 4));
+    ri = info(rs, rep);
+    CHECK(ri.fired >= 15 && ri.fired <= 30 && reg(&m, 0, "s2") == 1 + ri.fired - ri.waiting,
+          "%s: a rule with a delay fired %llu times in 1000 instructions, s2=%llu", md,
+          (unsigned long long)ri.fired, (unsigned long long)reg(&m, 0, "s2"));
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* With an access rule: the request's value, a while after the request. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    r = add(rs, "write=p:0x8004,len=4,delay=60,set [[sp]]=value");
+    run(&m, 40, "access rule with a delay, early", jit);
+    CHECK(reg(&m, 0, "s2") == 0 && info(rs, r).waiting, "%s: access delay: early", md);
+    run(&m, 60, "access rule with a delay, late", jit);
+    CHECK(reg(&m, 0, "s2") == 1 && word(&m, WORD_PA, 4) == 0x55, "%s: access delay: late", md);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* A snapshot keeps the stores that are on their way. */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    r = add(rs, "pc=0x14,delay=100,set [[sp]]=[sp+4]");
+    run(&m, 50, "to the snapshot", jit);
+    uam_snapshot *s = NULL;
+    CHECK(uam_snapshot_take(&m, &s) == UAM_OK && s, "%s: take with a store on its way", md);
+    run(&m, 200, "past the delay", jit);
+    CHECK(reg(&m, 0, "s2") == 1 && !info(rs, r).waiting, "%s: the delay did not end", md);
+    CHECK(uam_snapshot_restore(&m, s) == UAM_OK, "%s: restore", md);
+    CHECK(reg(&m, 0, "s2") == 0 && word(&m, WORD_PA, 4) == 0 && info(rs, r).waiting,
+          "%s: the store on its way did not come back", md);
+    run(&m, 30, "after the restore, early", jit);
+    CHECK(reg(&m, 0, "s2") == 0, "%s: the restored store came early", md);
+    run(&m, 60, "after the restore, late", jit);
+    CHECK(reg(&m, 0, "s2") == 1 && word(&m, WORD_PA, 4) == 0x55, "%s: the restored store did not "
+          "happen", md);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    r = add(rs, "pc=0x14,delay=100,set [[sp]]=[sp+4]");
+    CHECK(uam_snapshot_restore(&m, s) == UAM_OK && info(rs, r).waiting, "%s: restore elsewhere", md);
+    run(&m, 90, "elsewhere", jit);
+    CHECK(reg(&m, 0, "s2") == 1, "%s: the store did not happen elsewhere", md);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+
+    /* (Refused: an error is logged.) */
+    build(&m, jit, 0);
+    rs = rules_new(&m);
+    add(rs, "pc=0x14,set [[sp]]=[sp+4]");
+    CHECK(uam_snapshot_restore(&m, s) != UAM_OK, "%s: restored without the rule with a delay", md);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+    uam_snapshot_free(s);
+}
+
+/* ---- dump --------------------------------------------------------------------------- */
+
+static void test_dump(bool jit)
+{
+    const char *md = mode_name(jit);
+    uam_machine m;
+    char text[2048];
+    build(&m, jit, 0);
+    uam_rules *rs = rules_new(&m);
+    FILE *out = tmpfile();
+    uam_rules_set_log(rs, out);
+    add(rs, "pc=0x14,set [[sp]]=[sp+4]");
+    const int d = add(rs, "pc=0x24,name=d,dump sp 4+4,dump p:[sp]+0x10-2 2*10,dump p:0x40000000 4,"
+                          "dump p:0xffffe 4,dump sp 0x10001");
+    add(rs, "write=p:0x8004,len=4,name=w,dump addr-4 8");
+    run(&m, 1000, "dump", jit);
+    slurp(out, text, sizeof(text));
+    CHECK(!strcmp(text,
+        "rule w: cpu 0 pc 0x10 write 4 at 0x8004 value 0x55 dump 0x8000+0x8 icount=5\n"
+        "  0000000000008000  00 00 01 00 55 00 00 00                          |....U...|\n"
+        "rule d: cpu 0 pc 0x24 dump 0x8000+0x8 icount=9\n"
+        "  0000000000008000  00 00 01 00 55 00 00 00                          |....U...|\n"
+        "rule d: cpu 0 pc 0x24 dump p:0x1000e+0x14 icount=9\n"
+        "  000000000001000e  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|\n"
+        "  000000000001001e  00 00 00 00                                      |....|\n"
+        "rule d: cpu 0 pc 0x24 dump p:0x40000000+0x4 icount=9\n"
+        "  (physical 0x40000000 cannot be read)\n"
+        "rule d: cpu 0 pc 0x24 dump p:0xffffe+0x4 icount=9\n"
+        "  00000000000ffffe  00 00                                            |..|\n"
+        "  (physical 0x100000 cannot be read)\n"), "%s: dumps:\n%s", md, text);
+    CHECK(info(rs, d).failed == 3, "%s: %llu dumps failed, not 3", md,
+          (unsigned long long)info(rs, d).failed);
+    uam_machine_fini(&m);
+    uam_rules_free(rs);
+}
+
 /* ---- byte order and virtual addresses (MIPS32 big-endian) ------------------------ */
 
 static void test_mips_be(bool jit)
@@ -445,13 +722,19 @@ static void test_mips_be(bool jit)
     CHECK(uam_machine_init(&m, &uam_isa_mips32be) == UAM_OK, "machine init");
     m.board_name = "rules-test-be";
     CHECK(uam_bus_map_ram(&m.bus, "ram", 0, 1u << 20) == UAM_OK, "map ram");
-    const uint32_t p[] = { 0x08000000u /* j 0x80000000 */, 0 /* nop */ };
+    const uint32_t p[] = { 0x3C098001u /* lui r9, 0x8001 */, 0xAD290020u /* sw r9, 0x20(r9) */,
+                           0x08000002u /* j 0x80000008 */, 0 /* nop */ };
     put_words(&m, 0, p, UAM_ARRAY_LEN(p), true);
     uam_machine_reset(&m, 0x80000000u);
     m.cpu.isa->sysreg_write(&m.cpu, 12 * 8 + 0, 0);   /* Status.ERL off: kuseg goes through the TLB */
     if (jit)
         CHECK(uam_exec_enable_jit(&m.exec), "jit available");
     uam_rules *rs = rules_new(&m);
+    FILE *out = tmpfile();
+    uam_rules_set_log(rs, out);
+    /* access rules on virtual ranges: kseg0, and kseg1's alias of the same bytes */
+    add(rs, "write=0x80010020,len=4,name=k0,log value [addr] [p:0x10020]:2");
+    add(rs, "access=0xa0010022,name=k1,log");
     /* kseg0, then kseg1 and physical addresses of the same RAM */
     const int r = add(rs, "pc=0x80000000,count=1,set [0x80010000]=0x11223344,"
                           "set [0xa0010004]:2=[0x80010000]:2,set [p:0x10006]:1=[p:0x10003]:1,"
@@ -467,6 +750,15 @@ static void test_mips_be(bool jit)
     /* kuseg has no TLB entry: that store fails, the others stand */
     CHECK(info(rs, r).failed == 1 && word(&m, 0x10010, 4) == 0, "%s: an unmapped virtual store: "
           "failed=%llu", md, (unsigned long long)info(rs, r).failed);
+    char text[512];
+    slurp(out, text, sizeof(text));
+    CHECK(!strcmp(text, "rule k0: cpu 0 pc 0x80000004 write 4 at 0x80010020 value 0x80010000 "
+                        "value=0x80010000 [addr]=0x80010000 [p:0x10020]:2=0x8001 icount=2\n"
+                        "rule k1: cpu 0 pc 0x80000004 write 4 at 0xa0010020 value 0x80010000 "
+                        "icount=2\n"), "%s: access rules on virtual ranges:\n%s", md, text);
+    char err[256] = "";
+    CHECK(uam_rules_add(rs, "write=0x00010020,len=4,log", err, sizeof(err)) < 0
+          && strstr(err, "does not map"), "%s: an access rule on an unmapped range: %s", md, err);
     uam_machine_fini(&m);
     uam_rules_free(rs);
 }
@@ -514,6 +806,22 @@ static void test_parse(void)
         { "pc=0x28,set a0=", "value is expected" },
         { "pc=0x28,set a0=1 2", "unexpected" },
         { "pc=0x28,log a0 nosuch", "neither a register" },
+        { "pc=0x28,if value==1,stop", "neither a register" },
+        { "pc=0x28,len=4,stop", "goes with" },
+        { "pc=0x28,delay=10,stop", "has none" },
+        { "pc=0x28,delay=10,log", "has none" },
+        { "pc=0x28,delay=10,set a0=1,stop", "cannot stop" },
+        { "pc=0x28,delay=x,set a0=1", "delay=N" },
+        { "pc=0x28,dump a0", "dump wants" },
+        { "pc=0x28,dump a0 4 4", "dump wants" },
+        { "pc=0x28,dump a0 nosuch", "neither a register" },
+        { "write=a0,stop", "constant" },
+        { "write=p:,stop", "value is expected" },
+        { "write=p:0x8000,len=0,stop", "len=N" },
+        { "write=p:0x8000,len=a0,stop", "constant" },
+        { "write=p:0x8000,len=0x10000001,stop", "len=N" },
+        { "write=p:0xffffffffffffffff,len=4,stop", "address space" },
+        { "writes=p:0x8000,stop", "starts with pc=" },
         { "pc=0x28,if ((((((((((((((((((((((((((((((((((1)))))))))))))))))))))))))))))))))),stop",
           "too deep" },
         { "pc=0x28,if 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1,stop",
@@ -575,6 +883,9 @@ int main(void)
         test_failures(jit);
         test_snapshot(jit);
         test_smp(jit);
+        test_access(jit);
+        test_delay(jit);
+        test_dump(jit);
         test_mips_be(jit);
     }
     test_parse();

@@ -1,10 +1,14 @@
 /*
- * rules.c - Rules: a condition and actions at a guest pc (uam/rules.h).
+ * rules.c - Rules: a condition and actions at a guest pc or data access (uam/rules.h).
  *
- * Each rule is one PC hook on every processor. Its expressions are parsed once into
- * postfix node lists and evaluated on a small stack at each arrival, against the
- * arriving processor's registers (the ISA's debugger view) and memory (debug accesses:
- * no device side effects, no watches).
+ * A pc rule is one PC hook on every processor. An access rule is one bus watch per
+ * physically contiguous piece of its range: the watch notes the access and asks the
+ * accessing processor's executor to call back at the next instruction boundary
+ * (uam_exec_request_call), where the rule runs with precise state. Expressions are
+ * parsed once into postfix node lists and evaluated on a small stack, against that
+ * processor's registers (the ISA's debugger view) and memory (debug accesses: no device
+ * side effects, no watches). A rule with a delay computes its stores when it fires and
+ * carries them out from a scheduler timer.
  */
 #include <ctype.h>
 #include <stdarg.h>
@@ -13,11 +17,13 @@
 
 #include "uam/rules.h"
 
-#define EXPR_MAX  64    /* nodes in one expression: the evaluation stack's depth */
-#define DEPTH_MAX 32    /* nesting of ( ) and [ ] */
+#define EXPR_MAX  64            /* nodes in one expression: the evaluation stack's depth */
+#define DEPTH_MAX 32            /* nesting of ( ) and [ ] */
+#define DUMP_MAX  65536u        /* bytes one dump action shows */
+#define RANGE_MAX (UINT64_C(1) << 28)   /* bytes an access rule covers */
 
 typedef enum node_op {
-    N_CONST, N_REG, N_PC, N_LOAD,
+    N_CONST, N_REG, N_PC, N_LOAD, N_ADDR, N_VALUE,
     N_NEG, N_NOT, N_LNOT,
     N_MUL, N_ADD, N_SUB, N_SHL, N_SHR,
     N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE,
@@ -47,23 +53,66 @@ typedef struct lvalue {
     uint8_t  size;
 } lvalue;
 
-typedef enum { A_SET, A_LOG, A_STOP } act_kind;
+typedef enum { A_SET, A_LOG, A_DUMP, A_STOP } act_kind;
 
 typedef struct action {
     act_kind kind;
-    lvalue   dst;        /* A_SET */
-    expr     src;
+    lvalue   dst;        /* A_SET: where; A_DUMP: dst.addr and dst.phys are the address */
+    expr     src;        /* A_SET: what; A_DUMP: how many bytes */
     expr    *log;        /* A_LOG: what to show ... */
     char   **log_text;   /* ... and as what */
     uint32_t n_log;
 } action;
 
-typedef struct rule {
+/* A store worked out when its rule fired: what, and for memory the physical address of
+ * each byte. With a delay it waits here for the rule's timer. */
+typedef struct held {
+    bool     ok;
+    uint64_t val;
+    uint64_t pa[8];
+} held;
+
+typedef struct rule rule;
+
+/* A physically contiguous part of an access rule's range, and its bus watch. */
+typedef struct piece {
+    rule    *r;
+    uint64_t pa, len;
+    uint64_t off;        /* where it starts in the range */
+    int      wid;
+} piece;
+
+/* The access an access rule fires for. */
+typedef struct access {
+    bool     is_write;
+    unsigned size;
+    uint64_t addr;       /* in the space the rule's range was given in */
+    uint64_t val;        /* read or written */
+    uint64_t pc;         /* the accessing instruction */
+} access;
+
+struct rule {
     uam_rules *set;
     char      *name;
-    uint64_t   pc;
+    uint64_t   id;        /* of its text: tells rules apart in a snapshot */
+    bool       on_access; /* an access rule; else a pc rule */
+    uint64_t   pc;        /* pc rule */
+    unsigned   dir;       /* access rule: UAM_WATCH_READ and/or UAM_WATCH_WRITE */
+    uint64_t   addr, len; /* access rule: the range */
+    bool       phys;
+    piece     *piece;
+    uint32_t   n_piece;
+    bool       hit;       /* an access waits for its instruction to complete */
+    unsigned   hit_cpu;
+    access     acc;
     int        cpu;       /* -1: any */
     uint64_t   limit;     /* count=N; 0: none */
+    uint64_t   delay;     /* ticks between firing and its stores; 0: none */
+    uam_timer  timer;     /* delay: armed while stores wait */
+    bool       waiting;
+    unsigned   wait_cpu;
+    held      *held;      /* delay: one per set action */
+    uint32_t   n_set;
     expr      *cond;
     uint32_t   n_cond;
     action    *act;
@@ -71,12 +120,13 @@ typedef struct rule {
     bool       hooked;
     bool       told;      /* its first failure has been logged */
     uint64_t   arrivals, fired, failed;
-} rule;
+};
 
 struct uam_rules {
     uam_machine       *m;
     char              *state_name;   /* "rules-NAME" */
     bool               has_state;
+    bool               arm_later;
     rule             **r;
     uint32_t           n, cap;
     uam_rule_symbol_fn sym;
@@ -92,6 +142,7 @@ typedef struct parser {
     const char *p;
     uam_rules  *rs;
     bool        state;    /* registers and memory may appear */
+    bool        access;   /* ... and addr and value: an access rule's */
     unsigned    depth;
     expr       *e;
     char       *err;
@@ -221,6 +272,8 @@ static void p_primary(parser *ps)
                 return;
             }
             emit(ps, is_reg ? (node){ .op = N_REG, .regno = regno } : (node){ .op = N_PC });
+        } else if (ps->access && (!strcmp(name, "addr") || !strcmp(name, "value"))) {
+            emit(ps, (node){ .op = name[0] == 'a' ? N_ADDR : N_VALUE });
         } else if (ps->rs->sym && ps->rs->sym(ps->rs->sym_ctx, name, &v)) {
             emit(ps, (node){ .op = N_CONST, .val = v });
         } else {
@@ -304,20 +357,26 @@ static void expr_free(expr *e)
     *e = (expr){ 0 };
 }
 
-static void parser_init(parser *ps, uam_rules *rs, const char *text, bool state, expr *e,
+/* What an expression may hold: numbers and symbols; registers and memory too; and an
+ * access rule's addr and value. */
+typedef enum { M_CONST, M_STATE, M_ACCESS } parse_mode;
+
+static void parser_init(parser *ps, uam_rules *rs, const char *text, parse_mode mode, expr *e,
                         char *err, size_t errlen)
 {
-    *ps = (parser){ .p = text, .rs = rs, .state = state, .e = e, .err = err, .errlen = errlen };
+    *ps = (parser){ .p = text, .rs = rs, .state = mode != M_CONST, .access = mode == M_ACCESS,
+                    .e = e, .err = err, .errlen = errlen };
     *e = (expr){ .n = malloc(sizeof(node) * EXPR_MAX) };
     if (!e->n)
         fail(ps, "out of memory");
 }
 
 /* The whole of `text` as one expression. */
-static bool parse_expr(uam_rules *rs, const char *text, bool state, expr *e, char *err, size_t errlen)
+static bool parse_expr(uam_rules *rs, const char *text, parse_mode mode, expr *e, char *err,
+                       size_t errlen)
 {
     parser ps;
-    parser_init(&ps, rs, text, state, e, err, errlen);
+    parser_init(&ps, rs, text, mode, e, err, errlen);
     p_lor(&ps);
     ws(&ps);
     if (!ps.failed && *ps.p)
@@ -328,11 +387,12 @@ static bool parse_expr(uam_rules *rs, const char *text, bool state, expr *e, cha
 }
 
 /* "DST=EXPR": DST a register or [ADDR]. */
-static bool parse_set(uam_rules *rs, const char *text, action *a, char *err, size_t errlen)
+static bool parse_set(uam_rules *rs, const char *text, parse_mode mode, action *a, char *err,
+                      size_t errlen)
 {
     parser ps;
     expr dst;
-    parser_init(&ps, rs, text, true, &dst, err, errlen);
+    parser_init(&ps, rs, text, mode, &dst, err, errlen);
     ws(&ps);
     const bool mem = *ps.p == '[';
     if (!ps.failed && !mem && !name_start(*ps.p))
@@ -353,7 +413,8 @@ static bool parse_set(uam_rules *rs, const char *text, action *a, char *err, siz
         } else if (dst.len == 1 && last.op == N_PC) {
             a->dst = (lvalue){ .kind = LV_PC };
         } else {
-            fail(&ps, "set cannot store into a symbol; write [SYMBOL] for the memory there");
+            fail(&ps, "set stores into a register or [ADDR]; write [SYMBOL] for the memory at a "
+                 "symbol");
         }
     }
     if (ps.failed) {
@@ -364,7 +425,7 @@ static bool parse_set(uam_rules *rs, const char *text, action *a, char *err, siz
         a->dst.addr = dst;
     else
         expr_free(&dst);
-    if (!parse_expr(rs, ps.p + 1, true, &a->src, err, errlen)) {
+    if (!parse_expr(rs, ps.p + 1, mode, &a->src, err, errlen)) {
         expr_free(&a->dst.addr);
         return false;
     }
@@ -393,18 +454,29 @@ static bool to_phys(uam_cpu *cpu, uint64_t addr, bool phys, uint64_t *pa)
 
 static const char *space_of(bool phys) { return phys ? "physical" : "virtual"; }
 
+/* The physical address of each byte of [addr, addr + size). */
+static bool mem_where(uam_cpu *cpu, uint64_t addr, bool phys, unsigned size, uint64_t *pa,
+                      char *why, size_t n)
+{
+    for (unsigned i = 0; i < size; i++) {
+        if (!to_phys(cpu, addr + i, phys, &pa[i])) {
+            snprintf(why, n, "virtual 0x%llx is not mapped", (unsigned long long)(addr + i));
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool mem_read(uam_cpu *cpu, uint64_t addr, bool phys, unsigned size, uint64_t *val,
                      char *why, size_t n)
 {
     const bool be = cpu->isa->default_endian == UAM_ACC_BE;
-    uint64_t v = 0;
+    uint64_t pa[8], v = 0;
+    if (!mem_where(cpu, addr, phys, size, pa, why, n))
+        return false;
     for (unsigned i = 0; i < size; i++) {
-        uint64_t pa, b;
-        if (!to_phys(cpu, addr + i, phys, &pa)) {
-            snprintf(why, n, "virtual 0x%llx is not mapped", (unsigned long long)(addr + i));
-            return false;
-        }
-        if (uam_bus_read(cpu->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK) {
+        uint64_t b;
+        if (uam_bus_read(cpu->bus, pa[i], 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK) {
             snprintf(why, n, "%s 0x%llx cannot be read", space_of(phys),
                      (unsigned long long)(addr + i));
             return false;
@@ -415,30 +487,31 @@ static bool mem_read(uam_cpu *cpu, uint64_t addr, bool phys, unsigned size, uint
     return true;
 }
 
-static bool mem_write(uam_cpu *cpu, uint64_t addr, bool phys, unsigned size, uint64_t val,
-                      char *why, size_t n)
+static bool mem_write(uam_cpu *cpu, const uint64_t *pa, unsigned size, uint64_t val, char *why,
+                      size_t n)
 {
     const bool be = cpu->isa->default_endian == UAM_ACC_BE;
-    uint64_t pa[8];
-    for (unsigned i = 0; i < size; i++) {
-        if (!to_phys(cpu, addr + i, phys, &pa[i])) {
-            snprintf(why, n, "virtual 0x%llx is not mapped", (unsigned long long)(addr + i));
-            return false;
-        }
-    }
     for (unsigned i = 0; i < size; i++) {
         const uint64_t b = val >> 8 * (be ? size - 1 - i : i) & 0xFF;
         if (uam_bus_write(cpu->bus, pa[i], 1, UAM_ACC_LE | UAM_ACC_DEBUG, b) != UAM_OK) {
-            snprintf(why, n, "%s 0x%llx cannot be written (a rule stores to RAM only)",
-                     space_of(phys), (unsigned long long)(addr + i));
+            snprintf(why, n, "physical 0x%llx cannot be written (a rule stores to RAM only)",
+                     (unsigned long long)pa[i]);
             return false;
         }
     }
     return true;
 }
 
-/* cpu may be NULL for an expression parsed without state (a constant). */
-static bool eval(const expr *e, uam_cpu *cpu, uint64_t *out, char *why, size_t n)
+/* What a rule fires on: the processor, the pc it is reported at (a pc rule's pc, the
+ * accessing instruction of an access rule) and, for an access rule, the access. */
+typedef struct fire {
+    uam_cpu      *cpu;
+    uint64_t      pc;
+    const access *acc;
+} fire;
+
+/* f may be NULL for an expression parsed as a constant. */
+static bool eval(const expr *e, const fire *f, uint64_t *out, char *why, size_t n)
 {
     uint64_t st[EXPR_MAX];
     unsigned sp = 0;
@@ -447,16 +520,18 @@ static bool eval(const expr *e, uam_cpu *cpu, uint64_t *out, char *why, size_t n
         uint64_t a, b;
         switch ((node_op)nd->op) {
         case N_CONST: st[sp++] = nd->val; continue;
-        case N_PC:    st[sp++] = cpu->pc; continue;
+        case N_PC:    st[sp++] = f->cpu->pc; continue;
+        case N_ADDR:  st[sp++] = f->acc->addr; continue;
+        case N_VALUE: st[sp++] = f->acc->val; continue;
         case N_REG:
-            if (!cpu->isa->gdb->read_reg(cpu, nd->regno, &a)) {
+            if (!f->cpu->isa->gdb->read_reg(f->cpu, nd->regno, &a)) {
                 snprintf(why, n, "a register cannot be read");
                 return false;
             }
             st[sp++] = a;
             continue;
         case N_LOAD:
-            if (!mem_read(cpu, st[sp - 1], nd->phys, nd->size, &st[sp - 1], why, n))
+            if (!mem_read(f->cpu, st[sp - 1], nd->phys, nd->size, &st[sp - 1], why, n))
                 return false;
             continue;
         case N_NEG:  st[sp - 1] = -st[sp - 1]; continue;
@@ -491,7 +566,7 @@ static bool eval(const expr *e, uam_cpu *cpu, uint64_t *out, char *why, size_t n
     return true;
 }
 
-/* ---- the hook ---------------------------------------------------------------- */
+/* ---- firing ------------------------------------------------------------------- */
 
 static void note_failure(rule *r, const uam_cpu *cpu, const char *what, const char *why)
 {
@@ -504,60 +579,121 @@ static void note_failure(rule *r, const uam_cpu *cpu, const char *what, const ch
             (unsigned long long)cpu->pc, (unsigned long long)cpu->icount);
 }
 
-static void do_set(rule *r, const action *a, uam_cpu *cpu)
+/* Work a set action out: the value, and where a store to memory goes. */
+static void resolve(rule *r, const action *a, const fire *f, held *h)
 {
     char why[96];
-    uint64_t v, addr;
-    if (!eval(&a->src, cpu, &v, why, sizeof(why))) {
-        note_failure(r, cpu, "set", why);
-        return;
+    uint64_t addr;
+    *h = (held){ .ok = true };
+    if (!eval(&a->src, f, &h->val, why, sizeof(why))
+        || (a->dst.kind == LV_MEM
+            && (!eval(&a->dst.addr, f, &addr, why, sizeof(why))
+                || !mem_where(f->cpu, addr, a->dst.phys, a->dst.size, h->pa, why, sizeof(why))))) {
+        h->ok = false;
+        note_failure(r, f->cpu, "set", why);
     }
+}
+
+/* Carry a worked-out set action out on cpu. */
+static void apply(rule *r, const action *a, const held *h, uam_cpu *cpu)
+{
+    char why[96];
+    if (!h->ok)
+        return;
     switch (a->dst.kind) {
     case LV_PC:
-        cpu->pc = v;
+        cpu->pc = h->val;
         break;
     case LV_REG:
-        if (!cpu->isa->gdb->write_reg || !cpu->isa->gdb->write_reg(cpu, a->dst.regno, v))
+        if (!cpu->isa->gdb->write_reg || !cpu->isa->gdb->write_reg(cpu, a->dst.regno, h->val))
             note_failure(r, cpu, "set", "the register cannot be written");
         break;
     case LV_MEM:
-        if (!eval(&a->dst.addr, cpu, &addr, why, sizeof(why))
-            || !mem_write(cpu, addr, a->dst.phys, a->dst.size, v, why, sizeof(why)))
+        if (!mem_write(cpu, h->pa, a->dst.size, h->val, why, sizeof(why)))
             note_failure(r, cpu, "set", why);
         break;
     }
 }
 
-static void do_log(rule *r, const action *a, uam_cpu *cpu, uint64_t pc)
+/* "rule NAME: cpu N pc 0x..", and the access of an access rule. */
+static void log_head(const rule *r, const fire *f, FILE *out)
+{
+    fprintf(out, "rule %s: cpu %u pc 0x%llx", r->name, f->cpu->hartid, (unsigned long long)f->pc);
+    if (f->acc)
+        fprintf(out, " %s %u at 0x%llx value 0x%llx", f->acc->is_write ? "write" : "read",
+                f->acc->size, (unsigned long long)f->acc->addr, (unsigned long long)f->acc->val);
+}
+
+static void do_log(rule *r, const action *a, const fire *f)
 {
     FILE *out = r->set->log ? r->set->log : stderr;
-    fprintf(out, "rule %s: cpu %u pc 0x%llx", r->name, cpu->hartid, (unsigned long long)pc);
+    log_head(r, f, out);
     for (uint32_t i = 0; i < a->n_log; i++) {
         char why[96];
         uint64_t v;
-        if (eval(&a->log[i], cpu, &v, why, sizeof(why))) {
+        if (eval(&a->log[i], f, &v, why, sizeof(why))) {
             fprintf(out, " %s=0x%llx", a->log_text[i], (unsigned long long)v);
         } else {
             fprintf(out, " %s=?", a->log_text[i]);
-            note_failure(r, cpu, "log", why);
+            note_failure(r, f->cpu, "log", why);
         }
     }
-    fprintf(out, " icount=%llu\n", (unsigned long long)cpu->icount);
+    fprintf(out, " icount=%llu\n", (unsigned long long)f->cpu->icount);
 }
 
-static uam_hook_action rule_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+static void do_dump(rule *r, const action *a, const fire *f)
 {
-    rule *r = ctx;
-    if (r->cpu >= 0 && cpu->hartid != (unsigned)r->cpu)
-        return UAM_HOOK_CONTINUE;
+    FILE *out = r->set->log ? r->set->log : stderr;
+    char why[96] = "";
+    uint64_t addr, len, got = 0;
+    if (!eval(&a->dst.addr, f, &addr, why, sizeof(why)) || !eval(&a->src, f, &len, why, sizeof(why))) {
+        note_failure(r, f->cpu, "dump", why);
+        return;
+    }
+    uint8_t *buf = len <= DUMP_MAX ? malloc(len ? len : 1) : NULL;
+    if (!buf) {
+        snprintf(why, sizeof(why), "0x%llx bytes are more than a dump shows (%u)",
+                 (unsigned long long)len, DUMP_MAX);
+        note_failure(r, f->cpu, "dump", why);
+        return;
+    }
+    for (; got < len; got++) {
+        uint64_t b;
+        if (!mem_read(f->cpu, addr + got, a->dst.phys, 1, &b, why, sizeof(why)))
+            break;
+        buf[got] = (uint8_t)b;
+    }
+    log_head(r, f, out);
+    fprintf(out, " dump %s0x%llx+0x%llx icount=%llu\n", a->dst.phys ? "p:" : "",
+            (unsigned long long)addr, (unsigned long long)len, (unsigned long long)f->cpu->icount);
+    for (uint64_t i = 0; i < got; i += 16) {
+        char hex[16 * 3 + 1] = "", asc[17] = "";
+        for (unsigned k = 0; k < 16 && i + k < got; k++) {
+            const uint8_t c = buf[i + k];
+            snprintf(hex + 3 * k, 4, "%02x ", c);
+            asc[k] = c >= 0x20 && c < 0x7F ? (char)c : '.';
+        }
+        fprintf(out, "  %016llx  %-48s |%s|\n", (unsigned long long)(addr + i), hex, asc);
+    }
+    if (got < len) {
+        fprintf(out, "  (%s)\n", why);
+        note_failure(r, f->cpu, "dump", why);
+    }
+    free(buf);
+}
+
+/* The rule's place was reached: check its conditions, run its actions. */
+static uam_hook_action fire_rule(rule *r, const fire *f)
+{
+    uam_rules *rs = r->set;
     r->arrivals++;
-    if (r->limit && r->fired >= r->limit)
+    if ((r->limit && r->fired >= r->limit) || r->waiting)
         return UAM_HOOK_CONTINUE;
     for (uint32_t i = 0; i < r->n_cond; i++) {
         char why[96];
         uint64_t v;
-        if (!eval(&r->cond[i], cpu, &v, why, sizeof(why))) {
-            note_failure(r, cpu, "if", why);
+        if (!eval(&r->cond[i], f, &v, why, sizeof(why))) {
+            note_failure(r, f->cpu, "if", why);
             return UAM_HOOK_CONTINUE;
         }
         if (!v)
@@ -565,43 +701,210 @@ static uam_hook_action rule_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
     }
     r->fired++;
     uam_hook_action ret = UAM_HOOK_CONTINUE;
-    for (uint32_t i = 0; i < r->n_act; i++) {
+    for (uint32_t i = 0, k = 0; i < r->n_act; i++) {
         const action *a = &r->act[i];
         switch (a->kind) {
-        case A_SET: do_set(r, a, cpu); break;
-        case A_LOG: do_log(r, a, cpu, pc); break;
+        case A_SET: {
+            held h;
+            resolve(r, a, f, &h);
+            if (r->delay)
+                r->held[k] = h;
+            else
+                apply(r, a, &h, f->cpu);
+            k++;
+            break;
+        }
+        case A_LOG:  do_log(r, a, f); break;
+        case A_DUMP: do_dump(r, a, f); break;
         case A_STOP:
-            r->set->stopped = true;
-            r->set->stop = (uam_rule_stop){ .name = r->name, .cpu = cpu->hartid, .pc = pc,
-                                            .icount = cpu->icount };
+            rs->stopped = true;
+            rs->stop = (uam_rule_stop){ .name = r->name, .cpu = f->cpu->hartid, .pc = f->pc,
+                                        .icount = f->cpu->icount };
             ret = UAM_HOOK_STOP;
             break;
         }
     }
+    if (r->delay) {
+        r->waiting = true;
+        r->wait_cpu = f->cpu->hartid;
+        uam_timer_arm(&rs->m->sched, &r->timer, uam_sched_now(&rs->m->sched) + r->delay);
+    }
     return ret;
 }
 
-/* ---- counts in snapshots ------------------------------------------------------ */
+/* A delay is over: the stores worked out when the rule fired happen now. */
+static void deliver(void *ctx)
+{
+    rule *r = ctx;
+    uam_cpu *cpu = uam_machine_cpu(r->set->m, r->wait_cpu);
+    r->waiting = false;
+    for (uint32_t i = 0, k = 0; i < r->n_act; i++)
+        if (r->act[i].kind == A_SET)
+            apply(r, &r->act[i], &r->held[k++], cpu);
+}
 
-static uint32_t n_counted(const uam_rules *rs)
+static uam_hook_action pc_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    rule *r = ctx;
+    if (r->cpu >= 0 && cpu->hartid != (unsigned)r->cpu)
+        return UAM_HOOK_CONTINUE;
+    return fire_rule(r, &(fire){ .cpu = cpu, .pc = pc });
+}
+
+/* The instruction that made the noted accesses has completed (uam_exec_request_call). */
+static uam_hook_action accessed(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    uam_rules *rs = ctx;
+    uam_hook_action ret = UAM_HOOK_CONTINUE;
+    (void)pc;
+    for (uint32_t i = 0; i < rs->n; i++) {
+        rule *r = rs->r[i];
+        if (!r->hit || r->hit_cpu != cpu->hartid)
+            continue;
+        r->hit = false;
+        if (fire_rule(r, &(fire){ .cpu = cpu, .pc = r->acc.pc, .acc = &r->acc }) == UAM_HOOK_STOP)
+            ret = UAM_HOOK_STOP;
+    }
+    return ret;
+}
+
+/* Bus watch of an access rule: note the instruction's first access to the range, and
+ * have the rule run when the instruction is done. */
+static void on_access(void *ctx, uint64_t pa, unsigned size, bool is_write, uint64_t val)
+{
+    const piece *p = ctx;
+    rule *r = p->r;
+    uam_machine *m = r->set->m;
+    uam_origin o;
+    if (!uam_origin_get(&o))   /* nothing runs: not the guest's access */
+        return;
+    const unsigned hart = uam_machine_current_cpu(m);
+    if (r->cpu >= 0 && hart != (unsigned)r->cpu)
+        return;
+    if (!r->hit) {
+        r->hit = true;
+        r->hit_cpu = hart;
+        r->acc = (access){ .is_write = is_write, .size = size, .val = val,
+                           .addr = r->addr + p->off + (pa - p->pa),   /* wraps when it starts earlier */
+                           .pc = uam_machine_cpu(m, hart)->insn_pc };
+    }
+    uam_exec_request_call(uam_machine_exec(m, r->hit_cpu), accessed, r->set);
+}
+
+/* ---- access rules: the watches -------------------------------------------------- */
+
+static void disarm(rule *r)
+{
+    for (uint32_t i = 0; i < r->n_piece; i++)
+        if (r->piece[i].wid > 0)
+            uam_bus_remove_watch(&r->set->m->bus, r->piece[i].wid);
+    free(r->piece);
+    r->piece = NULL;
+    r->n_piece = 0;
+}
+
+/* Watch the rule's range: one piece per page of a virtual range, as the rule's processor
+ * (processor 0 without cpu=N) maps it now, merged where pages are physically contiguous. */
+static bool arm(rule *r, char *err, size_t errlen)
+{
+    uam_machine *m = r->set->m;
+    uam_cpu *cpu = uam_machine_cpu(m, r->cpu >= 0 ? (unsigned)r->cpu : 0);
+    const bool virt = !r->phys && cpu->isa->translate;
+    const uam_xlate_kind kind = r->dir == UAM_WATCH_WRITE ? UAM_XLATE_STORE : UAM_XLATE_LOAD;
+    disarm(r);
+    r->piece = calloc(virt ? r->len / UAM_PAGE_SIZE + 2 : 1, sizeof(*r->piece));
+    if (!r->piece) {
+        set_err(err, errlen, "out of memory");
+        return false;
+    }
+    for (uint64_t off = 0; off < r->len;) {
+        uint64_t va = r->addr + off, pa = va, chunk = r->len - off;
+        if (virt) {
+            const uint64_t room = UAM_PAGE_SIZE - (va & (UAM_PAGE_SIZE - 1));
+            if (chunk > room)
+                chunk = room;
+            uam_xlate xl = { 0 };
+            if (cpu->isa->translate(cpu, va, kind, &xl) != UAM_OK
+                && cpu->isa->translate(cpu, va, UAM_XLATE_DEBUG, &xl) != UAM_OK) {
+                set_err(err, errlen, "rule %s: processor %u does not map virtual 0x%llx (p: gives "
+                        "a physical address)", r->name, cpu->hartid, (unsigned long long)va);
+                disarm(r);
+                return false;
+            }
+            if (!xl.fixed && !xl.regs_only)
+                cpu->xlate_tables = true;
+            pa = xl.paddr;
+        }
+        piece *last = r->n_piece ? &r->piece[r->n_piece - 1] : NULL;
+        if (last && last->pa + last->len == pa)
+            last->len += chunk;
+        else
+            r->piece[r->n_piece++] = (piece){ .r = r, .pa = pa, .len = chunk, .off = off };
+        off += chunk;
+    }
+    for (uint32_t i = 0; i < r->n_piece; i++) {
+        piece *p = &r->piece[i];
+        p->wid = uam_bus_add_watch(&m->bus, p->pa, p->len, r->dir, on_access, p);
+        if (p->wid <= 0) {
+            set_err(err, errlen, "rule %s: cannot watch physical 0x%llx", r->name,
+                    (unsigned long long)p->pa);
+            disarm(r);
+            return false;
+        }
+    }
+    return true;
+}
+
+void uam_rules_arm_later(uam_rules *rs)
+{
+    rs->arm_later = true;
+}
+
+uam_status uam_rules_arm(uam_rules *rs, char *err, size_t errlen)
+{
+    for (uint32_t i = 0; i < rs->n; i++)
+        if (rs->r[i]->on_access && !arm(rs->r[i], err, errlen))
+            return UAM_ERR_INVALID;
+    return UAM_OK;
+}
+
+/* ---- what a snapshot holds ------------------------------------------------------- */
+
+/* The rules whose past decides what the machine does next: a count, stores on their way. */
+static bool stateful(const rule *r)
+{
+    return r->limit || r->delay;
+}
+
+static uint32_t n_stateful(const uam_rules *rs)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < rs->n; i++)
-        n += rs->r[i]->limit != 0;
+        n += stateful(rs->r[i]);
     return n;
 }
 
 static void rules_save(void *ctx, uam_state_writer *w)
 {
     const uam_rules *rs = ctx;
-    uam_state_put_u32(w, n_counted(rs));
+    uam_state_put_u32(w, n_stateful(rs));
     for (uint32_t i = 0; i < rs->n; i++) {
         const rule *r = rs->r[i];
-        if (!r->limit)
+        if (!stateful(r))
             continue;
-        uam_state_put_u64(w, r->pc);
-        uam_state_put_u64(w, r->limit);
+        uam_state_put_u64(w, r->id);
         uam_state_put_u64(w, r->fired);
+        if (!r->delay)
+            continue;
+        uam_state_put_timer(w, &r->timer);
+        uam_state_put_bool(w, r->waiting);
+        uam_state_put_u32(w, r->wait_cpu);
+        for (uint32_t k = 0; k < r->n_set; k++) {
+            uam_state_put_bool(w, r->held[k].ok);
+            uam_state_put_u64(w, r->held[k].val);
+            for (unsigned b = 0; b < 8; b++)
+                uam_state_put_u64(w, r->held[k].pa[b]);
+        }
     }
 }
 
@@ -609,23 +912,37 @@ static void rules_restore(void *ctx, uam_state_reader *rd)
 {
     uam_rules *rs = ctx;
     const uint32_t n = uam_state_get_u32(rd);
-    if (n != n_counted(rs)) {
-        uam_state_fail(rd, "the snapshot was taken with %u rules that have a count, the set "
-                       "has %u", (unsigned)n, (unsigned)n_counted(rs));
+    if (n != n_stateful(rs)) {
+        uam_state_fail(rd, "the snapshot was taken with %u rules that have a count or a delay, "
+                       "the set has %u", (unsigned)n, (unsigned)n_stateful(rs));
         return;
     }
     for (uint32_t i = 0; i < rs->n; i++) {
         rule *r = rs->r[i];
-        if (!r->limit)
+        if (!stateful(r))
             continue;
-        const uint64_t pc = uam_state_get_u64(rd), limit = uam_state_get_u64(rd);
-        const uint64_t fired = uam_state_get_u64(rd);
-        if (pc != r->pc || limit != r->limit) {
-            uam_state_fail(rd, "the snapshot was taken with other counted rules (rule %s)",
-                           r->name);
+        if (uam_state_get_u64(rd) != r->id) {
+            uam_state_fail(rd, "the snapshot was taken with other rules that have a count or a "
+                           "delay (rule %s)", r->name);
             return;
         }
-        r->fired = fired;
+        r->fired = uam_state_get_u64(rd);
+        r->hit = false;
+        if (!r->delay)
+            continue;
+        uam_state_get_timer(rd, &r->timer);
+        r->waiting = uam_state_get_bool(rd);
+        r->wait_cpu = uam_state_get_u32(rd);
+        if (r->wait_cpu >= uam_machine_ncpus(rs->m)) {
+            uam_state_fail(rd, "rule %s: processor out of range", r->name);
+            return;
+        }
+        for (uint32_t k = 0; k < r->n_set; k++) {
+            r->held[k].ok = uam_state_get_bool(rd);
+            r->held[k].val = uam_state_get_u64(rd);
+            for (unsigned b = 0; b < 8; b++)
+                r->held[k].pa[b] = uam_state_get_u64(rd);
+        }
     }
 }
 
@@ -647,6 +964,7 @@ bad:
     return NULL;
 }
 
+/* The rule's memory; its watches and timer are the machine's business (uam_rules_detach). */
 static void rule_free(rule *r)
 {
     if (!r)
@@ -666,6 +984,8 @@ static void rule_free(rule *r)
     }
     free(r->cond);
     free(r->act);
+    free(r->piece);
+    free(r->held);
     free(r->name);
     free(r);
 }
@@ -677,9 +997,16 @@ void uam_rules_detach(uam_rules *rs)
     for (uint32_t i = 0; i < rs->n; i++) {
         rule *r = rs->r[i];
         if (r->hooked)
-            uam_machine_remove_pc_hook(rs->m, r->pc, rule_hook, r);
+            uam_machine_remove_pc_hook(rs->m, r->pc, pc_hook, r);
         r->hooked = false;
+        disarm(r);
+        r->hit = false;
+        if (r->delay)
+            uam_timer_cancel(&rs->m->sched, &r->timer);
+        r->waiting = false;
     }
+    for (unsigned i = 0; i < uam_machine_ncpus(rs->m); i++)
+        uam_exec_cancel_call(uam_machine_exec(rs->m, i), accessed, rs);
     if (rs->has_state)
         uam_machine_remove_state(rs->m, rs->state_name);
     rs->has_state = false;
@@ -709,7 +1036,7 @@ void uam_rules_set_log(uam_rules *rs, FILE *out)
 
 /* The rest of `item` after the keyword `word` and the blanks behind it, or NULL if item
  * does not start with that word. */
-static const char *after_word(const char *item, const char *word)
+static char *after_word(char *item, const char *word)
 {
     const size_t n = strlen(word);
     if (strncmp(item, word, n) || (item[n] && item[n] != ' ' && item[n] != '\t'))
@@ -746,18 +1073,31 @@ static bool whole_number(const char *s, uint64_t *v)
     return !*end;
 }
 
-static action *new_action(rule *r, act_kind kind)
+/* `text` as a constant: numbers and symbols. */
+static bool constant(uam_rules *rs, const char *text, uint64_t *v, char *err, size_t errlen)
+{
+    expr e;
+    if (!parse_expr(rs, text, M_CONST, &e, err, errlen))
+        return false;
+    eval(&e, NULL, v, NULL, 0);
+    expr_free(&e);
+    return true;
+}
+
+static action *new_action(rule *r, act_kind kind, char *err, size_t errlen)
 {
     action *na = realloc(r->act, sizeof(*na) * (r->n_act + 1));
-    if (!na)
+    if (!na) {
+        set_err(err, errlen, "out of memory");
         return NULL;
+    }
     r->act = na;
     na[r->n_act] = (action){ .kind = kind };
     return &na[r->n_act];
 }
 
 /* "EXPR EXPR ...": what a log action shows. */
-static bool parse_log(uam_rules *rs, char *list, action *a, char *err, size_t errlen)
+static bool parse_log(uam_rules *rs, parse_mode mode, char *list, action *a, char *err, size_t errlen)
 {
     for (char *tok = strtok(list, " \t"); tok; tok = strtok(NULL, " \t")) {
         expr *ne = realloc(a->log, sizeof(*ne) * (a->n_log + 1));
@@ -770,7 +1110,7 @@ static bool parse_log(uam_rules *rs, char *list, action *a, char *err, size_t er
             set_err(err, errlen, "out of memory");
             return false;
         }
-        if (!parse_expr(rs, tok, true, &a->log[a->n_log], err, errlen))
+        if (!parse_expr(rs, tok, mode, &a->log[a->n_log], err, errlen))
             return false;
         if (!(a->log_text[a->n_log] = strdup(tok))) {
             expr_free(&a->log[a->n_log]);
@@ -782,11 +1122,33 @@ static bool parse_log(uam_rules *rs, char *list, action *a, char *err, size_t er
     return true;
 }
 
+/* "[p:]ADDR LEN": what a dump action shows. */
+static bool parse_dump(uam_rules *rs, parse_mode mode, char *list, action *a, char *err, size_t errlen)
+{
+    char *addr = strtok(list, " \t"), *len = strtok(NULL, " \t");
+    if (!addr || !len || strtok(NULL, " \t")) {
+        set_err(err, errlen, "dump wants [p:]ADDR LEN (two expressions, a blank between them)");
+        return false;
+    }
+    if (!strncmp(addr, "p:", 2)) {
+        a->dst.phys = true;
+        addr += 2;
+    }
+    if (!parse_expr(rs, addr, mode, &a->dst.addr, err, errlen))
+        return false;
+    if (!parse_expr(rs, len, mode, &a->src, err, errlen)) {
+        expr_free(&a->dst.addr);
+        return false;
+    }
+    return true;
+}
+
 static bool parse_item(uam_rules *rs, rule *r, char *item, char *err, size_t errlen)
 {
-    const char *rest;
-    char *val;
+    const parse_mode mode = r->on_access ? M_ACCESS : M_STATE;
+    char *rest, *val;
     uint64_t v;
+    action *a;
     if ((val = value_of(item, "cpu"))) {
         if (!whole_number(val, &v) || v >= uam_machine_ncpus(rs->m)) {
             set_err(err, errlen, "bad '%s': the machine's processors are 0..%u", item,
@@ -800,6 +1162,25 @@ static bool parse_item(uam_rules *rs, rule *r, char *item, char *err, size_t err
             return false;
         }
         r->limit = v;
+    } else if ((val = value_of(item, "delay"))) {
+        if (!whole_number(val, &v) || v > UAM_SCHED_TIME_MAX / 2) {
+            set_err(err, errlen, "bad '%s': delay=N, N ticks of virtual time", item);
+            return false;
+        }
+        r->delay = v;
+    } else if ((val = value_of(item, "len"))) {
+        if (!r->on_access) {
+            set_err(err, errlen, "len=N goes with read=, write= or access=");
+            return false;
+        }
+        if (!constant(rs, val, &v, err, errlen))
+            return false;
+        if (!v || v > RANGE_MAX) {
+            set_err(err, errlen, "bad '%s': len=N, N from 1 to 0x%llx bytes", item,
+                    (unsigned long long)RANGE_MAX);
+            return false;
+        }
+        r->len = v;
     } else if ((val = value_of(item, "name"))) {
         char *name = *val ? strdup(val) : NULL;
         if (!name) {
@@ -815,39 +1196,64 @@ static bool parse_item(uam_rules *rs, rule *r, char *item, char *err, size_t err
             return false;
         }
         r->cond = nc;
-        if (!parse_expr(rs, rest, true, &nc[r->n_cond], err, errlen))
+        if (!parse_expr(rs, rest, mode, &nc[r->n_cond], err, errlen))
             return false;
         r->n_cond++;
     } else if ((rest = after_word(item, "set")) && *rest) {
-        action *a = new_action(r, A_SET);
-        if (!a) {
-            set_err(err, errlen, "out of memory");
-            return false;
-        }
-        if (!parse_set(rs, rest, a, err, errlen))
+        if (!(a = new_action(r, A_SET, err, errlen)) || !parse_set(rs, rest, mode, a, err, errlen))
             return false;
         r->n_act++;
+        r->n_set++;
     } else if ((rest = after_word(item, "log"))) {
-        action *a = new_action(r, A_LOG);
-        if (!a) {
-            set_err(err, errlen, "out of memory");
+        if (!(a = new_action(r, A_LOG, err, errlen)))
             return false;
-        }
         r->n_act++;   /* owns what parse_log allocates, also when it fails */
-        if (!parse_log(rs, item + (rest - item), a, err, errlen))
+        if (!parse_log(rs, mode, rest, a, err, errlen))
             return false;
+    } else if ((rest = after_word(item, "dump"))) {
+        if (!(a = new_action(r, A_DUMP, err, errlen)) || !parse_dump(rs, mode, rest, a, err, errlen))
+            return false;
+        r->n_act++;
     } else if (!strcmp(item, "stop")) {
-        if (!new_action(r, A_STOP)) {
-            set_err(err, errlen, "out of memory");
+        if (!new_action(r, A_STOP, err, errlen))
             return false;
-        }
         r->n_act++;
     } else {
-        set_err(err, errlen, "unknown item '%s' (cpu=N, if COND, count=N, name=NAME, "
-                "set DST=EXPR, log [EXPR...], stop)", item);
+        set_err(err, errlen, "unknown item '%s' (cpu=N, if COND, count=N, delay=N, len=N, "
+                "name=NAME, set DST=EXPR, log [EXPR...], dump [p:]ADDR LEN, stop)", item);
         return false;
     }
     return true;
+}
+
+/* The first item: pc=ADDR, or read=, write= or access= with [p:]ADDR. */
+static bool parse_trigger(uam_rules *rs, rule *r, char *item, char *err, size_t errlen)
+{
+    static const struct { const char *key; unsigned dir; } on[] = {
+        { "read", UAM_WATCH_READ }, { "write", UAM_WATCH_WRITE },
+        { "access", UAM_WATCH_READ | UAM_WATCH_WRITE },
+    };
+    char *val = value_of(item, "pc");
+    if (!(r->name = strdup(item))) {
+        set_err(err, errlen, "out of memory");
+        return false;
+    }
+    if (val)
+        return constant(rs, val, &r->pc, err, errlen);
+    for (size_t i = 0; i < UAM_ARRAY_LEN(on); i++) {
+        if (!(val = value_of(item, on[i].key)))
+            continue;
+        r->on_access = true;
+        r->dir = on[i].dir;
+        r->len = 1;
+        if (!strncmp(val, "p:", 2)) {
+            r->phys = true;
+            val += 2;
+        }
+        return constant(rs, val, &r->addr, err, errlen);
+    }
+    set_err(err, errlen, "a rule starts with pc=ADDR, or read=, write= or access= and [p:]ADDR");
+    return false;
 }
 
 static char *trim(char *s)
@@ -860,6 +1266,26 @@ static char *trim(char *s)
     return s;
 }
 
+/* What the rule's parts must add up to. */
+static bool check_rule(const rule *r, char *err, size_t errlen)
+{
+    bool stop = false;
+    for (uint32_t i = 0; i < r->n_act; i++)
+        stop |= r->act[i].kind == A_STOP;
+    if (!r->n_act)
+        set_err(err, errlen, "the rule does nothing: add set DST=EXPR, log [EXPR...], "
+                "dump [p:]ADDR LEN or stop");
+    else if (r->delay && !r->n_set)
+        set_err(err, errlen, "delay=N postpones the rule's stores, and it has none (set DST=EXPR)");
+    else if (r->delay && stop)
+        set_err(err, errlen, "a rule with delay=N cannot stop: only its stores are postponed");
+    else if (r->on_access && r->addr + r->len - 1 < r->addr)
+        set_err(err, errlen, "the range runs past the end of the address space");
+    else
+        return true;
+    return false;
+}
+
 int uam_rules_add(uam_rules *rs, const char *text, char *err, size_t errlen)
 {
     char *copy = strdup(text);
@@ -870,6 +1296,9 @@ int uam_rules_add(uam_rules *rs, const char *text, char *err, size_t errlen)
     if (ok) {
         r->set = rs;
         r->cpu = -1;
+        r->id = UINT64_C(0xcbf29ce484222325);
+        for (const char *c = text; *c; c++)
+            r->id = (r->id ^ (uint8_t)*c) * UINT64_C(0x100000001b3);
     }
     /* The items, split at the commas (no expression holds one). */
     bool first = true;
@@ -879,18 +1308,7 @@ int uam_rules_add(uam_rules *rs, const char *text, char *err, size_t errlen)
             *next++ = '\0';
         item = trim(item);
         if (first) {
-            expr e;
-            const char *addr = value_of(item, "pc");
-            if (!addr) {
-                set_err(err, errlen, "a rule starts with pc=ADDR");
-                ok = false;
-            } else if (!(r->name = strdup(item))) {
-                set_err(err, errlen, "out of memory");
-                ok = false;
-            } else if ((ok = parse_expr(rs, addr, false, &e, err, errlen))) {
-                eval(&e, NULL, &r->pc, NULL, 0);
-                expr_free(&e);
-            }
+            ok = parse_trigger(rs, r, item, err, errlen);
         } else if (!*item) {
             set_err(err, errlen, "an empty item (two commas, or one at the end)");
             ok = false;
@@ -898,9 +1316,13 @@ int uam_rules_add(uam_rules *rs, const char *text, char *err, size_t errlen)
             ok = parse_item(rs, r, item, err, errlen);
         }
     }
-    if (ok && !r->n_act) {
-        set_err(err, errlen, "the rule does nothing: add set DST=EXPR, log [EXPR...] or stop");
-        ok = false;
+    ok = ok && check_rule(r, err, errlen);
+    if (ok && r->delay) {
+        uam_timer_init(&r->timer, deliver, r);
+        if (!(r->held = calloc(r->n_set, sizeof(*r->held)))) {
+            set_err(err, errlen, "out of memory");
+            ok = false;
+        }
     }
     if (ok && rs->n == rs->cap) {
         const uint32_t ncap = rs->cap ? rs->cap * 2 : 8;
@@ -913,7 +1335,7 @@ int uam_rules_add(uam_rules *rs, const char *text, char *err, size_t errlen)
             ok = false;
         }
     }
-    if (ok && r->limit && !rs->has_state) {
+    if (ok && stateful(r) && !rs->has_state) {
         if (uam_machine_add_state(rs->m, rs->state_name, rules_save, rules_restore, rs) != UAM_OK) {
             set_err(err, errlen, "cannot register the state '%s' (is another rule set called "
                     "the same?)", rs->state_name);
@@ -921,16 +1343,18 @@ int uam_rules_add(uam_rules *rs, const char *text, char *err, size_t errlen)
         }
         rs->has_state = ok;
     }
-    if (ok && uam_machine_add_pc_hook(rs->m, r->pc, rule_hook, r) != UAM_OK) {
-        set_err(err, errlen, "cannot hook pc 0x%llx", (unsigned long long)r->pc);
-        ok = false;
+    if (ok && r->on_access) {
+        ok = rs->arm_later || arm(r, err, errlen);
+    } else if (ok) {
+        ok = r->hooked = uam_machine_add_pc_hook(rs->m, r->pc, pc_hook, r) == UAM_OK;
+        if (!ok)
+            set_err(err, errlen, "cannot hook pc 0x%llx", (unsigned long long)r->pc);
     }
     free(copy);
     if (!ok) {
         rule_free(r);
         return -1;
     }
-    r->hooked = true;
     rs->r[rs->n] = r;
     return (int)rs->n++;
 }
@@ -973,8 +1397,10 @@ bool uam_rules_get(const uam_rules *rs, size_t i, uam_rule_info *out)
     if (i >= rs->n)
         return false;
     const rule *r = rs->r[i];
-    *out = (uam_rule_info){ .name = r->name, .pc = r->pc, .arrivals = r->arrivals,
-                            .fired = r->fired, .failed = r->failed, .limit = r->limit };
+    *out = (uam_rule_info){ .name = r->name, .pc = r->pc, .addr = r->addr,
+                            .len = r->on_access ? r->len : 0, .arrivals = r->arrivals,
+                            .fired = r->fired, .failed = r->failed, .limit = r->limit,
+                            .delay = r->delay, .waiting = r->waiting };
     return true;
 }
 

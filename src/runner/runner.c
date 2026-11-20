@@ -472,23 +472,35 @@ static void usage(FILE *out)
         "                          stack at the stop (fuzzing: for each input that is not ok),\n"
         "                          innermost first, named from the ELF image's symbols\n"
         "      --break ADDR        stop when ADDR is reached (repeatable)\n"
-        "      --on RULE           at a pc, check a condition and act (repeatable):\n"
-        "                          pc=ADDR[,cpu=N][,if COND][,count=N][,name=NAME],ACTION...\n"
+        "      --on RULE           at a pc or a data access, check a condition and act\n"
+        "                          (repeatable): WHERE[,cpu=N][,if COND][,count=N][,delay=N]\n"
+        "                          [,name=NAME],ACTION[,ACTION...]\n"
+        "                          WHERE: pc=ADDR (before that instruction), or write=, read=\n"
+        "                          or access=[p:]ADDR[,len=N]: after an instruction that stores\n"
+        "                          to, loads from, or touches those N bytes (default 1;\n"
+        "                          virtual as processor 0 maps them at the start, p: physical).\n"
         "                          ACTION: set DST=EXPR (DST a register or [ADDR]), log [EXPR...]\n"
-        "                          (operands separated by spaces), stop (exit 127, as --break).\n"
+        "                          (operands separated by spaces), dump [p:]ADDR LEN (a hex\n"
+        "                          dump), stop (exit 127, as --break).\n"
         "                          EXPR is C's, unsigned: numbers, registers (as gdb names them,\n"
         "                          and pc), ELF symbols, memory as [ADDR] or [ADDR]:1|2|4|8\n"
-        "                          (virtual, as the arriving processor maps it; x86: linear;\n"
-        "                          [p:ADDR]: physical), and the operators\n"
+        "                          (virtual, as the processor maps it; x86: linear;\n"
+        "                          [p:ADDR]: physical), in an access rule addr and value (the\n"
+        "                          address touched, the value stored or loaded), and\n"
         "                          ( ) - ~ ! * + - << >> < <= > >= == != & ^ | && ||.\n"
-        "                          if: fire only when COND is not 0; count=N: at most N times\n"
-        "                          (a snapshot keeps the count: it loads only with the counted\n"
-        "                          rules it was saved with); cpu=N: that processor only.\n"
-        "                          Stores reach RAM only; nothing touches a device. E.g.\n"
+        "                          if: fire only when COND is not 0; count=N: at most N times;\n"
+        "                          cpu=N: that processor only; delay=N: the stores happen N\n"
+        "                          ticks after the rule fires (worked out when it fires; it\n"
+        "                          does not fire again before). A snapshot keeps counts and\n"
+        "                          stores on their way: it loads only with the rules with a\n"
+        "                          count or delay it was saved with. Stores reach RAM only;\n"
+        "                          a rule never touches a device. E.g.\n"
         "                          --on 'pc=0x8000123c,set [[sp+8]]=[sp+12]' puts the value\n"
         "                          a firmware waits for where it looks, standing in for a\n"
         "                          coprocessor the machine does not model;\n"
-        "                          --on 'pc=parse,if a1>0x400,log a0 a1,stop'\n"
+        "                          --on 'write=p:0x7f000,len=4,delay=2000,set [p:0x7f010]:4=1'\n"
+        "                          answers a doorbell after a while;\n"
+        "                          --on 'pc=parse,if a1>0x400,log a0 a1,dump a0 a1,stop'\n"
         "      --on-file FILE      rules from FILE, one per line (# starts a comment line)\n"
         "      --guard SPEC        guard guest memory (repeatable): a data access that\n"
         "                          touches it stops the run before it happens (exit 129).\n"
@@ -1816,6 +1828,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         bool ok = (rules = uam_rules_create(&m, "run")) != NULL;
         if (!ok)
             fprintf(stderr, "uam-run: out of memory\n");
+        else
+            uam_rules_arm_later(rules);   /* access rules: as the machine maps memory then */
         if (ok && image)
             uam_rules_set_symbols(rules, rule_symbol, (void *)image);
         for (unsigned i = 0; ok && i < n_rule_args; i++) {
@@ -1869,9 +1883,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
             fprintf(stderr, "uam-run: cannot resume from snapshot %s\n", load_snap);
             uam_rule_info ri;
             for (size_t i = 0; rules && uam_rules_get(rules, i, &ri); i++)
-                if (ri.limit) {
-                    fprintf(stderr, "uam-run: (rules with count=N keep their counts in snapshots: "
-                            "one loads only with the counted rules it was saved with)\n");
+                if (ri.limit || ri.delay) {
+                    fprintf(stderr, "uam-run: (rules with count=N or delay=N keep state in "
+                            "snapshots: one loads only with the rules of that kind it was saved "
+                            "with)\n");
                     break;
                 }
             uam_machine_fini(&m);
@@ -1931,6 +1946,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: cannot install the --log-pc/--break/--snapshot-at hooks\n");
         uam_machine_fini(&m);
         goto out_host;
+    }
+    if (rules) {
+        /* Like the guards: virtual ranges as the machine (a loaded snapshot's) maps them. */
+        char rerr[512];
+        if (uam_rules_arm(rules, rerr, sizeof(rerr)) != UAM_OK) {
+            fprintf(stderr, "uam-run: --on: %s\n", rerr);
+            uam_machine_fini(&m);
+            goto out_host;
+        }
     }
     for (unsigned i = 0; i < n_guards; i++) {
         char gerr[256];

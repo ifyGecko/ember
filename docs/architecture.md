@@ -65,14 +65,14 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into, and `insn_pc`, the instruction a bus, system register or helper access is made for), the core services ISA modules may call (`uam_cpu_xlate_changed`, ...), and observers of system register accesses, interrupt input lines, exceptions taken and interrupt handlers entered (`uam_cpu_observer`: `--trace sysreg`, `--trace irq`, the `--trace exc` summary) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
-| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), compare logging (`uam_exec_set_cmp`, `uam_exec_cmp_attach`: the compare pass and the state `CMPLOG` reports to), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), an execution history ring (`uam_exec_set_history`: `--history N`), stops at the faulting instruction, requested from inside a refused access (`uam_exec_request_fault_stop`, `uam_exec_request_stop_at_fault`: guards with `UAM_STOP_GUARD`, `--unknown-mmio stop`), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics, the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
+| `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), compare logging (`uam_exec_set_cmp`, `uam_exec_cmp_attach`: the compare pass and the state `CMPLOG` reports to), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), an execution history ring (`uam_exec_set_history`: `--history N`), stops at the faulting instruction, requested from inside a refused access (`uam_exec_request_fault_stop`, `uam_exec_request_stop_at_fault`: guards with `UAM_STOP_GUARD`, `--unknown-mmio stop`), a callback at the next instruction boundary, requested from inside an access (`uam_exec_request_call`: access rules), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics, the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
 | `boards.h` | The stock boards and their registration, and board helpers (`uam_board_add_mmio_rules`, `uam_board_add_uart_input`, `uam_board_open_disk`) | `boards/stock.c`, `boards/mmio_rules.c` |
 | `pass.h` | IR → IR transformations run on every new block, after the optimizer and before native compilation (instrumentation); block editing helpers | `analysis/*`; registered with `uam_exec_add_pass` |
 | `guard.h` | Guarded and watched guest memory: byte ranges (virtual or physical, around an anchor) whose data accesses stop the run at the instruction (`UAM_STOP_GUARD`), become a bus fault for the guest, or are logged; hit records and an observer; the text form `--guard`/`--watch` and fuzz redzones use | `src/machine` (on bus fault watches and `uam_exec_request_fault_stop`) |
-| `rules.h` | Rules: at a guest pc, an optional condition on the arriving processor's registers and memory, and actions (store into a register or RAM, log values, stop), written as text (`pc=ADDR,if COND,set DST=EXPR,...`) with C's expressions; rule sets, per-rule counts, and the fire counts of `count=N` rules as snapshot state. What `--on`/`--on-file` use, and what a board can carry to stand in for something it does not model | `src/machine/rules.c` (on PC hooks and debug accesses) |
+| `rules.h` | Rules: at a guest pc or after a data access to a range, an optional condition on the processor's registers and memory, and actions (store into a register or RAM, at once or a number of ticks later; log values; dump memory; stop), written as text (`pc=ADDR,if COND,set DST=EXPR,...`, `write=p:ADDR,len=N,...`) with C's expressions; rule sets, per-rule counts, and what a snapshot must keep (the fire counts of `count=N` rules, the pending stores of `delay=N` rules). What `--on`/`--on-file` use, and what a board can carry to stand in for something it does not model | `src/machine/rules.c` (on PC hooks, bus watches with `uam_exec_request_call`, scheduler timers and debug accesses) |
 | `frames.h` | Call tracking: the frame pass (`UAM_OP_FRAME` before every exit a lifter marked a call, a return or an exception return), the per-processor stack of frames it keeps, the set of return addresses, and the machine-level switch and backtrace; the return guard on top is `guard.h`'s `uam_machine_guard_returns` | `analysis/frames.c` (the pass), `src/exec/frames.c` (the state), `src/machine/frames.c` (machines, snapshots, the guard) |
 | `uninit.h` | The check for reads of memory nothing wrote (`--fuzz-uninit`, opt-in): which RAM pages the boot wrote (a bitmap per RAM region on the bus, saved in snapshots as extra state `uninit`), exclusions, and arming the bus's lazily filled pages for a second run of an input; the fuzz harness does the comparison (`uam_fuzz_result.uninit`), the guarded heap fills fresh allocations while it is armed | `src/machine/uninit.c` (on `bus.h`: `uam_bus_written_*`, `uam_bus_lazy_arm`, and `uam_bus_set_digest` for what the devices were sent) |
 | `heap.h` | The guarded heap: an allocator for an arena of guest memory that a board runs in place of the firmware's own (the board hooks the firmware's functions; ember names none), with redzones, a quarantine and byte-exact checks of every guest access to the arena; hits are guard hits | `src/machine/heap.c` (on a checked bus watch, `uam_bus_add_check`) |
@@ -261,8 +261,8 @@ tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dum
                   console, dma; --history, --trace-file, --log-pc registers, --unknown-mmio
                   stop, --log-stamp, pcs in the catch-all logs, traces in --fuzz-replay;
                   interpreter and JIT alike)
-                  rules-check.sh  (--on / --on-file: set, log, if, stop, count and snapshots,
-                  with fuzzing; interpreter and JIT alike)
+                  rules-check.sh  (--on / --on-file: pc and access rules, set, log, dump, if,
+                  stop, count, delay and snapshots, with fuzzing; interpreter and JIT alike)
 tests/gdb/        gdb-check.py  (the gdb stub over the remote protocol, four processors)
 tests/smp/        smp_test.h  (one multiprocessor self-test for RISC-V, MIPS, ARM, PowerPC)
 tests/bench/      bench.c meson.build x86-start.S x86.ld pic32.ld  (one C benchmark for every guest ISA
@@ -718,21 +718,30 @@ devices.
   exempt; a guarded page leaves the JIT's direct memory access. Guards are configuration, not
   snapshot state. Every hit is recorded and goes to one observer; the fuzz harness's redzones
   are STOP guards.
-- **Rules** (`rules.h`, `--on`/`--on-file`): a rule is one PC hook on every processor. Its
-  text is parsed once into postfix expressions over numbers, the ISA's debugger registers,
-  symbols (a resolver the caller supplies) and memory operands, and evaluated at each
-  arrival against the arriving processor: virtual addresses through its `translate`
+- **Rules** (`rules.h`, `--on`/`--on-file`): a pc rule is one PC hook on every processor. An
+  access rule is one plain bus watch per physically contiguous piece of its range (a virtual
+  range is translated when the rule is armed, like a guard's): the watch notes the access
+  (address, size, value, the accessing instruction) and calls `uam_exec_request_call`, which
+  ends the block at the next instruction boundary and calls back from the run loop, so the
+  rule runs with precise state right after the accessing instruction, the same on the
+  interpreter and the JIT, without the access being refused or repeated. A rule's text is
+  parsed once into postfix expressions over numbers, the ISA's debugger registers, symbols (a
+  resolver the caller supplies), memory operands and an access rule's `addr` and `value`, and
+  evaluated against the processor: virtual addresses through its `translate`
   (`UAM_XLATE_DEBUG`), bytes through debug bus accesses in the ISA's byte order. So a rule
   reads what a debugger reads and stores to RAM only; no device is accessed and no watch or
   guard fires. Conditions that hold run the actions in order: `set` (a register through the
-  debugger view, the pc, or memory), `log`, `stop` (`UAM_HOOK_STOP`). An operand that cannot
-  be read fails that condition or action and is counted, not reported (one `info` line for a
-  rule's first). Rules are configuration; the exception is the fire count of `count=N`
-  rules, which decides what the machine does next: a set with one registers the extra state
-  `rules-NAME`, so a restore brings the counts back (every fuzz iteration meets the rule as
-  the first did) and a snapshot fits only a machine with the same counted rules. The
-  runner's older single-purpose options (`--break`, `--log-pc`, `--snapshot-at`) are still
-  their own hooks.
+  debugger view, the pc, or memory), `log`, `dump`, `stop` (`UAM_HOOK_STOP`). With `delay=N`
+  each `set` is worked out when the rule fires (the value, the physical address of every
+  byte) and carried out from a scheduler timer N ticks later; the rule does not fire again
+  in between. An operand that cannot be read fails that condition or action and is counted,
+  not reported (one `info` line for a rule's first). Rules are configuration; the exception
+  is what decides the machine's future, the fire count of `count=N` rules and the pending
+  stores (and timer) of `delay=N` rules: a set with such a rule registers the extra state
+  `rules-NAME`, so a restore brings them back (every fuzz iteration meets the rule as the
+  first did) and a snapshot fits only a machine with the same such rules, told apart by a
+  hash of their text. The runner's older single-purpose options (`--break`, `--log-pc`,
+  `--snapshot-at`) are still their own hooks.
 - **Fuzz harness** (`fuzz.h`, [`fuzzing.md`](fuzzing.md)): boot to a begin pc, snapshot,
   and run each input from the snapshot through a named route (guest memory, MMIO `input`
   rules, or an input a board published such as a UART FIFO), with paired or begin-only
@@ -857,12 +866,19 @@ Implemented (`meson test -C build`):
   self-test, with the interpreter and the JIT stopping at the same instruction.
 - Rules: `test_rules` runs hand-encoded RV32 and big-endian MIPS guests on the interpreter and
   the JIT: a rule supplies the value a wait loop polls for (through the guest's own frame, at a
-  physical address, by moving the pc), conditions and `stop`, `count=N` and its snapshot
-  state, `log` output with C's operators and precedence (also at a pc inside a block),
-  operands that cannot be read, `cpu=N` with two processors, byte order and virtual
-  addresses, and malformed rules. `tests/runner/rules-check.sh` checks `--on` and `--on-file`
-  on the RISC-V self-test: identical log lines on every backend, `--trace-file`, `--stats`,
-  counts across `--save-snapshot`/`--load-snapshot`, and a counted rule under `--fuzz-replay`.
+  physical address, by moving the pc, or in answer to the guest's own store with an access
+  rule), conditions and `stop`, `count=N` and its snapshot state, `log` output with C's
+  operators and precedence (also at a pc inside a block), operands that cannot be read,
+  `cpu=N` with two processors, byte order and virtual addresses, and malformed rules. Access
+  rules must run after the accessing instruction with its address and value, on ranges an
+  access only overlaps, once per instruction, and only when armed; a delay must end at the
+  same instruction on both backends, use the values of when the rule fired, not fire again
+  in between, and survive a snapshot while its stores are on their way; dumps must show the
+  bytes and say where reading stopped. `tests/runner/rules-check.sh` checks `--on` and
+  `--on-file` on the RISC-V self-test: identical log lines on every backend for pc and
+  access rules, `--trace-file`, `--stats`, counts and delayed stores across
+  `--save-snapshot`/`--load-snapshot`, access rules armed after a snapshot is loaded, and a
+  counted rule under `--fuzz-replay`.
 - Runner options: `tests/runner/runner-check.sh` (`meson test -C build --suite runner`) checks `--log-pc`,
   `--break`, `--dump-mem`, `--trace-after` (absolute and `+N`, across a snapshot) and block
   traces with `--jit`; `tests/runner/trace-check.sh` (part of `meson test -C build --suite runner`) checks the

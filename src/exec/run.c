@@ -253,6 +253,41 @@ static uam_stop_reason fault_stopped(uam_exec *x, const uam_exception *exc)
     return x->fault_stop_why;
 }
 
+void uam_exec_request_call(uam_exec *x, uam_pc_hook_fn fn, void *ctx)
+{
+    uam_cpu_request_exit(x->cpu);
+    for (uint32_t i = 0; i < x->n_calls; i++)
+        if (x->calls[i].fn == fn && x->calls[i].ctx == ctx)
+            return;
+    if (x->n_calls == UAM_EXEC_MAX_CALLS)
+        x->n_calls--;
+    x->calls[x->n_calls++] = (uam_pc_hook){ .fn = fn, .ctx = ctx };
+}
+
+void uam_exec_cancel_call(uam_exec *x, uam_pc_hook_fn fn, void *ctx)
+{
+    for (uint32_t i = 0; i < x->n_calls; i++) {
+        if (x->calls[i].fn != fn || x->calls[i].ctx != ctx)
+            continue;
+        memmove(&x->calls[i], &x->calls[i + 1], sizeof(x->calls[0]) * (x->n_calls - i - 1));
+        x->n_calls--;
+        return;
+    }
+}
+
+/* The requested calls (uam_exec_request_call), between blocks. True: a callee stops the run. */
+static bool called(uam_exec *x)
+{
+    uam_pc_hook calls[UAM_EXEC_MAX_CALLS];
+    const uint32_t n = x->n_calls;
+    bool stop = false;
+    memcpy(calls, x->calls, sizeof(calls[0]) * n);
+    x->n_calls = 0;
+    for (uint32_t i = 0; i < n; i++)
+        stop |= calls[i].fn(calls[i].ctx, x->cpu, x->cpu->pc) == UAM_HOOK_STOP;
+    return stop;
+}
+
 void uam_exec_request_reset(uam_exec *x, uam_reset_kind kind)
 {
     /* A system reset subsumes a CPU reset requested in the same window. */
@@ -822,6 +857,8 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         cpu->insn_pc = cpu->pc;
         if (x->fault_stop)   /* asked for between blocks (a hook, a device's timer) */
             return fault_stopped(x, NULL);
+        if (x->n_calls && called(x))
+            return UAM_STOP_HOOK;
         if (c->stop_request)
             return UAM_STOP_REQUEST;
         if (smp && c->smp_resync)
@@ -1227,6 +1264,7 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
         uam_exec *e = x->n_smp ? x->smp[i] : x;
         e->fault_stop = false;     /* requests from outside a run are dropped */
         e->fault_stop_pc = NULL;
+        e->n_calls = 0;
     }
     uam_origin_fn prev_fn;
     void *prev_ctx;
@@ -1238,6 +1276,13 @@ uam_stop_reason uam_exec_run(uam_exec *x, uint64_t max_insns)
         uint64_t before = x->cpu->icount;
         r = run_loop(x, max_insns ? x->cpu->icount + max_insns : UINT64_MAX, time_limit(x), false);
         x->retired += x->cpu->icount - before;
+    }
+    /* A run that ended between an access and the call it asked for: no request outlives
+     * its run (the caller may restore a snapshot next). The run stops as it was going to. */
+    for (uint32_t i = 0; i < (x->n_smp ? x->n_smp : 1); i++) {
+        uam_exec *e = x->n_smp ? x->smp[i] : x;
+        if (e->n_calls)
+            called(e);
     }
     uam_origin_set_provider(prev_fn, prev_ctx, NULL, NULL);
     return r;

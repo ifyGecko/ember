@@ -194,6 +194,8 @@ typedef struct uam_pc_hook {
     void          *ctx;
 } uam_pc_hook;
 
+#define UAM_EXEC_MAX_CALLS 4u   /* uam_exec_request_call: requests waiting per processor */
+
 /* --- exception observer --------------------------------------------------- */
 
 /*
@@ -329,6 +331,9 @@ typedef struct uam_exec {
     bool             fault_stop;
     uint64_t        *fault_stop_pc;
     uam_stop_reason  fault_stop_why;
+    /* uam_exec_request_call */
+    uam_pc_hook      calls[UAM_EXEC_MAX_CALLS];   /* .pc unused */
+    uint32_t         n_calls;
 
     /* uam_exec_set_history: a ring of the last hist_cap events (hist == NULL: off) */
     struct uam_hist_entry *hist;
@@ -381,6 +386,21 @@ void            uam_exec_stop(uam_exec *x, int64_t status);
 void            uam_exec_request_fault_stop(uam_exec *x, uint64_t *pc_out);
 /* The same with another stop reason (UAM_STOP_UNMAPPED: the --unknown-mmio stop policy). */
 void            uam_exec_request_stop_at_fault(uam_exec *x, uint64_t *pc_out, uam_stop_reason why);
+/*
+ * Call fn, as a PC hook is called, at the next instruction boundary of x's processor:
+ * made while that processor runs (from a bus watch, a device), the instruction executing
+ * now completes first, and fn then sees precise state with pc the next instruction to
+ * run. fn returning UAM_HOOK_STOP makes uam_exec_run return UAM_STOP_HOOK there. A request
+ * for an fn and ctx already waiting changes nothing; up to UAM_EXEC_MAX_CALLS different
+ * ones wait per processor and are called in the order they were made (a further one
+ * replaces the last). If the instruction raises an exception, fn is called once the
+ * handler is entered; if the run ends first (a stop at that instruction), fn is called
+ * before uam_exec_run returns, so no request outlives its run. A request made outside
+ * uam_exec_run is dropped when the next run starts; uam_exec_cancel_call withdraws one.
+ * For acting on a data access once it has happened (rules.h).
+ */
+void            uam_exec_request_call(uam_exec *x, uam_pc_hook_fn fn, void *ctx);
+void            uam_exec_cancel_call(uam_exec *x, uam_pc_hook_fn fn, void *ctx);
 
 /* Request a reset at the next instruction boundary. uam_exec_run performs it
  * through the reset handler and keeps running; without a handler it returns

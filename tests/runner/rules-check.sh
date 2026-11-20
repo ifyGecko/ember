@@ -15,6 +15,12 @@
 #   snapshots    a count comes back with a snapshot: the rule fires only as often as it
 #                had left; a snapshot taken with a counted rule does not load without it
 #   fuzzing      a counted rule fires in every input's run alike
+#   access       write= on the UART's data register: each byte the guest sends, after the
+#                instruction that sent it, the same lines on every backend; read= on a
+#                symbol's memory; a virtual range is armed as a loaded snapshot maps it
+#   dump         the bytes at a register's address as a hex dump
+#   delay        the store happens later: the guest prints the byte unchanged first; a
+#                snapshot taken while it is on its way loads only with the rule
 set -eu
 RUN=$1
 FW=$2
@@ -118,7 +124,7 @@ rc=0; $RUN --load-snapshot "$T/s.snap" "$FW" </dev/null >/dev/null 2>"$T/err" ||
 [ "$rc" -eq 2 ] && grep -q 'cannot resume from snapshot' "$T/err" ||
     fail "snapshot: one taken with a counted rule loaded without it (exit $rc)"
 rc=0; $RUN --on 'pc=puts_,count=5,log' --load-snapshot "$T/s.snap" "$FW" </dev/null >/dev/null 2>"$T/err" || rc=$?
-[ "$rc" -eq 2 ] && grep -q 'rules with count=N keep their counts in snapshots' "$T/err" ||
+[ "$rc" -eq 2 ] && grep -q 'rules with count=N or delay=N keep state in snapshots' "$T/err" ||
     fail "snapshot: loaded with another counted rule, or no hint why not (exit $rc)"
 # rules without a count are not in a snapshot: any of them goes with any snapshot
 $RUN --snapshot-at run_test --save-snapshot "$T/p.snap" --break run_test "$FW" </dev/null >/dev/null 2>&1 || true
@@ -137,5 +143,70 @@ $RUN --fuzz-begin "$begin" --fuzz-input uart0 --fuzz-replay "$T/in" \
     fail "replay with a rule failed"
 [ "$(grep -c '^rule once: ' "$T/err")" -eq 3 ] ||
     fail "fuzzing: a count=1 rule fired $(grep -c '^rule once: ' "$T/err") times over 3 inputs, not once in each"
+
+# ---- access rules ------------------------------------------------------------------------------
+for mode in interp jit nochain; do
+    case $mode in interp) a="";; jit) a="--jit";; nochain) a="--jit --no-chain";; esac
+    # shellcheck disable=SC2086
+    $RUN $a --on 'write=p:0x10000000,count=3,name=tx,log a0' "$FW" </dev/null >/dev/null 2>"$T/$mode" ||
+        fail "$mode: the self-test failed with an access rule"
+    grep '^rule ' "$T/$mode" >"$T/$mode.a" || fail "$mode: no access rule lines"
+done
+printf '%s\n' 0x55 0x41 0x4d >"$T/want"   # "UAM"
+sed -n 's/^rule tx: cpu 0 pc 0x[0-9a-f]* write 1 at 0x10000000 value \(0x[0-9a-f]*\) a0=0x[0-9a-f]* icount=[0-9]*$/\1/p' \
+    "$T/interp.a" | cmp -s - "$T/want" || fail "access: the UART rule's lines are $(cat "$T/interp.a")"
+cmp -s "$T/interp.a" "$T/jit.a" || fail "access rule lines differ: interpreter vs --jit"
+cmp -s "$T/interp.a" "$T/nochain.a" || fail "access rule lines differ: interpreter vs --jit --no-chain"
+# puts_ reads the banner's bytes: an address from a rule's log, a length, a condition on the value
+banner=$(readelf -sW "$FW" | awk '$NF == "puts_" { print "0x" $2; exit }')
+[ -n "$banner" ] || fail "no puts_ symbol"
+$RUN --on 'pc=puts_,count=1,name=at,log a0' "$FW" </dev/null >/dev/null 2>"$T/err"
+str=$(sed -n 's/^rule at: .* a0=\(0x[0-9a-f]*\) icount.*/\1/p' "$T/err")
+$RUN --on "read=$str,len=3,name=rd,if value==0x41,log addr-$str" "$FW" </dev/null >/dev/null 2>"$T/err" ||
+    fail "the self-test failed with a read rule"
+grep -q "^rule rd: cpu 0 pc 0x[0-9a-f]* read 1 at 0x[0-9a-f]* value 0x41 addr-$str=0x1 icount=[0-9]*\$" "$T/err" ||
+    fail "read: no line for the banner's second byte: $(grep '^rule' "$T/err" | head -3)"
+# (puts_ loads each byte twice: for its loop test and to send it)
+[ "$(grep -c '^rule rd: ' "$T/err")" -eq 2 ] && ! grep '^rule rd: ' "$T/err" | grep -qv ' value 0x41 ' ||
+    fail "read: the condition let other bytes through"
+# with a snapshot: the range is armed as the restored machine maps it, and the rule runs
+$RUN --on "read=$str,len=3,name=rd,if value==0x4d,log" --load-snapshot "$T/p.snap" "$FW" </dev/null \
+    >/dev/null 2>"$T/err" || fail "the self-test failed with an access rule from a snapshot"
+! grep -q '^rule rd: ' "$T/err" || fail "access: the banner was read again after the snapshot"
+$RUN --on 'write=p:0x10000000,name=tx,log' --load-snapshot "$T/p.snap" "$FW" </dev/null \
+    >/dev/null 2>"$T/err" || fail "the self-test failed with a UART rule from a snapshot"
+grep '^rule tx: ' "$T/err" | head -1 | grep -q '^rule tx: cpu 0 pc 0x[0-9a-f]* write 1 at 0x10000000 value 0x5b ' ||
+    fail "access: no UART write seen after the snapshot"
+rc=0; $RUN --on 'write=p:0x10000000,len=0,stop' "$FW" </dev/null >/dev/null 2>"$T/err" || rc=$?
+[ "$rc" -eq 2 ] || fail "access: len=0 accepted"
+
+# ---- dump -----------------------------------------------------------------------------------------
+$RUN --on 'pc=puts_,count=1,name=d,dump a0 16' "$FW" </dev/null >/dev/null 2>"$T/err" ||
+    fail "the self-test failed with a dump rule"
+grep -q "^rule d: cpu 0 pc 0x[0-9a-f]* dump $str+0x10 icount=[0-9]*\$" "$T/err" || fail "dump: no header line"
+grep -q "^  00000000${str#0x}  55 41 4d 20 73 65 6c 66 2d 74 65 73 74 20 28 72  |UAM self-test (r|\$" "$T/err" ||
+    fail "dump: the banner's bytes are not shown: $(grep -A1 '^rule d' "$T/err")"
+
+# ---- delay ----------------------------------------------------------------------------------------
+# at once, the banner's first byte is replaced before it is printed; 20 ticks later is too late
+# for that byte, 20 ticks before the fourth byte goes out is in time for it (9 instructions a byte)
+$RUN --on 'pc=puts_,count=1,delay=20,set [a0]:1=0x58,set [a0+3]:1=0x5f' "$FW" </dev/null >"$T/out" 2>"$T/err" ||
+    fail "the self-test failed with a delayed rule"
+head -1 "$T/out" | grep -q '^UAM_self-test' || fail "delay: the banner is '$(head -1 "$T/out")', not UAM_self-test..."
+# a store on its way is in the snapshot: it happens after a load, and the snapshot needs the rule
+D='pc=puts_,count=1,delay=2000,name=late,set [p:0x80100000]:1=0x77'
+$RUN --on "$D" --snapshot-at run_test --save-snapshot "$T/d.snap" --break run_test "$FW" </dev/null >/dev/null 2>&1 || true
+[ -s "$T/d.snap" ] || fail "delay: no snapshot saved"
+$RUN --load-snapshot "$T/p.snap" --dump-mem p:0x80100000+1="$T/b.bin" "$FW" </dev/null >/dev/null 2>&1 || true
+[ "$(od -An -tx1 "$T/b.bin" | tr -d ' ')" = 00 ] || fail "delay: the byte is set without the rule"
+$RUN --on "$D" --load-snapshot "$T/d.snap" --dump-mem p:0x80100000+1="$T/b.bin" "$FW" </dev/null \
+    >/dev/null 2>"$T/err" || true
+[ "$(od -An -tx1 "$T/b.bin" | tr -d ' ')" = 77 ] || fail "delay: the store on its way did not happen after the load"
+rc=0; $RUN --load-snapshot "$T/d.snap" "$FW" </dev/null >/dev/null 2>"$T/err" || rc=$?
+[ "$rc" -eq 2 ] || fail "delay: a snapshot with a store on its way loaded without the rule (exit $rc)"
+for bad in 'pc=puts_,delay=5,stop' 'pc=puts_,delay=5,set a0=1,stop' 'pc=puts_,dump a0'; do
+    rc=0; $RUN --on "$bad" "$FW" </dev/null >/dev/null 2>"$T/err" || rc=$?
+    [ "$rc" -eq 2 ] || fail "--on '$bad': exit $rc"
+done
 
 echo "rules-check: ok"
