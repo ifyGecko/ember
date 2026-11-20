@@ -14,6 +14,8 @@
 #                 network frontend, a parallel campaign
 #   gdb           the gdb stub over the remote protocol
 #   runner        uam-run's debugging options, traces and --on rules
+#   link          links between emulations: a hub and two or three uam-test-run processes
+#                 in the free, loose and exact modes (tests/link/link-check.sh)
 #   bench         the cross-ISA benchmark's correctness run (tools/xbench.sh --check)
 #   fuzz-throughput  what a fuzz execution costs, against tests/fuzz/throughput.ref
 #
@@ -318,6 +320,14 @@ if have_x86
   # uam-run's debugging options (--log-pc, --dump-mem, --trace-after, traces with --jit)
   test('runner-options', sh, args: [files('runner/runner-check.sh'), uam_test_run, fw_x86['selftest']],
     suite: 'runner', kwargs: std)
+endif
+
+# Links between processes: a hub and emulations that talk through it.
+if have_rv
+  test('link-processes', sh,
+    args: [files('link/link-check.sh'), uam_link_hub, uam_run, uam_test_run, fw_rv['linktest'],
+           fw_rv['fuzztarget']],
+    suite: 'link', kwargs: std)
 endif
 
 # ... and its traces (--trace exc/blocks/mmio/sysreg/irq/console/dma, --history,
