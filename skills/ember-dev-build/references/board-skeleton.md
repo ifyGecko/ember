@@ -395,12 +395,16 @@ extra state; `snapshots.md` has the whole picture. What the board itself must do
 - The reset hook may re-place images: the loader writes through the bus, so the pages are
   tracked. A hook that writes a backing store directly calls `uam_bus_mark_dirty`.
 
-## Board options, named images, network ports
+## Board options, named images, network ports, link ports
 - `-o key=value` → `uam_board_config_option(cfg, "key")` (NULL if absent). Use options for
   variants (console on which UART, straps, chip revision) instead of rebuilding.
 - `--image name=path` → `uam_board_config_image(cfg, "name")`.
 - `--nic port=SPEC` → `uam_board_config_netdev(cfg, "port")`; NULL means the cable is
   unplugged: create the MAC anyway, report link down.
+- `--link port=HUB[,bus=BUS][,latency=TIME]` → `uam_board_config_link(cfg, "port")`, a
+  `uam_link_port *` for a device that talks to another emulation (`links.md`); NULL means
+  the option was not given: create the device anyway, with nothing on the wire. A port
+  nobody takes is reported by the runner (`nothing uses link port ...`).
 - `--console SPEC` → `cfg->console`, handed to exactly one UART model (a chardev has one
   frontend). The runner holds its input until the run starts, so fixed input
   (`string:`, `in=FILE`) survives the board's power-on reset and a `--load-snapshot`;

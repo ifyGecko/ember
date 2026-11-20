@@ -1,6 +1,6 @@
 ---
 name: ember-fuzz
-description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the emulation built with ember-dev-build works and the user wants to fuzz it, measure coverage (ember's own block coverage by default, site lists opt-in), replay or triage crashing inputs, or run ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites', 'cmplog'."
+description: "Fuzz firmware that already runs on an ember (UAM) board with ember's in-process, snapshot-based fuzz harness, on any ember ISA. Use when the ember-dev-build emulation works and the user wants to fuzz it, measure coverage (ember's own block coverage by default, site lists opt-in), replay or triage crashing inputs, or run ember's fuzz brain. Covers: the readiness gate (snapshot-exact, deterministic), the handler and begin/end pcs (Ghidra), input routes (a guest buffer, MMIO input rules, a board's named input, a link port), crash oracles (exception classes, crash pcs, interrupts, mem: redzones, --guard; cores without exceptions), --fuzz-replay smoke tests, coverage, campaigns (ember's brain over --fuzz-net, or uam/fuzz.h), crash dedup. Not for bring-up (ember-dev-build). Triggers: 'fuzz this firmware with ember', '--fuzz-begin', '--fuzz-replay', 'fuzz input route', 'uart0 input', 'coverage map', 'triage crashes', 'crash-guard', 'redzone', '--guard', 'fuzz brain', '--fuzz-net', '--cov-sites', 'cmplog'."
 ---
 
 # ember-fuzz: fuzzing firmware on a working ember board
@@ -41,6 +41,11 @@ Before anything else, check and **stop and hand back to ember-dev-build** if one
   equals the uninterrupted run, interpreter and JIT on either side (ember-dev-build
   `references/snapshots.md`). Every device needs `save`/`restore`; the harness cannot start
   otherwise;
+- the run is **not connected to a link hub**. Each input starts from the snapshot, and the
+  emulation at the other end of a hub does not go back with it; ember refuses such a run
+  (exit 2). A device that talks over a link is fuzzed through its port instead: leave the
+  port unconnected and make it the route, `--link bus0=none --fuzz-input bus0`
+  (`references/harness.md`, "Routes"). Fuzzing two live emulations together is not built;
 - the interpreter and `--jit` agree on the boot. If they don't, that is an ember bug to
   report, not something to fuzz around. (`--jit` compiles on x86-64 and AArch64 hosts;
   elsewhere it falls back to the interpreter and this check proves nothing.)

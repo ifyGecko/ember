@@ -88,16 +88,18 @@ is needed for the library and the runner.
 
 ```bash
 meson setup build                        # configure, once; the options: meson_options.txt
-meson compile -C build                   # build/uam-run, the libraries (build/libuam.a), the test programs
+meson compile -C build                   # build/uam-run, build/uam-link-hub, the libraries (build/libuam.a), the test programs
 meson test -C build                      # everything: unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32,
                                          # PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, the
                                          # external-board example, snapshot split runs (interpreter and JIT),
                                          # coverage and fuzzing checks, the gdb stub, the runner's debugging
                                          # options, the cross-ISA benchmark's checksums, fuzz throughput
-                                         # (and site lists, boundary files and the fuzz brain)
+                                         # (and site lists, boundary files and the fuzz brain), links
+                                         # between emulations and what a message costs
 meson test -C build --suite runner       # one group on its own: unit, firmware, mips, arm, x86, ppc, avr,
                                          # avr32, pic, mcs51, pic32, 6502, z80, xtensa, example, snapshot, cov,
-                                         # fuzz, fuzz-lists, gdb, runner, bench, fuzz-throughput
+                                         # fuzz, fuzz-lists, gdb, runner, link, bench, fuzz-throughput,
+                                         # link-throughput
 meson test -C build --list               # every test by name; `meson test -C build NAME` runs one
 meson compile -C build firmware          # every test firmware image (build/tests/firmware*/)
 meson compile -C build jitdiff-soak      # the JIT-against-interpreter differential test, at length
@@ -105,15 +107,16 @@ meson compile -C build xbench            # time the cross-ISA benchmark (docs/ji
                                          # arguments: -Dxbench_args="--per-kernel")
 meson compile -C build fuzz-throughput-record  # rewrite the figures the fuzz-throughput test checks against
                                          # (tests/fuzz/throughput.ref; on a quiet machine)
+meson compile -C build link-throughput-record  # the same for the link-throughput test (tests/link/throughput.ref)
 meson compile -C build net-check         # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
-meson install -C build                   # headers, libraries, uam-run and uam.pc (meson setup --prefix DIR)
+meson install -C build                   # headers, libraries, uam-run, uam-link-hub and uam.pc (meson setup --prefix DIR)
 ```
 
 `meson configure build` lists the options and `meson configure build -Dname=value` changes
 one: the toolchain prefixes of the test firmware (below), `buildtype`, `b_sanitize=address`,
 `c_args`, `-Dtests=false` (the library and the runner only), `-Djitdiff_blocks=N` (the
 length of `jitdiff-soak`), `-Dthroughput_ref=` (empty: the fuzz-throughput test only
-reports). The tests are registered one per check (`rv32-ref` self-test on the interpreter,
+reports), `-Dlink_throughput_ref=` (the same for link-throughput). The tests are registered one per check (`rv32-ref` self-test on the interpreter,
 on the JIT, each snapshot split, ...), run in parallel, and report failures by name; the
 full output of each is in `build/meson-logs/testlog.txt`. A test firmware is built only
 when its toolchain is found: the summary at the end of `meson setup` says which were, and
@@ -345,7 +348,8 @@ All of these are counted in virtual time, so runs stay deterministic.
 The other exit statuses: the firmware's own status when it ends the run (0-123 or 130; any other value exits 1), 2 usage or setup error
 (including a library/header ABI mismatch), 125 deadlock (waiting with nothing that could wake it),
 126 internal error or fetch-fault loop, 127 breakpoint or debug trap, 129 a `--guard`, the return
-guard or a guarded heap stopped the run, 130 SIGINT/SIGTERM, 131 `--unknown-mmio stop` stopped it at an unmapped access. `--fuzz-replay` has its own (20-25, above).
+guard or a guarded heap stopped the run, 130 SIGINT/SIGTERM, 131 `--unknown-mmio stop` stopped it at an unmapped access,
+132 the link hub went away (`--link`). `--fuzz-replay` has its own (20-25, above).
 
 ```bash
 build/uam-run -n 50000000 --max-ticks 1000000000 fw.elf   # bound both instructions and idle time
@@ -384,7 +388,8 @@ ones a bring-up step needs, all on stderr:
 | `irq` | each change of a processor's interrupt input lines; at the stop, each line's rises and falls and whether an interrupt is pending and enabled | "was the interrupt raised, did it reach the CPU, is it masked" |
 | `console` | each line the guest prints, with the icount and pc of its first byte | lining console output up with `--trace-after`, `--snapshot-at`, `-n N -d` |
 | `dma` | every DMA transfer a device makes: `dma: r 16 0x80001720 dram+0x1720 pc=.. icount=N` | descriptor rings and buffers of network, storage and DMA engines |
-| `all` | `exc,mmio,sysreg,irq,console,dma` | a first look at a short run |
+| `link` | every message a link port sends or hands to its device: `link p0 rx time=5003000 key=0x0 flags=0x0 kind=0 len=17 data=.. at=5003000 pc=.. icount=N` | what two emulations said to each other, and when (`docs/link.md`) |
+| `all` | `exc,mmio,sysreg,irq,console,dma,link` | a first look at a short run |
 
 `--trace-mmio-range LO:HI` limits the `mmio` trace (and its summary) to physical addresses in
 [LO, HI); with `-t mmio-summary` it gives the summary of that range without the per-access
@@ -601,8 +606,9 @@ backend, and a port left out is an unplugged cable. Backends:
 | `tap:[IFNAME]` | a Linux tap interface: a real Ethernet segment (bridge it, or give the tap an address) |
 | `tun:[IFNAME]` | a Linux tun interface (IP only) behind an adapter that answers ARP / IPv6 ND as one host-side station |
 | `tap-fd:FD`, `tun-fd:FD` | an interface already attached by a privileged launcher |
-| `udp:LPORT:RHOST:RPORT` | a UDP socket pair: a "cable" or radio "air" to another emulator |
-| `null` | a link with nothing on the other end |
+| `udp:LPORT:RHOST:RPORT` | a UDP socket pair: a "cable" or radio "air" to another emulator (frames shorter than 60 bytes arrive padded to 60; nothing is promised about time) |
+| `link:PORT` | a link port (`--link PORT=...`, below): frames at their exact length, to any number of emulations through a hub, with deterministic timing if the hub keeps it |
+| `null` | a cable with nothing on the other end |
 
 Append `,pcap=FILE` to record the port's traffic. The reference boards have no network
 ports (not every board of their architecture has one). The test board `rv32-test`
@@ -620,6 +626,43 @@ A host interface implies `--realtime`, because a guest network stack times out i
 time; `--virtual-time` keeps the run deterministic anyway. Boards built on the library get
 ports with `uam_board_config_netdev(cfg, "wan")`; devices reach guest memory with
 `uam_bus_dma_read` / `uam_bus_dma_write`.
+
+## Links between emulations
+
+A **link** connects emulated devices over any channel that is not Ethernet - a serial
+protocol, a field bus, a radio, a few wires - or over Ethernet when frames must keep their
+length or runs must be repeatable. It carries timestamped messages (a payload of exact
+length, a key, flags) between link **ports**; a **hub** routes them over named buses.
+ember ships the mechanism and no protocol: what a message means belongs to the device
+models at the ends. `docs/link.md` is the guide.
+
+```bash
+build/uam-link-hub unix:/tmp/hub.sock &                      # a hub: routes, and decides how time is kept
+build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name left  --nic net0=link:p0 a.elf &
+build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name right --nic net0=link:p0 b.elf
+```
+
+`--link PORT=HUB[,bus=BUS][,latency=TIME]` creates a port (`HUB`: `unix:PATH`,
+`tcp:HOST:PORT`, or `none` for a port that is not connected). It is used as a console
+(`--console link:PORT`: any UART talks over it), as a network port (`--nic NAME=link:PORT`),
+or by a device of the board's own (`uam_board_config_link(cfg, "name")`, then
+`uam_link_port_set_frontend` / `uam_link_send`). Each emulation needs its own
+`--link-name` on a hub.
+
+The hub decides how time is kept between the emulations (`uam-link-hub --sync MODE`):
+
+| MODE | what it guarantees | for |
+|---|---|---|
+| `free` (default) | nothing about time: a message is delivered when it arrives. Costs nothing. Two emulations drift apart in guest time unless both run with `--realtime` | real hardware or tools at the far end; protocols that tolerate any timing |
+| `loose[=TIME]` | no emulation runs more than TIME (1 ms) ahead of the others; late messages are flagged. Not deterministic | guest timeouts that must not fire spuriously |
+| `exact` | lockstep: every message is delivered at its time, the run is the same every time (guest state and `--trace link`). Every port needs a `latency=`, and `--nodes N` holds the clocks until all have joined | repeatable runs, regression tests, one snapshot of every emulation (`--link-stop-at TIME --save-snapshot` on each) |
+
+`uam-link-hub --bus NAME=p2p|broadcast|arbitrated[,slot=TIME]` gives a bus its medium
+(broadcast unless declared; on an arbitrated bus messages for the same time contend and
+the lowest key wins). A fuzz run is not connected to a hub; it leaves the port unconnected
+and feeds it: `--link bus0=none --fuzz-input bus0`. Several machines can also share a hub
+inside one process (`uam_link_world_run`). `uam-run` exits 132 when its hub goes away.
+`meson test -C build --suite link-throughput` measures what a message costs in each mode.
 
 ## Building a board on ember
 
@@ -864,21 +907,24 @@ into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agen
 
 ```
 include/uam/       public interfaces: common.h access.h ir.h isa.h bus.h device.h signal.h sched.h
-                   cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h
+                   cpu.h exec.h loader.h machine.h state.h snapshot.h chardev.h netdev.h link.h
                    blockdev.h host.h gdbstub.h runner.h boards.h pass.h cov.h cmp.h guard.h
                    rules.h frames.h heap.h fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
 include/uam/dev/   one header per device model
 include/uam/isa/   one header per ISA module (riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h
                    pic.h mcs51.h m6502.h z80.h xtensa.h)
 src/ir/            IR builder, verifier, printer, block optimizer, pass pipeline
-src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams
+src/core/          bus, scheduler, logging, chardev/netdev plumbing, state streams, links (ports,
+                   nodes, timed delivery)
 src/exec/          interpreter, translation cache, run loop, the JIT (jit.c: analyses, arena,
                    linking; code generators jit_x86.c and jit_a64.c), coverage, spin-loop
                    skipping
 src/loader/        ELF / raw loaders
 src/machine/       machine lifecycle, resets, board registry, snapshots, guards, call tracking,
                    the guarded heap
-src/host/          chardev/netdev/block-device backends, host loop, real-time pacing
+src/host/          chardev/netdev/block-device backends, host loop, real-time pacing; the link hub
+                   (link_hub.c), links between processes (link_wire.c), a port as a chardev or
+                   netdev (link_adapters.c)
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
 analysis/          IR passes (cov.c: coverage; cmp.c: compare logging; frames.c: call tracking)
@@ -950,6 +996,7 @@ boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    parts, the only files that pair an ISA with devices; mmio_rules.c:
                    per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
+tools/uam-link-hub.c  uam-link-hub: a link hub as a process (docs/link.md)
 tools/             also xbench.sh / jitbench.sh (timing),
                    jitprof.py (native-code profiles; docs/jit-perf.md)
 meson.build        the build (meson_options.txt: its options; tests/meson.build: the tests;
@@ -1021,4 +1068,6 @@ tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard
 tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC, a meson project of
                    its own (meson test -C build --suite bench, meson compile -C build xbench)
 tests/net/         net-check.sh: the network test against real tap/tun interfaces
+tests/link/        link-check.sh: a hub and two or three emulations in every mode; throughput.py:
+                   what a message costs (meson test -C build --suite link, link-throughput)
 ```

@@ -1,6 +1,6 @@
 ---
 name: ember-dev-build
-description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC board, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, make a board snapshot-capable, or debug a stalled bring-up (exit 124/125/126/128/129/131, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (meson project pinning ember, one file per device, a wiring-only board); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
+description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, connect emulations over any channel (--link, uam-link-hub: serial, bus, radio), make a board snapshot-capable, or debug a stalled bring-up (exit 124-132, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (meson project, one file per device); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
 ---
 
 # ember-dev-build: iterative firmware bring-up on ember
@@ -21,7 +21,10 @@ writing it. **For a PC (x86-64: UEFI, coreboot or a legacy BIOS) also read
 `references/pc-platform.md`** before the first run: the PC template, the chipset layer, the
 boot phases and their typical blockers, and the tested chipset examples in
 `references/examples/pc/`. `references/snapshots.md` covers what a board owes ember's
-snapshots and using them to skip a long boot. Once the emulation is functional, fuzzing it
+snapshots and using them to skip a long boot. **When the firmware talks to another device**
+(a second MCU, a bus with several nodes, a radio) read `references/links.md`: connecting
+two or more emulations through a link hub, a device model on a link port, and the three
+ways of keeping time between them (free, loose, exact). Once the emulation is functional, fuzzing it
 is a separate step: the **ember-fuzz** skill.
 
 Script paths are relative to this skill's directory, `skills/ember-dev-build/` in the ember
@@ -150,7 +153,8 @@ built, not the project's `subprojects/ember`).
    timer/interrupt not modelled or wired), 128 livelock (a timer fires but its interrupt
    never reaches the CPU), 126 fetch-fault loop, internal error, or a reset nothing handles,
    127 breakpoint or debug trap, 129 a `--guard` hit, 130 interrupted, 131 an unmapped access
-   under `--unknown-mmio stop`, 2 setup error (a bad option, an unknown trace or register
+   under `--unknown-mmio stop`, 132 the link hub went away (`--link`, `references/links.md`),
+   2 setup error (a bad option, an unknown trace or register
    name; `abi:` = rebuild with `build-ember.sh`); any other status is the firmware's own,
    through a finisher (1 to 123 as given; one outside that range is reported as 1).
    An AVR, 8-bit PIC, 8051, 6502 or Z80 has no bus error: a `core halted` line before a 125
@@ -189,7 +193,8 @@ built, not the project's `subprojects/ember`).
      everything that ran in a region. The table "Who touches this address?" in
      `references/diagnostics.md` has each case and what each switch does not see;
    - *a return into garbage, a crash far from its cause?* `--guard-returns` with
-     `--backtrace`; *network traffic?* `--nic PORT=SPEC,pcap=FILE`.
+     `--backtrace`; *network traffic?* `--nic PORT=SPEC,pcap=FILE`; *what two
+     emulations said to each other?* `-t link` on both.
    Ember answers these directly: before scripting gdb, adding prints to a device or
    bisecting with `-n`, check "Do not take the hard route" in that file. When no switch
    fits, its section 7 covers diagnostics in the board itself (`uam_log`,

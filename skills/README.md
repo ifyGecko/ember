@@ -109,7 +109,8 @@ skills/
                                 registered.sh, boot.sh, board.c.in, board-pc.c.in, board.h.in,
                                 main.c.in, master_abort_log.{c,h}
                     references/  organization, iteration-loop, diagnostics, board-skeleton,
-                                 device-anatomy, snapshots, pc-platform, examples/ (tested device models;
+                                 device-anatomy, snapshots, links (emulations connected through a
+                                 link hub), pc-platform, examples/ (tested device models;
                                  examples/pc/ a Q35-class chipset)
   ember-fuzz/       SKILL.md
                     scripts/  replay_summary.py

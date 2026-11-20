@@ -125,10 +125,17 @@ taken is host state, not snapshot state: never leave a step pending into the ite
 | a board input (`uart0`, ...) | the board's published input function: bytes queued as if received | the input really arrives through a device: most faithful, exercises the driver |
 | `mem:ADDR[,len=ADDR][,max=N][,reject]` `[,before=N[:DIR]][,after[=N][:DIR]][,extent=@OFF:SZ[:le\|:be][+D\|-D]]` | written at virtual ADDR as a store translates it (truncated to N, default 4096; `reject` refuses longer ones), optionally its length as a 32-bit word in the CPU's byte order; optional redzones around the buffer ("Redzones" below) | a handler that takes a buffer and length: quickest, skips the driver |
 | `mmio` | the stream `--mmio-rule ADDR=input,width=N` registers read (`--mmio-input` for a plain run) | firmware that reads its input straight from device registers |
+| a link port (`--link PORT=none`, then `--fuzz-input PORT`) | the input's records, each a 16-bit little-endian length and that many payload bytes, are handed to the port's device as messages, in order (a record that runs past the end takes what is left; under two bytes: one message). Nothing is dropped: what the device has no room for waits | the input arrives over a link (ember-dev-build `references/links.md`): a bus controller or radio model of the board's own, a UART behind `--console link:PORT`, a NIC behind `--nic NAME=link:PORT`. One record is one frame, so the mutator varies frame boundaries too |
 
 A route that cannot deliver an input (too long for its buffer) returns `UAM_ERR_REJECTED`:
 verdict *rejected*, nothing runs, the campaign goes on. Any other error stops the campaign
 (exit 2).
+
+A link port's messages carry key 0 and no flags. When the target tells frames apart by an
+identifier or a flag (an arbitration ID, an error frame), have the board publish an input
+of its own (`uam_machine_add_input`) that parses the fuzz bytes into key, flags and payload
+and calls `uam_link_port_inject(port, &msg, 0)` for each. A fuzz run cannot be connected to
+a hub (the gate in SKILL.md).
 
 Every stock reference board publishes its console UART as `uart0` (the 8051 board its
 serial port), except the x86-64 PC board, whose is `com1`. Those feeds drop what does not

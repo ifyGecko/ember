@@ -1,9 +1,11 @@
 /*
- * uam/host.h - The host side: chardev/netdev backends and the host loop.
+ * uam/host.h - The host side: chardev/netdev backends, link hubs and their
+ * transports, and the host loop.
  *
  * Nothing in the machine depends on this header. Devices see only the
- * chardev.h / netdev.h interfaces; a program (uam-run, a fuzzer, an external
- * runner) chooses backends here and attaches a host loop to the executor.
+ * chardev.h / netdev.h / link.h interfaces; a program (uam-run, a fuzzer, an
+ * external runner) chooses backends here and attaches a host loop to the
+ * executor.
  *
  * Pacing:
  *   UAM_PACE_VIRTUAL  (default) virtual time never waits for the host. Idle

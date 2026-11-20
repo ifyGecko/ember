@@ -16,7 +16,7 @@ fails, naming the culprit:
 | take: `device X (type) has no save/restore` | implement `save`/`restore` in its ops (`device-anatomy.md`, "Snapshots"), or set `.flags = UAM_DEVICE_STATELESS` if it really holds no guest-visible state |
 | take: `an armed timer (deadline N) is not saved by its owner` | the device that arms it must `uam_state_put_timer` / `uam_state_get_timer` it |
 | restore: `X left N bytes of its saved state unread (save and restore disagree)`, `state ends early`, `saved array is N bytes, expected M`, `... is N in the snapshot but M in this machine` | the device's `save` and `restore` read different fields, or its layout changed since the snapshot was taken: fix the pair, then take a new snapshot |
-| restore: `snapshot is of board ...`, `memory region N differs`, `snapshot holds state for 'X', which this machine ...` | load with the same board build, `-o` options, `--image`s, `--ram`, `--mmio-rule`s and `--nic` ports the snapshot was taken with |
+| restore: `snapshot is of board ...`, `memory region N differs`, `snapshot holds state for 'X', which this machine ...` | load with the same board build, `-o` options, `--image`s, `--ram`, `--mmio-rule`s, `--nic` ports and `--link` ports the snapshot was taken with |
 
 What the snapshot covers by itself: RAM/ROM/ROMD contents (and each ROMD region's mode),
 every processor's state (registers, CP0/CSRs/SPRs/MSRs, TLBs), virtual time, every device's `save` stream, extra state
@@ -30,6 +30,11 @@ and anything a board or device keeps outside those. So:
 - **Direct writes to a backing store** (`region->host`, `uam_bus_romd_backing`) are reported
   with `uam_bus_romd_dirty` / `uam_bus_mark_dirty`. Otherwise an incremental restore (it only
   copies back dirty 4 KiB pages) silently keeps the guest's change.
+- **Link ports** (`links.md`): what waits in a port is saved by ember (`link-NAME`), what a
+  device took out of it is the device's own state. A snapshot taken with `--link` ports
+  loads only with the same ports. While connected to a hub, a snapshot holds this
+  emulation alone, unless the hub keeps exact time and every emulation is stopped at the
+  same moment (`--link-stop-at TIME --save-snapshot FILE` on each).
 - **HLE hooks are configuration**: a board installs the same hooks on every build, so they
   hold after a restore. A hook that keeps its own counters registers them as extra state.
 

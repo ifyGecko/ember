@@ -43,6 +43,7 @@ depends on what kind of address X is. All of them name the pc and the icount of 
 | code | every arrival, with registers | `--log-pc ADDR[,REG...]`; `--break ADDR -d` to stop there; `-t blocks --trace-range LO:HI` for a region |
 | an address nothing decodes | the first access, stopped before it happens | `--unknown-mmio stop` (exit 131); `zero` logs each first access and goes on |
 | a system register (CSR, CP0, CP15, SPR, MSR) | who reads or writes it, and what | `-t sysreg` (first of each) or `-t sysreg-all` |
+| a message to or from another emulation (`--link`) | every one a port sends or hands to its device, with its time and the guest pc | `-t link` on each emulation; `uam-link-hub --log` for what the hub routed and refused |
 
 What `--watch` and `--guard` cover: data accesses of the processors, on any kind of
 region (RAM, ROM, a ROM device, a device's registers). They do not see instruction
@@ -131,6 +132,7 @@ addresses in [LO, HI); given without either, it turns the `mmio` trace on.
 | `--snapshot-at PC --save-snapshot F` / `--load-snapshot F` | bookmark a state and start later runs there | skip a long boot; trace only the part you are working on |
 | `--dump-mem ...=FILE` | the same bytes written raw to FILE | code or data the firmware built in RAM (a stage it decompressed or relocated), to load into Ghidra at that address |
 | `--nic PORT=SPEC,pcap=FILE` | records every frame of that network port in a pcap file | what the guest sent and received, read with any pcap tool |
+| `-t link` | one line per message of a `--link` port: `link bus0 tx time=.. key=0x.. flags=0x.. kind=0 len=N data=.. pc=.. icount=N` when the guest sends, `rx ... at=..` when the device gets it (`at`: this emulation's time; `time`: when it took effect; bit 2 of `flags`: it came late) | what two emulations said to each other and when; under an exact hub the trace is the same every run, so `diff` two runs (`links.md`) |
 | `--gdb PORT` (`scripts/gdb_trace_calls.py`) | a gdb remote stub: breakpoints, `watch`/`rwatch`/`awatch` (on RAM and on device registers), single-step, reading **and writing** registers and memory, one gdb thread per processor | interactive digging; call tracing without stopping the guest; changing a register or a RAM word by hand to test "would it get past if this were V" |
 | `-v` / `-v -v` | more logging: `-v` shows `info` lines (`mmio-stub` first accesses), `-v -v` `debug` lines (POST codes on a PC); your own `uam_log` lines follow the same levels (section 7) | |
 

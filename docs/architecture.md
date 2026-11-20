@@ -61,12 +61,13 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `blockdev.h` | Fixed-size sectors between a storage controller (AHCI, NVMe, IDE, floppy) and the host: read, write, flush; read-only and volatile (in-memory overlay) modes | core interface; the file backend in `src/host` |
 | `chardev.h` | Byte streams between a device and the host (UART consoles); input can be held back until the run starts (`uam_chardev_hold`); one tap on guest output (`uam_chardev_set_tap`: `--trace console`) | core plumbing; backends in `src/host` |
 | `netdev.h` | Ethernet frames between a device and the host (NICs, switches, radio "air") | core plumbing; backends in `src/host` |
-| `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports), extra snapshot state (`uam_machine_add_state`), named inputs a board publishes (`uam_machine_add_input`: a UART FIFO, a DMA buffer), extra processors (`uam_machine_add_cpus`: each with its own translation cache, sharing bus and clock; `uam_machine_current_cpu` for per-processor devices) and observers on all of them (`uam_machine_add_pc_hook`, `_set_exc_hook`, `_set_irq_hook`, `_add_pass`, `_set_coverage` with a coverage history per processor, `_get_stats`), ABI handshake | `src/machine`, `boards/*` |
+| `link.h` | Links: timestamped messages (a payload of exact length, a key, flags, a kind; no protocol) between a device model and whatever it is connected to. Ports with a frontend and an unbounded queue; a node per machine with its clock (ticks to the hub's time unit and back), delivery at a message's time as the last thing at its tick, the grant it may run to and the waiting for more (an idle machine's promise to stay quiet), its saved state; the transport interface a hub connection implements. Three ways of keeping time, the hub's choice: free (default), loose, exact (see [`link.md`](link.md)) | `src/core/link.c`; hubs and transports in `src/host` |
+| `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports, named link ports), extra snapshot state (`uam_machine_add_state`), named inputs a board publishes (`uam_machine_add_input`: a UART FIFO, a DMA buffer), extra processors (`uam_machine_add_cpus`: each with its own translation cache, sharing bus and clock; `uam_machine_current_cpu` for per-processor devices) and observers on all of them (`uam_machine_add_pc_hook`, `_set_exc_hook`, `_set_irq_hook`, `_add_pass`, `_set_coverage` with a coverage history per processor, `_get_stats`), ABI handshake | `src/machine`, `boards/*` |
 | `snapshot.h` | Machine snapshots: take / restore in memory (incremental against the last baseline), save / load files | `src/machine` |
 | `cpu.h` | ISA-neutral hart state (including the coverage state `UAM_OP_COV` counts into, and `insn_pc`, the instruction a bus, system register or helper access is made for), the core services ISA modules may call (`uam_cpu_xlate_changed`, ...), and observers of system register accesses, interrupt input lines, exceptions taken and interrupt handlers entered (`uam_cpu_observer`: `--trace sysreg`, `--trace irq`, the `--trace exc` summary) | the core |
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
 | `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), compare logging (`uam_exec_set_cmp`, `uam_exec_cmp_attach`: the compare pass and the state `CMPLOG` reports to), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), an execution history ring (`uam_exec_set_history`: `--history N`), stops at the faulting instruction, requested from inside a refused access (`uam_exec_request_fault_stop`, `uam_exec_request_stop_at_fault`: guards with `UAM_STOP_GUARD`, `--unknown-mmio stop`), a callback at the next instruction boundary, requested from inside an access (`uam_exec_request_call`: access rules), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics, the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
-| `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing | `src/host` |
+| `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing; for links: a node's binding to its machine (clock, snapshot state, a named input per port), the hub (buses and their media, granting in the loose and exact modes, members), the connection of a node to a hub in another process and the server side of it, several machines on one thread (`uam_link_world_run`), a port as a chardev or a netdev, the host loop's part (servicing the connection; where an idle machine waits for its grant) | `src/host` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
 | `boards.h` | The stock boards and their registration, and board helpers (`uam_board_add_mmio_rules`, `uam_board_add_uart_input`, `uam_board_open_disk`) | `boards/stock.c`, `boards/mmio_rules.c` |
@@ -104,21 +105,26 @@ isa/*         → ir, isa.h, state.h      (x86 and PowerPC page-table walks also
 exec/*        → ir, isa.h, cpu.h, bus.h, sched.h, state.h, exec.h, pass.h, cov.h, cmp.h,
                 frames.h (it wires passes in and holds the state they report to)
 analysis/*    → ir, pass.h, cov.h, cmp.h, frames.h (never an ISA or a device)
-core (bus, sched, signal, chardev, netdev, state) → their own headers only
+core (bus, sched, signal, chardev, netdev, link, state) → their own headers only
                                          (bus: also device.h, whose ops it calls; state.h: also
-                                         sched.h and signal.h, whose objects it saves)
+                                         sched.h and signal.h, whose objects it saves; link: also
+                                         sched.h for its clock and timers and state.h for what
+                                         it saves)
 machine       → public interfaces        (it composes them; loader → loader.h, isa.h, bus.h)
-devices/*     → device.h, signal.h, sched.h, chardev.h, netdev.h, blockdev.h, state.h,
+devices/*     → device.h, signal.h, sched.h, chardev.h, netdev.h, link.h, blockdev.h, state.h,
                 other uam/dev/*.h,
                 bus.h (DMA, the backing store of a ROMD region it owns, a PCI bus's BAR windows)
                                          (never ir, never an ISA, never the host)
 boards/*      → everything public except host.h; the only place concrete modules meet
-host/, debug/ → public interfaces (chardev, netdev, blockdev, exec, machine, guard); never a concrete device
+host/, debug/ → public interfaces (chardev, netdev, link, blockdev, exec, machine, guard); never a concrete device
 runner, fuzz/, tools/ → boards + public headers
 ```
 
 The consequences are deliberate:
 
+- A link knows no protocol: the hub routes by bus and arbitrates by a key it does not
+  interpret, and what a message means is the business of the device models at its ends.
+  A machine with no link port has no link code on any path and unchanged snapshots.
 - A device never knows which CPU is driving it, nor which host backend is behind its chardev.
   For a log line it may ask `uam_origin_get` (`common.h`) which instruction is behind the
   current access: a processor number, a pc and an icount the executor publishes while it
@@ -146,7 +152,7 @@ Implemented:
 
 ```
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
-                  loader.h machine.h chardev.h netdev.h host.h gdbstub.h runner.h boards.h
+                  loader.h machine.h chardev.h netdev.h link.h host.h gdbstub.h runner.h boards.h
                   state.h snapshot.h pass.h cov.h cmp.h blockdev.h guard.h rules.h frames.h heap.h
                   uninit.h
                   fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
@@ -158,7 +164,8 @@ include/uam/dev/  clint.h plic.h gic.h uart16550.h test_finisher.h unknown_mmio.
 include/uam/isa/  riscv.h mips32.h arm.h x86.h ppc.h avr.h avr32.h pic.h mcs51.h m6502.h z80.h
                   xtensa.h
 src/ir/           builder.c verify.c print.c opt.c pass.c ir_eval.h
-src/core/         bus.c sched.c common.c chardev.c netdev.c state.c
+src/core/         bus.c sched.c common.c chardev.c netdev.c state.c link.c (ports, nodes, timed
+                  delivery, grants, a node's saved state)
 src/exec/         interp.c tcache.c run.c cpu.c jit.c jit_x86.c jit_a64.c coverage.c cmp.c frames.c spin.c jit.h
                   jit_impl.h execops.h spin.h
 analysis/         cov.c (the edge-coverage pass) cmp.c (the compare pass) frames.c (the frame pass)
@@ -168,6 +175,9 @@ src/machine/      machine.c snapshot.c guard.c (guards, on bus fault watches) ru
                   and the return guard for a machine) heap.c (the guarded heap) uninit.c (the
                   written-page record and the fill for --fuzz-uninit)
 src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.c
+                  link_node.c (a node in a machine) link_hub.c (the hub: routing, granting; several
+                  machines on one thread) link_wire.c (the wire protocol, the node's transport,
+                  the hub's server) link_adapters.c (a port as a chardev or a netdev)
 src/debug/        gdbstub.c
 src/runner/       runner.c trace.c trace.h (the --trace kinds, --history, the summaries)
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
@@ -216,8 +226,8 @@ fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists an
                   fuzz_crashes.py (which saved crash the brain minimizes, and when)
                   fuzz_launch.py (a parallel campaign of brain + ember workers)
                   status_tui.py (its status screen) cov_region.py (reads a coverage region)
-tools/            uam-run.c xbench.sh jitbench.sh (timing) jitprof.py (native-code profiles,
-                  docs/jit-perf.md)
+tools/            uam-run.c uam-link-hub.c (a link hub as a process) xbench.sh jitbench.sh (timing)
+                  jitprof.py (native-code profiles, docs/jit-perf.md)
 examples/         external-board/ (an out-of-tree board project in the prescribed layout, built
                   with ember as its meson subproject)
 skills/           ember-dev-recon/ ember-dev-build/ ember-fuzz/ (agent skills: SKILL.md, scripts,
@@ -254,6 +264,12 @@ tests/fuzz/       fuzz-check.sh fuzztarget.h  (the harness on planted-bug firmwa
                   session: the UNINIT frame, uninit/ saved and replayed)
                   throughput.py throughput.ref  (executions per second against recorded
                   figures: the fuzz-throughput suite)
+tests/link/       link-check.sh  (a hub and two or three emulations of tests/firmware/linktest.c:
+                  free, loose and exact; exact runs identical in every run and on every backend;
+                  bytes through a console link; refusals; hub loss; one snapshot of both, resumed;
+                  fuzzing through a port)
+                  throughput.py throughput.ref  (what a message costs in each mode against
+                  recorded figures: the link-throughput suite)
 tests/snapshot/   snapshot-check.sh  (split runs through --save-snapshot / --load-snapshot)
 tests/runner/     runner-check.sh  (uam-run's debugging options: --log-pc, --dump-mem,
                   --trace-after, traces with --jit, --guard/--watch)
@@ -269,7 +285,9 @@ tests/bench/      bench.c meson.build x86-start.S x86.ld pic32.ld  (one C benchm
                   but the 8-bit PIC, a meson project of its own; `meson test --suite bench`
                   checks it, tools/xbench.sh times it)
 tests/firmware/       start.S selftest.c nettest.c smpstart.S smptest.c fuzztarget.c irqtarget.c
-                      heaptarget.c consoletest.c consoletest.script link.ld  (RISC-V; the console test: scripted input)
+                      heaptarget.c consoletest.c consoletest.script linktest.c link.ld  (RISC-V; the
+                      console test: scripted input; linktest: two of them exchange frames or UART
+                      bytes over a link)
 tests/net/            net-check.sh  (nettest.elf against real tap and tun interfaces)
 tests/firmware-mips/  start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (MIPS32)
 tests/firmware-arm/   start.S selftest.c smpstart.S smptest.c fuzztarget.c link.ld  (ARMv7: ARM and
@@ -802,7 +820,8 @@ devices.
 Done outside the plan: MIPS32 (CP0, TLB, both byte orders), ARMv7-A (ARM and Thumb-2, CP15,
 short-descriptor MMU, generic timer, a GIC, little-endian and BE8), x86-64, 32-bit PowerPC (FPU,
 OEA MMU, decrementer; and Book E), 8-bit AVR, AVR32, 8-bit PIC, PIC32, the 8051, the 6502,
-the Z80, Xtensa, host networking, a gdb stub, the library build with
+the Z80, Xtensa, host networking, links between emulations (a hub, three ways of keeping
+time, in one process or several), a gdb stub, the library build with
 an ABI handshake. ARMv7-M (the M-profile NVIC exception model) is still planned.
 
 ## 8. Verification
@@ -1009,6 +1028,14 @@ Implemented (`meson test -C build`):
   and `CMPLOG` on every ISA's loop under the interpreter, the JIT and the JIT without
   chaining (identical logs, runs unchanged). `fuzz-check.sh` adds a planted bug behind a
   32-bit magic value to every board's fuzz target.
+- Links: `test_link` checks ports and queues, delivery at a message's time and its order
+  among timers, waiting for grants running and idle, a node's saved state, the hub's
+  routing over each medium, its grants in the exact and loose modes, arbitration, and two
+  machines in one process whose exact runs are identical on the interpreter and the JIT
+  and however the run is cut. `tests/link/link-check.sh` (`--suite link`) does the same
+  between processes through `uam-link-hub`, with one snapshot of both emulations resumed
+  on a new hub; `tests/link/throughput.py` (`--suite link-throughput`) holds what a message
+  costs in each mode to recorded figures.
 - The external-board example is built and run against the library.
 - Cross-ISA benchmark: `meson test -C build --suite bench` builds `tests/bench/bench.c` for every reference
   board but `pic-ref` (RV32, MIPS32 BE/LE, ARM, Thumb-2 LE and BE8, PowerPC, x86-64, AVR, AVR32A

@@ -6,7 +6,7 @@
 #                 ember header except uam/host.h (the runner owns the host side)
 #   device files  everything else                    may include only the device-side
 #                 interfaces: common.h access.h device.h signal.h sched.h chardev.h
-#                 netdev.h blockdev.h state.h bus.h, stock device headers (uam/dev/*.h), and
+#                 netdev.h link.h blockdev.h state.h bus.h, stock device headers (uam/dev/*.h), and
 #                 other device headers of this project - never an ISA, the CPU, the
 #                 executor, the IR, the machine, the loader, the host, or a board header.
 #
@@ -21,7 +21,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in --proj) P="$2"; shift 2;; -h|--help) sed -n '2,16p' "$0"; exit 0;; *) _die "unknown argument: $1";; esac
 done
 PROJ="$(resolve_proj "$P")"
-ALLOWED='^uam/(common|access|device|signal|sched|chardev|netdev|blockdev|state|bus)\.h$|^uam/dev/[A-Za-z0-9_]+\.h$'
+ALLOWED='^uam/(common|access|device|signal|sched|chardev|netdev|link|blockdev|state|bus)\.h$|^uam/dev/[A-Za-z0-9_]+\.h$'
 bad=0
 shopt -s nullglob
 for f in "$PROJ"/emulation/*.[ch]; do

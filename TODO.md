@@ -1,7 +1,8 @@
 # TODO
 
-Capabilities ember's fuzz layer does not have yet. Each entry says what is missing, why it
-matters and where it would go. Nothing here is started.
+Capabilities ember does not have yet: its fuzz layer first, then links between emulations.
+Each entry says what is missing, why it matters and where it would go. Nothing here is
+started.
 
 ## Coverage you can read
 
@@ -113,3 +114,35 @@ inputs, after restores stopped dropping translations:
 - A device's `restore` reads its state field by field (an interrupt controller's arrays one
   word at a time); a machine with many devices pays for all of them per input.
 - The figures are recorded for x86-64 only.
+
+## Links between emulations
+
+`docs/link.md` describes what there is: ports, a hub, free/loose/exact time, one process
+or several. Not built:
+
+- **Fuzzing several live emulations together.** A fuzz run restores its snapshot for every
+  input, and the other end of a hub does not go back with it, so `uam-run` refuses to
+  fuzz while connected; today the port is the input (`--fuzz-input PORT`). Fuzzing a pair
+  needs the harness to take and restore one snapshot of several machines per input, which
+  is only cheap in one process: `uam_fuzz` over a `uam_link_world`, with a say in whose
+  coverage counts (the target's, or everyone's) and a crash identity that names the machine.
+- **Several machines on several host threads.** One process, one thread works
+  (`uam_link_world_run`). Threads need the process globals out of the way first: the log
+  threshold and origin provider (`src/core/common.c`), the receive buffer shared by the
+  fd netdev backends (`fdn_poll`), the PowerPC list of all harts.
+- **`uam-run` driving more than one machine.** The runner is one machine per process by
+  design (its signal handling, traces and fuzz setup assume it); several machines in one
+  process are a library facility.
+- **A machine on more than one hub that keeps time.** Each node waits for its own hub, and
+  a node waiting on one does not report to the other, so two timed hubs can end up waiting
+  for each other. Several buses on one hub cover the need; lifting this means reporting to
+  every hub whenever the machine waits.
+- **Telling the hub that a busy node will not send.** With both guests busy, lockstep is
+  one round trip per latency of guest time (`tests/link/throughput.py`, exact-busy). A
+  device model that knows it cannot transmit before some time could say so and widen its
+  neighbours' grants; rollback (optimistic) synchronisation on top of snapshots is the
+  other way out.
+- **A shared-memory transport** between processes on one host, and **a converter from the
+  hub's log to pcapng** with a link type of the user's choosing.
+- **A scheduler query for "the next timer other than this one".** The node walks
+  `uam_sched.head` for it, which a scheduler that is not a list would have to offer itself.

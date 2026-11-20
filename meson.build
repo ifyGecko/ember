@@ -11,8 +11,8 @@
 # revision - or, installed, through pkg-config (`uam`).
 #
 # Libraries, one per module group (each is also contained in libuam.a):
-#   libuam-core.a     IR, bus, scheduler, signals/chardev/netdev plumbing, executor, analysis passes,
-#                     loader, machine
+#   libuam-core.a     IR, bus, scheduler, signals/chardev/netdev plumbing, links (ports and
+#                     nodes), executor, analysis passes, loader, machine
 #   libuam-riscv.a    RISC-V ISA module          libuam-mips.a   MIPS32 ISA module
 #   libuam-arm.a      ARM (AArch32) ISA module   libuam-ppc.a    32-bit PowerPC ISA module
 #   libuam-x86.a      x86-64 ISA module
@@ -23,7 +23,8 @@
 #   libuam-xtensa.a   Xtensa (LX106, LX6, LX7; little- and big-endian) ISA module
 #   libuam-devices.a  stock device models        libuam-boards.a stock boards (rv32-ref, mips-ref, ...)
 #   libuam-fuzz.a     the fuzz harness and its frontends (fuzz/)
-#   libuam-host.a     host backends, gdb stub, the stock runner (uam_run_main; uses libuam-fuzz)
+#   libuam-host.a     host backends, the link hub and its transports, gdb stub, the stock
+#                     runner (uam_run_main; uses libuam-fuzz)
 
 project('ember', 'c',
   version: '0.2',

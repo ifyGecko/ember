@@ -303,6 +303,11 @@ Do this for **every stage** (each run with its own `--report` and `--out`, above
   registers can sit inside another block's window.
 - **Inputs** (buttons, straps): record the active polarity, so ember's read-as-zero default is
   known to be safe.
+- **Channels to another device** (a second MCU on a UART or SPI, a field bus, a radio, a
+  host controller): name the peripheral, the protocol if the strings or framing code give
+  it away, and whether the firmware waits for the peer during boot. With the peer's
+  firmware at hand, ember can run both and connect them (`--link`, ember-dev-build's
+  `references/links.md`); without it, the wait is a blocker the build phase has to answer.
 - Pages that are only stored to and loaded from (magics, counters) may be **on-chip SRAM**,
   not a peripheral.
 - **Check the table against a run** when a bare board can execute the stage: `-t

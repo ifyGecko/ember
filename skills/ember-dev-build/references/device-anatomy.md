@@ -122,7 +122,7 @@ when cut by `--save-snapshot` / `--load-snapshot` at any point.
 
 ### What a device may use
 Only the device-side interfaces: `uam/common.h access.h device.h signal.h sched.h chardev.h
-netdev.h blockdev.h state.h bus.h`, the stock device headers `uam/dev/*.h`, and other device
+netdev.h link.h blockdev.h state.h bus.h`, the stock device headers `uam/dev/*.h`, and other device
 headers of the project (`check-layering.sh` enforces this). Everything else comes from the board as a
 parameter:
 
@@ -134,6 +134,7 @@ parameter:
 | an input (interrupt controller, GPIO) | a sink function in its header | `void x_input(void *ctx, unsigned n, int level)` |
 | console | `uam_chardev *` | `uam_chardev_write`, `uam_chardev_set_frontend`, `uam_chardev_accept_input` |
 | network | `uam_netdev *` | `uam_netdev_send`, `uam_netdev_set_frontend`, `uam_netdev_accept_input` |
+| another emulation, over any channel | `uam_link_port *` | `uam_link_send`, `uam_link_port_set_frontend`, `uam_link_accept_input` (`links.md`) |
 | guest memory (DMA) | `uam_bus *` | `uam_bus_dma_read/write` (physical addresses) |
 | end the run | `uam_finish_fn` + ctx | the board passes `uam_machine_stop_cb, m` |
 | a clock rate | a number | e.g. ticks per counter increment |
@@ -293,8 +294,19 @@ uam_netdev_accept_input(nd);              /* the driver returned RX buffers: del
 a user + network namespace (`unshare -Urn`, then `ip tuntap add dev tap0 mode tap`), exactly
 as ember's `tests/net/net-check.sh` does; run `ping`/`busybox udhcpc`/`wget` there as the
 client. `,pcap=build/lan.pcap` records a port. `udp:LPORT:RHOST:RPORT` cables two emulators
-together. A host interface makes the runner pace virtual time to the host clock
+together (frames under 60 bytes arrive padded, no time is kept); `--nic NAME=link:PORT`
+puts the port on a link instead: exact frame lengths, any number of emulations, and
+repeatable timing if the hub keeps it (`links.md`). A host interface makes the runner pace virtual time to the host clock
 (`--virtual-time` keeps it deterministic).
+
+## A device that talks to another emulation
+When the far end of a channel is another emulated board (a second MCU on a serial line or
+a field bus, a radio peer), the device model takes a **link port** from the board and
+exchanges messages through it: `uam_link_send(port, key, flags, UAM_LINK_DATA, bytes, len)`
+when the guest transmits, a `receive` callback for what arrives, `uam_link_accept_input`
+when its FIFO has room again. Ember carries the bytes, a 64-bit key and flags and knows no
+protocol; framing, addressing, acknowledges and error states are the model's. `links.md`
+has the pattern, the hub, and how time is kept between the emulations.
 
 ## Buses without MMIO (MDIO, I2C-like side channels)
 Ember has no generic side bus. Define a tiny C interface in its own header (a device

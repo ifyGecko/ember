@@ -200,6 +200,7 @@ map. That is intended: it does not depend on the input.
 | `mem:ADDR[,len=ADDR][,max=N][,reject]` `[,before=N[:DIR]][,after[=N][:DIR]][,extent=@OFF:SZ[:le\|:be][+D\|-D]]` | the input written at virtual ADDR (truncated to N bytes, default 4096; with `reject`, a longer input is refused instead: verdict rejected), and optionally its length as a 32-bit word in the CPU's byte order; redzones around the buffer (below) |
 | `mmio` | the stream that `--mmio-rule ADDR=input` registers read |
 | a board input | anything a board published with `uam_machine_add_input`; the stock boards publish their console UART: `uart0`, `com1` on `x86_64-ref` (the receive FIFO; what does not fit is dropped) |
+| a link port | the name of a `--link PORT=none` port ([`link.md`](link.md)): the input's bytes are records, each a 16-bit little-endian length and that many payload bytes, and each record is one message handed to the port's device in order (a record that runs past the end takes what is left; fewer than two bytes are one message). Nothing is dropped: what the device has no room for waits in the port |
 
 **Redzones.** The `mem:` route can guard the memory around its buffer `[ADDR, ADDR+max)`
 with STOP guards ([guards](#guards---guard---watch)): an access that touches one ends the
@@ -219,6 +220,14 @@ terminates a string in place (`buf[len] = 0`) writes into `after`'s zone, so use
 there. The older forms still work: `guard` is `after:r`, `guard=@OFF:SZ[+-D]` is
 `after:r,extent=@OFF:SZ[+-D]`, and `guardabs=ADDR:N` a fixed read zone (`--guard` does that
 generally).
+
+**A device's communication channel as the input.** A device model that talks over a link
+(a bus controller, a radio, a UART behind `--console link:PORT`, a NIC behind
+`--nic NAME=link:PORT`) is fuzzed through that link's port: leave the port unconnected and
+name it, `--link bus0=none --fuzz-input bus0`. A run that fuzzes cannot be connected to a
+hub, because the emulation at the other end does not go back to the snapshot with each
+input; `uam-run` refuses it (exit 2). Fuzzing two live emulations together is not built
+(`TODO.md`).
 
 The harness never names a device: boards publish inputs, the harness picks one by name.
 A route that cannot deliver a particular input (too long for its buffer, not in the shape
