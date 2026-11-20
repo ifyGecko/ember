@@ -80,7 +80,7 @@ uam_link_accept_input(s->port);
 ## 3. Running two emulations
 
 ```bash
-build/subprojects/ember/uam-link-hub unix:/tmp/hub.sock &   # built with the project, as part of ember
+build/subprojects/ember/uam-link-hub unix:/tmp/hub.sock --nodes 2 &   # built with the project, as part of ember
 build/<board>-run --link bus0=unix:/tmp/hub.sock --link-name ecu1 fw1.bin &
 build/<board>-run --link bus0=unix:/tmp/hub.sock --link-name ecu2 fw2.bin
 ```
@@ -92,6 +92,10 @@ hub and the bus name.
 - Ports that name the same **bus** on the same hub are connected. The bus defaults to the
   port's name, so two boards that both call their port `bus0` meet without `bus=`.
 - Every emulation needs its own `--link-name` on a hub.
+- `--nodes N` holds every emulation at the hub until N have connected. Without it each
+  starts as it connects, and what the first one sends before the second is there goes
+  nowhere (a cable not plugged in yet): firmware that sends once at boot and then waits
+  hangs.
 - A bus is broadcast unless the hub is told otherwise: `--bus NAME=p2p` (two ends),
   `--bus NAME=arbitrated[,slot=TIME]` (messages for the same time contend, the lowest key
   wins, the losers come back flagged `UAM_LINK_F_LOST`; without kept time nothing contends).
@@ -114,7 +118,7 @@ allows, so one can be seconds of guest time ahead. Fix: `--realtime` on both, or
 
 - `latency=TIME` on **every** port (`50us`, `1ms`, ...): the time the medium takes for a
   frame. It is the lookahead; a smaller one costs more round trips when the guests are busy.
-- `--nodes N` on the hub, so no emulation runs ahead before the others have joined.
+- `--nodes N` on the hub (above), so no emulation runs ahead before the others have joined.
 - a console that cannot produce input (`--console file:OUT` or `null`), or the run is not
   repeatable and an idle guest costs round trips.
 - `--link-tick-hz N` if your board's ticks are not worth 10 ns (the default 100 M ticks per
@@ -131,6 +135,7 @@ when all stand at TIME), then a new hub and `--load-snapshot FILE` on each.
 | exit 2, `needs a latency` | a hub that keeps time, a port without `latency=` | add it |
 | exit 2, `already connected` | two emulations with the same name | `--link-name` |
 | `nothing uses link port 'X'` | the board has no port of that name and no `--console`/`--nic` takes it | the name in `uam_board_config_link` and on the command line must match |
+| the first message is lost, then both wait | one emulation sent before the other had joined the hub | `uam-link-hub --nodes N` |
 | nothing arrives | different bus names; or the frontend never has room | `uam-link-hub --log` (is it routed?), `--trace link` on both (tx on one, rx on the other?) |
 | exit 132 | the hub went away | it exits when its last emulation leaves unless `--keep`; a crashed hub |
 | exit 125 on a timed hub | every emulation idle with nothing armed: nobody will ever send | what was the last `link ... rx` line; which side should have answered |

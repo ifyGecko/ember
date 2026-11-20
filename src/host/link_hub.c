@@ -304,6 +304,7 @@ static void settle_once(uam_link_hub *h)
 {
     if (h->cfg.sync == UAM_LINK_FREE || h->n_alive < h->cfg.start_members)
         return;
+    h->cfg.start_members = 0;    /* started: who leaves later does not stop the clocks */
     relax(h);
     if (release_held(h))
         relax(h);
@@ -433,10 +434,7 @@ void uam_link_hub_leave(uam_link_hub *h, unsigned member_id)
             h->held[kept++] = h->held[i];
     }
     h->n_held = kept;
-    /* The others no longer wait for it. */
-    if (h->cfg.start_members > h->n_alive)
-        h->cfg.start_members = h->n_alive;
-    settle(h);
+    settle(h);                   /* the others no longer wait for it */
 }
 
 static bool hold(uam_link_hub *h, unsigned bus, unsigned mem, unsigned port, const uam_link_msg *m)

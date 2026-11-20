@@ -589,20 +589,25 @@ static void test_hub_grants(void)
     uam_link_hub_add_port(h, 0, 0, "bus", 1000);
     uam_link_hub_report(h, 0, 0, 0, UINT64_MAX);
     CHECK(a.grants == 0, "nothing is granted before everyone has joined");
-    uam_link_hub_join(h, "b", &rec_ops, &b, 0);
-    uam_link_hub_add_port(h, 1, 0, "bus", 3000);
-    uam_link_hub_report(h, 1, 0, 0, UINT64_MAX);
+    rec gone = { 0 };
+    int g = uam_link_hub_join(h, "gone", &rec_ops, &gone, 0);
+    uam_link_hub_leave(h, (unsigned)g);
+    CHECK(a.grants == 0, "someone who came and went does not count");
+    int bid = uam_link_hub_join(h, "b", &rec_ops, &b, 0);
+    CHECK(bid == 2, "b is member 2");
+    uam_link_hub_add_port(h, 2, 0, "bus", 3000);
+    uam_link_hub_report(h, 2, 0, 0, UINT64_MAX);
     /* Each may run to where the other's next message could take effect. */
     CHECK(a.grant == 3000 && b.grant == 1000, "grants: a %llu b %llu",
           (unsigned long long)a.grant, (unsigned long long)b.grant);
-    uam_link_hub_report(h, 1, 1000, 1000, UINT64_MAX);
+    uam_link_hub_report(h, 2, 1000, 1000, UINT64_MAX);
     CHECK(a.grant == 4000, "a follows b: %llu", (unsigned long long)a.grant);
     uam_link_hub_report(h, 0, 3000, 3000, UINT64_MAX);
     CHECK(b.grant == 4000, "b follows a: %llu", (unsigned long long)b.grant);
 
     /* b idle with nothing armed: a is held only by its own echo path
      * (a's message reaches b one latency later, b's answer another). */
-    uam_link_hub_report(h, 1, 4000, UAM_LINK_NEVER, UINT64_MAX);
+    uam_link_hub_report(h, 2, 4000, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.grant == 3000 + 1000 + 3000, "a runs ahead of a quiet b: %llu",
           (unsigned long long)a.grant);
     CHECK(a.quiets == 0 && b.quiets == 0, "not quiescent while a runs");
@@ -619,22 +624,22 @@ static void test_hub_grants(void)
      * wake-up: b says "quiet for ever" having taken none of the two sent. */
     m.time = 7000;
     uam_link_hub_msg(h, 0, 0, &m);
-    uam_link_hub_report(h, 1, 6000, UAM_LINK_NEVER, 1);
+    uam_link_hub_report(h, 2, 6000, UAM_LINK_NEVER, 1);
     uam_link_hub_report(h, 0, 7500, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.quiets == 0 && b.quiets == 0, "a message under way: not quiescent");
     CHECK(a.grant == 7000 + 3000, "a is still held by b's wake-up at 7000: %llu",
           (unsigned long long)a.grant);
-    uam_link_hub_report(h, 1, 7000, 7000, 2);
+    uam_link_hub_report(h, 2, 7000, 7000, 2);
 
     /* Everyone quiet: told once. */
-    uam_link_hub_report(h, 1, 8000, UAM_LINK_NEVER, UINT64_MAX);
+    uam_link_hub_report(h, 2, 8000, UAM_LINK_NEVER, UINT64_MAX);
     uam_link_hub_report(h, 0, 8000, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.quiets == 1 && b.quiets == 1, "quiescent");
     uam_link_hub_report(h, 0, 8000, UAM_LINK_NEVER, UINT64_MAX);
     CHECK(a.quiets == 1, "only once");
 
     /* The one left alone has no limit. */
-    uam_link_hub_leave(h, 1);
+    uam_link_hub_leave(h, 2);
     CHECK(a.grant == UAM_LINK_NEVER, "alone: no limit");
     uam_link_hub_destroy(h);
 

@@ -10,6 +10,8 @@
 #   bytes        the console as the link (--console link:PORT), one message a byte
 #   three nodes  a broadcast bus: everyone hears everyone
 #   refusals     an exact hub refuses a port without latency; a name is taken once
+#   quiescence   two emulations that both wait for the other, in lockstep: nothing will
+#                ever happen, and both stop as a deadlock (exit 125)
 #   hub loss     the emulation stops with exit 132
 #   snapshot     --link-stop-at on both, --save-snapshot, then both resumed on a new hub:
 #                the run ends exactly as the uninterrupted one
@@ -51,7 +53,7 @@ node() {
 pair() {
     tag=$1 sync=$2 mode=$3
     shift 3
-    if [ "$sync" = free ]; then hub; else hub --sync "$sync" --nodes 2; fi
+    hub --sync "$sync" --nodes 2      # --nodes: nobody sends before the other is there
     node a 01 "$mode" 00:64 "$@"
     pa=$!
     node b 02 "$mode" 00:64 "$@"
@@ -111,7 +113,7 @@ cmp -s "$T/exact-poll1.a" "$T/exact-poll2.a" && cmp -s "$T/exact-poll1.b" "$T/ex
 
 # ---- bytes: the console is the link ------------------------------------------------
 for sync in free exact; do
-    if [ "$sync" = free ]; then hub; else hub --sync exact --nodes 2; fi
+    hub --sync "$sync" --nodes 2
     for n in a b; do
         role=02; [ $n = a ] && role=01
         timeout 120 "$TRUN" -b rv32-test --link "u0=unix:$T/hub.sock,bus=serial,latency=87us" \
@@ -143,6 +145,19 @@ kill $HUBPID 2>/dev/null || true
 wait $HUBPID 2>/dev/null || true
 [ $rb -eq 3 ] || [ $rc -eq 3 ] || [ $ra -eq 3 ] \
     || fail "three nodes: nobody heard a second answer (exit $ra / $rb / $rc)"
+
+# ---- nothing will ever happen ----------------------------------------------------------
+hub --sync exact --nodes 2
+node a 02 00 00:64
+pa=$!
+node b 03 00 00:64
+pb=$!
+ra=0; rb=0
+wait $pa || ra=$?
+wait $pb || rb=$?
+wait $HUBPID || true
+[ $ra -eq 125 ] && [ $rb -eq 125 ] \
+    || fail "two emulations waiting for each other: exit $ra / $rb, wanted 125: $(cat "$T/a.log" "$T/b.log")"
 
 # ---- refusals ------------------------------------------------------------------------
 hub --sync exact

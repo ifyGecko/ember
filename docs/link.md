@@ -32,7 +32,9 @@ uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name right \
 ```
 
 That is the default, `free` mode: messages are delivered as they arrive and
-nothing is promised about time. For a run that is the same every time:
+nothing is promised about time. A message sent on a bus nobody else has joined
+yet goes nowhere, as on a cable not plugged in: `uam-link-hub --nodes 2` holds
+every emulation at the hub until both have connected, so they start together. For a run that is the same every time:
 
 ```sh
 uam-link-hub unix:/tmp/hub.sock --sync exact --nodes 2 &
@@ -98,8 +100,8 @@ What `exact` needs:
 
 - **A latency on every port** (`latency=TIME`, at least one time unit). A hub
   that keeps time refuses a port without one.
-- **Every node present at the start**: `--nodes N` holds the clocks until N
-  have joined.
+- **Every node present at the start**: `--nodes N` holds every node at the
+  hub until N have joined (in any mode), so none runs ahead alone.
 - **Stable names** (`--link-name`): ties between messages for the same instant
   are broken by the sender's name, so the order nodes connected in does not
   matter.
@@ -360,7 +362,7 @@ A reader skips frame types it does not know. Version 1:
 | 2 WELCOME | hub | u32 version, u32 capabilities (0), u32 sync (0 free, 1 loose, 2 exact), u32 0, u64 time units per second, u64 skew |
 | 3 PORT | node | u32 port, u32 0, u64 latency in units, bus name |
 | 4 READY | node | — (its ports are declared) |
-| 5 JOINED | hub | — |
+| 5 JOINED | hub | — (sent once every node the hub waits for, `--nodes`, has joined) |
 | 6 ERROR | hub | text; the connection ends |
 | 7 MSG | both | u32 port, u32 flags, u32 kind, u32 source, u32 sequence, u32 0, u64 time, u64 key, payload |
 | 8 REPORT | node | u64 reached, u64 quiet until, u64 messages received so far |

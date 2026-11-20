@@ -36,7 +36,7 @@ enum {
     F_WELCOME,        /* hub:  u32 version, u32 capabilities (0), u32 sync, u32 0, u64 unit_hz, u64 skew */
     F_PORT,           /* node: u32 port, u32 0, u64 latency (units), bus name */
     F_READY,          /* node: its ports are declared */
-    F_JOINED,         /* hub:  the node is a member */
+    F_JOINED,         /* hub:  the node is a member, and everyone the hub waits for is here */
     F_ERROR,          /* hub:  text; the connection ends */
     F_MSG,            /* both: u32 port, u32 flags, u32 kind, u32 src, u32 seq, u32 0, u64 time, u64 key, payload */
     F_REPORT,         /* node: u64 reached, u64 quiet, u64 messages received so far */
@@ -312,6 +312,7 @@ typedef struct wire {
     uam_link_node *node;
     buf            in, out;
     bool           dead, in_poll;
+    size_t         hs_off;           /* handshake: where the frame just read ends */
     uint64_t       barrier_done;     /* the last barrier the hub declared complete, + 1 */
 } wire;
 
@@ -442,16 +443,20 @@ static void set_err(char *err, size_t errlen, const char *fmt, ...)
     va_end(ap);
 }
 
-/* Wait for one frame of the handshake (10 s). */
-static bool handshake_frame(wire *w, unsigned *type, const uint8_t **body, size_t *len)
+/* Wait for one frame of the handshake: 10 s, or for as long as it takes when the
+ * hub may be holding us until the other nodes have joined (`patient`). */
+static bool handshake_frame(wire *w, bool patient, unsigned *type, const uint8_t **body, size_t *len)
 {
-    for (int tries = 0; tries < 100; tries++) {
+    for (int tries = 0; patient || tries < 100; tries++) {
+        if (patient && tries == 30)
+            uam_log(UAM_LOG_WARN, "link", "%s: waiting for the other nodes to join the hub",
+                    uam_link_node_name(w->node));
         size_t off = 0;
         bool bad = false;
         if (next_frame(&w->in, &off, type, body, len, &bad)) {
             /* The body stays valid until the buffer is touched again: the caller
              * consumes it with handshake_done. */
-            w->barrier_done = off;
+            w->hs_off = off;
             return true;
         }
         if (bad)
@@ -465,8 +470,8 @@ static bool handshake_frame(wire *w, unsigned *type, const uint8_t **body, size_
 
 static void handshake_done(wire *w)
 {
-    buf_consume(&w->in, (size_t)w->barrier_done);
-    w->barrier_done = 0;
+    buf_consume(&w->in, w->hs_off);
+    w->hs_off = 0;
 }
 
 uam_status uam_link_node_connect(uam_link_node *n, const char *spec, char *err, size_t errlen)
@@ -496,7 +501,7 @@ uam_status uam_link_node_connect(uam_link_node *n, const char *spec, char *err, 
     put32(f, WIRE_VERSION);
     put32(f + 4, 0);
     if (!buf_frame(&w->out, F_HELLO, f, 8, name, strlen(name)) || !wire_flush(w)
-        || !handshake_frame(w, &type, &body, &len)) {
+        || !handshake_frame(w, false, &type, &body, &len)) {
         set_err(err, errlen, "the hub at %s did not answer", spec);
         goto fail;
     }
@@ -521,7 +526,7 @@ uam_status uam_link_node_connect(uam_link_node *n, const char *spec, char *err, 
             goto fail;
     }
     if (!buf_frame(&w->out, F_READY, NULL, 0, NULL, 0) || !wire_flush(w)
-        || !handshake_frame(w, &type, &body, &len)) {
+        || !handshake_frame(w, true, &type, &body, &len)) {
         set_err(err, errlen, "the hub at %s went away", spec);
         goto fail;
     }
@@ -533,6 +538,7 @@ uam_status uam_link_node_connect(uam_link_node *n, const char *spec, char *err, 
     }
     handshake_done(w);
     uam_link_node_set_transport(n, &wire_transport, w);
+    wire_dispatch(w);       /* what came in behind the answer: a first grant, a message */
     return UAM_OK;
 
 fail:
@@ -563,6 +569,7 @@ typedef struct client {
     unsigned      n_ports;
     bool          at_barrier;
     uint64_t      barrier;
+    bool          held;              /* a member, not yet told so: the others are not all here */
 } client;
 
 struct uam_link_server {
@@ -572,6 +579,7 @@ struct uam_link_server {
     client      **clients;
     unsigned      n_clients;
     bool          ever;
+    unsigned      start_nodes;       /* nobody is let go before this many have joined */
     FILE         *log;
     uint64_t      n_msgs;
 };
@@ -708,10 +716,20 @@ static void client_frame(client *c, unsigned type, const uint8_t *body, size_t l
             }
         }
         c->member = id;
+        c->held = true;
         s->ever = true;
-        buf_frame(&c->out, F_JOINED, NULL, 0, NULL, 0);
         if (s->log)
             fprintf(s->log, "hub: %s joined with %u port(s)\n", c->name, c->n_ports);
+        /* Nobody starts before everyone is here: a message sent to a bus the others
+         * have not joined yet would go nowhere. */
+        if (uam_link_hub_members(s->hub) >= s->start_nodes) {
+            s->start_nodes = 0;
+            for (unsigned i = 0; i < s->n_clients; i++)
+                if (s->clients[i]->held) {
+                    s->clients[i]->held = false;
+                    buf_frame(&s->clients[i]->out, F_JOINED, NULL, 0, NULL, 0);
+                }
+        }
         /* Count it towards the start only now that its ports are known. */
         uam_link_hub_report(s->hub, (unsigned)id, 0, 0, UINT64_MAX);
         break;
@@ -764,6 +782,7 @@ uam_link_server *uam_link_server_create(uam_link_hub *hub, const char *spec)
     }
     s->hub = hub;
     s->lfd = fd;
+    s->start_nodes = uam_link_hub_get_config(hub)->start_members;
     if (!strncmp(spec, "unix:", 5))
         snprintf(s->path, sizeof(s->path), "%s", spec + 5);
     return s;

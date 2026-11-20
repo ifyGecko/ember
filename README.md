@@ -637,7 +637,8 @@ ember ships the mechanism and no protocol: what a message means belongs to the d
 models at the ends. `docs/link.md` is the guide.
 
 ```bash
-build/uam-link-hub unix:/tmp/hub.sock &                      # a hub: routes, and decides how time is kept
+build/uam-link-hub unix:/tmp/hub.sock --nodes 2 &            # a hub: routes, decides how time is kept, and
+                                                             # (--nodes) lets both start only when both are there
 build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name left  --nic net0=link:p0 a.elf &
 build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name right --nic net0=link:p0 b.elf
 ```
@@ -655,7 +656,7 @@ The hub decides how time is kept between the emulations (`uam-link-hub --sync MO
 |---|---|---|
 | `free` (default) | nothing about time: a message is delivered when it arrives. Costs nothing. Two emulations drift apart in guest time unless both run with `--realtime` | real hardware or tools at the far end; protocols that tolerate any timing |
 | `loose[=TIME]` | no emulation runs more than TIME (1 ms) ahead of the others; late messages are flagged. Not deterministic | guest timeouts that must not fire spuriously |
-| `exact` | lockstep: every message is delivered at its time, the run is the same every time (guest state and `--trace link`). Every port needs a `latency=`, and `--nodes N` holds the clocks until all have joined | repeatable runs, regression tests, one snapshot of every emulation (`--link-stop-at TIME --save-snapshot` on each) |
+| `exact` | lockstep: every message is delivered at its time, the run is the same every time (guest state and `--trace link`). Every port needs a `latency=`; use `--nodes N` | repeatable runs, regression tests, one snapshot of every emulation (`--link-stop-at TIME --save-snapshot` on each) |
 
 `uam-link-hub --bus NAME=p2p|broadcast|arbitrated[,slot=TIME]` gives a bus its medium
 (broadcast unless declared; on an arbitrated bus messages for the same time contend and

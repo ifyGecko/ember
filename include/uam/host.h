@@ -151,7 +151,9 @@ typedef struct uam_link_hub_config {
     uam_link_sync sync;            /* UAM_LINK_FREE unless set */
     uint64_t      unit_hz;         /* time units per emulated second; 0: picoseconds */
     uint64_t      skew;            /* loose: how far a node may run ahead, in units */
-    unsigned      start_members;   /* timed modes: grant nothing until this many joined */
+    unsigned      start_members;   /* start together: grant nothing (timed modes), and let no
+                                    * node of another process go (any mode), until this
+                                    * many have joined */
 } uam_link_hub_config;
 
 uam_link_hub *uam_link_hub_create(const uam_link_hub_config *cfg);

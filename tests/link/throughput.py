@@ -97,7 +97,12 @@ class Bench:
         """Seconds for the pair to finish, and the instructions both executed."""
         h = self.start_hub(hub_args) if hub_args is not None else None
         t0 = time.perf_counter()
-        ps = [self.node(n, r, mode, rounds, node_args(n)) for n, r in (("a", 1), ("b", 2))]
+        # The answering node first: without a hub to start them together (udp), what
+        # the other sends before it listens is lost.
+        ps = [self.node("b", 2, mode, rounds, node_args("b"))]
+        if h is None:
+            time.sleep(0.2)
+        ps.append(self.node("a", 1, mode, rounds, node_args("a")))
         outs = [p.communicate(timeout=600)[0] for p in ps]
         dt = time.perf_counter() - t0
         if h:
@@ -154,7 +159,7 @@ def measure(b, runs):
         rate("udp", None, 4, lambda n: ["--nic", "net0=udp:%d:127.0.0.1:%d"
                                         % ((pa, pb) if n == "a" else (pb, pa)),
                                         "--virtual-time", "--console", "null"])
-        rate("free", [], 0, link_args(b.sock, "50us"))
+        rate("free", ["--nodes", "2"], 0, link_args(b.sock, "50us"))
         rate("loose", ["--sync", "loose", "--nodes", "2"], 0, link_args(b.sock, "50us"))
         rate("exact", ["--sync", "exact", "--nodes", "2"], 0, link_args(b.sock, "50us"))
         for lat in ("500us", "50us", "5us"):
