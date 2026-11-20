@@ -905,8 +905,9 @@ ember board and then fuzz it: `ember-dev-recon` (triage: architecture, load addr
 map, MMIO, whether ember can run it), `ember-dev-build` (an out-of-tree board in the layout
 of "Building a board on ember", brought up one device at a time, against a local ember
 clone pinned to the latest commit, with any change to ember kept as `git am`-ready patch
-files) and `ember-fuzz` (the snapshot
-fuzz harness with ember's own block coverage, the brain, and opt-in site lists). They are plain `SKILL.md` folders; `skills/install.sh` links them
+files), `ember-fuzz` (the snapshot
+fuzz harness with ember's own block coverage, the brain, and opt-in site lists) and `ember-fuzz-triage` (from a crashing input to an
+explanation: replay, the runner's traces and probes, gdb on the emulation, a written report). They are plain `SKILL.md` folders; `skills/install.sh` links them
 into Claude Code and Qwen Code (`--claude`, `--qwen`, or `--agents` for `~/.agents/skills`).
 `skills/tests/run-tests.sh ~/ember` checks their tooling end to end. See `skills/README.md`.
 

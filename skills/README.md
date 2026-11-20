@@ -2,16 +2,19 @@
 
 Agent skills for taking a raw embedded firmware image from "unknown blob" to "boots on
 ember" (the UAM firmware emulator in this repository: guest code lifted into a small IR,
-devices behind explicit interfaces), and then fuzzing it there. They are plain `SKILL.md`
+devices behind explicit interfaces), then fuzzing it there, and then explaining what the
+fuzzer found. They are plain `SKILL.md`
 folders with no harness-specific content, so any agent that reads the Agent Skills format
 can use them; `install.sh` sets them up for Claude Code and Qwen Code. Two skills form the
-pipeline every ember build goes through; the third is for later, once the emulation works:
+pipeline every ember build goes through; the third and fourth are for later, once the
+emulation works:
 
 | Skill | Job |
 |---|---|
 | **`ember-dev-recon`** | Triage an unknown image: container members and flash layout, architecture/endianness and **whether ember can run it**, load address of each stage (with evidence), entry state, memory map, RTOS identity, an MMIO table with per-register offsets and owning functions, and what the image's own strings, tables and constants say about the hardware it was written for (chips, console path, waits, the expected boot log); on PC firmware the flash descriptor, firmware volumes, I/O ports, PCI config and MSRs. Emits `RECON.md`. |
 | **`ember-dev-build`** | Write an ember board for it and bring the firmware up **iteratively**, one blocker and one device at a time, with an `iter-XX.md` journal per iteration. The project is a separate tree that links against its own local ember clone, pinned to the latest ember commit; no emulation code ever lives in the ember tree, and any change ember itself needs is a `git format-patch` file in the project, applied to the clone as a commit and ready to `git am` upstream. Every device saves its own state, so the finished board snapshots and resumes bit-identically. |
 | **`ember-fuzz`** | *Later, when the emulation is functional.* Fuzz the firmware with ember's snapshot-based harness: pick a target handler and begin pc, publish the input route from the board, set crash oracles and guards (redzones, the return guard, a guarded heap behind the firmware's allocator), smoke-test with replay, check coverage (ember's own block coverage by default; site lists only when a target is worth them), run a campaign (ember's fuzz brain, with ember mutating), and triage crashes into firmware bugs or emulation gaps, journaled in `fuzz-XX.md`. |
+| **`ember-fuzz-triage`** | *After a campaign.* Explain a crashing, hanging or timing-out input: replay it, read the verdict, find where it stopped and how execution got there (`--history`, `--backtrace`, traces), reproduce it as a plain run from a snapshot, look around with gdb (`--gdb`: breakpoints, watchpoints, memory, registers, scripted sessions), follow the bad value back to the input bytes (`--watch`, `--guard`, `--on` rules), decide between a firmware bug and an emulation gap, and write the report. Uses only what every ember emulation has, and is written step by step for a newcomer or a small model. |
 
 They cover every ISA ember has: RV32IMAC, MIPS32r2 (big and little endian, and the PIC32
 cores: MIPS16e, microMIPS, FPU, DSP), ARMv7-A (ARM and Thumb-2, LE and BE8), x86-64 PCs from
@@ -115,6 +118,11 @@ skills/
   ember-fuzz/       SKILL.md
                     scripts/  replay_summary.py
                     references/  harness, lists-and-brain
+  ember-fuzz-triage/  SKILL.md
+                    scripts/  triage.py (the first pass on one input, as a report)
+                    references/  flags (every runner option for triage, with its output),
+                                 gdb (connecting, a cheat sheet, scripted sessions, pitfalls),
+                                 verdicts (reading each verdict; usual causes), report (the template)
   tests/
     run-tests.sh    end-to-end regression against an ember checkout
     fixture/        the wired test boards, an HLE example, and the fixture firmware

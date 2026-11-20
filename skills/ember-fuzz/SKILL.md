@@ -140,8 +140,10 @@ own: the harness is part of ember's library, which the project already links.
    state between iterations: back to the readiness gate. Keep inputs, crashes and hangs in
    `fuzz/` of the project.
 8. **Triage**: replay the crash directory, group with `scripts/replay_summary.py`, reproduce
-   each group's smallest input alone, then debug it with ember-dev-build's tools from the
-   snapshot (`--load-snapshot`, `--break`, `-d`, gdb). A `crash-guard` (replay exit 25;
+   each group's smallest input alone, then debug it from the snapshot
+   (`--load-snapshot`, `--break`, `-d`, gdb). The **ember-fuzz-triage** skill is the
+   step-by-step guide to that: where, how and why an input crashes, with every runner probe
+   and a gdb cheat sheet, ending in a report. A `crash-guard` (replay exit 25;
    to the brain it arrives as `GUARD` with the pc) is an out-of-bounds access stopped
    before it happened: its replay line names the guard and the access's offset into it
    (`read 1 at 0x80000470: +0 into guard mem-after [...]`), which says whether it is an

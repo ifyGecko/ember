@@ -253,6 +253,17 @@ if command -v mips-linux-gnu-gcc >/dev/null; then
         && grep -q "^2 inputs: 1 crash-oracle, 1 ok" "$P/build/fz-sum.txt" \
         && grep -q "^crash-oracle *pc=$(nm_of fuzz_bug)  x1" "$P/build/fz-sum.txt" \
         && ok "ember-fuzz: replay_summary groups the verdicts" || { bad "ember-fuzz: replay_summary"; cat "$P/build/fz-sum.txt"; }
+    # ember-fuzz-triage: the first pass on the crashing input, as a report
+    rc=0; (cd "$P" && IMAGE="$T/fw/fw.bin" python3 "$HERE/../ember-fuzz-triage/scripts/triage.py" \
+        --out build/triage "$T/in/2-bug" -- ./run.sh -n 5000000 --cov-blocks \
+        --fuzz-begin "$(nm_of fuzz_entry)" --fuzz-crash-pc "$(nm_of fuzz_bug)" --fuzz-input uart0 \
+        --fuzz-iter-insns 100000 > build/triage.txt 2>&1) || rc=$?
+    [[ "$rc" -eq 0 ]] && grep -q "crash-oracle pc=$(nm_of fuzz_bug)" "$P/build/triage/report.md" \
+        && grep -q "^- Repeatable: yes" "$P/build/triage/report.md" \
+        && grep -q "^- On the JIT: the same verdict" "$P/build/triage/report.md" \
+        && grep -q "^history: " "$P/build/triage/report.md" && grep -q "^backtrace: #0" "$P/build/triage/report.md" \
+        && ok "ember-fuzz-triage: triage.py writes the first-pass report" \
+        || { bad "ember-fuzz-triage: triage.py (exit $rc)"; cat "$P/build/triage.txt"; }
     # ember-fuzz: a read guard on the soc_uart RX register, which only fuzz_entry reads:
     # the boot passes, every input is a crash-guard (exit 25), grouped by pc and guard
     rc=0; (cd "$P" && IMAGE="$T/fw/fw.bin" ./run.sh -n 5000000 --fuzz-begin "$(nm_of fuzz_entry)" \

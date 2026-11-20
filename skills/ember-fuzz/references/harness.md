@@ -540,6 +540,9 @@ count into one map, each in its own history; edges between processors are not co
 
 ## Triage
 
+The **ember-fuzz-triage** skill covers this at length (reading each verdict, every probe
+with its output, gdb, the report); what follows is the short form.
+
 1. `--fuzz-replay` the crash (and hang) directory; `replay_summary.py` it.
 2. For each group, replay its smallest input alone, with the interpreter and `--jit`. Both
    must give the same verdict; if not, report an ember bug. Add `--history 64` to see the

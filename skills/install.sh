@@ -14,7 +14,7 @@
 #   --uninstall remove the links this script made (only links into this directory)
 set -euo pipefail
 SKILLS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILLS=(ember-dev-recon ember-dev-build ember-fuzz)
+SKILLS=(ember-dev-recon ember-dev-build ember-fuzz ember-fuzz-triage)
 CLAUDE_DEST="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 QWEN_DEST="${QWEN_SKILLS_DIR:-${QWEN_HOME:-$HOME/.qwen}/skills}"
 AGENTS_DEST="${AGENTS_SKILLS_DIR:-$HOME/.agents/skills}"
