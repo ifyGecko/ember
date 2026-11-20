@@ -996,6 +996,29 @@ static void test_world_snapshot(void)
     uam_link_hub_destroy(h);
 }
 
+/* A block of bytes as messages (a port's named input): every byte is used. */
+static void test_input_records(void)
+{
+    uam_link_node *n = uam_link_node_create("n0");
+    uam_link_port *a = uam_link_node_add_port(n, "a", NULL, 0);
+    sink s = { .ready = true };
+    uam_link_port_set_frontend(a, sink_can, sink_rx, NULL, &s);
+    static const uint8_t two[] = { 2, 0, 'x', 'y', 0, 0, 1, 0, 'z' };
+    CHECK(uam_link_input_deliver(a, NULL, two, sizeof(two)) == UAM_OK, "records");
+    CHECK(s.n == 3 && !strncmp(s.log, "x.z", 3), "two bytes, none, one: %.3s", s.log);
+    static const uint8_t over[] = { 9, 0, 'o', 'v' };
+    uam_link_input_deliver(a, NULL, over, sizeof(over));
+    CHECK(s.n == 4 && s.last_len == 2, "a record past the end takes what is left");
+    static const uint8_t tail[] = { 1, 0, 'a', 't' };
+    uam_link_input_deliver(a, NULL, tail, sizeof(tail));
+    CHECK(s.n == 6 && s.log[5] == 't' && s.last_len == 1, "a byte left over is a message");
+    uam_link_input_deliver(a, NULL, (const uint8_t *)"q", 1);
+    CHECK(s.n == 7 && s.log[6] == 'q', "one byte alone is a message");
+    uam_link_input_deliver(a, NULL, tail, 0);
+    CHECK(s.n == 8 && s.last_len == 0, "an empty input is one empty message");
+    uam_link_node_destroy(n);
+}
+
 int main(void)
 {
     test_ports();
@@ -1003,6 +1026,7 @@ int main(void)
     test_timed();
     test_grants();
     test_state();
+    test_input_records();
     test_hub_routing();
     test_hub_grants();
     test_hub_arbitration();

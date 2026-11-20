@@ -325,8 +325,8 @@ end of a hub does not go back with it. So:
   The input's bytes are records, each a 16-bit little-endian length followed
   by that many payload bytes; each record becomes one `UAM_LINK_DATA` message
   handed to the port, in order. A record that runs past the end takes what is
-  left; an input shorter than two bytes is one message, and a single byte
-  left over after the last record is ignored. The messages carry key 0 and no
+  left; an input shorter than two bytes is one message, and so is a single
+  byte left behind the last record: no byte of an input goes unused. The messages carry key 0 and no
   flags. A board that wants another framing, or keys and flags from the input,
   publishes an input of its own (`uam_machine_add_input`) and hands each
   message to the port with `uam_link_port_inject(port, &msg, 0)`.

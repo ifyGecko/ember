@@ -115,8 +115,9 @@ uam_status uam_link_node_bind(uam_link_node *n, struct uam_machine *m, uint64_t 
 /* The named input of a port (ctx is the uam_link_port): the bytes are records,
  * each a 16-bit little-endian length followed by that many payload bytes, and
  * each becomes one UAM_LINK_DATA message handed to the port at once, in order.
- * A record that runs past the end takes what is left; fewer than two bytes are
- * one message. */
+ * A record that runs past the end takes what is left; bytes too few to hold a
+ * length (a whole input of one or none, or one byte behind the last record)
+ * are one message themselves: no byte of an input goes unused. */
 uam_status uam_link_input_deliver(void *ctx, struct uam_machine *m, const uint8_t *data,
                                   size_t len);
 

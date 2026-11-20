@@ -25,11 +25,9 @@ uam_status uam_link_input_deliver(void *ctx, uam_machine *m, const uint8_t *data
     uam_link_port *p = ctx;
     size_t off = 0;
     /* Records: u16 length (little-endian), then that many bytes; a record that
-     * runs past the end takes what is left. No complete header: one message. */
-    if (len < 2) {
-        uam_link_msg one = { .len = (uint32_t)len, .data = data };
-        return uam_link_port_inject(p, &one, 0);
-    }
+     * runs past the end takes what is left. Bytes too few to be a header - the
+     * whole of a short input, or one left behind the last record - are a
+     * message themselves, so every byte of an input reaches the device. */
     while (off + 2 <= len) {
         size_t n = data[off] | (size_t)data[off + 1] << 8;
         off += 2;
@@ -40,6 +38,10 @@ uam_status uam_link_input_deliver(void *ctx, uam_machine *m, const uint8_t *data
         if (st != UAM_OK)
             return st;
         off += n;
+    }
+    if (off < len || !len) {
+        uam_link_msg rest = { .len = (uint32_t)(len - off), .data = data + off };
+        return uam_link_port_inject(p, &rest, 0);
     }
     return UAM_OK;
 }
