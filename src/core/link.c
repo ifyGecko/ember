@@ -41,6 +41,7 @@ struct uam_link_node {
     const uam_link_transport *ops;
     void           *ops_ctx;
     bool            lost, quiescent, in_send;
+    uint64_t        received;
     void          (*lost_fn)(void *ctx);
     void           *lost_ctx;
     qmsg           *pend;          /* not yet due, sorted by (tick, time, src, seq) */
@@ -510,6 +511,7 @@ void uam_link_node_input(uam_link_node *n, unsigned port, const uam_link_msg *m)
     if (port >= n->n_ports || m->kind >= UAM_LINK_KIND_RESERVED)
         return;
     n->quiescent = false;
+    n->received++;
     uint64_t tick = 0;
     if (stamped(n)) {
         tick = uam_link_node_to_ticks(n, m->time);
@@ -554,6 +556,14 @@ uint64_t uam_link_node_next_delivery(const uam_link_node *n)
 {
     return n->n_pend ? n->pend[0].tick : UINT64_MAX;
 }
+
+void uam_link_node_report(uam_link_node *n, uint64_t reached, uint64_t quiet)
+{
+    if (n->ops && !n->lost && n->ops->report)
+        n->ops->report(n->ops_ctx, reached, quiet);
+}
+
+uint64_t uam_link_node_received(const uam_link_node *n) { return n->received; }
 
 bool uam_link_node_poll(uam_link_node *n)
 {
@@ -645,8 +655,12 @@ int uam_link_node_idle(uam_link_node *n, uint64_t limit, bool promise)
     uint64_t quiet = !promise ? t : event == UINT64_MAX ? UAM_LINK_NEVER
                                                          : uam_link_node_from_ticks(n, event);
     n->ops->report(n->ops_ctx, t, quiet);
+    /* Having promised, stay put until the grant covers the next thing that can
+     * happen here (a message that arrives meanwhile is one). Without a promise
+     * the others wait for this node, so follow every grant. */
     bool ok = true;
-    while (ok && n->grant_tick <= now && uam_link_node_next_delivery(n) > now && !n->quiescent)
+    while (ok && !n->quiescent
+           && (promise ? n->grant_tick < next_own_event(n) : n->grant_tick <= now))
         ok = wait_once(n);
     if (!uam_link_node_timed(n))
         return 1;

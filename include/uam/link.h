@@ -214,6 +214,11 @@ bool     uam_link_node_timed(const uam_link_node *n);
 uint64_t uam_link_node_grant_tick(const uam_link_node *n);
 /* The earliest tick at which a message is due to be delivered, or UINT64_MAX. */
 uint64_t uam_link_node_next_delivery(const uam_link_node *n);
+/* Tell the hub where the node stands (see uam_link_transport.report); for a
+ * driver that runs the node itself. */
+void     uam_link_node_report(uam_link_node *n, uint64_t reached, uint64_t quiet);
+/* Messages that have arrived for the node so far (a driver sees activity). */
+uint64_t uam_link_node_received(const uam_link_node *n);
 /* Take what the hub has sent without waiting. False: the hub is gone. */
 bool     uam_link_node_poll(uam_link_node *n);
 int      uam_link_node_fd(const uam_link_node *n);
@@ -231,6 +236,8 @@ void     uam_link_node_set_waiter(uam_link_node *n, bool (*wait)(void *ctx, uam_
  * for more. `limit` is a tick time must not pass; `promise` says that nothing
  * but a message or a timer can wake the machine, so the hub may let the others
  * run ahead until then (false when host input can wake it).
+ * Having promised, it waits until the grant covers the next thing that can
+ * happen here; otherwise it returns after every grant.
  * Returns 0: nothing to do (not timed, or the next event is within the grant),
  *         1: waited; look at the machine again,
  *        -1: nothing will ever happen (every node is quiet).

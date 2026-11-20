@@ -24,7 +24,10 @@
 
 #include "uam/chardev.h"
 #include "uam/exec.h"
+#include "uam/link.h"
 #include "uam/netdev.h"
+
+struct uam_machine;
 
 /* ---- chardev backends ---- */
 uam_chardev *uam_chardev_null_create(void);
@@ -93,6 +96,110 @@ uam_status  uam_netdev_pair_create(uam_netdev **a, uam_netdev **b);
 uam_netdev *uam_netdev_open(const char *spec);
 /* Record every frame (both directions) to a pcap file. */
 uam_status  uam_netdev_capture(uam_netdev *nd, const char *path);
+
+/* ---- links (uam/link.h) ---- */
+
+/*
+ * Give a node its machine: the machine's clock at `tick_hz` ticks per emulated
+ * second (0: 100 M, the host loop's default rate), the node's state in the
+ * machine's snapshots (as "link-NAME"), and one named input per port
+ * (uam_machine_add_input, under the port's name) that hands the guest a block
+ * of bytes as messages - see uam_link_input_deliver. Call it once the board is
+ * built and before the first snapshot. The node must outlive the machine.
+ */
+uam_status uam_link_node_bind(uam_link_node *n, struct uam_machine *m, uint64_t tick_hz);
+/* The named input of a port (ctx is the uam_link_port): the bytes are records,
+ * each a 16-bit little-endian length followed by that many payload bytes, and
+ * each becomes one UAM_LINK_DATA message handed to the port at once, in order.
+ * A record that runs past the end takes what is left; fewer than two bytes are
+ * one message. */
+uam_status uam_link_input_deliver(void *ctx, struct uam_machine *m, const uint8_t *data,
+                                  size_t len);
+
+/* How a bus shares its medium. */
+typedef enum uam_link_medium {
+    UAM_LINK_BROADCAST,        /* every other port on the bus gets every message */
+    UAM_LINK_POINT_TO_POINT,   /* the same, and a third port is refused */
+    UAM_LINK_ARBITRATED,       /* messages for the same time contend: the lowest key takes
+                                * the bus, the others return to their senders with
+                                * UAM_LINK_F_LOST. Times are rounded up to the bus's slot. With
+                                * no time kept (free) every message has the bus to itself. */
+    UAM_LINK_CUSTOM,           /* uam_link_hub_set_medium */
+} uam_link_medium;
+
+typedef struct uam_link_hub uam_link_hub;
+
+typedef struct uam_link_hub_config {
+    uam_link_sync sync;            /* UAM_LINK_FREE unless set */
+    uint64_t      unit_hz;         /* time units per emulated second; 0: picoseconds */
+    uint64_t      skew;            /* loose: how far a node may run ahead, in units */
+    unsigned      start_members;   /* timed modes: grant nothing until this many joined */
+} uam_link_hub_config;
+
+uam_link_hub *uam_link_hub_create(const uam_link_hub_config *cfg);
+void          uam_link_hub_destroy(uam_link_hub *h);
+const uam_link_hub_config *uam_link_hub_get_config(const uam_link_hub *h);
+/* Members that have joined and not left. */
+unsigned      uam_link_hub_members(const uam_link_hub *h);
+/* A bus is created as a broadcast bus the first time a port names it; declare
+ * it first to give it another medium. `slot` is an arbitrated bus's time grid
+ * in units (0 or 1: messages contend only at exactly the same time). */
+uam_status    uam_link_hub_add_bus(uam_link_hub *h, const char *name, uam_link_medium medium,
+                                   uint64_t slot);
+/* A medium of the caller's own: called for each message sent on the bus, it
+ * hands it on with uam_link_hub_deliver (to whom, when and changed how is its
+ * business; in a timed mode never earlier than the message's own time). */
+typedef void (*uam_link_medium_fn)(void *ctx, uam_link_hub *h, const char *bus, unsigned member,
+                                   unsigned port, const uam_link_msg *m);
+uam_status    uam_link_hub_set_medium(uam_link_hub *h, const char *bus, uam_link_medium_fn fn,
+                                      void *ctx);
+void          uam_link_hub_deliver(uam_link_hub *h, unsigned member, unsigned port,
+                                   const uam_link_msg *m);
+/* Connect a node in this process (its ports join their buses). The node is
+ * then driven by its owner: see uam_link_world_run. UAM_ERR_REJECTED: a port
+ * the hub will not have (latency 0 in a timed mode, a third end). */
+uam_status    uam_link_hub_attach(uam_link_hub *h, uam_link_node *n);
+/* Stop waiting for start_members: grant with whoever has joined. */
+void          uam_link_hub_start(uam_link_hub *h);
+
+/* Members: what the hub routes between. A transport joins on behalf of a node
+ * it reaches some other way. */
+typedef struct uam_link_member_ops {
+    void (*msg)(void *ctx, unsigned port, const uam_link_msg *m);
+    void (*grant)(void *ctx, uint64_t time);
+    void (*quiescent)(void *ctx);        /* optional */
+} uam_link_member_ops;
+/* Returns the member's id (>= 0), or -1. `time` is where the member stands. */
+int           uam_link_hub_join(uam_link_hub *h, const char *name, const uam_link_member_ops *ops,
+                                void *ctx, uint64_t time);
+uam_status    uam_link_hub_add_port(uam_link_hub *h, unsigned member, unsigned port,
+                                    const char *bus, uint64_t latency);
+void          uam_link_hub_leave(uam_link_hub *h, unsigned member);
+bool          uam_link_hub_msg(uam_link_hub *h, unsigned member, unsigned port,
+                               const uam_link_msg *m);
+void          uam_link_hub_report(uam_link_hub *h, unsigned member, uint64_t reached,
+                                  uint64_t quiet);
+
+/*
+ * Several machines in one process, one thread: each has a node attached to the
+ * same hub (uam_link_hub_attach) and bound to it (uam_link_node_bind). The
+ * world runs them in turn - in a timed mode each up to its grant, the one
+ * furthest behind first; with no time kept, `slice` instructions at a time -
+ * so the result is deterministic in every mode. The machines must not have a
+ * host loop that blocks.
+ */
+typedef struct uam_link_world uam_link_world;
+uam_link_world *uam_link_world_create(uam_link_hub *hub);
+void            uam_link_world_destroy(uam_link_world *w);
+uam_status      uam_link_world_add(uam_link_world *w, struct uam_machine *m, uam_link_node *n);
+void            uam_link_world_set_slice(uam_link_world *w, uint64_t insns);
+/* Run until every machine has stopped or waits for a message that cannot come
+ * (returns true), or until all have reached `until_time` in the hub's unit
+ * (UAM_LINK_NEVER: no bound; returns false). Can be called again. */
+bool            uam_link_world_run(uam_link_world *w, uint64_t until_time);
+/* Why machine `index` (in the order added) stopped; UAM_STOP_NONE while it runs
+ * or waits. */
+uam_stop_reason uam_link_world_reason(const uam_link_world *w, unsigned index);
 
 /* ---- host loop ---- */
 typedef enum uam_pacing { UAM_PACE_VIRTUAL, UAM_PACE_REALTIME } uam_pacing;
