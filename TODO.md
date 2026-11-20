@@ -120,12 +120,18 @@ inputs, after restores stopped dropping translations:
 `docs/link.md` describes what there is: ports, a hub, free/loose/exact time, one process
 or several. Not built:
 
-- **Fuzzing several live emulations together.** A fuzz run restores its snapshot for every
-  input, and the other end of a hub does not go back with it, so `uam-run` refuses to
-  fuzz while connected; today the port is the input (`--fuzz-input PORT`). Fuzzing a pair
-  needs the harness to take and restore one snapshot of several machines per input, which
-  is only cheap in one process: `uam_fuzz` over a `uam_link_world`, with a say in whose
-  coverage counts (the target's, or everyone's) and a crash identity that names the machine.
+- **Fuzzing several live emulations together.** Not wanted until a target needs it. A
+  fuzz run restores its snapshot for every input, and the other end of a hub does not go
+  back with it, so `uam-run` refuses to fuzz while connected; the port is the input
+  (`--fuzz-input PORT`), which is faster, lets the fuzzer control every byte, and makes
+  crashes easy to attribute. A protocol with a deep handshake is covered too: run both
+  emulations past it on an exact hub, snapshot the target (`--link-stop-at`), and fuzz the
+  target alone from there. The case with no cheap substitute is a peer whose every answer
+  depends on what the target just sent (a nonce, a sequence number, a MAC), without which
+  the target rejects it. If that comes up: the harness takes and restores one snapshot of
+  several machines per input, which is only cheap in one process (`uam_fuzz` over a
+  `uam_link_world`; a restore there already works, on a new hub), with a say in whose
+  coverage counts and a crash identity that names the machine.
 - **Several machines on several host threads.** One process, one thread works
   (`uam_link_world_run`). Threads need the process globals out of the way first: the log
   threshold and origin provider (`src/core/common.c`), the receive buffer shared by the
@@ -133,7 +139,8 @@ or several. Not built:
 - **`uam-run` driving more than one machine.** The runner is one machine per process by
   design (its signal handling, traces and fuzz setup assume it); several machines in one
   process are a library facility.
-- **A machine on more than one hub that keeps time.** Each node waits for its own hub, and
+- **A machine on more than one hub that keeps time.** (Several hubs of which at most one
+  keeps time work: a node per hub.) Each node waits for its own hub, and
   a node waiting on one does not report to the other, so two timed hubs can end up waiting
   for each other. Several buses on one hub cover the need; lifting this means reporting to
   every hub whenever the machine waits.

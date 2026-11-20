@@ -8,6 +8,8 @@
 #                and the --trace link output are identical in every run, on the
 #                interpreter and the JIT, sleeping in WFI or polling
 #   bytes        the console as the link (--console link:PORT), one message a byte
+#   a device     the board's own device on a link port (rv32-test's msg0), beside a second
+#                port that is not connected: two nodes in one emulation
 #   three nodes  a broadcast bus: everyone hears everyone
 #   refusals     an exact hub refuses a port without latency; a name is taken once
 #   quiescence   two emulations that both wait for the other, in lockstep: nothing will
@@ -78,6 +80,19 @@ pair loose-tight loose=20us 02
 
 # ---- exact: the same in every run, on every backend --------------------------------
 pair exact1 exact 00
+# ,pcap=FILE works on a link port as on any other: 100 frames of 17 bytes, each seen once
+# going out and once coming in over the pair, behind the 24-byte file header.
+hub --sync exact --nodes 2
+timeout 120 "$TRUN" -b rv32-test --link "p0=unix:$T/hub.sock,bus=wire,latency=50us" --link-name a \
+    --nic "net0=link:p0,pcap=$T/a.pcap" -o net0.mac=02:00:00:64:00:01 --console null "$FW" >"$T/a.log" 2>&1 &
+pa=$!
+node b 02 00 00:64
+pb=$!
+wait $pa || fail "pcap: a failed: $(cat "$T/a.log")"
+wait $pb || fail "pcap: b failed"
+wait $HUBPID || true
+[ "$(wc -c <"$T/a.pcap")" -eq $((24 + 101 * (16 + 17))) ] \
+    || fail "pcap on a link port: $(wc -c <"$T/a.pcap") bytes, wanted $((24 + 101 * 33))"
 for run in 1 2; do
     hub --sync exact --nodes 2
     node a 01 00 00:64 --trace link --trace-file "$T/x$run.a.trace"
@@ -125,6 +140,35 @@ for sync in free exact; do
     wait $pb || fail "bytes ($sync): b failed ($?): $(cat "$T/b.log")"
     wait $HUBPID || true
 done
+
+# ---- a device of the board's own on a link port ----------------------------------------
+# msg0 is taken by the board (uam_board_config_link); spare is a second port on no hub,
+# so each emulation has two nodes, and their state two places in a snapshot.
+for sync in free exact; do
+    hub --sync "$sync" --nodes 2
+    for n in a b; do
+        role=02; [ $n = a ] && role=01
+        timeout 120 "$TRUN" -b rv32-test --link "msg0=unix:$T/hub.sock,bus=words,latency=20us" \
+            --link spare=none --link-name $n --nic net0=link:spare -o "net0.mac=02:00:00:c8:08:$role" \
+            --console null --save-snapshot "$T/dev-$n.snap" "$FW" >"$T/$n.log" 2>&1 &
+        eval "p$n=\$!"
+    done
+    wait $pa || fail "device ($sync): a failed ($?): $(cat "$T/a.log")"
+    wait $pb || fail "device ($sync): b failed ($?): $(cat "$T/b.log")"
+    wait $HUBPID || true
+    [ -s "$T/dev-a.snap" ] || fail "device ($sync): no snapshot with two nodes"
+done
+# The ports are part of what a snapshot is of: given in another order, it does not fit.
+rc=0
+"$TRUN" -b rv32-test --link spare=none --link msg0=none --link-name a --nic net0=link:spare \
+    -o net0.mac=02:00:00:c8:08:01 --console null --load-snapshot "$T/dev-a.snap" --max-insns 1000 \
+    "$FW" >"$T/out" 2>&1 || rc=$?
+grep -q "cannot resume from snapshot" "$T/out" \
+    || fail "a snapshot was loaded onto other link ports (exit $rc): $(cat "$T/out")"
+rc=0
+"$TRUN" -b rv32-test --link p0=none --link-name "a-name-that-is-far-too-long-for-a-hub" "$FW" \
+    >"$T/out" 2>&1 || rc=$?
+[ $rc -eq 2 ] && grep -q 'link-name' "$T/out" || fail "an over-long --link-name was taken (exit $rc)"
 
 # ---- three nodes on a broadcast bus --------------------------------------------------
 # a starts; b and c both answer every frame they have not seen the like of, so each

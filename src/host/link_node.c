@@ -48,15 +48,28 @@ uam_status uam_link_node_bind(uam_link_node *n, uam_machine *m, uint64_t tick_hz
 {
     if (!n || !m)
         return UAM_ERR_INVALID;
-    char name[UAM_LINK_NAME_MAX + 8];
-    snprintf(name, sizeof(name), "link-%s", uam_link_node_name(n));
-    uam_status st = uam_machine_add_state(m, name, node_save, node_restore, n);
+    /* "link-NAME"; a machine on several hubs has several nodes of one name, told
+     * apart by the order they were bound in ("link-NAME#2", ...). */
+    char name[UAM_LINK_NAME_MAX + 16];
+    uam_status st = UAM_ERR_INVALID;
+    for (unsigned k = 1; k <= 64 && st != UAM_OK; k++) {
+        if (k == 1)
+            snprintf(name, sizeof(name), "link-%s", uam_link_node_name(n));
+        else
+            snprintf(name, sizeof(name), "link-%s#%u", uam_link_node_name(n), k);
+        st = uam_machine_add_state(m, name, node_save, node_restore, n);
+        if (st == UAM_ERR_NOMEM)
+            return st;
+    }
     if (st != UAM_OK)
         return st;
     st = uam_link_node_set_clock(n, &m->sched, tick_hz ? tick_hz : 100000000u);
     for (unsigned i = 0; st == UAM_OK && i < uam_link_node_ports(n); i++) {
         uam_link_port *p = uam_link_node_port(n, i);
-        if (!uam_machine_find_input(m, uam_link_port_name(p)))
+        if (uam_machine_find_input(m, uam_link_port_name(p)))
+            uam_log(UAM_LOG_WARN, "link", "port %s: the machine already has an input of that "
+                    "name, so the port is not one", uam_link_port_name(p));
+        else
             st = uam_machine_add_input(m, uam_link_port_name(p), uam_link_input_deliver, p);
     }
     return st;

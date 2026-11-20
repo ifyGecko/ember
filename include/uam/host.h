@@ -104,7 +104,9 @@ uam_status  uam_netdev_capture(uam_netdev *nd, const char *path);
 /*
  * Give a node its machine: the machine's clock at `tick_hz` ticks per emulated
  * second (0: 100 M, the host loop's default rate), the node's state in the
- * machine's snapshots (as "link-NAME"), and one named input per port
+ * machine's snapshots (as "link-NAME", NAME being the node's; a further node
+ * of the same name as "link-NAME#2", in the order bound), and one named input
+ * per port, unless the machine already has an input of that name
  * (uam_machine_add_input, under the port's name) that hands the guest a block
  * of bytes as messages - see uam_link_input_deliver. Call it once the board is
  * built and before the first snapshot. The node must outlive the machine.
@@ -209,8 +211,11 @@ void          uam_link_hub_report(uam_link_hub *h, unsigned member, uint64_t rea
  * the node declares its ports. The node's name identifies it on the hub and
  * must be unique there; ties between messages are broken by it, so a run does
  * not depend on the order the nodes connected in. Add the ports first.
- * UAM_ERR_FAULT: no hub there; UAM_ERR_REJECTED: the hub refused a port (the
- * reason is in err).
+ * The call waits, for as long as it takes, while the hub holds the node until
+ * the others it was told to wait for have joined (start_members).
+ * UAM_ERR_FAULT: no hub there, or one that does not speak this protocol
+ * version; UAM_ERR_REJECTED: the hub refused the node - a port it will not
+ * have, or a name already taken (the reason is in err).
  */
 uam_status uam_link_node_connect(uam_link_node *n, const char *spec, char *err, size_t errlen);
 /*
@@ -234,8 +239,9 @@ void             uam_link_server_set_log(uam_link_server *s, FILE *log);
 uint64_t         uam_link_server_messages(const uam_link_server *s);
 
 /*
- * Several machines in one process, one thread: each has a node attached to the
- * same hub (uam_link_hub_attach) and bound to it (uam_link_node_bind). The
+ * Several machines in one process, one thread: each has a node bound to its
+ * machine (uam_link_node_bind, before uam_link_world_add) and attached to the
+ * same hub (uam_link_hub_attach). The
  * world runs them in turn - in a timed mode each up to its grant, the one
  * furthest behind first; with no time kept, `slice` instructions at a time -
  * so the result is deterministic in every mode. The machines must not have a

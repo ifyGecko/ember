@@ -20,26 +20,44 @@ Contents: [quick start](#quick-start) · [when to use it](#when-to-use-a-link)
 ## Quick start
 
 Start a hub, then connect two emulations to it. Each gives its port a name, a
-bus, and its own name on the hub:
+bus, and its own name on the hub. Here the two boards' console UARTs are wired
+to each other, which works on every board:
 
 ```sh
-uam-link-hub unix:/tmp/hub.sock &
+uam-link-hub unix:/tmp/hub.sock --nodes 2 &
+while [ ! -S /tmp/hub.sock ]; do sleep 0.1; done      # the hub is listening
 
 uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name left  \
-        --nic net0=link:p0 left.elf &
+        --console link:p0 left.elf &
 uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name right \
-        --nic net0=link:p0 right.elf
+        --console link:p0 right.elf
 ```
 
+On a board with a network port, `--nic PORT=link:p0` connects that instead
+(ember's own reference boards have none; `build/tests/uam-test-run -b rv32-test`
+has `net0`), and a board can hand a port to a device of its own
+([using a port](#using-a-port)).
+
 That is the default, `free` mode: messages are delivered as they arrive and
-nothing is promised about time. A message sent on a bus nobody else has joined
-yet goes nowhere, as on a cable not plugged in: `uam-link-hub --nodes 2` holds
-every emulation at the hub until both have connected, so they start together. For a run that is the same every time:
+nothing is promised about time. For a run that is the same every time:
 
 ```sh
 uam-link-hub unix:/tmp/hub.sock --sync exact --nodes 2 &
 uam-run ... --link p0=unix:/tmp/hub.sock,bus=wire,latency=50us ...
 ```
+
+About the hub:
+
+- **Start it first.** An emulation that finds no hub exits with status 2.
+- **`--nodes N` starts everyone together.** Each emulation waits at the hub,
+  for as long as it takes, until N have connected. Without it each starts as it
+  connects, and a message sent on a bus nobody else has joined yet goes
+  nowhere, as on a cable not plugged in.
+- **It leaves with its last emulation** (`--keep` makes it stay), and an
+  emulation whose hub goes away exits with status 132.
+- It listens on `unix:PATH` or `tcp:[HOST:]PORT`; HOST defaults to 127.0.0.1,
+  so name an address of the machine (`tcp:0.0.0.0:7000`) for emulations on
+  other machines to reach it.
 
 ## When to use a link
 
@@ -71,6 +89,11 @@ uam-run ... --link p0=unix:/tmp/hub.sock,bus=wire,latency=50us ...
 - **Latency**: how long a port's messages take to reach the far end. Each
   message is stamped with the sender's time plus its port's latency: that is
   when it takes effect at the receiver.
+- **Grant**: on a hub that keeps time, the time a node may run to. A node that
+  reaches its grant tells the hub where it stands and waits for a new one: a
+  **round trip** to the hub, which is what keeping time costs.
+
+Port, bus and node names are up to 31 characters.
 
 ## Keeping time: free, loose, exact
 
@@ -79,7 +102,7 @@ The hub chooses (`--sync`); every node connected to it follows.
 | Mode | What is guaranteed | Cost | Use it for |
 |---|---|---|---|
 | `free` (default) | Nothing about time. A message is delivered when it arrives. | none | real hardware and tools at the far end; links whose protocol tolerates any timing |
-| `loose[=TIME]` | No node runs more than TIME (default 1 ms) further ahead than the others allow. A message whose time has already passed is delivered at once and flagged `UAM_LINK_F_LATE`. Not deterministic. | a round trip to the hub per grant | emulations whose guest timeouts must not fire spuriously |
+| `loose[=TIME]` | No node runs more than TIME (default 1 ms) further ahead than the others allow. A message whose time has already passed is delivered at once and flagged `UAM_LINK_F_LATE`. Not deterministic. Every port needs a latency, as for `exact`. | a round trip to the hub per grant | emulations whose guest timeouts must not fire spuriously |
 | `exact` | Every message is delivered at its time, ties in a fixed order. A run is deterministic. | a round trip per grant; grants are a latency long while a guest is busy | repeatable runs, regression tests, a snapshot of all nodes at one moment |
 
 **`free` and guest time.** Each emulation's virtual time runs as fast as its
@@ -99,7 +122,7 @@ quiet (until its next timer), and the others run ahead to there.
 What `exact` needs:
 
 - **A latency on every port** (`latency=TIME`, at least one time unit). A hub
-  that keeps time refuses a port without one.
+  that keeps time, `loose` or `exact`, refuses a port without one.
 - **Every node present at the start**: `--nodes N` holds every node at the
   hub until N have joined (in any mode), so none runs ahead alone.
 - **Stable names** (`--link-name`): ties between messages for the same instant
@@ -124,16 +147,20 @@ changes it; 64 bits of picoseconds are 213 days).
 ## Using a port
 
 `--link PORT=HUB[,bus=BUS][,latency=TIME]` creates port `PORT`. `HUB` is
-`unix:PATH`, `tcp:HOST:PORT`, or `none` (not connected). Ports that name the
-same hub share one connection. `TIME` is a number with `ps`, `ns`, `us`, `ms`
-or `s`. A port is then used in one of three ways.
+`unix:PATH`, `tcp:HOST:PORT`, or `none` (not connected). `BUS` defaults to the
+port's name, so two emulations that both call their port `p0` meet without it.
+`TIME` is a number with `ps`, `ns`, `us`, `ms` or `s`, and defaults to 0.
+Ports that name the same hub share one connection (one node); ports on
+different hubs, or some on a hub and some on `none`, make one node per hub,
+all under the emulation's `--link-name`. A port is then used in one of three
+ways.
 
 **As a console** — `--console link:PORT`. The bytes of one UART write are one
 message; a message's bytes are the UART's input. Any board's console works.
 
-**As a network port** — `--nic NAME=link:PORT`. A frame is a message at its
-exact length (nothing is padded to 60 bytes). The line is up while the port
-reaches a hub.
+**As a network port** — `--nic NAME=link:PORT[,pcap=FILE]`. A frame is a
+message at its exact length (nothing is padded to 60 bytes). The line is up
+while the port reaches a hub.
 
 **By a device of the board's own.** The board looks the port up by name and
 its device model takes it:
@@ -172,10 +199,32 @@ uam_link_accept_input(d->port);
 ```
 
 A line (a GPIO, a strobe) is the same with `UAM_LINK_LEVEL`: send when the
-level changes, with the line number as the key.
+level changes, with the line number as the key. A device model may use any
+kind below `0x80000000` for messages of its own; the hub passes them on unread.
 
-State the device holds of messages it has taken belongs in the device's own
-`save`/`restore`. Messages still waiting in the port are saved by the node.
+What a device model should know:
+
+- **Nothing connected.** `uam_board_config_link` returns NULL when the option
+  was not given, and `uam_link_send` returns false when the port reaches no
+  hub. Model both as the real part behaves with nothing on the wire.
+- **Events.** The fourth argument of `uam_link_port_set_frontend` is called
+  with `UAM_LINK_EV_UP` when the port reaches a hub, `UAM_LINK_EV_DOWN` when
+  the hub is gone, and `UAM_LINK_EV_REWOUND` after a snapshot restore the far
+  end did not take part in ([snapshots](#snapshots)).
+- **No room.** While `can_receive` returns false the message waits in the
+  port. Call `uam_link_accept_input` when room appears; a model that is not
+  told when that is asks to be offered the messages again later with
+  `uam_link_port_retry(port, ticks)`.
+- **Flags of its own** start at `1u << UAM_LINK_F_MODEL_SHIFT` (bit 16).
+- **State.** What the device has taken belongs in its own `save`/`restore`;
+  what still waits in the port is saved by the node. An adapter that keeps
+  messages on the port's behalf registers them with `uam_link_port_set_state`.
+- **Headers.** A device includes `uam/link.h` only. `uam/host.h` (hubs,
+  connections, the chardev and netdev adapters) is for the program that builds
+  the machine, not for boards or devices.
+
+A worked example with its state saved is the `msgport` device of the test
+board `rv32-test` (`tests/boards/test_boards.c`), on the port `msg0`.
 
 ## Buses and media
 
@@ -187,12 +236,16 @@ it on the hub to give it another medium (`--bus NAME=MEDIUM`):
 | `broadcast` | Every other port on the bus gets every message. |
 | `p2p` | The same; a third port is refused. |
 | `arbitrated[,slot=TIME]` | Messages for the same time contend: the lowest key takes the bus and goes to everyone else; the others return to their senders flagged `UAM_LINK_F_LOST`. Times are rounded up to the slot. Under `free` nothing contends: each message has the bus to itself. |
-| custom | In a program of your own: `uam_link_hub_set_medium` installs a function that decides who gets what, when, and changed how. |
+| custom | In a program of your own: `uam_link_hub_set_medium(hub, bus, fn, ctx)` installs `fn(ctx, hub, bus, member, port, msg)`, called for each message sent on the bus; it hands messages on with `uam_link_hub_deliver(hub, member, port, msg)`: to whom, when, and changed how is its business (on a hub that keeps time, never earlier than the message's own time). |
+
+A program that holds the hub itself declares a bus with
+`uam_link_hub_add_bus(hub, name, medium, slot)`, which is what `--bus` does.
 
 ## Several machines in one process
 
 A program can build several machines, attach each one's node to a hub it
-created, and let `uam_link_world_run` drive them on one thread:
+created, and let `uam_link_world_run` drive them on one thread
+(`uam/host.h`, `uam/machine.h`):
 
 ```c
 uam_link_hub *hub = uam_link_hub_create(&(uam_link_hub_config){ .sync = UAM_LINK_EXACT });
@@ -210,8 +263,16 @@ uam_link_world_run(w, UAM_LINK_NEVER);
 
 No sockets and no waiting: in a timed mode the world runs each machine up to
 its grant, the one furthest behind first; under `free`, a slice of
-instructions at a time — so the result is deterministic in every mode.
-`uam-run` itself runs one machine.
+instructions at a time (`uam_link_world_set_slice`, 4096 unless set) — so the
+result is deterministic in every mode. `uam-run` itself runs one machine.
+
+- Bind each node to its machine (`uam_link_node_bind`) before adding it to the
+  world.
+- `uam_link_world_run(w, until)` returns true when every machine has stopped
+  or waits for a message that cannot come, and false when all have reached
+  `until` (a time in the hub's unit; `UAM_LINK_NEVER` for no bound). It can be
+  called again. `uam_link_world_reason(w, i)` says why machine `i` stopped.
+- The machines must not have a host loop that blocks waiting for input.
 
 ## Snapshots
 
@@ -219,15 +280,23 @@ A node's queues and timers are part of its machine's snapshot (the record
 `link-NAME`), and so is the queue of a console or network port that sits on a
 link. Rules:
 
-- A snapshot taken with link ports restores only on a machine with the same
-  ports. Create ports before the first snapshot.
+- A snapshot taken with link ports restores only with the same ports in the
+  same order and the same `--link-name`: the record is named after the node,
+  and each port's name is checked. Create ports before the first snapshot.
 - A machine without link ports is unchanged: its snapshots are byte for byte
   what they were.
-- **Not connected, or one process**: a snapshot is complete.
-- **Connected to a `free` or `loose` hub**: a snapshot holds this node only.
-  What is at the far end does not go back with it. On restore the device
-  models get `UAM_LINK_EV_REWOUND` (a network port sees its line drop and come
-  back), so a protocol can resynchronise as after a pulled cable.
+- **Not connected** (`none`): a snapshot is complete.
+- **Connected to a `free` or `loose` hub**, in another process or this one: a
+  snapshot holds this node only. What is at the far end does not go back with
+  it. On restore the device models get `UAM_LINK_EV_REWOUND` (a network port
+  sees its line drop and come back), so a protocol can resynchronise as after
+  a pulled cable.
+- **Several machines in one process, `exact`**: take a snapshot of each
+  machine between two calls of `uam_link_world_run`. To go back, disconnect
+  every node (`uam_link_node_set_transport(node, NULL, NULL)`), restore the
+  machines, and attach the nodes to a **new** hub and world: a hub's own
+  record of where its members stand only moves forward. The run then ends as
+  the uninterrupted one would have (`test_link`, `test_world_snapshot`).
 - **Connected to an `exact` hub**: take one consistent snapshot of every node
   by stopping them all at the same link time:
 
@@ -236,7 +305,8 @@ link. Rules:
   ```
 
   Each node runs to that time, the hub confirms once all stand there and
-  everything sent before has been handed over, and each saves. To resume,
+  everything sent before has been handed over, and each saves and exits with
+  status 0 (not the 124 of a time limit). To resume,
   start a new hub and every node with `--load-snapshot`; the run continues
   exactly as the uninterrupted one would have. The hub needs no file.
 
@@ -255,8 +325,13 @@ end of a hub does not go back with it. So:
   The input's bytes are records, each a 16-bit little-endian length followed
   by that many payload bytes; each record becomes one `UAM_LINK_DATA` message
   handed to the port, in order. A record that runs past the end takes what is
-  left; an input shorter than two bytes is one message. (A board that wants
-  another framing publishes its own input, `uam_machine_add_input`.)
+  left; an input shorter than two bytes is one message, and a single byte
+  left over after the last record is ignored. The messages carry key 0 and no
+  flags. A board that wants another framing, or keys and flags from the input,
+  publishes an input of its own (`uam_machine_add_input`) and hands each
+  message to the port with `uam_link_port_inject(port, &msg, 0)`.
+- A port named like an input the board already has (`uart0` on the stock
+  boards) does not become one; the runner says so. Give the port another name.
 
 Fuzzing several live emulations together is not built (see [limits](#limits)).
 
@@ -267,7 +342,9 @@ All off unless asked for.
 - `--trace link`: one line per message a port sends (`tx`) or hands to its
   device (`rx`), with time, key, flags, kind, length, the first 16 payload
   bytes, and for `rx` the node's own time (`at=`), followed by the guest pc
-  and instruction count.
+  and instruction count. `time=` and `at=` are in the hub's unit, picoseconds
+  unless the hub was given another. A program of its own gets the same
+  messages with `uam_link_node_set_tap`.
 - `uam-link-hub --log`: joins, leaves, refusals, and every message routed.
 - A message delivered after its time carries `UAM_LINK_F_LATE` and is counted
   in the port's statistics (`uam_link_port_stats`: sent, received, dropped for
@@ -339,11 +416,13 @@ Inherent in keeping exact time:
 
 Not built yet (in `TODO.md`):
 
-- fuzzing several live emulations together;
+- fuzzing several live emulations together (not planned until a target needs
+  it: the port as the input, from a snapshot taken after the peers' handshake,
+  covers the usual cases);
 - several machines on several host threads (one process, one thread works);
 - `uam-run` driving more than one machine;
 - a machine on more than one hub that keeps time (several buses on one hub
-  are fine);
+  are fine, and so are several hubs when at most one keeps time);
 - a shared-memory transport, and a converter from the hub's log to pcapng.
 
 ## The wire protocol
@@ -381,8 +460,8 @@ a tool that only sends and receives messages belongs on a `free` hub.
 
 | Header | What |
 |---|---|
-| `uam/link.h` | messages, ports (`uam_link_send`, `uam_link_port_set_frontend`, `uam_link_accept_input`), nodes, the transport interface |
-| `uam/host.h` | `uam_link_node_bind`, the hub (`uam_link_hub_*`), `uam_link_node_connect`, the server (`uam_link_server_*`), `uam_link_world_*`, `uam_chardev_link_create`, `uam_netdev_link_create`, `uam_host_add_link`, `uam_link_node_barrier` |
+| `uam/link.h` | messages; ports (`uam_link_send`, `uam_link_port_set_frontend`, `uam_link_accept_input`, `uam_link_port_retry`, `uam_link_port_inject`, `uam_link_port_set_state`, `uam_link_port_stats`); nodes (`uam_link_node_create`, `_add_port`, `_set_tap`, `_save`, `_restore`); the transport interface a hub connection implements |
+| `uam/host.h` | `uam_link_node_bind`, the hub (`uam_link_hub_create`, `_add_bus`, `_set_medium`, `_deliver`, `_attach`), `uam_link_node_connect` (it waits while the hub holds the node for `--nodes`), the server (`uam_link_server_*`), `uam_link_world_*`, `uam_chardev_link_create`, `uam_netdev_link_create`, `uam_host_add_link`, `uam_link_node_barrier`, `uam_link_parse_time` |
 | `uam/machine.h` | `uam_board_config.links`, `uam_board_config_link` |
 
 Sources: `src/core/link.c` (ports, nodes, timed delivery, grants, saved

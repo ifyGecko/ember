@@ -13,7 +13,8 @@ watchpoints, dirty-page tracking), RV32IMAC (`rv32-ref` board), MIPS32 big/littl
 (`avr-ref`), AVR32 (`avr32-ref`), 8-bit PIC (`pic-ref`), PIC32 (`pic32-ref`, on the MIPS32
 module), the 8051 (`mcs51-ref`), the 6502
 (`6502-ref`), the Z80 (`z80-ref`), Xtensa (`xtensa-ref` / `xtensaeb-ref`), host
-I/O backends (console, tap/tun/UDP networking), a gdb stub, a reusable runner, machine snapshots,
+I/O backends (console, tap/tun/UDP networking), links between emulations
+([`link.md`](link.md)), a gdb stub, a reusable runner, machine snapshots,
 IR passes with edge coverage and an exception observer, and a library build for out-of-tree
 boards. Section 7 says what of the plan remains; the fuzz layer's backlog is in
 [`../TODO.md`](../TODO.md).
@@ -240,6 +241,8 @@ tests/unit/       test_ir.c test_core.c test_host.c test_snapshot.c test_jit.c t
                   test_spin.c test_codestore.c test_mmio.c test_cov.c test_fuzz.c test_cov_formats.c
                   test_mutate.c (the mutator) formats_header_check.c (fuzz/formats.h compiles alone)
                   test_oracles.c (call tracking, the return guard, the guarded heap)
+                  test_link.c (links: ports, timed delivery, grants, the hub, two machines in
+                  one process and a snapshot of both)
                   (with cov_golden.txt, its golden map hashes)
                   test_smp.c test_f80.c test_xtensa_fpu.c, and one per ISA: test_riscv.c
                   test_mips.c test_arm.c test_x86.c test_ppc.c test_avr.c test_avr32.c

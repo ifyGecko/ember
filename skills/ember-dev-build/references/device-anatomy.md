@@ -309,7 +309,9 @@ protocol; framing, addressing, acknowledges and error states are the model's. `l
 has the pattern, the hub, and how time is kept between the emulations.
 
 ## Buses without MMIO (MDIO, I2C-like side channels)
-Ember has no generic side bus. Define a tiny C interface in its own header (a device
+This is about two devices **inside one board** (a MAC and its PHY, a controller and an
+EEPROM); for a device on another emulated board, see the section above. Inside a board
+ember has no generic side bus. Define a tiny C interface in its own header (a device
 header, so both sides may include it):
 
 ```c

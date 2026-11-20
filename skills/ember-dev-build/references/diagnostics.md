@@ -104,7 +104,8 @@ instruction that made it (`pc=0x.. icount=N`): decompile that pc.
 | `dma` | `dma: r\|w LEN 0xADDR REGION+0xOFF pc=.. icount=N` for every DMA transfer a device makes; `(fault)` when no RAM is there | | descriptor rings and buffers of network, storage and DMA engines: what the device reads and writes, and whether the addresses the driver gave it are sane |
 | `blocks` | `blk 0xPC icount=N` per block executed (narrow it: `--trace-range LO:HI`, `--trace-after N`) | | control flow through a region |
 | `ir` | the IR of each translated block | | ember lifter questions (reports, not bring-up) |
-| `all` | `exc,mmio,sysreg,irq,console,dma` | | a first look at a *short* run |
+| `link` | `link PORT tx\|rx time=T key=0xK flags=0xF kind=N len=L data=HEX.. [at=T] pc=.. icount=N` for every message a `--link` port sends (`tx`) or hands to its device (`rx`; `at`: this emulation's time then). Times are in the hub's unit, picoseconds by default | | what two emulations said to each other, and when (`links.md`) |
+| `all` | `exc,mmio,sysreg,irq,console,dma,link` | | a first look at a *short* run |
 
 An unknown name is an error (exit 2) and lists the valid ones. `--trace-after N` holds
 back every trace but `ir` until icount N, and the summaries and sysreg's "first" count

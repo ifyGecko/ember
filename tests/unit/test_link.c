@@ -10,6 +10,7 @@
 #include "uam/isa/riscv.h"
 #include "uam/link.h"
 #include "uam/machine.h"
+#include "uam/snapshot.h"
 
 static int n_checks, n_failed;
 
@@ -768,8 +769,26 @@ static uam_status ping_write(uam_device *dev, uint64_t off, unsigned size, uint6
     return UAM_OK;
 }
 
-static const uam_device_ops ping_ops = { .type = "test,ping", .read = ping_read,
-                                         .write = ping_write, .flags = UAM_DEVICE_STATELESS };
+static void ping_save(uam_device *dev, uam_state_writer *w)
+{
+    ping_dev *d = UAM_CONTAINER_OF(dev, ping_dev, dev);
+    uam_state_put_bytes(w, d->rx, sizeof(d->rx));
+    uam_state_put_u32(w, d->rx_head);
+    uam_state_put_u32(w, d->rx_len);
+    uam_state_put_u32(w, d->n_log);      /* the log goes on from where it stood */
+}
+
+static void ping_restore(uam_device *dev, uam_state_reader *r)
+{
+    ping_dev *d = UAM_CONTAINER_OF(dev, ping_dev, dev);
+    uam_state_get_bytes(r, d->rx, sizeof(d->rx));
+    d->rx_head = uam_state_get_u32(r);
+    d->rx_len = uam_state_get_u32(r);
+    d->n_log = uam_state_get_u32(r);
+}
+
+static const uam_device_ops ping_ops = { .type = "test,ping", .read = ping_read, .write = ping_write,
+                                         .save = ping_save, .restore = ping_restore };
 
 /* RV32 encoders for the few instructions the guests use. */
 static uint32_t rv_i(unsigned op, unsigned f3, unsigned rd, unsigned rs1, int imm)
@@ -823,6 +842,7 @@ static void pnode_build(pnode *pn, const char *name, bool first, int rounds, boo
     uam_bus_map_ram(&pn->m.bus, "ram", 0, 1u << 16);
     uam_device_init(&pn->dev.dev, &ping_ops, "ping");
     pn->dev.m = &pn->m;
+    uam_machine_add_device(&pn->m, &pn->dev.dev);     /* so its state is in snapshots */
     CHECK(uam_bus_map_mmio(&pn->m.bus, "ping", PING_DEV, 0x1000, &pn->dev.dev) == UAM_OK, "map");
     uint32_t prog[11];
     ping_program(prog, first, rounds);
@@ -921,6 +941,61 @@ static void test_world(void)
     CHECK(same_log(&a0, &a1) && same_log(&b0, &b1), "free: repeatable in one process");
 }
 
+/* One snapshot of both machines, taken between two runs of the world, and gone
+ * back to: the nodes let go of the hub, the machines are restored, a new hub
+ * takes them, and the run ends as it did the first time. (The hub itself keeps
+ * nothing that could be restored: it is replaced.) */
+static void test_world_snapshot(void)
+{
+    static ping_dev ref_a, ref_b, first_a, first_b;
+    static pnode a, b;
+    run_pair(UAM_LINK_EXACT, false, false, 4096, 1000000000u, false, &ref_a, &ref_b);
+
+    uam_link_hub_config cfg = { .sync = UAM_LINK_EXACT };
+    uam_link_hub *h = uam_link_hub_create(&cfg);
+    pnode_build(&a, "a", true, 40, false, 50000, 1000000000u);
+    pnode_build(&b, "b", false, 40, false, 50000, 1000000000u);
+    uam_link_hub_attach(h, a.node);
+    uam_link_hub_attach(h, b.node);
+    uam_link_world *w = uam_link_world_create(h);
+    uam_link_world_add(w, &a.m, a.node);
+    uam_link_world_add(w, &b.m, b.node);
+    CHECK(!uam_link_world_run(w, 1000000), "stopped on the way, at 1 us");
+    uam_snapshot *sa = NULL, *sb = NULL;
+    CHECK(uam_snapshot_take(&a.m, &sa) == UAM_OK && uam_snapshot_take(&b.m, &sb) == UAM_OK,
+          "a snapshot of each machine, its node in it");
+    unsigned at_snap = a.dev.n_log + b.dev.n_log;
+    CHECK(at_snap > 4 && at_snap < 41, "taken in the middle: %u words so far", at_snap);
+    CHECK(uam_link_world_run(w, UAM_LINK_NEVER), "ran on to the end");
+    first_a = a.dev;
+    first_b = b.dev;
+    CHECK(same_log(&ref_a, &first_a) && same_log(&ref_b, &first_b), "stopping changed nothing");
+    uam_link_world_destroy(w);
+
+    /* Back, onto a new hub. */
+    uam_link_node_set_transport(a.node, NULL, NULL);
+    uam_link_node_set_transport(b.node, NULL, NULL);
+    uam_link_hub_destroy(h);
+    CHECK(uam_snapshot_restore(&a.m, sa) == UAM_OK && uam_snapshot_restore(&b.m, sb) == UAM_OK,
+          "both restored");
+    CHECK(a.dev.n_log + b.dev.n_log == at_snap, "the devices are back where they were");
+    h = uam_link_hub_create(&cfg);
+    CHECK(uam_link_hub_attach(h, a.node) == UAM_OK && uam_link_hub_attach(h, b.node) == UAM_OK,
+          "attached to a new hub");
+    w = uam_link_world_create(h);
+    uam_link_world_add(w, &a.m, a.node);
+    uam_link_world_add(w, &b.m, b.node);
+    CHECK(uam_link_world_run(w, UAM_LINK_NEVER), "the restored pair ran to the end");
+    CHECK(same_log(&ref_a, &a.dev) && same_log(&ref_b, &b.dev),
+          "and ended as the uninterrupted pair did (%u + %u words)", a.dev.n_log, b.dev.n_log);
+    uam_link_world_destroy(w);
+    uam_snapshot_free(sa);
+    uam_snapshot_free(sb);
+    pnode_free(&a);
+    pnode_free(&b);
+    uam_link_hub_destroy(h);
+}
+
 int main(void)
 {
     test_ports();
@@ -932,6 +1007,7 @@ int main(void)
     test_hub_grants();
     test_hub_arbitration();
     test_world();
+    test_world_snapshot();
     printf("test_link: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

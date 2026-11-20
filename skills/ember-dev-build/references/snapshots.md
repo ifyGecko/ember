@@ -30,9 +30,10 @@ and anything a board or device keeps outside those. So:
 - **Direct writes to a backing store** (`region->host`, `uam_bus_romd_backing`) are reported
   with `uam_bus_romd_dirty` / `uam_bus_mark_dirty`. Otherwise an incremental restore (it only
   copies back dirty 4 KiB pages) silently keeps the guest's change.
-- **Link ports** (`links.md`): what waits in a port is saved by ember (`link-NAME`), what a
-  device took out of it is the device's own state. A snapshot taken with `--link` ports
-  loads only with the same ports. While connected to a hub, a snapshot holds this
+- **Link ports** (`links.md`): what waits in a port is saved by ember (in a record named
+  after the emulation's `--link-name`), what a device took out of it is the device's own
+  state. A snapshot taken with `--link` ports loads only with the same ports in the same
+  order and the same `--link-name`. While connected to a hub, a snapshot holds this
   emulation alone, unless the hub keeps exact time and every emulation is stopped at the
   same moment (`--link-stop-at TIME --save-snapshot FILE` on each).
 - **HLE hooks are configuration**: a board installs the same hooks on every build, so they

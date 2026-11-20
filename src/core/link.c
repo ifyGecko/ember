@@ -773,6 +773,7 @@ void uam_link_node_save(uam_link_node *n, uam_state_writer *w)
     uam_state_put_u64(w, n->grant_time);
     for (unsigned i = 0; i < n->n_ports; i++) {
         const uam_link_port *p = n->ports[i];
+        uam_state_put_bytes(w, p->name, sizeof(p->name));
         uam_state_put_u32(w, p->seq);
         uam_state_put_u64(w, p->r_len);
         for (size_t k = 0; k < p->r_len; k++)
@@ -799,6 +800,14 @@ void uam_link_node_restore(uam_link_node *n, uam_state_reader *r)
     uint64_t grant = uam_state_get_u64(r);
     for (unsigned i = 0; i < n->n_ports && uam_state_ok(r); i++) {
         uam_link_port *p = n->ports[i];
+        char saved[UAM_LINK_NAME_MAX];
+        uam_state_get_bytes(r, saved, sizeof(saved));
+        saved[sizeof(saved) - 1] = 0;
+        if (uam_state_ok(r) && strcmp(saved, p->name)) {
+            uam_state_fail(r, "link %s: port %u is '%s' in the snapshot but '%s' here (give the "
+                           "ports in the same order)", n->name, i, saved, p->name);
+            return;
+        }
         p->seq = uam_state_get_u32(r);
         uint64_t count = uam_state_get_u64(r);
         for (uint64_t k = 0; k < count && uam_state_ok(r); k++) {

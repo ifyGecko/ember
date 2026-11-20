@@ -150,7 +150,8 @@ built, not the project's `subprojects/ember`).
    `log_summary.py` prints it), not from `$?`: `timeout` also returns 124 when it kills the
    run, and the log then says `stop requested (status 130)`.
    Exit codes help: 124 budget or `--max-ticks` used (look at hot offsets), 125 deadlock (a
-   timer/interrupt not modelled or wired), 128 livelock (a timer fires but its interrupt
+   timer/interrupt not modelled or wired; on a link hub that keeps time, every emulation
+   waiting for another), 128 livelock (a timer fires but its interrupt
    never reaches the CPU), 126 fetch-fault loop, internal error, or a reset nothing handles,
    127 breakpoint or debug trap, 129 a `--guard` hit, 130 interrupted, 131 an unmapped access
    under `--unknown-mmio stop`, 132 the link hub went away (`--link`, `references/links.md`),

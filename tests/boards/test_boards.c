@@ -276,6 +276,119 @@ const uam_board test_board_x86_64 = {
 
 /* ---- rv32-test ------------------------------------------------------------ */
 
+/*
+ * A device that talks over a link port (uam/link.h), the way a board's own bus
+ * controller or radio would: the board looks the port up by name ("msg0", from
+ * --link msg0=...) and the device takes it. A message is one 32-bit word, also
+ * sent as the key.
+ *   +0  write: send the word        +4  read: 1 when a word has arrived
+ *   +8  read: the next word         +12 read: 1 while the port reaches a hub
+ */
+#include "uam/link.h"
+
+#define MSGPORT_BASE  UINT64_C(0x10010000)
+#define MSGPORT_DEPTH 16u
+
+typedef struct msgport {
+    uam_device     dev;
+    uam_link_port *port;
+    uint32_t       rx[MSGPORT_DEPTH];
+    uint32_t       head, len;
+    bool           up;
+} msgport;
+
+static bool msgport_can_receive(void *ctx)
+{
+    return ((msgport *)ctx)->len < MSGPORT_DEPTH;
+}
+
+static void msgport_receive(void *ctx, const uam_link_msg *m)
+{
+    msgport *d = ctx;
+    uint32_t v = 0;
+    memcpy(&v, m->data, m->len < 4 ? m->len : 4);
+    d->rx[(d->head + d->len++) % MSGPORT_DEPTH] = v;
+}
+
+static void msgport_event(void *ctx, uam_link_event ev)
+{
+    msgport *d = ctx;
+    if (ev != UAM_LINK_EV_REWOUND)
+        d->up = ev == UAM_LINK_EV_UP;
+}
+
+static uam_status msgport_read(uam_device *dev, uint64_t off, unsigned size, uint64_t *val)
+{
+    (void)size;
+    msgport *d = UAM_CONTAINER_OF(dev, msgport, dev);
+    *val = 0;
+    if (off == 4) {
+        *val = d->len != 0;
+    } else if (off == 8 && d->len) {
+        *val = d->rx[d->head];
+        d->head = (d->head + 1) % MSGPORT_DEPTH;
+        d->len--;
+        uam_link_accept_input(d->port);     /* room again: take what waited in the port */
+    } else if (off == 12) {
+        *val = d->up;
+    }
+    return UAM_OK;
+}
+
+static uam_status msgport_write(uam_device *dev, uint64_t off, unsigned size, uint64_t val)
+{
+    (void)size;
+    msgport *d = UAM_CONTAINER_OF(dev, msgport, dev);
+    uint32_t v = (uint32_t)val;
+    if (off == 0)
+        uam_link_send(d->port, v, 0, UAM_LINK_DATA, &v, sizeof(v));
+    return UAM_OK;
+}
+
+/* What the device has taken is its own state; what still waits in the port is the node's. */
+static void msgport_save(uam_device *dev, uam_state_writer *w)
+{
+    msgport *d = UAM_CONTAINER_OF(dev, msgport, dev);
+    uam_state_put_u32(w, d->head);
+    uam_state_put_u32(w, d->len);
+    for (unsigned i = 0; i < MSGPORT_DEPTH; i++)
+        uam_state_put_u32(w, d->rx[i]);
+}
+
+static void msgport_restore(uam_device *dev, uam_state_reader *r)
+{
+    msgport *d = UAM_CONTAINER_OF(dev, msgport, dev);
+    d->head = uam_state_get_u32(r) % MSGPORT_DEPTH;
+    d->len = uam_state_get_u32(r);
+    if (d->len > MSGPORT_DEPTH)
+        uam_state_fail(r, "msgport: more words than the FIFO holds");
+    for (unsigned i = 0; i < MSGPORT_DEPTH; i++)
+        d->rx[i] = uam_state_get_u32(r);
+}
+
+static void msgport_destroy(uam_device *dev)
+{
+    msgport *d = UAM_CONTAINER_OF(dev, msgport, dev);
+    uam_link_port_set_frontend(d->port, NULL, NULL, NULL, NULL);
+    free(d);
+}
+
+static const uam_device_ops msgport_ops = {
+    .type = "test,msgport", .read = msgport_read, .write = msgport_write,
+    .save = msgport_save, .restore = msgport_restore, .destroy = msgport_destroy,
+};
+
+static uam_device *msgport_create(const char *name, uam_link_port *port)
+{
+    msgport *d = calloc(1, sizeof(*d));
+    if (!d)
+        return NULL;
+    uam_device_init(&d->dev, &msgport_ops, name);
+    d->port = port;
+    uam_link_port_set_frontend(port, msgport_can_receive, msgport_receive, msgport_event, d);
+    return &d->dev;
+}
+
 #define RV32TEST_VIRTIO_BASE   UINT64_C(0x10001000)
 #define RV32TEST_VIRTIO_STRIDE UINT64_C(0x1000)
 #define RV32TEST_VIRTIO_COUNT  8u
@@ -321,6 +434,14 @@ static uam_status rv32_test_build(uam_machine *m, const uam_board_config *cfg)
             return st;
         uam_signal_connect(uam_virtio_net_irq_line(dev), uam_plic_input, plic, RV32TEST_VIRTIO_IRQ + i);
     }
+    /* --link msg0=...: a device of the board's own on a link port. */
+    uam_link_port *msg = uam_board_config_link(cfg, "msg0");
+    if (msg) {
+        uam_device *dev = msgport_create("msg0", msg);
+        if ((st = add(m, dev)) != UAM_OK
+            || (st = uam_bus_map_mmio(&m->bus, dev->name, MSGPORT_BASE, 0x1000, dev)) != UAM_OK)
+            return st;
+    }
     if ((st = test_heap_hooks_install(m, cfg)) != UAM_OK)
         return st;
     uam_machine_reset(m, m->reset_pc);
@@ -329,7 +450,8 @@ static uam_status rv32_test_build(uam_machine *m, const uam_board_config *cfg)
 
 const uam_board test_board_rv32 = {
     .name = "rv32-test",
-    .description = "rv32-ref plus virtio-net ports net0..net7 and, with -o heap=BASE+SIZE, a guarded "
+    .description = "rv32-ref plus virtio-net ports net0..net7, a message port on the link port msg0 "
+                   "(--link msg0=...) and, with -o heap=BASE+SIZE, a guarded "
                    "heap behind -o malloc=ADDR, free=ADDR, realloc=ADDR (tests only)",
     .build = rv32_test_build,
 };

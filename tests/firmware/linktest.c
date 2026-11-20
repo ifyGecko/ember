@@ -10,6 +10,8 @@
  *                 (frames only; the UART is always polled)
  *          bit 2: 1 = frames of 60 bytes, the Ethernet minimum, instead of 17
  *                 (for a backend that pads short frames)
+ *          bit 3: 1 = words through the board's message port (the link port msg0,
+ *                 a device of the board's own), polled
  *   ROLE   1 = sends the first message; anything else answers
  *
  * Each message carries a number; whoever receives n answers n + 1, and both
@@ -19,7 +21,8 @@
  * With frames the console is free: the last line gives the count, the time
  * (mtime) and the interrupts taken - the same in every run when the hub keeps
  * exact time. The exit status is the finisher's: 0 passed, 2 a frame of the
- * wrong length, 3 a number out of order, 1 no network port.
+ * wrong length, 3 a number out of order, 1 no network port, 4 the message port
+ * reaches no hub.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -304,6 +307,32 @@ static int uart_bytes(int first)
     }
 }
 
+/* ---- words through the message port ----------------------------------------- */
+
+#define MSGPORT 0x10010000u
+
+static int msg_words(int first)
+{
+    unsigned want = first ? 1 : 0;
+    if (!REG32(MSGPORT + 12))
+        return FAIL(4);              /* the port reaches no hub */
+    if (first)
+        REG32(MSGPORT) = 0;
+    for (;;) {
+        while (!REG32(MSGPORT + 4))
+            ;
+        unsigned n = REG32(MSGPORT + 8);
+        if (n != want)
+            return FAIL(3);
+        want = n + 2;
+        if (n >= rounds)
+            return PASS;
+        REG32(MSGPORT) = n + 1;
+        if (n + 1 >= rounds)
+            return PASS;
+    }
+}
+
 int main(void);
 int main(void)
 {
@@ -313,6 +342,8 @@ int main(void)
     int mode = my_mac[4], first = my_mac[5] == 1;
     if (mode & 1)
         return uart_bytes(first);
+    if (mode & 8)
+        return msg_words(first);
     if (mode & 4)
         frame_len = 60;
     expect_num = first ? 1 : 0;

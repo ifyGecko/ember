@@ -1,10 +1,10 @@
 # UAM firmware emulator (ember) - top-level build.
 #
 #   meson setup build            configure (once); options: meson_options.txt, `meson configure build`
-#   meson compile -C build       build/uam-run and the libraries
+#   meson compile -C build       build/uam-run, build/uam-link-hub and the libraries
 #   meson test -C build          the whole test suite (tests/meson.build lists the suites)
 #   meson test -C build --suite unit      one suite on its own
-#   meson install -C build       headers, libraries, uam-run and uam.pc under --prefix
+#   meson install -C build       headers, libraries, uam-run, uam-link-hub and uam.pc under --prefix
 #
 # Out-of-tree use (README.md, "Building a board on ember"): a board project consumes ember
 # as a meson subproject - `dependency('uam')` with subprojects/ember.wrap pinning a

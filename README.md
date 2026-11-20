@@ -53,7 +53,7 @@ once, resume in milliseconds), a gdb stub, guarded and watched guest memory (`--
 `--watch`), an opt-in check for reads of memory nothing wrote (`--fuzz-uninit`), a return guard and call stacks (`--guard-returns`, `--backtrace`), a guarded heap
 a board puts behind a firmware's allocator, bring-up traces that are off until asked for (device accesses, system registers,
 interrupt lines, the register and value a polling loop waits for, stamped console lines), a persistent-mode fuzz harness, host console and network backends (tap, tun, UDP,
-pcap; a virtio-net device model), and a library build for out-of-tree boards. C11, no
+pcap; a virtio-net device model), links that connect emulations over any channel with free, loose or exact timing (`docs/link.md`), and a library build for out-of-tree boards. C11, no
 dependencies beyond libc and libm.
 
 ## Hosts
@@ -388,7 +388,7 @@ ones a bring-up step needs, all on stderr:
 | `irq` | each change of a processor's interrupt input lines; at the stop, each line's rises and falls and whether an interrupt is pending and enabled | "was the interrupt raised, did it reach the CPU, is it masked" |
 | `console` | each line the guest prints, with the icount and pc of its first byte | lining console output up with `--trace-after`, `--snapshot-at`, `-n N -d` |
 | `dma` | every DMA transfer a device makes: `dma: r 16 0x80001720 dram+0x1720 pc=.. icount=N` | descriptor rings and buffers of network, storage and DMA engines |
-| `link` | every message a link port sends or hands to its device: `link p0 rx time=5003000 key=0x0 flags=0x0 kind=0 len=17 data=.. at=5003000 pc=.. icount=N` | what two emulations said to each other, and when (`docs/link.md`) |
+| `link` | every message a link port sends or hands to its device: `link p0 rx time=5003000 key=0x0 flags=0x0 kind=0 len=17 data=.. at=5003000 pc=.. icount=N` (times in the hub's unit: picoseconds) | what two emulations said to each other, and when (`docs/link.md`) |
 | `all` | `exc,mmio,sysreg,irq,console,dma,link` | a first look at a short run |
 
 `--trace-mmio-range LO:HI` limits the `mmio` trace (and its summary) to physical addresses in
@@ -445,7 +445,8 @@ build/uam-run --watch p:0x3000+4 fw.elf          # log every access to 4 physica
 build/uam-run --gdb 1234 fw.elf               # then: gdb-multiarch fw.elf -ex 'target remote :1234'
 build/uam-run --console pty fw.elf            # console on a pseudo-terminal (also tcp:PORT, unix:PATH,
                                               # stdio-raw, file:OUT[,in=FILE], string:TEXT,
-                                              # script:FILE, null)
+                                              # script:FILE, null, link:PORT: another
+                                              # emulation's UART, "Links between emulations")
 build/uam-run --console 'string:ls\n,after=# ' fw.elf  # type "ls" once the shell's prompt is printed
 build/uam-run --uart-input 'ls\n' fw.elf      # shorthand for --console 'string:ls\n'
 build/uam-run --realtime fw.elf               # pace virtual time to the host clock
@@ -639,16 +640,21 @@ models at the ends. `docs/link.md` is the guide.
 ```bash
 build/uam-link-hub unix:/tmp/hub.sock --nodes 2 &            # a hub: routes, decides how time is kept, and
                                                              # (--nodes) lets both start only when both are there
-build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name left  --nic net0=link:p0 a.elf &
-build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name right --nic net0=link:p0 b.elf
+while [ ! -S /tmp/hub.sock ]; do sleep 0.1; done             # start it first: with no hub an emulation exits 2
+build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name left  --console link:p0 a.elf &
+build/uam-run -b BOARD --link p0=unix:/tmp/hub.sock,bus=wire --link-name right --console link:p0 b.elf
 ```
+
+That wires the two boards' console UARTs to each other, which every board can do. The hub
+leaves with its last emulation (`--keep`: it stays).
 
 `--link PORT=HUB[,bus=BUS][,latency=TIME]` creates a port (`HUB`: `unix:PATH`,
 `tcp:HOST:PORT`, or `none` for a port that is not connected). It is used as a console
-(`--console link:PORT`: any UART talks over it), as a network port (`--nic NAME=link:PORT`),
+(`--console link:PORT`: any UART talks over it), as a network port (`--nic NAME=link:PORT`, on a
+board that has one: `rv32-test`'s `net0`),
 or by a device of the board's own (`uam_board_config_link(cfg, "name")`, then
-`uam_link_port_set_frontend` / `uam_link_send`). Each emulation needs its own
-`--link-name` on a hub.
+`uam_link_port_set_frontend` / `uam_link_send`; `rv32-test`'s `msg0` is a worked example).
+Each emulation needs its own `--link-name` on a hub; names are up to 31 characters.
 
 The hub decides how time is kept between the emulations (`uam-link-hub --sync MODE`):
 
@@ -925,7 +931,7 @@ src/machine/       machine lifecycle, resets, board registry, snapshots, guards,
                    the guarded heap
 src/host/          chardev/netdev/block-device backends, host loop, real-time pacing; the link hub
                    (link_hub.c), links between processes (link_wire.c), a port as a chardev or
-                   netdev (link_adapters.c)
+                   netdev (link_adapters.c), a node in its machine (link_node.c)
 src/debug/         gdb remote stub
 src/runner/        the command-line runner as a library (uam_run_main)
 analysis/          IR passes (cov.c: coverage; cmp.c: compare logging; frames.c: call tracking)
@@ -1006,7 +1012,8 @@ examples/          external-board: an out-of-tree board project in the prescribe
 skills/            agent skills (recon, board bring-up, fuzzing), their installer and tests
 tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI), host side,
                    snapshots, JIT chaining and the JIT-vs-interpreter differential test, spin
-                   loops, stores next to code, MMIO rules, coverage, the fuzz harness,
+                   loops, stores next to code, MMIO rules, coverage, the fuzz harness, links
+                   (test_link: ports, timed delivery, the hub, two machines in one process),
                    multiprocessor observers, the fuzz formats and golden coverage maps, the x87's software 80-bit
                    format (against the host's x87 on x86-64), the Xtensa FPU against exact
                    arithmetic (test_xtensa_fpu); and one test_<arch>.c per ISA for what its
@@ -1024,9 +1031,11 @@ tests/unit/        IR semantics/verifier, core (bus, resets, hooks, guards, ABI)
                    instruction flags, MEMPTR, the CTC) and test_xtensa (special registers per
                    model, interrupt levels, CCOMPARE, window exceptions, BREAK, the ERI)
 tests/boards/      x86_64-test and rv32-test: reference boards plus components only the tests
-                   use (storage, VGA, printer, virtio-net), run by build/tests/uam-test-run
+                   use (storage, VGA, printer, virtio-net, a device on a link port), run by
+                   build/tests/uam-test-run
 tests/firmware/    bare-metal RV32 self-test, network-test, multiprocessor, fuzz-target and
-                   scripted-console images
+                   scripted-console images, and linktest (two of them talk over a link: frames,
+                   UART bytes, or words through a device of the board's own)
 tests/firmware-mips/ bare-metal MIPS32 self-test (big and little endian), fuzz target, multiprocessor test
 tests/firmware-arm/ bare-metal ARMv7 self-test (ARM and Thumb-2, LE and BE8), fuzz target, multiprocessor test
 tests/firmware-ppc/ bare-metal 32-bit PowerPC self-test (classic and Book E builds), multiprocessor

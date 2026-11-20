@@ -416,13 +416,15 @@ static void usage(FILE *out)
         "      --mmio-input FILE   bytes read by 'input' rules, in order (0 once used up)\n"
         "      --console SPEC      console backend: stdio (default), stdio-raw, null, pty,\n"
         "                          tcp:[HOST:]PORT, unix:PATH, file:OUT[,in=FILE], string:TEXT,\n"
-        "                          script:FILE (expect/send lines), file:OUT,script=FILE;\n"
+        "                          script:FILE (expect/send lines), file:OUT,script=FILE,\n"
+        "                          link:PORT (a --link port: the UART talks over the link);\n"
         "                          string: and in= take a last ,after=PATTERN: each input line\n"
         "                          waits until the guest prints PATTERN (a prompt)\n"
         "      --uart-input STR    shorthand for --console string:STR\n"
         "      --nic PORT=SPEC     attach the board's network port PORT (repeatable; port names\n"
         "                          are the board's) to a backend: tap:[IFNAME], tun:[IFNAME],\n"
-        "                          tap-fd:FD, tun-fd:FD, udp:LPORT:RHOST:RPORT, null;\n"
+        "                          tap-fd:FD, tun-fd:FD, udp:LPORT:RHOST:RPORT, null,\n"
+        "                          link:PORT (a --link port: frames keep their length);\n"
         "                          append ,pcap=FILE to capture. Ports left out are unplugged\n"
         "      --link PORT=HUB[,bus=BUS][,latency=TIME]\n"
         "                          a link port PORT (repeatable) connected to the hub at HUB\n"
@@ -465,7 +467,9 @@ static void usage(FILE *out)
         "                          console each line the guest prints, with its icount and pc\n"
         "                          dma     every DMA transfer a device makes (address,\n"
         "                                  length, direction)\n"
-        "                          all     exc, mmio, sysreg, irq, console, dma\n"
+        "                          link    every message a --link port sends or hands to its\n"
+        "                                  device (time, key, flags, length, first bytes)\n"
+        "                          all     exc, mmio, sysreg, irq, console, dma, link\n"
         "      --trace-file FILE   write the traces (and --watch, --history, the log lines of\n"
         "                          --on rules) to FILE, not stderr\n"
         "      --trace-range LO:HI trace blocks only for pcs in [LO, HI)\n"
@@ -581,8 +585,10 @@ static void usage(FILE *out)
         "                          the buffer and past the input in it: verdict crash-guard;\n"
         "                          DIR r, w or rw) [,extent=@OFF:SZ[:le|:be][+-D]] (the input's\n"
         "                          length field bounds it instead of its size),\n"
-        "                          mmio (--mmio-rule input registers), or a board input\n"
-        "                          (stock boards: uart0; x86_64-ref: com1)\n"
+        "                          mmio (--mmio-rule input registers), a board input\n"
+        "                          (stock boards: uart0; x86_64-ref: com1), or a --link port\n"
+        "                          (PORT=none; the input is records of a 16-bit little-endian\n"
+        "                          length and that many bytes, one message each)\n"
         "      --fuzz-crash-pc PC  reaching PC is a crash (repeatable)\n"
         "      --fuzz-crash-exc L  exceptions that are crashes: comma list of fetch, load,\n"
         "                          store, align, xlate, trap, sysreg, all, none\n"
@@ -1385,7 +1391,13 @@ static int run_main(int argc, char **argv, const ext_set *es)
             links[cfg.n_links++].port = NULL;
             break;
         }
-        case OPT_LINK_NAME: link_name = optarg; break;
+        case OPT_LINK_NAME:
+            if (!*optarg || strlen(optarg) >= UAM_LINK_NAME_MAX) {
+                fprintf(stderr, "uam-run: --link-name: 1 to %u characters\n", UAM_LINK_NAME_MAX - 1);
+                return 2;
+            }
+            link_name = optarg;
+            break;
         case OPT_LINK_TICK_HZ: link_tick_hz = parse_size(optarg); break;
         case OPT_LINK_STOP_AT:
             if (!uam_link_parse_time(optarg, &link_stop_ps)) {
@@ -1870,11 +1882,24 @@ static int run_main(int argc, char **argv, const ext_set *es)
     bool host_net = false;   /* a port is wired to a host interface */
     for (size_t i = 0; i < cfg.n_netdevs; i++) {
         if (!strncmp(nic_specs[i], "link:", 5)) {
-            uam_link_port *lp = find_link(links, cfg.n_links, nic_specs[i] + 5);
+            /* link:PORT[,pcap=FILE] */
+            char port[UAM_LINK_NAME_MAX];
+            const char *pcap = strstr(nic_specs[i] + 5, ",pcap=");
+            size_t pl = pcap ? (size_t)(pcap - (nic_specs[i] + 5)) : strlen(nic_specs[i] + 5);
+            uam_link_port *lp = NULL;
+            if (pl < sizeof(port)) {
+                memcpy(port, nic_specs[i] + 5, pl);
+                port[pl] = 0;
+                lp = find_link(links, cfg.n_links, port);
+            }
             if (!lp)
                 fprintf(stderr, "uam-run: --nic %s=%s: no --link port of that name\n",
                         nics[i].name, nic_specs[i]);
             nics[i].nd = lp ? uam_netdev_link_create(lp) : NULL;
+            if (nics[i].nd && pcap && uam_netdev_capture(nics[i].nd, pcap + 6) != UAM_OK) {
+                uam_netdev_destroy(nics[i].nd);
+                nics[i].nd = NULL;
+            }
         } else {
             nics[i].nd = uam_netdev_open(nic_specs[i]);
         }

@@ -23,8 +23,9 @@ time.
 | anything else: a bus controller, a radio, an SPI/I2C block, GPIO lines | a device model that takes the port | below |
 
 A board has **one** console; a second UART that should talk over a link is "anything
-else": give that UART model a link port instead of a chardev, or a second chardev made
-with `uam_chardev_link_create(port)`.
+else": give that UART model a link port (`uam/link.h`) instead of a chardev. Boards and
+devices never include `uam/host.h`, where the hub and the chardev and netdev adapters
+live; those are the runner's.
 
 ## 2. A device on a link
 
@@ -68,9 +69,19 @@ uam_link_accept_input(s->port);
   room, `uam_link_port_retry(port, ticks)` looks again later, at a fixed guest time.
 - `uam_link_send` returns false when nothing is connected; model that as the real part
   would behave with nothing on the wire (no acknowledge, a timeout), not as an error.
+- **Events.** The fourth argument of `uam_link_port_set_frontend` (NULL above) is called
+  with `UAM_LINK_EV_UP` when the port reaches a hub, `UAM_LINK_EV_DOWN` when the hub is
+  gone, `UAM_LINK_EV_REWOUND` after a snapshot restore the far end took no part in: a
+  model with a "carrier" or "bus off" status bit drives it from these.
 - **Snapshots.** What the device has taken (its FIFO) is the device's own state; what still
   waits in the port is saved by ember. A port must exist before the first snapshot, and a
-  snapshot only restores on a board with the same ports.
+  snapshot only loads with the same `--link` ports in the same order and the same
+  `--link-name`.
+- **A tested example**: the `msgport` device of ember's test board
+  (`tests/boards/test_boards.c` in the ember checkout): `create` takes the port,
+  `receive` fills a FIFO, `save`/`restore` keep it, and the board looks the port up with
+  `uam_board_config_link(cfg, "msg0")`.
+- Port, bus and node names are up to 31 characters.
 - Do not send from inside `receive` in a way that cannot terminate; an answer sent from
   `receive` is fine.
 - **Time a transmission takes** (a byte time, a frame time) is the model's: arm a timer
@@ -91,7 +102,11 @@ hub and the bus name.
 
 - Ports that name the same **bus** on the same hub are connected. The bus defaults to the
   port's name, so two boards that both call their port `bus0` meet without `bus=`.
+- Start the hub first: an emulation that finds none exits 2. The hub leaves with its last
+  emulation (`--keep`: it stays).
 - Every emulation needs its own `--link-name` on a hub.
+- A hub on another machine: `uam-link-hub tcp:0.0.0.0:7000` there, `--link
+  bus0=tcp:HOST:7000` here (it listens on 127.0.0.1 unless given an address).
 - `--nodes N` holds every emulation at the hub until N have connected. Without it each
   starts as it connects, and what the first one sends before the second is there goes
   nowhere (a cable not plugged in yet): firmware that sends once at boot and then waits
@@ -138,19 +153,22 @@ when all stand at TIME), then a new hub and `--load-snapshot FILE` on each.
 | the first message is lost, then both wait | one emulation sent before the other had joined the hub | `uam-link-hub --nodes N` |
 | nothing arrives | different bus names; or the frontend never has room | `uam-link-hub --log` (is it routed?), `--trace link` on both (tx on one, rx on the other?) |
 | exit 132 | the hub went away | it exits when its last emulation leaves unless `--keep`; a crashed hub |
+| an emulation prints `waiting for the other nodes to join the hub` | the hub has `--nodes N` and fewer have connected; it waits without limit | start the others, or lower N |
 | exit 125 on a timed hub | every emulation idle with nothing armed: nobody will ever send | what was the last `link ... rx` line; which side should have answered |
 | the pair hangs under `exact` | one emulation stopped (in gdb, at a breakpoint): the others wait for its time | let it run; debug one side on a `free` hub |
 | a guest timeout under `free` | guest clocks drift apart | `--realtime` on both, or `--sync loose` |
 | a full-duplex or acknowledged transfer is off by one step under `exact` | nothing crosses a link in zero time | make the responder a device in the same board, or hold the guest in the controller model until the answer is in |
 
 `--trace link` prints one line per message sent (`tx`) and handed to the device (`rx`),
-with its time, key, flags, length, first bytes, and the guest pc; under `exact` the two
+with its time (in picoseconds unless the hub has another unit), key, flags, length, first
+bytes, and the guest pc; under `exact` the two
 sides' traces are identical from run to run, so `diff` finds what changed.
 
 ## 6. Fuzzing through a link
 
 A fuzz run is never connected to a hub (ember refuses it). The port itself is the input:
 `--link bus0=none --fuzz-input bus0`, each record of the input (a 16-bit little-endian
-length, then the payload) one message to your device. A board that needs keys or flags in
+length, then the payload) one message to your device, with key 0 and no flags. Do not name
+the port like an input the board already publishes (`uart0`): it would not become one. A board that needs keys or flags in
 the input publishes its own input with `uam_machine_add_input` and calls
 `uam_link_port_inject`. See the **ember-fuzz** skill.
