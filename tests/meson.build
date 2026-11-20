@@ -87,7 +87,7 @@ uam_test_run = executable('uam-test-run',
 # ---------------------------------------------------------------------------------------
 foreach n : ['ir', 'core', 'host', 'snapshot', 'jit', 'spin', 'codestore', 'mmio', 'cov', 'fuzz',
              'mutate', 'oracles', 'smp', 'ppc', 'avr', 'pic', 'mcs51', 'm6502', 'z80', 'xtensa',
-             'arm', 'riscv', 'x86', 'mips', 'avr32', 'f80', 'rules']
+             'arm', 'riscv', 'x86', 'mips', 'avr32', 'f80', 'rules', 'link']
   test(n, executable('test_' + n, 'unit/test_' + n + '.c', dependencies: uam_dep),
     suite: 'unit', kwargs: std)
 endforeach

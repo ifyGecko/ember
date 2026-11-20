@@ -51,7 +51,7 @@ m_dep = cc.find_library('m', required: false)   # the x87 model uses long-double
 # One list per module, mirroring the dependency rules in docs/architecture.md.
 ir_src = files('src/ir/builder.c', 'src/ir/verify.c', 'src/ir/print.c', 'src/ir/opt.c', 'src/ir/pass.c')
 core_src = files('src/core/common.c', 'src/core/bus.c', 'src/core/sched.c', 'src/core/chardev.c',
-  'src/core/netdev.c', 'src/core/state.c')
+  'src/core/netdev.c', 'src/core/state.c', 'src/core/link.c')
 exec_src = files('src/exec/interp.c', 'src/exec/tcache.c', 'src/exec/run.c', 'src/exec/cpu.c',
   'src/exec/jit.c', 'src/exec/jit_x86.c', 'src/exec/jit_a64.c', 'src/exec/coverage.c',
   'src/exec/cmp.c', 'src/exec/frames.c', 'src/exec/spin.c')
