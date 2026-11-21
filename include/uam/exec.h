@@ -183,8 +183,13 @@ typedef enum uam_hook_action {
  * Called when the hart arrives at `pc`, before that instruction executes, with
  * the architectural state precise (all earlier instructions retired). The hook
  * may read and write registers and memory, change cpu->pc (to emulate a
- * function, say), or stop the run. Hooks on an instruction that continues
- * another (a delay slot) are not supported; hook the branch instead.
+ * function, say), or stop the run. On an instruction that continues the one before
+ * it (UAM_IMARK_CONT) a hook works where the ISA can end a block there with the
+ * group's state carried over (a Thumb instruction in an IT block, a MIPS delay slot,
+ * the instruction after x86 STI or MOV SS or Z80 EI): the hook sees the instructions
+ * before it done and interrupts still held off. Where it cannot (AVR after SEI, the
+ * 8051 after an IE/IP write, Z80 behind a prefix) translating that code fails with an
+ * error naming the pc, rather than the hook never firing.
  */
 typedef uam_hook_action (*uam_pc_hook_fn)(void *ctx, uam_cpu *cpu, uint64_t pc);
 

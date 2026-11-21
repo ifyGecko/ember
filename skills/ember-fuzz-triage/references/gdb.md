@@ -322,9 +322,11 @@ wait
   (`x/3i ADDR-8`), that the code is not in a different mode, and that execution gets
   there at all (`--log-pc ADDR` in a plain run, or `--break ADDR` in a replay). On ARM,
   gdb wants a Thumb address **without** its low bit (`break *0x100288`), while ember's
-  own options and every pc it prints have the bit **set** (`--break 0x100289`). An
-  instruction inside a Thumb IT block is not a place to stop: gdb accepts the breakpoint
-  and the guest stops at the IT instruction in front of it.
+  own options and every pc it prints have the bit **set** (`--break 0x100289`). Inside a
+  Thumb IT block and on a MIPS delay slot a breakpoint stops at that instruction. On AVR
+  after `SEI`, the 8051 after an `IE`/`IP` write and Z80 behind a prefix it cannot: the
+  emulation ends with an error naming the pc (gdb sees the target go away). Break on the
+  instruction before it.
 - **Symbols are at the wrong addresses** (relocated or separately loaded code): see "Code
   that is not where the ELF says".
 - **`bt` shows one frame, or nonsense.** No debug info, or a damaged stack. Use ember's

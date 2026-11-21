@@ -432,8 +432,9 @@ devices.
   chains like any computed exit). PC hooks, coverage sites and fuzz boundaries in Thumb code
   name the pc with bit 0 set; the gdb stub and the site-list importer (a list flags Thumb sites
   as ALT_STATE) translate. IT blocks are continuations (`UAM_IMARK_CONT`) so no
-  interrupt splits one; only an exception return into the middle of one leaves IT state for
-  the next block, which `cpu->priv` then carries (`uam-isa.md` section 10b). Byte order is
+  interrupt splits one; only a block that has to end inside one (its length limit, a pc
+  hook on a governed instruction) or an exception return into the middle of one leaves IT
+  state for the next block, which `cpu->priv` then carries (`uam-isa.md` section 10b). Byte order is
   BE8: code is always little-endian, data follows CPSR.E (also part of `cpu->priv`, so code
   lifted for one order never runs in the other; SETEND, exception entry from SCTLR.EE and
   return from SPSR switch it), and `uam_isa_armeb` resets big-endian. Not modelled: VFP/NEON,

@@ -286,9 +286,12 @@ depends on the verdict:
 - **crash-oracle** at a `--fuzz-crash-pc`: `--break` that address.
 - **hang**: the run ends by itself (exit status 125 or 128). **timeout**: `-n` ends it.
 
-A `--break` that never fires on ARM Thumb code: give the address with bit 0 set, and if
-the instruction is inside an IT block (`it`, `itt`, `ite` ... a few lines above it in the
-disassembly), break on the IT instruction: ember stops only at the start of such a group.
+A `--break` that never fires on ARM Thumb code: give the address with bit 0 set. One on
+an instruction inside an IT block or in a MIPS delay slot works: the run stops there with
+the instructions before it done. On a few cores an instruction cannot be stopped at (AVR
+after `SEI`, the 8051 after an `IE`/`IP` write, Z80 behind a prefix): the run ends at
+once with `a pc hook at 0x... is on an instruction that continues the one before it`
+(exit status 126). Put the `--break` on the instruction before it.
 
 ## Step 7: look around with gdb
 
@@ -481,7 +484,9 @@ classification with its evidence.
   where the campaign has `fault` (a project's `run.sh`), a guard is missing, or the
   snapshot is not the harness's (`--fuzz-begin-skip`).
 - **A `--break`, `--on pc=` or `--log-pc` never fires**: not an instruction boundary; on
-  ARM Thumb, bit 0 is missing or the instruction is inside an IT block (step 6).
+  ARM Thumb or MIPS16e/microMIPS, bit 0 is missing (step 6).
+- **`a pc hook at 0x... is on an instruction that continues the one before it`**: that
+  core cannot stop there (step 6); hook the instruction before it.
 - **Symbols do not match the addresses** (a bootloader that copies itself, a module
   loaded at run time): `references/gdb.md`, "Code that is not where the ELF says".
 - **gdb says `Cannot execute this command while the target is running`**: the guest is

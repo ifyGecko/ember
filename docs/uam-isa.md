@@ -548,6 +548,29 @@ all are ISA-neutral and unused by ISAs that do not need them.
   reported with `UAM_EXC_F_CONT` and the branch's `parent_pc`, so the ISA can
   restart the whole group (MIPS: `EPC` = branch, `Cause.BD` = 1).
 
+  A pc hook can only fire where a block starts, and the executor ends blocks before
+  hooked instructions only at ordinary `IMARK`s. So the lifter is asked
+  (`uam_lift_hooked`, only while the executor has hooks, and only where it would emit a
+  continuation) whether the continuation is hooked; if it is, an ISA that can carry the
+  group's state across a block boundary ends the block there instead. A hooked
+  continuation still emitted fails translation with an error naming the pc. For MIPS the
+  branch's block then ends at the slot with the branch's outcome kept
+  (`MIPS_HELPER_DS_ENTER`: the target and exit kind in `mips_state`, the branch's length
+  in `cpu->priv`); the slot is lifted as a one-instruction block that leaves for that
+  target (`MIPS_HELPER_DS_LEAVE`). `irq_take` refuses while the slot is pending, and
+  `isa->exc_adjust` reports an exception in it as the branch's, as unsplit. A slot without
+  a hook is lifted as above. Two differences remain when a slot is hooked: a timer due
+  right after the branch fires between the two blocks, one instruction earlier than
+  unsplit (an interrupt it raises still waits for the slot), and a branch-likely's hooked
+  slot counts as a block of its own in block coverage.
+
+  Cost: nothing for code without such a hook (the lifter only asks while the executor has
+  hooks). A hooked continuation pays on every pass: two blocks instead of one and, under
+  the JIT, two changes of `cpu->priv`, each of which unlinks chained blocks and flushes the
+  data TLB. In a tight loop that measured about ten times the cost of a hook on an
+  ordinary instruction under the JIT (some 300 ns a pass), 15-25% more under the
+  interpreter: fine for a breakpoint or a crash pc, noticeable for a hook in a hot loop.
+
 - **Optional address translation (`isa->translate`).** An ISA may supply a
   virtual-to-physical translation that the executor calls for every fetch, load
   and store except `PHYS` accesses (and that loaders and debuggers use with the
@@ -635,9 +658,11 @@ ARM needed no new IR; these are conventions of its lifter (`isa/arm`).
   lifted with `UAM_IMARK_CONT` under their own conditions, so no interrupt is
   taken inside an IT block, and a fault in one reports the IT instruction as
   `parent_pc` (from which the ISA recomputes the IT state for SPSR). When a block
-  must stop inside an IT block, or an exception returns into one, the remaining
+  must stop inside an IT block (its length limit, a fetch that fails, a pc hook on a
+  governed instruction), or an exception returns into one, the remaining
   IT state goes into `cpu->priv`, which tags translated code: the next block is
-  lifted for it, one instruction at a time, until the IT block ends.
+  lifted for it, one instruction at a time, until the IT block ends. A pc set from
+  outside the guest (`isa->pc_moved`) ends it.
 
 ## 10c. Condition register fields and lift-time privilege (32-bit PowerPC)
 
@@ -888,7 +913,9 @@ The module is `isa/x86`.
   code-fetch check (11). Translated code is never reused across a change of any of them.
 - **`CONT` for the interrupt shadow.** The instruction after `STI` or `MOV SS` is a
   continuation, so no interrupt lands between them. Unlike a delay slot, its fault is its own:
-  the parent has completed.
+  the parent has completed. When a block must end inside the shadow (a run of openers, or a
+  pc hook on the shadowed instruction) the `X86_H_SHADOW` helper carries it in `cpu->priv`;
+  a helper, because it follows the opener's own register writes (`MOV SS`).
 - **I/O ports are memory.** A port is the physical address `UAM_X86_PIO_BASE` + port. The string forms `INS` and `OUTS` are `PHYS` `LD`/`ST` there; plain `IN` and `OUT` are one helper, which makes the same bus access and also records the I/O state an SMI handler reads.
 - **128-bit division is a helper**, as is everything that touches descriptors or system state.
 

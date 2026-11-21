@@ -296,8 +296,8 @@ uam_status board_hle_install(uam_machine *m, const uam_board_config *cfg)
 ```
 
 (`reg()` looks a name up in `cpu->isa->regs`, the ISA module's own register table: MIPS has
-`v0`, `a0`, `ra` there. `--log-pc` and gdb use other names, `r2`, `r4`, `r31`.) Hook a function's first instruction, never a
-branch delay slot. Adding a hook discards translated code once; it costs nothing afterwards.
+`v0`, `a0`, `ra` there. `--log-pc` and gdb use other names, `r2`, `r4`, `r31`.) Hook a function's first instruction. (A hook on a
+branch delay slot works, but an HLE hook belongs on the entry.) Adding a hook discards translated code once; it costs nothing afterwards.
 The board calls the install function before `uam_machine_reset`.
 
 ## A guarded heap behind the firmware's allocator, in `<board>_heap.c`
