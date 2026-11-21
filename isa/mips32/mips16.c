@@ -336,59 +336,31 @@ static bool has_slot(const m16_insn *d)
     return d->kind == M16_JAL || (d->kind == M16_JR && !d->compact);
 }
 
-/* The delay slot at `spc` (even), lifted into L (L->pc: the slot; jpc: the jump, the base
- * of a PC-relative slot). LIFT_DONE if it ended the block (a trap). */
-static lift_result lift_slot(ml *L, uint32_t spc, uint16_t si, uint32_t jpc)
-{
-    m16_insn s;
-    if (m16_is_ext_or_jal(si) || !mips16_decode(spc | 1u, 0, false, si, 0, &s) || is_control(&s)) {
-        mips_trap(L, NONE, EXC_RI, mips_imm(L, si));
-        return LIFT_DONE;
-    }
-    L->pc = spc | 1u;
-    L->npc = (spc + 2) | 1u;
-    L->raw = si;
-    L->in_slot = true;
-    return lift_simple(L, &s, jpc & ~1u);
-}
-
 /* The delay slot at `spc` (even), then the jump to `target`. */
 static lift_result jump_with_slot(ml *L, uint32_t spc, uam_ref target, uam_exit_kind kind)
 {
     uint64_t raw = 0;
     uint32_t jpc = L->pc;
-    if (uam_lift_hooked(L->lc, spc | 1u)) {   /* a pc hook on the slot */
-        mips_enter_slot(L, NONE, target, (spc + 2) | 1u, kind, spc | 1u, spc - (jpc & ~1u), false);
-        return LIFT_DONE;
-    }
     uam_imark_cont(L->b, spc | 1u, 2);
     if (L->lc->fetch(L->lc, spc, 2, &raw) != UAM_OK) {
         mips_trap(L, NONE, MIPS_TRAP_SLOT_FETCH, mips_imm(L, spc | 1u));
         return LIFT_DONE;
     }
+    m16_insn s;
+    uint16_t si = (uint16_t)raw;
+    if (m16_is_ext_or_jal(si) || !mips16_decode(spc | 1u, 0, false, si, 0, &s) || is_control(&s)) {
+        mips_trap(L, NONE, EXC_RI, mips_imm(L, si));
+        return LIFT_DONE;
+    }
     ml slot = *L;
-    if (lift_slot(&slot, spc, (uint16_t)raw, jpc) == LIFT_DONE)
+    slot.pc = spc | 1u;
+    slot.npc = (spc + 2) | 1u;
+    slot.raw = si;
+    slot.in_slot = true;
+    if (lift_simple(&slot, &s, jpc & ~1u) == LIFT_DONE)
         return LIFT_DONE;
     uam_exit(L->b, NONE, target, kind);
     return LIFT_DONE;
-}
-
-uam_status mips16_lift_slot(uam_lift_ctx *lc)
-{
-    const mips_state *s = mips_st(lc->cpu);
-    uint32_t spc = (uint32_t)lc->pc & ~1u;
-    uint64_t raw = 0;
-    uam_status st = lc->fetch(lc, spc, 2, &raw);
-    ml L = { .lc = lc, .b = lc->b, .s = s, .endian = s->endian, .priv = lc->cpu->priv };
-    uam_imark(lc->b, spc | 1u, 2);
-    if (st != UAM_OK) {   /* as unsplit: the slot counts, its exception is the jump's */
-        mips_trap(&L, NONE, MIPS_TRAP_SLOT_FETCH, mips_imm(&L, spc | 1u));
-        return UAM_OK;
-    }
-    if (lift_slot(&L, spc, (uint16_t)raw, spc - MIPS_PRIV_DS_LEN(lc->cpu->priv)) == LIFT_DONE)
-        return UAM_OK;
-    mips_leave_slot(&L);
-    return UAM_OK;
 }
 
 static lift_result lift_control(ml *L, const m16_insn *d)

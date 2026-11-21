@@ -674,48 +674,6 @@ static uam_ref cond(ml *L, const um_insn *d)
     }
 }
 
-/* The delay slot at `after` (even; halfwords s0, s1), lifted into L (L->pc becomes the
- * slot). pcb: the branch, the base of a PC-relative slot. LIFT_DONE if it ended the block
- * (a trap). */
-static lift_result lift_slot(ml *L, uint32_t after, uint16_t s0, uint16_t s1, bool short_slot,
-                             uint32_t pcb)
-{
-    unsigned slen = umips_is32(s0) ? 4 : 2;
-    L->pc = after | 1u;
-    L->npc = (after + slen) | 1u;
-    L->raw = slen == 4 ? ((uint32_t)s0 << 16) | s1 : s0;   /* RI reports the slot's word */
-    L->in_slot = true;
-    um_insn sd;
-    umips_decode(after | 1u, s0, s1, &sd);
-    if (um_control(&sd) || (short_slot && slen != 2)) {
-        mips_ri(L);
-        return LIFT_DONE;
-    }
-    return lift_simple(L, &sd, pcb);
-}
-
-uam_status mips_umips_lift_slot(uam_lift_ctx *lc)
-{
-    const mips_state *s = mips_st(lc->cpu);
-    uint32_t after = (uint32_t)lc->pc & ~1u;
-    uint64_t s0 = 0, s1 = 0;
-    uam_status st = lc->fetch(lc, after, 2, &s0);
-    const unsigned slen = st == UAM_OK && umips_is32((uint16_t)s0) ? 4 : 2;
-    if (st == UAM_OK && slen == 4)
-        st = lc->fetch(lc, after + 2, 2, &s1);
-    ml L = { .lc = lc, .b = lc->b, .s = s, .endian = s->endian, .priv = lc->cpu->priv };
-    uam_imark(lc->b, after | 1u, slen);
-    if (st != UAM_OK) {   /* as unsplit: the slot counts, its exception is the branch's */
-        mips_trap(&L, NONE, MIPS_TRAP_SLOT_FETCH, mips_imm(&L, after | 1u));
-        return UAM_OK;
-    }
-    if (lift_slot(&L, after, (uint16_t)s0, (uint16_t)s1, lc->cpu->priv & MIPS_PRIV_DS_SHORT,
-                  after - MIPS_PRIV_DS_LEN(lc->cpu->priv)) == LIFT_DONE)
-        return UAM_OK;
-    mips_leave_slot(&L);
-    return UAM_OK;
-}
-
 static lift_result lift_control(ml *L, const um_insn *d)
 {
     uint32_t pcb = L->pc & ~1u, after = pcb + d->len;
@@ -769,17 +727,23 @@ static lift_result lift_control(ml *L, const um_insn *d)
     uint32_t link = (after + slen) | 1u;
     if (d->link)
         mips_reg_w(L, d->kind == UM_JR ? d->rd : RA, mips_imm(L, link));
-    if (uam_lift_hooked(L->lc, after | 1u)) {   /* a pc hook on the slot */
-        mips_enter_slot(L, c, target, link, k, after | 1u, d->len, d->short_slot);
-        return LIFT_DONE;
-    }
     uam_imark_cont(L->b, after | 1u, slen);
     if (st != UAM_OK) {
         mips_trap(L, NONE, MIPS_TRAP_SLOT_FETCH, mips_imm(L, after | 1u));
         return LIFT_DONE;
     }
     ml slot = *L;
-    if (lift_slot(&slot, after, (uint16_t)s0, (uint16_t)s1, d->short_slot, pcb) == LIFT_DONE)
+    slot.pc = after | 1u;
+    slot.npc = link;
+    slot.raw = slen == 4 ? ((uint32_t)s0 << 16) | (uint16_t)s1 : (uint16_t)s0;
+    slot.in_slot = true;
+    um_insn sd;
+    umips_decode(after | 1u, (uint16_t)s0, (uint16_t)s1, &sd);
+    if (um_control(&sd) || (d->short_slot && slen != 2)) {
+        mips_ri(&slot);   /* Reserved Instruction reports the slot's word */
+        return LIFT_DONE;
+    }
+    if (lift_simple(&slot, &sd, pcb) == LIFT_DONE)
         return LIFT_DONE;
     if (uam_ref_is_none(c)) {
         uam_exit(L->b, NONE, target, k);

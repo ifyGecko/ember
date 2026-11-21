@@ -553,16 +553,17 @@ all are ISA-neutral and unused by ISAs that do not need them.
   (`uam_lift_hooked`, only while the executor has hooks, and only where it would emit a
   continuation) whether the continuation is hooked; if it is, an ISA that can carry the
   group's state across a block boundary ends the block there instead. A hooked
-  continuation still emitted fails translation with an error naming the pc. For MIPS the
-  branch's block then ends at the slot with the branch's outcome kept
-  (`MIPS_HELPER_DS_ENTER`: the target and exit kind in `mips_state`, the branch's length
-  in `cpu->priv`); the slot is lifted as a one-instruction block that leaves for that
-  target (`MIPS_HELPER_DS_LEAVE`). `irq_take` refuses while the slot is pending, and
-  `isa->exc_adjust` reports an exception in it as the branch's, as unsplit. A slot without
-  a hook is lifted as above. Two differences remain when a slot is hooked: a timer due
-  right after the branch fires between the two blocks, one instruction earlier than
-  unsplit (an interrupt it raises still waits for the slot), and a branch-likely's hooked
-  slot counts as a block of its own in block coverage.
+  continuation still emitted fails translation with an error naming the pc and the
+  instruction its group begins at (hook that one instead).
+
+  An ISA splits only where the boundary is one the hardware has too, with state it
+  already carries: ARM's IT state (in `cpsr`, so exceptions and debug stops inside an IT
+  block exist on the hardware), the x86 interrupt shadow and Z80's after `EI` (both
+  already carried in `cpu->priv` or the core's state). MIPS does not split: the hardware
+  never stops between a branch and its delay slot (an exception or debug stop in the slot
+  reports the branch, and both run again), so a hook on a slot is an error, as on AVR
+  after `SEI`, the 8051 after an `IE`/`IP` write and Z80 behind a prefix. Hook the
+  branch: it shows what the hardware would.
 
   Cost: nothing for code without such a hook (the lifter only asks while the executor has
   hooks). A hooked continuation pays on every pass: two blocks instead of one and, under
@@ -570,6 +571,8 @@ all are ISA-neutral and unused by ISAs that do not need them.
   data TLB. In a tight loop that measured about ten times the cost of a hook on an
   ordinary instruction under the JIT (some 300 ns a pass), 15-25% more under the
   interpreter: fine for a breakpoint or a crash pc, noticeable for a hook in a hot loop.
+  An interrupt due at the boundary may be taken there (ARM), one instruction earlier than
+  unhooked, which the hardware also allows.
 
 - **Optional address translation (`isa->translate`).** An ISA may supply a
   virtual-to-physical translation that the executor calls for every fetch, load

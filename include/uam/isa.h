@@ -216,14 +216,9 @@ typedef struct uam_isa {
     /* Optional: cpu->pc was set from outside the guest (a hook that emulates a
      * function, a rule's `set pc=`, a debugger) to an address the guest did not branch
      * to. Drop state that carries an instruction group across a block boundary (ARM's
-     * IT state, a MIPS delay slot split at a hook): the group does not continue there.
+     * IT state): the group does not continue there.
      * A snapshot restore does not call it (the state is restored with the pc). */
     void       (*pc_moved)(uam_cpu *cpu);
-    /* Optional, cold path: called with each synchronous exception before anything
-     * reads it (the exception observer, a fault stop, take_exception). An ISA that
-     * splits an instruction group at a hook makes a fault in the split-off part look
-     * as it does unsplit: UAM_EXC_F_CONT and parent_pc set (a MIPS delay slot). */
-    void       (*exc_adjust)(uam_cpu *cpu, uam_exception *exc);
 } uam_isa;
 
 /* The bits of a pc that select an instruction-set state rather than an address

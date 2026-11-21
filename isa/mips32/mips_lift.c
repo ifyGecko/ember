@@ -20,14 +20,6 @@
  * taken. An exception raised by the delay slot is reported by the executor as
  * a continuation of the branch (UAM_EXC_F_CONT), which becomes EPC = branch,
  * Cause.BD = 1.
- *
- * The one exception: a pc hook on the delay slot (uam_lift_hooked). The hook can only
- * fire where a block starts, so the branch's block ends at the slot with the branch's
- * outcome kept in hidden state (mips_enter_slot: the target, the exit kind, and in
- * cpu->priv the branch's length), and the slot runs as a block of its own that leaves
- * for that target (mips_lift_slot, mips_leave_slot). No interrupt is taken in between
- * (irq_take), and an exception in the slot is still the branch's (exc_adjust). A slot
- * without a hook is lifted as above: nothing changes for it.
  */
 #include "mips.h"
 
@@ -348,61 +340,6 @@ static lift_result end_after(ml *L)
     return LIFT_DONE;
 }
 
-/* ---- a delay slot split at a pc hook ------------------------------------- */
-
-void mips_enter_slot(ml *L, uam_ref cond, uam_ref target, uint32_t fall, uam_exit_kind kind,
-                     uint32_t slot_pc, unsigned blen, bool short_slot)
-{
-    /* A link to its own return address reads the pc (bal .+8): not a call, as call
-     * tracking judges it when the branch and its slot are one block (frames.c). */
-    if (kind == UAM_EXIT_CALL && uam_ref_is_imm(target)
-        && (uint32_t)L->b->imm[uam_ref_index(target)] == fall)
-        kind = UAM_EXIT_JUMP;
-    uam_ref t = target, k = imm(L, kind);
-    if (!uam_ref_is_none(cond)) {
-        t = uam_select(L->b, 32, cond, target, imm(L, fall));
-        if (kind != UAM_EXIT_JUMP)   /* not taken, it is no call or return */
-            k = uam_select(L->b, 32, cond, imm(L, kind), imm(L, UAM_EXIT_JUMP));
-    }
-    uint32_t ds = ((blen / 2) << MIPS_PRIV_DS_SHIFT) | (short_slot ? MIPS_PRIV_DS_SHORT : 0);
-    mips_helper(L, MIPS_HELPER_DS_ENTER, t, k, imm(L, ds));
-    uam_exit(L->b, NONE, imm(L, slot_pc), UAM_EXIT_JUMP);
-}
-
-void mips_leave_slot(ml *L)
-{
-    uam_ref k = mips_helper(L, MIPS_HELPER_DS_KIND, NONE, NONE, NONE);
-    uam_ref t = mips_helper(L, MIPS_HELPER_DS_LEAVE, NONE, NONE, NONE);
-    uam_exit(L->b, bin(L, UAM_OP_EQ, k, imm(L, UAM_EXIT_CALL)), t, UAM_EXIT_CALL);
-    uam_exit(L->b, bin(L, UAM_OP_EQ, k, imm(L, UAM_EXIT_RET)), t, UAM_EXIT_RET);
-    uam_exit(L->b, NONE, t, UAM_EXIT_JUMP);
-}
-
-/* The block of a split MIPS32 delay slot: the slot alone, then the branch's exit. The
- * slot is checked again: its bytes may have changed since the branch's block ran. */
-static uam_status lift_slot32(uam_lift_ctx *lc)
-{
-    const mips_state *s = mips_st(lc->cpu);
-    uint32_t pc = (uint32_t)lc->pc;
-    uint64_t raw = 0;
-    uam_status st = lc->fetch(lc, pc, 4, &raw);
-    ml L = { .lc = lc, .b = lc->b, .s = s, .endian = s->endian, .priv = lc->cpu->priv,
-             .pc = pc, .npc = pc + 4, .raw = (uint32_t)raw, .in_slot = true };
-    uam_imark(lc->b, pc, 4);
-    if (st != UAM_OK) {   /* as unsplit: the slot counts, its exception is the branch's */
-        trap(&L, NONE, MIPS_TRAP_SLOT_FETCH, imm(&L, pc));
-        return UAM_OK;
-    }
-    if (!is_simple_delay(s, (uint32_t)raw)) {
-        trap(&L, NONE, EXC_RI, imm(&L, (uint32_t)raw));
-        return UAM_OK;
-    }
-    if (lift_insn(&L, (uint32_t)raw) == LIFT_DONE)
-        return UAM_OK;                                            /* the slot always traps */
-    mips_leave_slot(&L);
-    return UAM_OK;
-}
-
 /*
  * Emit the delay slot then the branch exits. `cond` is NONE for an
  * unconditional transfer; `likely` annuls the slot when not taken.
@@ -418,10 +355,6 @@ static lift_result finish_branch_k(ml *L, uam_ref cond, uam_ref target, bool lik
         /* Not taken: skip the delay slot entirely. */
         uam_exit(L->b, uam_binop(L->b, UAM_OP_XOR, 1, cond, imm(L, 1)),
                  imm(L, L->pc + 8), UAM_EXIT_JUMP);
-    }
-    if (uam_lift_hooked(L->lc, dpc)) {
-        mips_enter_slot(L, likely ? NONE : cond, target, L->pc + 8, kind, dpc, 4, false);
-        return LIFT_DONE;
     }
 
     uam_imark_cont(L->b, dpc, 4);
@@ -830,9 +763,6 @@ uam_status mips_lift(uam_lift_ctx *lc)
 {
     const mips_state *s = mips_st(lc->cpu);
     uint32_t pc = (uint32_t)lc->pc;
-    if (lc->cpu->priv & MIPS_PRIV_DS_MASK)   /* a delay slot split at a pc hook */
-        return !(pc & 1) ? lift_slot32(lc)
-             : mips_has_m16(s) ? mips16_lift_slot(lc) : mips_umips_lift_slot(lc);
     if (pc & 1) {
         if (mips_has_m16(s))
             return mips16_lift(lc);

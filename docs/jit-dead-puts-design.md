@@ -234,7 +234,7 @@ Read for it: src/core, src/exec, src/ir, src/machine, src/runner, src/loader, sr
 | Register GET/PUT must be 8–64 bits wide | Flags are bytes: each write is ZEXT.8+PUT.8 and each read GET.8+TRUNC. Peepholes remove the round trips within a block; step 9 removes the dead ones across instructions |
 | No add-with-carry-in form | ADC/SBC (ARM, x86, PPC adde) cost about 8 IR ops. A generic `CARRY3`-style op would be a candidate if profiles ever show it |
 | Edge cases follow particular ISAs | Division-by-zero results follow RISC-V and shift-by-≥width follows ARM. The other ISAs pay one extra op (a guard or an AND) |
-| Other limits | One translation per pc: code reached alternately under two privilege tags is retranslated each time. The minimum page size is 4 KiB: sub-4K pages (MIPS PageGrain 1K, ARMv5 tiny pages) are not supported. A pc hook on an instruction that continues another splits the group where the ISA can carry its state (ARM IT blocks, MIPS delay slots, x86 STI/MOV SS, Z80 EI) and is an error elsewhere (`uam-isa.md` §10a) |
+| Other limits | One translation per pc: code reached alternately under two privilege tags is retranslated each time. The minimum page size is 4 KiB: sub-4K pages (MIPS PageGrain 1K, ARMv5 tiny pages) are not supported. A pc hook on an instruction that continues another splits the group where the ISA can carry its state (ARM IT blocks, x86 STI/MOV SS, Z80 EI) and is an error elsewhere (`uam-isa.md` §10a) |
 
 ### 9.3 Measuring parity, not just reasoning about it
 

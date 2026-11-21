@@ -165,7 +165,7 @@ static void mode_update(uam_cpu *cpu)
     if (s->c.status & ST_CU1) p |= MIPS_PRIV_CU1;
     if (s->c.status & ST_FR)  p |= MIPS_PRIV_FR;
     if (s->c.status & ST_MX)  p |= MIPS_PRIV_MX;
-    cpu->priv = p | (cpu->priv & MIPS_PRIV_DS_MASK);   /* in a split delay slot: still */
+    cpu->priv = p;
     bool erl = s->c.status & ST_ERL;
     if (erl != s->erl_seen) {
         s->erl_seen = erl;
@@ -638,10 +638,7 @@ static bool mips_irq_take(uam_cpu *cpu)
     if (!ints_enabled(s) || !int_pending(s))
         return false;
     /* Interrupts are only taken between blocks, never inside a branch/delay
-     * slot pair (UAM_IMARK_CONT), so EPC is simply the next pc. A slot split from its
-     * branch at a pc hook (MIPS_PRIV_DS_*) runs first, as it would unsplit. */
-    if (cpu->priv & MIPS_PRIV_DS_MASK)
-        return false;
+     * slot pair (UAM_IMARK_CONT), so EPC is simply the next pc. */
     uint32_t pc = (uint32_t)cpu->pc;
     uint32_t spacing = ((s->c.intctl >> 5) & 0x1Fu) * 32u;
     bool iv = (s->c.cause & CAUSE_IV) && !(s->c.status & ST_BEV);
@@ -919,45 +916,6 @@ static uint64_t helper_wrpgpr(void *env, uint64_t rd, uint64_t v, uint64_t c, ua
 
 #define PRIV_HELPER(nm, f) { .name = nm, .n_args = 0, .result_width = 0, .effect = ALL_EFFECTS, .fn = f }
 
-/* A delay slot split from its branch at a pc hook (mips_enter_slot, mips_leave_slot).
- * The slot runs as a block of its own, lifted for the bits set here. */
-static void ds_clear(uam_cpu *cpu)
-{
-    mips_state *s = mips_st(cpu);
-    cpu->priv &= ~MIPS_PRIV_DS_MASK;
-    s->ds_target = 0;
-    s->ds_kind = 0;
-}
-
-static uint64_t helper_ds_enter(void *env, uint64_t target, uint64_t kind, uint64_t ds,
-                                uam_status *st)
-{
-    (void)st;
-    uam_cpu *cpu = env;
-    mips_state *s = mips_st(cpu);
-    s->ds_target = (uint32_t)target;
-    s->ds_kind = (uint8_t)kind;
-    cpu->priv = (cpu->priv & ~MIPS_PRIV_DS_MASK) | ((unsigned)ds & MIPS_PRIV_DS_MASK);
-    uam_cpu_request_exit(cpu);
-    return 0;
-}
-
-static uint64_t helper_ds_kind(void *env, uint64_t a, uint64_t b, uint64_t c, uam_status *st)
-{
-    (void)a; (void)b; (void)c; (void)st;
-    return mips_st((uam_cpu *)env)->ds_kind;
-}
-
-static uint64_t helper_ds_leave(void *env, uint64_t a, uint64_t b, uint64_t c, uam_status *st)
-{
-    (void)a; (void)b; (void)c; (void)st;
-    uam_cpu *cpu = env;
-    uint32_t t = mips_st(cpu)->ds_target;
-    ds_clear(cpu);
-    uam_cpu_request_exit(cpu);
-    return t;
-}
-
 const uam_helper_desc mips_helpers[MIPS_HELPER__COUNT] = {
     [MIPS_HELPER_ERET] = {
         .name = "mips_eret", .n_args = 0, .result_width = 32,
@@ -995,19 +953,6 @@ const uam_helper_desc mips_helpers[MIPS_HELPER__COUNT] = {
     [MIPS_HELPER_DSP] = {
         .name = "mips_dsp", .n_args = 1, .arg_width = { 32 }, .result_width = 0,
         .effect = UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE, .fn = mips_dsp_op,
-    },
-    /* None of them faults: they follow the branch's link write or the slot's own writes. */
-    [MIPS_HELPER_DS_ENTER] = {
-        .name = "mips_ds_enter", .n_args = 3, .arg_width = { 32, 32, 32 }, .result_width = 0,
-        .effect = UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE, .fn = helper_ds_enter,
-    },
-    [MIPS_HELPER_DS_KIND] = {
-        .name = "mips_ds_kind", .n_args = 0, .result_width = 32,
-        .effect = UAM_HELPER_READS_STATE, .fn = helper_ds_kind,
-    },
-    [MIPS_HELPER_DS_LEAVE] = {
-        .name = "mips_ds_leave", .n_args = 0, .result_width = 32,
-        .effect = UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE, .fn = helper_ds_leave,
     },
 };
 
@@ -1060,7 +1005,6 @@ static void mips_reset(uam_cpu *cpu, uint64_t entry)
     uam_signal_set(&s->swint_line[1], 0);
     for (size_t i = 0; i < cpu->regfile_size; i++)
         cpu->regfile[i] = 0;
-    ds_clear(cpu);
     s->erl_seen = !(s->c.status & ST_ERL); /* force mode_update to report the ERL state */
     mode_update(cpu);
     /* A processor whose reset ISA is microMIPS (Config3.ISA 1 or 3) starts there. */
@@ -1090,9 +1034,6 @@ static void mips_dump_state(uam_cpu *cpu, FILE *out)
             s->c.status, cause_read(s), s->c.epc, s->c.badvaddr, mips_count_now(cpu),
             s->c.compare);
     fprintf(out, "entryhi=%08x index=%08x wired=%u\n", s->c.entryhi, s->c.index, s->c.wired);
-    if (cpu->priv & MIPS_PRIV_DS_MASK)
-        fprintf(out, "in a delay slot split at a pc hook: the branch at %08llx goes to %08x\n",
-                (unsigned long long)(cpu->pc - MIPS_PRIV_DS_LEN(cpu->priv)), s->ds_target);
     if (s->cfg.shadow_sets || mips_has_eic(s))
         fprintf(out, "srsctl=%08x intctl=%08x ripl=%u vector=%u\n", srsctl_read(s),
                 intctl_read(s), s->eic.ripl, s->eic.vector);
@@ -1154,8 +1095,6 @@ static void mips_save(uam_cpu *cpu, uam_state_writer *w)
     uam_state_put_u32(w, s->eic.vector);
     uam_state_put_u32(w, s->eic.offset);
     uam_state_put_u32(w, s->eic.ss);
-    uam_state_put_u32(w, s->ds_target);
-    uam_state_put_u8(w, s->ds_kind);
 }
 
 static void mips_restore(uam_cpu *cpu, uam_state_reader *r)
@@ -1195,8 +1134,6 @@ static void mips_restore(uam_cpu *cpu, uam_state_reader *r)
     s->eic.vector = uam_state_get_u32(r);
     s->eic.offset = uam_state_get_u32(r);
     s->eic.ss = uam_state_get_u32(r);
-    s->ds_target = uam_state_get_u32(r);
-    s->ds_kind = uam_state_get_u8(r);
     /* The outputs' levels follow the state; their sinks restore their own. */
     s->timer_line.level = c->timer_ip;
     s->swint_line[0].level = (c->cause >> CAUSE_IP_SHIFT) & 1;
@@ -1288,7 +1225,7 @@ static bool mips_gdb_write(uam_cpu *cpu, unsigned n, uint64_t v)
     if (n < 32)       uam_cpu_reg_write(cpu, MIPS_REG_OFF(n), 32, v);
     else if (n == 33) uam_cpu_reg_write(cpu, MIPS_LO_OFF, 32, v);
     else if (n == 34) uam_cpu_reg_write(cpu, MIPS_HI_OFF, 32, v);
-    else if (n == 37) uam_cpu_set_pc(cpu, (uint32_t)v);   /* elsewhere: a split slot ends */
+    else if (n == 37) cpu->pc = (uint32_t)v;
     else if (n == 32) {
         s->c.status = (uint32_t)v;
         mode_update(cpu);
@@ -1305,20 +1242,6 @@ static const uam_gdb_arch mips_gdb = {
     .read_reg = mips_gdb_read,
     .write_reg = mips_gdb_write,
 };
-
-/* An exception in a delay slot split from its branch at a pc hook is the branch's, as it
- * is unsplit: a continuation of it (EPC = the branch, Cause.BD), for every observer. */
-static void mips_exc_adjust(uam_cpu *cpu, uam_exception *e)
-{
-    unsigned len = MIPS_PRIV_DS_LEN(cpu->priv);
-    if (!len)
-        return;
-    if (!(e->flags & UAM_EXC_F_CONT)) {
-        e->flags |= UAM_EXC_F_CONT;
-        e->parent_pc = e->pc - len;
-    }
-    ds_clear(cpu);
-}
 
 /* ------------------------------------------------------------------------ */
 /* Descriptors                                                               */
@@ -1345,9 +1268,7 @@ static void mips_exc_adjust(uam_cpu *cpu, uam_exception *e)
     .dump_state     = mips_dump_state,                \
     .save           = mips_save,                      \
     .restore        = mips_restore,                   \
-    .irq_lines      = mips_irq_lines,                 \
-    .pc_moved       = ds_clear,                       \
-    .exc_adjust     = mips_exc_adjust
+    .irq_lines      = mips_irq_lines
 
 const uam_isa uam_isa_mips32be = {
     .name = "mips32be", .default_endian = UAM_ACC_BE, MIPS_COMMON,

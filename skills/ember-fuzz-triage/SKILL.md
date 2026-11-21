@@ -287,11 +287,12 @@ depends on the verdict:
 - **hang**: the run ends by itself (exit status 125 or 128). **timeout**: `-n` ends it.
 
 A `--break` that never fires on ARM Thumb code: give the address with bit 0 set. One on
-an instruction inside an IT block or in a MIPS delay slot works: the run stops there with
-the instructions before it done. On a few cores an instruction cannot be stopped at (AVR
-after `SEI`, the 8051 after an `IE`/`IP` write, Z80 behind a prefix): the run ends at
-once with `a pc hook at 0x... is on an instruction that continues the one before it`
-(exit status 126). Put the `--break` on the instruction before it.
+an instruction inside an IT block works: the run stops there with the instructions
+before it done. Some instructions cannot be stopped at (a MIPS delay slot, AVR after
+`SEI`, the 8051 after an `IE`/`IP` write, Z80 behind a prefix): the run ends at once
+with `a pc hook at 0x... is on an instruction that continues the one before it ...:
+hook 0x... instead` (exit status 126). Put the `--break` on the address it names (for a
+delay slot, the branch).
 
 ## Step 7: look around with gdb
 
@@ -486,7 +487,7 @@ classification with its evidence.
 - **A `--break`, `--on pc=` or `--log-pc` never fires**: not an instruction boundary; on
   ARM Thumb or MIPS16e/microMIPS, bit 0 is missing (step 6).
 - **`a pc hook at 0x... is on an instruction that continues the one before it`**: that
-  core cannot stop there (step 6); hook the instruction before it.
+  core cannot stop there (step 6); hook the address the message names.
 - **Symbols do not match the addresses** (a bootloader that copies itself, a module
   loaded at run time): `references/gdb.md`, "Code that is not where the ELF says".
 - **gdb says `Cannot execute this command while the target is running`**: the guest is

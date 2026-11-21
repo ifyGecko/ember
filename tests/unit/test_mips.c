@@ -490,361 +490,6 @@ static void test_delay_slots(bool jit)
     }
 }
 
-/* ---- pc hooks on delay slots ------------------------------------------------------ */
-
-/* A hook on a delay slot ends the branch's block at the slot, the branch's outcome
- * kept: the hook fires there, sees the branch done (its link written) and the slot not,
- * and the run goes on as if nothing had stopped it, exceptions in the slot included. */
-
-#define J(t)          (0x08000000u | (((uint32_t)(t) >> 2) & 0x03FFFFFFu))
-#define JALR(rd, rs)  ((uint32_t)(rs) << 21 | (uint32_t)(rd) << 11 | 0x09u)
-#define BEQL(rs, rt, off) I(0x14, rs, rt, off)
-#define BNEL(rs, rt, off) I(0x15, rs, rt, off)
-#define BGEZAL(rs, off)   I(0x01, rs, 17, off)
-enum { A0 = 4, A1 = 5, A2 = 6, V1 = 3, T4 = 12 };
-
-typedef struct ds_end {
-    uint32_t r[32], status, cause, epc, badvaddr;
-    uint64_t pc, icount;
-    unsigned priv;
-} ds_end;
-
-static ds_end ds_end_of(uam_machine *m)
-{
-    ds_end e = { .pc = m->cpu.pc, .icount = m->cpu.icount, .priv = m->cpu.priv,
-                 .status = st(m)->c.status, .cause = st(m)->c.cause, .epc = st(m)->c.epc,
-                 .badvaddr = st(m)->c.badvaddr };
-    for (unsigned i = 0; i < 32; i++)
-        e.r[i] = gpr(m, i);
-    return e;
-}
-
-static void ds_same(const ds_end *a, const ds_end *b, const char *what)
-{
-    for (unsigned i = 0; i < 32; i++)
-        CHECK(a->r[i] == b->r[i], "%s: r%u 0x%x, unhooked 0x%x", what, i, (unsigned)a->r[i],
-              (unsigned)b->r[i]);
-    CHECK(a->pc == b->pc, "%s: pc 0x%llx, unhooked 0x%llx", what, (unsigned long long)a->pc,
-          (unsigned long long)b->pc);
-    CHECK(a->icount == b->icount, "%s: icount %llu, unhooked %llu", what,
-          (unsigned long long)a->icount, (unsigned long long)b->icount);
-    CHECK(a->status == b->status && a->cause == b->cause && a->epc == b->epc
-          && a->badvaddr == b->badvaddr,
-          "%s: status/cause/epc/badvaddr 0x%x/0x%x/0x%x/0x%x, unhooked 0x%x/0x%x/0x%x/0x%x", what,
-          (unsigned)a->status, (unsigned)a->cause, (unsigned)a->epc, (unsigned)a->badvaddr,
-          (unsigned)b->status, (unsigned)b->cause, (unsigned)b->epc, (unsigned)b->badvaddr);
-    CHECK(a->priv == b->priv, "%s: priv 0x%x, unhooked 0x%x", what, a->priv, b->priv);
-}
-
-enum { DS_NONE, DS_IRQ, DS_MOVE, DS_STOP, DS_REWRITE, DS_RESTORE };
-typedef struct ds_hook {
-    uam_machine *m;
-    unsigned     hits, act;
-    uint32_t     arg;
-    ds_end       seen;
-    const uam_snapshot *snap;
-} ds_hook;
-
-static uam_hook_action ds_hook_fn(void *ctx, uam_cpu *cpu, uint64_t pc)
-{
-    ds_hook *h = ctx;
-    if (!h->hits++)
-        h->seen = ds_end_of(h->m);
-    switch (h->act) {
-    case DS_IRQ:      /* software interrupt 0 */
-        cpu->isa->sysreg_write(cpu, CP0_CAUSE, 1u << 8);
-        break;
-    case DS_MOVE:
-        cpu->pc = h->arg;
-        break;
-    case DS_STOP:
-        return UAM_HOOK_STOP;
-    case DS_REWRITE:  /* the slot's bytes change between the branch's block and its own */
-        put(h->m, (uint32_t)pc, h->arg);
-        break;
-    case DS_RESTORE:
-        CHECK(uam_snapshot_restore(h->m, h->snap) == UAM_OK, "restore from a hook");
-        break;
-    }
-    return UAM_HOOK_CONTINUE;
-}
-
-/* The first exception as an exception observer sees it (the fuzz harness's view). */
-typedef struct ds_exc { unsigned n; uint64_t pc, epc_pc; unsigned flags; } ds_exc;
-static uam_hook_action ds_exc_fn(void *ctx, uam_cpu *cpu, const uam_exception *e)
-{
-    ds_exc *x = ctx;
-    if (!x->n++) {
-        x->pc = cpu->pc;
-        x->flags = e->flags;
-        x->epc_pc = e->parent_pc;
-    }
-    return UAM_HOOK_CONTINUE;
-}
-
-typedef void (*ds_setup)(uam_machine *m, const void *arg);
-
-/* Run setup's program from pc for n instructions without a hook, then with a hook on
- * `slot` (act/arg as ds_hook): the end must be the same. backend: 0 the interpreter, 1
- * the JIT, 2 the JIT without chaining. Returns the hook's record. */
-static ds_hook ds_compare(unsigned backend, const uam_isa *isa, const uam_mips_config *cfg,
-                          ds_setup setup, const void *arg, uint32_t pc, uint32_t slot, uint64_t n,
-                          unsigned want_hits, const char *what)
-{
-    ds_end ref = { 0 };
-    ds_exc xr = { 0 }, xh = { 0 };
-    ds_hook h = { 0 };
-    for (int hooked = 0; hooked < 2; hooked++) {
-        uam_machine m;
-        machine(&m, isa, cfg, backend != 0);
-        if (backend == 2)
-            m.exec.chain = false;
-        setup(&m, arg);
-        uam_exec_set_exc_hook(&m.exec, ds_exc_fn, hooked ? &xh : &xr);
-        h.m = &m;
-        if (hooked)
-            CHECK(uam_machine_add_pc_hook(&m, slot, ds_hook_fn, &h) == UAM_OK, "%s: add", what);
-        run(&m, pc, n);
-        if (!hooked)
-            ref = ds_end_of(&m);
-        else {
-            ds_end e = ds_end_of(&m);
-            ds_same(&e, &ref, what);
-            CHECK(h.hits == want_hits, "%s: the hook fired %u times, want %u", what, h.hits, want_hits);
-            CHECK(xh.n == xr.n && xh.pc == xr.pc && xh.flags == xr.flags && xh.epc_pc == xr.epc_pc,
-                  "%s: the exception observer saw %u at pc 0x%llx flags %u parent 0x%llx, unhooked "
-                  "%u at 0x%llx flags %u parent 0x%llx", what, xh.n, (unsigned long long)xh.pc,
-                  xh.flags, (unsigned long long)xh.epc_pc, xr.n, (unsigned long long)xr.pc,
-                  xr.flags, (unsigned long long)xr.epc_pc);
-            EQ64(m.cpu.priv & MIPS_PRIV_DS_MASK, 0, "no split slot left");
-        }
-        uam_machine_fini(&m);
-    }
-    return h;
-}
-
-/* MIPS32: branch at CODE, its slot, then a spin at CODE + 8 (not taken) and CODE + 16
- * (taken). */
-typedef struct ds_case { uint32_t br, slot; unsigned hits; const char *what; } ds_case;
-static void ds_setup32(uam_machine *m, const void *arg)
-{
-    const ds_case *c = arg;
-    PROG(m, CODE, c->br, c->slot, SPIN, NOP, SPIN, NOP);
-    setr(m, T0, NOWHERE);
-    setr(m, T2, CODE + 16);
-    setr(m, T3, 0x7FFFFFFFu);
-    setr(m, T4, 0x0000FF00u);
-}
-
-/* MIPS16e: jal sub (slot: addiu v0, pc, 8); li v1, 5; b . -- sub: jr ra (slot: addiu a0,
- * pc, 4). The PC-relative slots count from the jump. */
-static void ds_setup16(uam_machine *m, const void *arg)
-{
-    (void)arg;
-    put16(m, put16(m, put16(m, put16(m, put16(m, CODE, 0x1800), 0x0440), 0x0A02), 0x6B05), 0x17FF);
-    put16(m, put16(m, CODE + 0x100, 0xE820), 0x0C01);
-}
-
-/* microMIPS: jals sub (16-bit slot: move v0, v1); beq v0, v1, 1f (slot: addiu a0, 1);
- * addiu a2, 1; 1: jalr t1 (32-bit slot: addiu a1, 1); b16 . -- sub: jrc ra. */
-static void ds_setup_um(uam_machine *m, const void *arg)
-{
-    const uint16_t *bad = arg;   /* non-NULL: the jals slot is this 32-bit instruction */
-    uint32_t a = put16(m, put16(m, CODE, 0x7400), 0x0880);
-    if (bad) {
-        put16(m, put16(m, a, bad[0]), bad[1]);
-        return;
-    }
-    a = put16(m, a, 0x0C43);
-    a = put16(m, put16(m, a, 0x9462), 0x0002);
-    a = put16(m, put16(m, a, 0x6E40), 0x6F60);
-    a = put16(m, a, 0x45C9);
-    a = put16(m, put16(m, a, 0x30A5), 0x0001);
-    put16(m, put16(m, a, UM_B16_SELF), UM_NOP16);
-    put16(m, CODE + 0x100, 0x45BF);
-    setr(m, V1, 0x1234);
-    setr(m, T1, (CODE + 0x14) | 1);
-}
-
-/* A slot at the end of RAM whose fetch fails. */
-static void ds_setup_edge(uam_machine *m, const void *arg)
-{
-    (void)arg;
-    put(m, 0x800FFFFCu, BEQ(0, 0, 3));
-}
-
-static void test_slot_hooks(unsigned backend)
-{
-    static const char *const be[] = { "interp", "jit", "jit no-chain" };
-    char what[160];
-    static const ds_case cases[] = {
-        { BEQ(0, 0, 3),   ADDIU(T1, T1, 1), 1, "beq taken" },
-        { BNE(0, 0, 3),   ADDIU(T1, T1, 1), 1, "bne not taken" },
-        { BEQL(0, 0, 3),  ADDIU(T1, T1, 1), 1, "beql taken" },
-        { BNEL(0, 0, 3),  ADDIU(T1, T1, 1), 0, "bnel not taken: the slot is annulled" },
-        { J(CODE + 16),   ADDIU(T1, T1, 1), 1, "j" },
-        { JAL(CODE + 16), ADDIU(T1, RA, 0), 1, "jal (the slot reads the link)" },
-        { JR(T2),         ADDIU(T1, T1, 1), 1, "jr" },
-        { JALR(RA, T2),   ADDIU(T1, T1, 1), 1, "jalr" },
-        { BGEZAL(T0, 3),  ADDIU(T1, T1, 1), 1, "bgezal not taken (it links anyway)" },
-        { BGEZAL(0, 1),   ADDIU(T1, T1, 1), 1, "bal .+8" },
-        { BEQ(0, 0, 3),   LW(T1, 0, T0),    1, "a load from nothing in the slot" },
-        { JR(T2),         SW(T1, 0, T0),    1, "a store to nothing in the slot" },
-        { BEQ(0, 0, 3),   ADD(T1, T3, T3),  1, "an overflow in the slot" },
-        { BNE(0, 0, 3),   BREAK,            1, "BREAK in the slot of a branch not taken" },
-        { BEQ(0, 0, 3),   BEQ(0, 0, 3),     1, "a branch in the slot: RI" },
-        { BEQ(0, 0, 3),   ERET,             1, "ERET in the slot: RI" },
-        { BEQ(0, 0, 3),   MTC0(T4, 12, 0),  1, "MTC0 Status in the slot" },
-    };
-    for (size_t i = 0; i < UAM_ARRAY_LEN(cases); i++) {
-        snprintf(what, sizeof(what), "%s %s", be[backend], cases[i].what);
-        ds_hook h = ds_compare(backend, &uam_isa_mips32be, NULL, ds_setup32, &cases[i], CODE,
-                               CODE + 4, 12, cases[i].hits, what);
-        if (cases[i].hits) {
-            EQ64(h.seen.pc, CODE + 4, "the hook's pc: the slot");
-            EQ64(h.seen.r[T1], 0, "the slot has not run at the hook");
-            if (cases[i].br == JAL(CODE + 16) || cases[i].br == BGEZAL(T0, 3))
-                EQ64(h.seen.r[RA], CODE + 8, "the branch's link is written at the hook");
-            CHECK(h.seen.priv & MIPS_PRIV_DS_MASK, "%s: in a split slot at the hook", what);
-        }
-    }
-
-    /* the slot's fetch fails: the branch's exception, as unhooked */
-    snprintf(what, sizeof(what), "%s a slot that cannot be fetched", be[backend]);
-    ds_compare(backend, &uam_isa_mips32be, NULL, ds_setup_edge, NULL, 0x800FFFFCu, 0x80100000u, 12,
-               1, what);
-
-    /* MIPS16e, both slots */
-    for (int k = 0; k < 2; k++) {
-        snprintf(what, sizeof(what), "%s mips16e %s", be[backend], k ? "jr's slot" : "jal's slot");
-        ds_hook h = ds_compare(backend, &uam_isa_mips32le, &uam_mips_m16_ref, ds_setup16, NULL,
-                               CODE | 1, k ? (CODE + 0x102) | 1 : (CODE + 4) | 1, 12, 1, what);
-        if (!k)
-            EQ64(h.seen.r[RA], (CODE + 6) | 1, "mips16e: jal's link at the hook");
-    }
-    {
-        uam_machine m;
-        machine(&m, &uam_isa_mips32le, &uam_mips_m16_ref, backend != 0);
-        ds_setup16(&m, NULL);
-        run(&m, CODE | 1, 12);
-        EQ64(gpr(&m, V0), CODE + 8, "mips16e: the jal slot's addiu counts from the jal");
-        EQ64(gpr(&m, A0), CODE + 0x104, "mips16e: the jr slot's addiu counts from the jr");
-        uam_machine_fini(&m);
-    }
-
-    /* microMIPS: a 16-bit slot a jals requires, a beq's, a 32-bit one; a jals with a 32-bit
-     * slot is RI */
-    static const uint32_t um_slots[] = { CODE + 4, CODE + 0xA, CODE + 0x10 };
-    for (size_t k = 0; k < UAM_ARRAY_LEN(um_slots); k++) {
-        snprintf(what, sizeof(what), "%s micromips slot at +0x%x", be[backend],
-                 (unsigned)(um_slots[k] - CODE));
-        ds_compare(backend, &uam_isa_mips32le, &uam_mips_umips_ref, ds_setup_um, NULL, CODE | 1,
-                   um_slots[k] | 1, 16, 1, what);
-    }
-    static const uint16_t wide[2] = { 0x30A5, 0x0001 };
-    snprintf(what, sizeof(what), "%s micromips jals with a 32-bit slot: RI", be[backend]);
-    ds_compare(backend, &uam_isa_mips32le, &uam_mips_umips_ref, ds_setup_um, wide, CODE | 1,
-               (CODE + 4) | 1, 8, 1, what);
-
-    /* an interrupt raised at the hook: taken after the slot, at the branch's target */
-    {
-        uam_machine m;
-        machine(&m, &uam_isa_mips32be, NULL, backend != 0);
-        ds_case c = { BEQ(0, 0, 3), ADDIU(T1, T1, 1), 1, "" };
-        ds_setup32(&m, &c);
-        sysw(&m, CP0_STATUS, ST_IE | 1u << ST_IM_SHIFT);
-        ds_hook h = { .m = &m, .act = DS_IRQ };
-        CHECK(uam_machine_add_pc_hook(&m, CODE + 4, ds_hook_fn, &h) == UAM_OK, "add");
-        run(&m, CODE, 12);
-        EQ64(gpr(&m, T1), 1, "irq at a slot hook: the slot ran first");
-        expect_exc(&m, GENERAL, EXC_INT, CODE + 16, false, "irq at a slot hook: at the target");
-        uam_machine_fini(&m);
-    }
-
-    /* a hook that moves the pc: the split slot is gone, the instruction moved to is not a
-     * slot (it would leave for the branch's target, CODE + 16) */
-    {
-        uam_machine m;
-        machine(&m, &uam_isa_mips32be, NULL, backend != 0);
-        ds_case c = { BEQ(0, 0, 3), ADDIU(T1, T1, 1), 1, "" };
-        ds_setup32(&m, &c);
-        PROG(&m, CODE + 0x40, ADDIU(T3, 0, 0x55), SPIN, NOP);
-        ds_hook h = { .m = &m, .act = DS_MOVE, .arg = CODE + 0x40 };
-        CHECK(uam_machine_add_pc_hook(&m, CODE + 4, ds_hook_fn, &h) == UAM_OK, "add");
-        run(&m, CODE, 12);
-        EQ64(gpr(&m, T3), 0x55, "a hook moved the pc: that instruction ran");
-        CHECK((m.cpu.pc & ~4u) == CODE + 0x44 - 4 || m.cpu.pc == CODE + 0x44,
-              "and the run went on there (pc 0x%llx)", (unsigned long long)m.cpu.pc);
-        EQ64(m.cpu.priv & MIPS_PRIV_DS_MASK, 0, "no split slot");
-        uam_machine_fini(&m);
-    }
-
-    /* the slot rewritten between the two blocks: what is there now runs, checked again */
-    {
-        uam_machine m;
-        machine(&m, &uam_isa_mips32be, NULL, backend != 0);
-        ds_case c = { BEQ(0, 0, 3), ADDIU(T1, T1, 1), 1, "" };
-        ds_setup32(&m, &c);
-        ds_hook h = { .m = &m, .act = DS_REWRITE, .arg = BNE(0, 0, 3) };
-        CHECK(uam_machine_add_pc_hook(&m, CODE + 4, ds_hook_fn, &h) == UAM_OK, "add");
-        run(&m, CODE, 12);
-        expect_exc(&m, GENERAL, EXC_RI, CODE, true, "a branch written into the slot at the hook: RI");
-        uam_machine_fini(&m);
-    }
-
-    /* stopped at the slot's hook: the debugger writes the same pc (still split) or another
-     * (not); a snapshot taken there resumes without the hook, and restored from a hook */
-    {
-        uam_machine m, m2;
-        ds_case c = { BEQ(0, 0, 3), ADDIU(T1, T1, 1), 1, "" };
-        machine(&m, &uam_isa_mips32be, NULL, backend != 0);
-        ds_setup32(&m, &c);
-        run(&m, CODE, 12);
-        ds_end ref = ds_end_of(&m);
-        uam_machine_fini(&m);
-
-        machine(&m, &uam_isa_mips32be, NULL, backend != 0);
-        ds_setup32(&m, &c);
-        ds_hook h = { .m = &m, .act = DS_STOP };
-        CHECK(uam_machine_add_pc_hook(&m, CODE + 4, ds_hook_fn, &h) == UAM_OK, "add");
-        m.cpu.pc = CODE;
-        EQ64(uam_exec_run(&m.exec, 12), UAM_STOP_HOOK, "stops at the slot's hook");
-        CHECK(m.cpu.isa->gdb->write_reg(&m.cpu, 37, CODE + 4), "gdb pc write");
-        CHECK(m.cpu.priv & MIPS_PRIV_DS_MASK, "the same pc: still in the split slot");
-        char *d = dump(&m);
-        CHECK(d && strstr(d, "split at a pc hook"), "dump: the split slot");
-        free(d);
-        uam_snapshot *s = NULL;
-        CHECK(uam_snapshot_take(&m, &s) == UAM_OK && s, "snapshot at the slot's hook");
-        machine(&m2, &uam_isa_mips32be, NULL, backend != 0);
-        ds_setup32(&m2, &c);
-        CHECK(s && uam_snapshot_restore(&m2, s) == UAM_OK, "restore without the hook");
-        uam_exec_run(&m2.exec, 12 - m2.cpu.icount);
-        ds_end e = ds_end_of(&m2);
-        ds_same(&e, &ref, "resumed from a snapshot at the slot's hook");
-        uam_machine_fini(&m2);
-
-        /* a hook on the branch restores the snapshot taken at its slot: it brings the
-         * split slot with it (the hook moved the pc, but by a restore) */
-        machine(&m2, &uam_isa_mips32be, NULL, backend != 0);
-        ds_setup32(&m2, &c);
-        ds_hook hr = { .m = &m2, .act = DS_RESTORE, .snap = s };
-        CHECK(uam_machine_add_pc_hook(&m2, CODE, ds_hook_fn, &hr) == UAM_OK, "add");
-        m2.cpu.pc = CODE;
-        uam_exec_run(&m2.exec, 12);
-        EQ64(gpr(&m2, T1), 1, "restored from a hook: the slot ran");
-        EQ64(m2.cpu.pc, ref.pc, "and the branch was taken");
-        uam_machine_fini(&m2);
-
-        CHECK(m.cpu.isa->gdb->write_reg(&m.cpu, 37, CODE + 0x40), "gdb pc write elsewhere");
-        EQ64(m.cpu.priv & MIPS_PRIV_DS_MASK, 0, "another pc: no split slot");
-        uam_machine_reset(&m, CODE);
-        EQ64(m.cpu.priv & MIPS_PRIV_DS_MASK, 0, "a reset: no split slot");
-        uam_snapshot_free(s);
-        uam_machine_fini(&m);
-    }
-}
-
 /* COP0 instructions in a delay slot run, and the branch still goes where it goes. */
 static void test_cop0_in_slot(bool jit)
 {
@@ -875,6 +520,79 @@ static void test_cop0_in_slot(bool jit)
     setr(&m, T3, 1u << 8 | ST_IE);
     run(&m, CODE + 0xC0, 8);
     expect_exc(&m, GENERAL, EXC_INT, CODE + 0xD0, false, "an interrupt the slot's MTC0 enabled");
+    uam_machine_fini(&m);
+}
+
+/* A pc hook on a delay slot cannot fire (the branch and its slot are one step, as on the
+ * hardware, which reports an exception in the slot at the branch): translation fails and
+ * the run stops with an error, nothing run. A hook on the branch fires. MIPS32, MIPS16e
+ * (jal) and microMIPS (jals, 16-bit slot). */
+static unsigned slot_hits;
+static uam_hook_action slot_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx; (void)cpu; (void)pc;
+    slot_hits++;
+    return UAM_HOOK_CONTINUE;
+}
+
+static uint64_t ri_word;
+static uam_hook_action ri_observer(void *ctx, uam_cpu *cpu, const uam_exception *e)
+{
+    (void)ctx; (void)cpu;
+    ri_word = e->tval;
+    return UAM_HOOK_CONTINUE;
+}
+
+static void test_slot_hooks(bool jit)
+{
+    static const struct {
+        const uam_isa *isa; const uam_mips_config *cfg; uint32_t start, branch, slot;
+        const char *what;
+    } cases[] = {
+        { &uam_isa_mips32be, NULL, CODE, CODE, CODE + 4, "mips32 beq" },
+        { &uam_isa_mips32le, &uam_mips_m16_ref, CODE | 1, CODE | 1, (CODE + 4) | 1, "mips16e jal" },
+        { &uam_isa_mips32le, &uam_mips_umips_ref, CODE | 1, CODE | 1, (CODE + 4) | 1, "micromips jals" },
+    };
+    for (size_t i = 0; i < UAM_ARRAY_LEN(cases); i++) {
+        for (int on_slot = 0; on_slot < 2; on_slot++) {
+            uam_machine m;
+            machine(&m, cases[i].isa, cases[i].cfg, jit);
+            if (i == 0)
+                PROG(&m, CODE, BEQ(0, 0, 3), ADDIU(T1, T1, 1), SPIN, NOP, SPIN, NOP);
+            else if (i == 1)   /* jal CODE+0x100; addiu v0, pc, 8 -- there: b . */
+                put16(&m, put16(&m, put16(&m, put16(&m, CODE, 0x1800), 0x0440), 0x0A02), M16_B_SELF);
+            else               /* jals CODE+0x100; move v0, v1 -- there: b16 . */
+                put16(&m, put16(&m, put16(&m, CODE, 0x7400), 0x0880), 0x0C43);
+            if (i)
+                put16(&m, put16(&m, CODE + 0x100, i == 1 ? M16_B_SELF : UM_B16_SELF), UM_NOP16);
+            slot_hits = 0;
+            CHECK(uam_machine_add_pc_hook(&m, on_slot ? cases[i].slot : cases[i].branch, slot_hook,
+                                          NULL) == UAM_OK, "%s: add", cases[i].what);
+            m.cpu.pc = cases[i].start;
+            uam_stop_reason why = uam_exec_run(&m.exec, 8);
+            if (on_slot) {
+                EQ64(why, UAM_STOP_ERROR, "a hook on a delay slot is an error");
+                EQ64(slot_hits, 0, "it never fired");
+                EQ64(m.cpu.pc, cases[i].start, "nothing ran");
+                EQ64(m.cpu.icount, 0, "no instruction counted");
+            } else {
+                EQ64(why, UAM_STOP_INSN_LIMIT, "a hook on the branch runs");
+                CHECK(slot_hits == 1, "%s: the branch's hook fired once (%u)", cases[i].what, slot_hits);
+            }
+            uam_machine_fini(&m);
+        }
+    }
+
+    /* microMIPS: a jals whose slot is 32-bit is Reserved Instruction, reported with the
+     * slot's word, not the branch's */
+    uam_machine m;
+    machine(&m, &uam_isa_mips32le, &uam_mips_umips_ref, jit);
+    put16(&m, put16(&m, put16(&m, put16(&m, CODE, 0x7400), 0x0880), 0x30A5), 0x0001);
+    ri_word = 0;
+    uam_machine_set_exc_hook(&m, ri_observer, NULL);
+    run(&m, CODE | 1, 4);
+    expect_exc(&m, GENERAL, EXC_RI, CODE | 1, true, "micromips jals with a 32-bit slot");
+    EQ64(ri_word, 0x30A50001u, "its RI reports the slot's word");
     uam_machine_fini(&m);
 }
 
@@ -1491,6 +1209,7 @@ int main(void)
         test_vectors(jit);
         test_delay_slots(jit);
         test_cop0_in_slot(jit);
+        test_slot_hooks(jit);
         test_modes(jit);
         test_irq_vectored(jit);
         test_wait(jit);
@@ -1500,8 +1219,6 @@ int main(void)
         test_endian(&uam_isa_mips32be, jit);
         test_endian(&uam_isa_mips32le, jit);
     }
-    for (unsigned backend = 0; backend < 3; backend++)
-        test_slot_hooks(backend);
     printf("test_mips: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }
