@@ -343,9 +343,44 @@ static void test_guard(void)
         fclose(quiet);
 }
 
+static unsigned hook_hits;
+static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx; (void)cpu; (void)pc;
+    hook_hits++;
+    return UAM_HOOK_CONTINUE;
+}
+
+/* The instruction after SEI runs before any interrupt, in the same block: a pc hook
+ * there can never fire, so translation fails with an error instead of missing it. A hook
+ * on SEI itself is an ordinary one. */
+static void test_hook_after_sei(void)
+{
+    for (int on_sei = 0; on_sei < 2; on_sei++) {
+        uam_machine m;
+        machine(&m, &uam_avr_e_ref);
+        put16(&m, 0x400, 0x9478);              /* SEI */
+        put16(&m, 0x402, NOP);
+        put16(&m, 0x404, RJMP_SELF);
+        hook_hits = 0;
+        CHECK(uam_machine_add_pc_hook(&m, on_sei ? 0x400 : 0x402, count_hook, NULL) == UAM_OK, "add");
+        uam_stop_reason why = uam_exec_run(&m.exec, 10);
+        if (on_sei) {
+            EQ64(why, UAM_STOP_INSN_LIMIT, "a hook on SEI runs");
+            EQ64(hook_hits, 1, "and fires");
+        } else {
+            EQ64(why, UAM_STOP_ERROR, "a hook on the instruction after SEI is an error");
+            EQ64(hook_hits, 0, "it never fired");
+            EQ64(m.cpu.pc, 0x400, "nothing ran");
+        }
+        uam_machine_fini(&m);
+    }
+}
+
 int main(void)
 {
     test_classic();
+    test_hook_after_sei();
     test_guard();
     test_pmic();
     test_cpuint();

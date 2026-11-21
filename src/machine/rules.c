@@ -602,7 +602,7 @@ static void apply(rule *r, const action *a, const held *h, uam_cpu *cpu)
         return;
     switch (a->dst.kind) {
     case LV_PC:
-        cpu->pc = h->val;
+        uam_cpu_set_pc(cpu, h->val);
         break;
     case LV_REG:
         if (!cpu->isa->gdb->write_reg || !cpu->isa->gdb->write_reg(cpu, a->dst.regno, h->val))

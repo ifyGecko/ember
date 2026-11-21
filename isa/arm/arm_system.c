@@ -1083,7 +1083,7 @@ static bool arm_gdb_write(uam_cpu *cpu, unsigned n, uint64_t v)
     if (n < 15) {
         reg_w(cpu, n, (uint32_t)v);
     } else if (n == 15) {
-        cpu->pc = ((uint32_t)v & ~1u) | (cpu->pc & 1);
+        uam_cpu_set_pc(cpu, ((uint32_t)v & ~1u) | (cpu->pc & 1));   /* elsewhere: IT ends */
     } else if (n == 16) {
         write_cpsr_full(cpu, (uint32_t)v);
         cpu->pc = (cpu->pc & ~UINT64_C(1)) | (((uint32_t)v & CPSR_T) ? 1 : 0);
@@ -1101,6 +1101,12 @@ static const uam_gdb_arch arm_gdb = {
     .write_reg = arm_gdb_write,
     .pc_state_bits = 1,   /* Thumb */
 };
+
+/* The pc was set from outside the guest: an IT block split at a hook does not go on. */
+static void arm_pc_moved(uam_cpu *cpu)
+{
+    set_it(cpu, 0);
+}
 
 /* ------------------------------------------------------------------------ */
 /* Descriptor                                                                */
@@ -1127,7 +1133,8 @@ static const uam_gdb_arch arm_gdb = {
     .dump_state     = arm_dump_state,                 \
     .save           = arm_save,                       \
     .restore        = arm_restore,                    \
-    .irq_lines      = arm_irq_lines
+    .irq_lines      = arm_irq_lines,                  \
+    .pc_moved       = arm_pc_moved
 
 const uam_isa uam_isa_arm = {
     .name = "armv7", .default_endian = UAM_ACC_LE, ARM_COMMON,

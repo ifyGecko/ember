@@ -122,7 +122,19 @@ typedef struct uam_lift_ctx {
      * page. In both cases end the block before this instruction. */
     uam_status (*fetch)(struct uam_lift_ctx *lc, uint64_t addr, unsigned size, uint64_t *val);
     void        *core;        /* private to the core */
+    /* Is a pc hook registered at pc (with its instruction-set bits)? NULL when the
+     * executor has none. Ask through uam_lift_hooked(), and only where an instruction
+     * would be a continuation (UAM_IMARK_CONT): a hook on an ordinary instruction needs
+     * nothing from the lifter. A lifter that can carry the group's state into the next
+     * block (cpu->priv) ends the block before a hooked continuation, so the hook fires;
+     * a hooked continuation it still emits fails translation (uam_exec_add_pc_hook). */
+    bool       (*hooked)(struct uam_lift_ctx *lc, uint64_t pc);
 } uam_lift_ctx;
+
+static inline bool uam_lift_hooked(uam_lift_ctx *lc, uint64_t pc)
+{
+    return lc->hooked && lc->hooked(lc, pc);
+}
 
 typedef struct uam_isa {
     const char             *name;
@@ -200,6 +212,18 @@ typedef struct uam_isa {
      * processor ran. State the platform keeps once for every processor (a
      * chipset's view of SMRAM, say) is switched to this processor's here. */
     void       (*switch_in)(uam_cpu *cpu);
+
+    /* Optional: cpu->pc was set from outside the guest (a hook that emulates a
+     * function, a rule's `set pc=`, a debugger) to an address the guest did not branch
+     * to. Drop state that carries an instruction group across a block boundary (ARM's
+     * IT state, a MIPS delay slot split at a hook): the group does not continue there.
+     * A snapshot restore does not call it (the state is restored with the pc). */
+    void       (*pc_moved)(uam_cpu *cpu);
+    /* Optional, cold path: called with each synchronous exception before anything
+     * reads it (the exception observer, a fault stop, take_exception). An ISA that
+     * splits an instruction group at a hook makes a fault in the split-off part look
+     * as it does unsplit: UAM_EXC_F_CONT and parent_pc set (a MIPS delay slot). */
+    void       (*exc_adjust)(uam_cpu *cpu, uam_exception *exc);
 } uam_isa;
 
 /* The bits of a pc that select an instruction-set state rather than an address

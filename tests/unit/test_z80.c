@@ -272,6 +272,48 @@ static void test_ei_shadow(void)
     uam_machine_fini(&m);
 }
 
+static unsigned hook_hits;
+static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx; (void)cpu; (void)pc;
+    hook_hits++;
+    return UAM_HOOK_CONTINUE;
+}
+
+/* A pc hook on the instruction after EI fires (the block ends before it, the shadow
+ * carried by the core), and the interrupt still waits for that instruction. One on the
+ * instruction behind a second prefix cannot: the prefix and it are one, an error. */
+static void test_ei_hook(void)
+{
+    uam_machine m;
+    machine(&m, &uam_z80_nmos_ref);
+    const uint8_t prog[] = { 0xFB, 0x04, 0x04, 0x04, 0x18, 0xFE };   /* EI; INC B x3; JR $ */
+    code(&m, 0x2000, prog, sizeof(prog));
+    code(&m, 0x0038, (const uint8_t[]){ 0x18, 0xFE }, 2);
+    sysw(&m, SYS_IM, 1);
+    line(&m, UAM_Z80_LINE_INT, 1);
+    hook_hits = 0;
+    CHECK(uam_machine_add_pc_hook(&m, 0x2001, count_hook, NULL) == UAM_OK, "add");
+    m.cpu.pc = 0x2000;
+    m.cpu.regfile[1] = 0;                           /* B */
+    step(&m, 6);
+    EQ64(hook_hits, 1, "the hook after EI fired");
+    EQ64(m.cpu.regfile[1], 1, "one instruction ran after EI");
+    EQ64(mem(&m, r16(&m, R_SP)), 0x02, "the interrupt returns to the second INC B");
+    EQ64(m.exec.stats.interrupts, 1, "one interrupt");
+    uam_machine_fini(&m);
+
+    machine(&m, &uam_z80_nmos_ref);
+    const uint8_t pre[] = { 0xDD, 0xDD, 0x21, 0x34, 0x12, 0x18, 0xFE };   /* DD; LD IX, 0x1234 */
+    code(&m, 0x2000, pre, sizeof(pre));
+    hook_hits = 0;
+    CHECK(uam_machine_add_pc_hook(&m, 0x2001, count_hook, NULL) == UAM_OK, "add");
+    m.cpu.pc = 0x2000;
+    EQ64(uam_exec_run(&m.exec, 6), UAM_STOP_ERROR, "a hook behind a prefix is an error");
+    EQ64(hook_hits, 0, "it never fired");
+    uam_machine_fini(&m);
+}
+
 static void test_r(void)
 {
     uam_machine m;
@@ -501,6 +543,7 @@ int main(void)
     test_im0();
     test_nmi_halt();
     test_ei_shadow();
+    test_ei_hook();
     test_r();
     test_repeat_flags();
     test_memptr();

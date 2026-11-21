@@ -59,8 +59,10 @@ enum { ARM_BANK_USR, ARM_BANK_FIQ, ARM_BANK_IRQ, ARM_BANK_SVC, ARM_BANK_ABT, ARM
  * besides the pc (whose bit 0 is the instruction set): bit 0 is set in User mode
  * (translation permissions), bit 1 is CPSR.E (the data byte order lifted code
  * uses), bits 15:8 hold the IT state at the start of the block.
- * The IT state is non-zero only when a block resumes inside an IT block, after an
- * exception return into one.
+ * The IT state is non-zero only when a block resumes inside an IT block: after an
+ * exception return into one, or where the lifter ended a block inside one (the block
+ * length limit, a fetch that failed, a pc hook on a governed instruction). Each
+ * remaining instruction of the IT block then runs as a block of its own.
  */
 #define ARM_PRIV_USER      1u
 #define ARM_PRIV_BE        2u   /* CPSR.E: big-endian data */

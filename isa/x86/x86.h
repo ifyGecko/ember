@@ -323,6 +323,7 @@ enum {
     X86_H_X87,           /* (descriptor, linear address): the x87 control/status subset */
     X86_H_IO,            /* (IOMisc, rip, memory address): INS/OUTS begin their access */
     X86_H_IO_PORT,       /* (IOMisc, rip, value) -> value: IN/OUT, recorded and done */
+    X86_H_SHADOW,        /* (): the next block starts in an interrupt shadow (cannot fault) */
     X86_H__COUNT
 };
 extern const uam_helper_desc x86_helpers[X86_H__COUNT];

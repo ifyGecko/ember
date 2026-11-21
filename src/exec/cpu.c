@@ -18,6 +18,15 @@ void uam_cpu_irq_sink(void *ctx, unsigned line, int level)
     uam_cpu_request_exit(cpu);
 }
 
+void uam_cpu_set_pc(uam_cpu *cpu, uint64_t pc)
+{
+    if (cpu->pc == pc)
+        return;
+    cpu->pc = pc;
+    if (cpu->isa->pc_moved)
+        cpu->isa->pc_moved(cpu);
+}
+
 uam_status uam_cpu_peek(uam_cpu *cpu, uint64_t addr, unsigned size, uint64_t *val)
 {
     return uam_bus_read(cpu->bus, addr, size, UAM_ACC_LE | UAM_ACC_DEBUG, val);

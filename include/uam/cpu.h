@@ -231,6 +231,9 @@ typedef struct uam_cpu {
      * (uam_exec_set_cpu_observer); NULL when nothing watches. */
     uint64_t              insn_pc;
     const struct uam_cpu_observer *obs;
+    /* Bumped each time a snapshot restores this processor: the executor tells a hook that
+     * restored the state (keep what came with it) from one that moved the pc (pc_moved). */
+    uint32_t              restores;
 } uam_cpu;
 
 /*
@@ -295,6 +298,11 @@ static inline void uam_cpu_xlate_changed(uam_cpu *cpu)
 /* Signal sink that forwards an interrupt line into isa->irq_input().
  * Connect device lines with: uam_signal_connect(&sig, uam_cpu_irq_sink, cpu, line). */
 void uam_cpu_irq_sink(void *cpu, unsigned line, int level);
+
+/* Set the pc from outside the guest (a rule, a debugger, a hook that emulates code):
+ * when it changes, the ISA drops state carried across a block boundary for the
+ * instruction group the old pc was in (isa->pc_moved). */
+void uam_cpu_set_pc(uam_cpu *cpu, uint64_t pc);
 
 /* Side-effect-free read of guest memory (instruction bits for tval, debugger). */
 uam_status uam_cpu_peek(uam_cpu *cpu, uint64_t addr, unsigned size, uint64_t *val);

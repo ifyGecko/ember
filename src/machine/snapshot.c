@@ -245,6 +245,7 @@ static void restore_cpu(uam_cpu *cpu, uam_state_reader *r)
     cpu->resv.valid = uam_state_get_bool(r);
     cpu->resv.addr = uam_state_get_u64(r);
     cpu->resv.size = uam_state_get_u32(r);
+    cpu->restores++;
 }
 
 static void save_exec(const uam_exec *x, uam_state_writer *w)

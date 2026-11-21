@@ -982,7 +982,12 @@ arm_lift_result arm_hint(arm_lift *L, unsigned op)
 {
     if (op != 3)
         return ARM_SEQ;   /* NOP, YIELD, SEV, DBG; WFE: the event register is always set */
-    /* WFI: WAIT is an unguarded terminator, so a condition skips it with a side exit. */
+    /* WFI: WAIT is an unguarded terminator, so a condition skips it with a side exit.
+     * Inside an IT block both ways lead to the next instruction with the IT state
+     * advanced past this one, as an ISB's exit does. */
+    if (L->it_next != ARM_PRIV_IT(L->lc->cpu->priv))
+        uam_helper(L->b, &L->lc->cpu->isa->helpers, ARM_HELPER_SET_IT, imm(L, L->it_next),
+                   NONE, NONE, NONE);
     if (!uam_ref_is_none(L->guard)) {
         uam_exit(L->b, not1(L, L->guard), imm(L, arm_next_pc(L)), UAM_EXIT_JUMP);
         L->guard = NONE;
@@ -1521,7 +1526,10 @@ uam_status arm_lift_block(uam_lift_ctx *lc)
         it = 0;
 
     for (uint32_t n = 0;; n++) {
-        if (n >= lc->max_insns || (resumed && n > 0)) {
+        /* A pc hook on an instruction an IT instruction governs: end the block before
+         * it with the IT state in cpu->priv, so it starts a block where the hook fires. */
+        if (n >= lc->max_insns || (resumed && n > 0)
+            || (it && n > 0 && uam_lift_hooked(lc, pc | tbit))) {
             fall_through(&L, pc | tbit, it);
             return UAM_OK;
         }

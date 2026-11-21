@@ -240,6 +240,14 @@ void uam_exec_history_print(const uam_exec *x, FILE *out, const char *prefix)
     }
 }
 
+/* A synchronous exception as the ISA reports it (isa->exc_adjust): before anything
+ * reads it. */
+static void adjust_exc(uam_exec *x, uam_exception *exc)
+{
+    if (x->cpu->isa->exc_adjust)
+        x->cpu->isa->exc_adjust(x->cpu, exc);
+}
+
 /* A requested fault stop (uam_exec_request_fault_stop): at the faulting instruction
  * when the block raised `exc`, else where the block left the processor. */
 static uam_stop_reason fault_stopped(uam_exec *x, const uam_exception *exc)
@@ -449,15 +457,27 @@ static uam_status run_passes(uam_exec *x, uam_block *blk)
     return UAM_OK;
 }
 
-/* Mark the IMARKs of hooked instructions so the block stops before them. */
-static void mark_hooked_imarks(uam_exec *x, uam_block *blk)
+/* Mark the IMARKs of hooked instructions so the block stops before them. A hooked
+ * continuation (UAM_IMARK_CONT) is one the ISA could not end the block before
+ * (uam_lift_ctx.hooked): the hook would never fire there, so translation fails. */
+static uam_status mark_hooked_imarks(uam_exec *x, uam_block *blk)
 {
     for (uint32_t i = 1; i < blk->n_insn; i++) {
         uam_insn *in = &blk->insn[i];
-        if (in->op == UAM_OP_IMARK && !(in->flags & UAM_IMARK_CONT)
-            && uam_exec_has_pc_hook(x, blk->imm[uam_ref_index(in->a)]))
-            in->flags |= UAM_IMARK_BREAK;
+        if (in->op != UAM_OP_IMARK)
+            continue;
+        uint64_t pc = blk->imm[uam_ref_index(in->a)];
+        if (!uam_exec_has_pc_hook(x, pc))
+            continue;
+        if (in->flags & UAM_IMARK_CONT) {
+            uam_log(UAM_LOG_ERROR, "exec", "a pc hook at 0x%llx is on an instruction that "
+                    "continues the one before it (%s cannot stop between the two): hook the "
+                    "instruction before it instead", (unsigned long long)pc, x->cpu->isa->name);
+            return UAM_ERR_INVALID;
+        }
+        in->flags |= UAM_IMARK_BREAK;
     }
+    return UAM_OK;
 }
 
 /* Run the hooks registered for cpu->pc. Returns true to stop. */
@@ -513,6 +533,12 @@ static uam_status fetch_xlate(lift_core *lc, uint64_t addr, uint64_t *pa)
     lc->mapped |= !xl.fixed;
     *pa = xl.paddr;
     return UAM_OK;
+}
+
+/* uam_lift_ctx.hooked: set only while the executor has hooks. */
+static bool lift_hooked(uam_lift_ctx *lc, uint64_t pc)
+{
+    return uam_exec_has_pc_hook(((lift_core *)lc->core)->x, pc);
 }
 
 static uam_status lift_fetch(uam_lift_ctx *lc, uint64_t addr, unsigned size, uint64_t *val)
@@ -589,7 +615,8 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
     uam_builder_begin(&x->b, pc);
     lift_core core = { .x = x, .fault_st = UAM_OK };
     uam_lift_ctx lc = { .cpu = cpu, .b = &x->b, .pc = pc,
-                        .max_insns = x->max_block_insns, .fetch = lift_fetch, .core = &core };
+                        .max_insns = x->max_block_insns, .fetch = lift_fetch, .core = &core,
+                        .hooked = x->n_hooks ? lift_hooked : NULL };
     *st = isa->lift(&lc);
     if (*st != UAM_OK) {
         if (*st == UAM_ERR_FAULT) {
@@ -661,8 +688,10 @@ static uam_block *translate(uam_exec *x, uint64_t pc, uam_status *st, uam_except
             return NULL;
         }
     }
-    if (x->n_hooks)
-        mark_hooked_imarks(x, blk);
+    if (x->n_hooks && (*st = mark_hooked_imarks(x, blk)) != UAM_OK) {
+        uam_block_free(blk);
+        return NULL;
+    }
     x->stats.ir_ops_final += blk->n_insn;
     /* A block with a PC hook on a non-first instruction is broken at that IMARK and
      * must stop there; the JIT honours UAM_IMARK_BREAK, so it can still run it. */
@@ -974,7 +1003,14 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
             && !(x->hook_fired && x->hook_fired_pc == cpu->pc
                  && x->hook_fired_icount == cpu->icount)) {
             uint64_t pc = cpu->pc;
-            if (run_hooks(x))
+            uint32_t restores = cpu->restores;
+            bool stop = run_hooks(x);
+            /* A hook that moved the pc (not by restoring a snapshot, which brings the
+             * state that goes with its pc): an instruction group split at this hook
+             * does not continue (isa->pc_moved). */
+            if (cpu->pc != pc && cpu->restores == restores && isa->pc_moved)
+                isa->pc_moved(cpu);
+            if (stop)
                 return UAM_STOP_HOOK;
             /* A hook that emulated the function it hooks and returned for it. */
             if (cpu->pc != pc && cpu->frames)
@@ -1007,6 +1043,7 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
                     x->last_fetch_fault_valid = true;
                     x->last_fetch_fault_pc = cpu->pc;
                     x->last_fetch_fault_icount = cpu->icount;
+                    adjust_exc(x, &exc);
                     if (!deliver(x, &exc))
                         return UAM_STOP_EXC_HOOK;
                     continue;
@@ -1112,6 +1149,7 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
                 return fault_stopped(x, NULL);
             break;
         case UAM_BR_FAULT:
+            adjust_exc(x, &r.exc);
             if (x->fault_stop)
                 return fault_stopped(x, &r.exc);
             if (!deliver(x, &r.exc))
@@ -1120,6 +1158,7 @@ static uam_stop_reason run_loop(uam_exec *x, uint64_t limit, uint64_t tlimit, bo
         case UAM_BR_TRAP:
             switch (r.trap_class) {
             case UAM_TRAP_EXCEPTION:
+                adjust_exc(x, &r.exc);
                 if (x->fault_stop)
                     return fault_stopped(x, &r.exc);
                 if (!deliver(x, &r.exc))

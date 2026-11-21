@@ -196,6 +196,31 @@ static void test_ie_shadow(void)
     uam_machine_fini(&m);
 }
 
+static unsigned hook_hits;
+static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx; (void)cpu; (void)pc;
+    hook_hits++;
+    return UAM_HOOK_CONTINUE;
+}
+
+/* The instruction after an IE write runs before any interrupt, in the same block: a pc
+ * hook there could never fire, so translation fails with an error instead. */
+static void test_hook_after_ie(void)
+{
+    uam_machine m;
+    machine(&m, &uam_mcs51_8051_ref);
+    const uint8_t prog[] = { 0x75, 0xA8, 0x82, NOP, SJMP, 0xFE };   /* MOV IE, #0x82; NOP */
+    code(&m, 0x200, prog, sizeof(prog));
+    m.cpu.pc = 0x200;
+    hook_hits = 0;
+    CHECK(uam_machine_add_pc_hook(&m, 0x203, count_hook, NULL) == UAM_OK, "add");
+    EQ64(uam_exec_run(&m.exec, 10), UAM_STOP_ERROR, "a hook after an IE write is an error");
+    EQ64(hook_hits, 0, "it never fired");
+    EQ64(m.cpu.pc, 0x200, "nothing ran");
+    uam_machine_fini(&m);
+}
+
 static void test_sfr_pages(void)
 {
     uam_machine m;
@@ -432,6 +457,7 @@ int main(void)
     test_entry();
     test_levels();
     test_ie_shadow();
+    test_hook_after_ie();
     test_sfr_pages();
     test_banks();
     test_priv();

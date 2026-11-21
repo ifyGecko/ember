@@ -937,11 +937,14 @@ uam_status z80_lift(uam_lift_ctx *lc)
     for (uint32_t n = 0;; n++) {
         /* Also in the middle of a run of EIs or prefixes, which could otherwise grow
          * without bound: an EI's shadow is carried by the core's flag (irq_take). */
-        if (n >= lc->max_insns) {
+        /* A pc hook on the instruction after an EI ends the block before it the same way,
+         * so it starts the next block, where the hook fires. (After a prefix it cannot:
+         * the prefix and the instruction are one.) */
+        if (n >= lc->max_insns || (cont && clear_shadow && uam_lift_hooked(lc, pc))) {
             uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
             return UAM_OK;
         }
-        z80_lifter L = { .lc = lc, .b = lc->b, .s = s, .pc = pc, .qv_prev = qv };
+        z80_lifter L ={ .lc = lc, .b = lc->b, .s = s, .pc = pc, .qv_prev = qv };
         decode(&L);
         if (L.fault) {
             if (n == 0)

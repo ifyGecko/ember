@@ -1014,6 +1014,13 @@ uam_status x86_lift(uam_lift_ctx *lc)
             uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
             return UAM_OK;
         }
+        if (shadow && uam_lift_hooked(lc, pc)) {
+            /* A pc hook on the instruction in a shadow: end the block before it and carry
+             * the shadow, so it starts the next block, where the hook fires. */
+            uam_helper(lc->b, &cpu->isa->helpers, X86_H_SHADOW, NONE, NONE, NONE, NONE);
+            uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
+            return UAM_OK;
+        }
         fetch_ctx fc = { lc, pc, wrap32, UAM_OK };
         x86_dec_status ds = x86_decode(&x.in, x.code, fetch_byte, &fc);
         if (ds == X86_DEC_FAULT) {
@@ -1045,8 +1052,9 @@ uam_status x86_lift(uam_lift_ctx *lc)
         }
         if (x.sti_shadow && shadow && n + 1 >= lc->max_insns) {
             /* A run of shadow openers (STI STI ..., MOV SS after STI) has used the slot
-             * kept free above: the block ends here and carries the shadow to the next. */
-            uam_syswr(lc->b, 64, X86_SR_SHADOW, uam_imm(lc->b, 1), NONE);
+             * kept free above: the block ends here and carries the shadow to the next
+             * (a helper: it follows the opener's own register writes, MOV SS's). */
+            uam_helper(lc->b, &cpu->isa->helpers, X86_H_SHADOW, NONE, NONE, NONE, NONE);
             uam_exit(lc->b, NONE, uam_imm(lc->b, x.next), UAM_EXIT_JUMP);
             return UAM_OK;
         }

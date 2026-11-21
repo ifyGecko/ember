@@ -677,7 +677,8 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
         case 'c':
         case 's': {
             if (p[1])   /* an address, in the current instruction-set state */
-                cpu->pc = (strtoull(p + 1, NULL, 16) & ~state_bits(g)) | (cpu->pc & state_bits(g));
+                uam_cpu_set_pc(cpu, (strtoull(p + 1, NULL, 16) & ~state_bits(g))
+                                    | (cpu->pc & state_bits(g)));
             bool done;
             last = resume(g, p[0] == 's');
             report(g, last, &done);

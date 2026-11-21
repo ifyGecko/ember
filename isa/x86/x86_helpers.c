@@ -311,6 +311,18 @@ static uint64_t h_io_port(void *env, uint64_t misc, uint64_t rip, uint64_t val, 
     return val;
 }
 
+/* A block that ends while the next instruction is still in an interrupt shadow carries it
+ * to the next block (X86_PRIV_SHADOW). A helper, not a SYSWR to X86_SR_SHADOW: it cannot
+ * fault, so it may follow the register writes of the instruction that opened the shadow
+ * (MOV SS). */
+static uint64_t h_shadow(void *env, uint64_t a, uint64_t b, uint64_t c, uam_status *st)
+{
+    CPU; (void)a; (void)b; (void)c; (void)st;
+    x86_st(cpu)->int_shadow = true;
+    x86_update_priv(cpu);
+    return 0;
+}
+
 /* ---- the table ----------------------------------------------------------- */
 
 #define RW (UAM_HELPER_READS_STATE | UAM_HELPER_WRITES_STATE)
@@ -341,4 +353,5 @@ const uam_helper_desc x86_helpers[X86_H__COUNT] = {
     H(X86_H_X87,      "x86_x87",      2, 0,  RWF, x86_h_x87),
     H(X86_H_IO,       "x86_io",       3, 0,  RWF, h_io),
     H(X86_H_IO_PORT,  "x86_io_port",  3, 64, RWF, h_io_port),
+    H(X86_H_SHADOW,   "x86_shadow",   0, 0,  RW,  h_shadow),
 };

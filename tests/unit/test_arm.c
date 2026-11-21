@@ -562,6 +562,313 @@ static void test_wfi(bool jit)
     uam_machine_fini(&m);
 }
 
+/* ---- pc hooks inside an IT block ----------------------------------------------------- */
+
+/* A hook on an instruction an IT instruction governs ends the block before it, the IT
+ * state carried in cpu->priv: the hook fires there, sees the state of the instructions
+ * before it, and the run goes on as if nothing had stopped it. */
+
+#define T_ITTEE_EQ 0xBF07u       /* ittee eq */
+#define T_ITTTT_EQ 0xBF01u       /* itttt eq */
+#define T_ADD(n)   (0x3001u | (n) << 8)   /* add(s) rn, #1 */
+static uint32_t t_b(uint32_t at, uint32_t to) { return 0xE000u | (((to - at - 4) >> 1) & 0x7FFu); }
+/* The CPSR bits of the IT state of the k-th instruction (from 1) an IT instruction with
+ * firstcond:mask `it` governs: IT[1:0] at 26:25, IT[7:2] at 15:10. */
+static uint32_t it_bits(uint8_t it, unsigned k)
+{
+    for (unsigned i = 1; i < k; i++)
+        it = (it & 7) ? (uint8_t)((it & 0xE0) | ((it << 1) & 0x1F)) : 0;
+    return ((uint32_t)(it & 3) << 25) | ((uint32_t)(it >> 2) << 10);
+}
+
+/* What a run leaves: the registers, CPSR (with the IT bits), mode, pc and icount. */
+typedef struct arm_end {
+    uint32_t r[16], cpsr, spsr;
+    uint64_t pc, icount;
+    bool     waiting;
+} arm_end;
+
+static arm_end end_of(uam_machine *m)
+{
+    arm_end e = { .pc = m->cpu.pc, .icount = m->cpu.icount, .waiting = m->cpu.waiting };
+    for (unsigned i = 0; i < 16; i++) {
+        uint64_t v = 0;
+        m->cpu.isa->gdb->read_reg(&m->cpu, i, &v);
+        e.r[i] = (uint32_t)v;
+    }
+    uint64_t c = 0;
+    m->cpu.isa->gdb->read_reg(&m->cpu, 16, &c);
+    e.cpsr = (uint32_t)c;
+    e.spsr = mode(m) == ARM_MODE_SYS ? 0 : (uint32_t)sysr(m, ARM_SR_SPSR);
+    return e;
+}
+
+static void same_end(const arm_end *a, const arm_end *b, const char *what)
+{
+    for (unsigned i = 0; i < 16; i++)
+        CHECK(a->r[i] == b->r[i], "%s: r%u 0x%x, unhooked 0x%x", what, i, (unsigned)a->r[i],
+              (unsigned)b->r[i]);
+    CHECK(a->cpsr == b->cpsr, "%s: cpsr 0x%x, unhooked 0x%x", what, (unsigned)a->cpsr,
+          (unsigned)b->cpsr);
+    CHECK(a->spsr == b->spsr, "%s: spsr 0x%x, unhooked 0x%x", what, (unsigned)a->spsr,
+          (unsigned)b->spsr);
+    CHECK(a->pc == b->pc, "%s: pc 0x%llx, unhooked 0x%llx", what, (unsigned long long)a->pc,
+          (unsigned long long)b->pc);
+    CHECK(a->icount == b->icount, "%s: icount %llu, unhooked %llu", what,
+          (unsigned long long)a->icount, (unsigned long long)b->icount);
+    CHECK(a->waiting == b->waiting, "%s: waiting %d, unhooked %d", what, a->waiting, b->waiting);
+}
+
+/* A hook that records what it saw, and may move the pc or stop. */
+typedef struct it_hook {
+    unsigned hits;
+    arm_end  seen;
+    uint32_t move_to;    /* non-zero: set the pc there */
+    bool     stop;
+    unsigned raise;      /* non-zero: raise the IRQ line (1) or lower it (2) */
+} it_hook;
+
+static uam_machine *hook_m;
+
+static uam_hook_action it_hook_fn(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)pc;
+    it_hook *h = ctx;
+    if (!h->hits++)
+        h->seen = end_of(hook_m);
+    if (h->raise)
+        uam_cpu_irq_sink(cpu, UAM_ARM_IRQ, h->raise == 1);
+    if (h->move_to)
+        cpu->pc = h->move_to;
+    return h->stop ? UAM_HOOK_STOP : UAM_HOOK_CONTINUE;
+}
+
+/* backend: 0 the interpreter, 1 the JIT, 2 the JIT without chaining */
+static void it_machine(uam_machine *m, unsigned backend, bool z)
+{
+    machine(m, &uam_isa_arm, backend != 0);
+    if (backend == 2)
+        m->exec.chain = false;
+    m->cpu.regfile[ARM_Z_OFF] = z;
+    hook_m = m;
+}
+
+/* The program at CODE: ittee eq; add r1..r4; add r5; b . (one Thumb instruction each). */
+static void it_program(uam_machine *m)
+{
+    uint32_t a = t16(m, CODE, T_ITTEE_EQ);
+    for (unsigned k = 1; k <= 4; k++)
+        a = t16(m, a, T_ADD(k));
+    t16(m, t16(m, a, T_ADD(5)), T_SPIN);
+}
+
+static void test_it_hooks(unsigned backend)
+{
+    static const char *const be[] = { "interp", "jit", "jit no-chain" };
+    char what[120];
+    for (int z = 0; z < 2; z++) {
+        /* the reference: no hook */
+        uam_machine m;
+        it_machine(&m, backend, z);
+        it_program(&m);
+        run(&m, CODE | 1, 40);
+        arm_end ref = end_of(&m);
+        EQ64(ref.r[1] + ref.r[2], z ? 2 : 0, "the then-instructions ran as Z says");
+        EQ64(ref.r[3] + ref.r[4], z ? 0 : 2, "the else-instructions ran as Z says");
+        uam_machine_fini(&m);
+
+        /* a hook on each governed instruction, alone and together with the IT instruction */
+        for (unsigned k = 1; k <= 4; k++) {
+            for (int with_it = 0; with_it < 2; with_it++) {
+                snprintf(what, sizeof(what), "%s Z=%d hook on governed %u%s", be[backend], z, k,
+                         with_it ? " and on the IT" : "");
+                it_machine(&m, backend, z);
+                it_program(&m);
+                it_hook h = { 0 }, hi = { 0 };
+                uint32_t at = CODE + 2 * k;
+                CHECK(uam_machine_add_pc_hook(&m, at | 1, it_hook_fn, &h) == UAM_OK, "%s: add", what);
+                if (with_it)
+                    CHECK(uam_machine_add_pc_hook(&m, CODE | 1, it_hook_fn, &hi) == UAM_OK, "%s: add", what);
+                run(&m, CODE | 1, 40);
+                EQ64(h.hits, 1, what);
+                if (with_it)
+                    EQ64(hi.hits, 1, "the IT instruction's hook too");
+                EQ64(h.seen.pc, at | 1, "the hook's pc");
+                /* the instructions before it have run, none after */
+                for (unsigned i = 1; i <= 4; i++)
+                    CHECK(h.seen.r[i] == (i < k ? ref.r[i] : 0), "%s: r%u 0x%x at the hook", what, i,
+                          (unsigned)h.seen.r[i]);
+                /* the IT bits at the hook are the governed instruction's */
+                EQ64(h.seen.cpsr & CPSR_IT_MASK, it_bits(0x07, k), "the IT bits at the hook");
+                arm_end e = end_of(&m);
+                same_end(&e, &ref, what);
+                EQ64(ARM_PRIV_IT(m.cpu.priv), 0, "the IT state is gone after the block");
+                uam_machine_fini(&m);
+            }
+        }
+    }
+
+    /* the last governed instruction a branch: taken (Z set) or not, the IT block ends */
+    for (int z = 0; z < 2; z++) {
+        snprintf(what, sizeof(what), "%s Z=%d hook on a governed branch", be[backend], z);
+        arm_end ref = { 0 };
+        for (int hooked = 0; hooked < 2; hooked++) {
+            uam_machine m;
+            it_machine(&m, backend, z);
+            uint32_t a = t16(&m, CODE, T_ITTTT_EQ);
+            a = t16(&m, t16(&m, t16(&m, a, T_ADD(1)), T_ADD(2)), T_ADD(3));
+            uint32_t br = a;
+            a = t16(&m, a, t_b(br, CODE + 0x40));
+            t16(&m, t16(&m, a, T_ADD(4)), T_SPIN);           /* not taken: here */
+            t16(&m, t16(&m, CODE + 0x40, T_ADD(5)), T_SPIN);  /* taken: here */
+            it_hook h = { 0 };
+            if (hooked)
+                CHECK(uam_machine_add_pc_hook(&m, br | 1, it_hook_fn, &h) == UAM_OK, "add");
+            run(&m, CODE | 1, 40);
+            arm_end e = end_of(&m);
+            if (!hooked) {
+                ref = e;
+                EQ64(e.r[5], z, "taken with Z set");
+                EQ64(e.r[4], !z, "not taken with Z clear");
+            } else {
+                EQ64(h.hits, 1, what);
+                same_end(&e, &ref, what);
+            }
+            uam_machine_fini(&m);
+        }
+    }
+
+    /* a fault in the instruction after the hook: SPSR.IT, LR and the handler as unhooked */
+    {
+        arm_end ref = { 0 };
+        for (int hooked = 0; hooked < 2; hooked++) {
+            snprintf(what, sizeof(what), "%s abort in a split IT block%s", be[backend],
+                     hooked ? " (hooked)" : "");
+            uam_machine m;
+            it_machine(&m, backend, true);
+            uint32_t a = t16(&m, CODE, T_ITTEE_EQ);
+            t16(&m, t16(&m, t16(&m, t16(&m, t16(&m, a, T_ADD(1)), T_LDR), T_ADD(3)), T_ADD(4)), T_SPIN);
+            setr(&m, 2, NOWHERE);
+            it_hook h = { 0 };
+            if (hooked)
+                CHECK(uam_machine_add_pc_hook(&m, (CODE + 4) | 1, it_hook_fn, &h) == UAM_OK, "add");
+            run(&m, CODE | 1, 6);
+            arm_end e = end_of(&m);
+            if (!hooked) {
+                ref = e;
+                EQ64(mode(&m), ARM_MODE_ABT, "the load aborts");
+                EQ64(e.spsr & CPSR_IT_MASK, it_bits(0x07, 2), "SPSR.IT: the load's own state");
+            } else {
+                EQ64(h.hits, 1, what);
+                same_end(&e, &ref, what);
+            }
+            uam_machine_fini(&m);
+        }
+    }
+
+    /* an interrupt raised at the hook: taken after the hooked instruction, with the IT
+     * state of the next one in SPSR; the return finishes the IT block as it says */
+    for (int z = 0; z < 2; z++) {
+        snprintf(what, sizeof(what), "%s Z=%d irq at a hook in an IT block", be[backend], z);
+        uam_machine m;
+        it_machine(&m, backend, z);
+        it_program(&m);
+        a32(&m, 0x4018, A_ERET);
+        sysw(&m, VBAR, 0x4000);
+        it_hook h = { .raise = 1 }, low = { .raise = 2 };
+        CHECK(uam_machine_add_pc_hook(&m, (CODE + 4) | 1, it_hook_fn, &h) == UAM_OK, "add");
+        CHECK(uam_machine_add_pc_hook(&m, 0x4018, it_hook_fn, &low) == UAM_OK, "add");
+        run(&m, CODE | 1, 40);
+        EQ64(low.hits, 1, "the handler ran once");
+        EQ64(low.seen.r[14], (CODE + 6) + 4, "LR: the instruction after the hooked one, + 4");
+        EQ64(low.seen.spsr & CPSR_IT_MASK, it_bits(0x07, 3), "SPSR.IT: the third instruction's");
+        arm_end e = end_of(&m);
+        EQ64(e.r[1] + e.r[2], z ? 2 : 0, "then-instructions after the return");
+        EQ64(e.r[3] + e.r[4], z ? 0 : 2, "else-instructions after the return");
+        EQ64(e.r[5], 1, "and the instruction after the IT block");
+        EQ64(e.pc, (CODE + 12) | 1, "at the spin");
+        EQ64(mode(&m), ARM_MODE_SYS, "back in System mode");
+        uam_machine_fini(&m);
+    }
+
+    /* a hook that moves the pc out of the IT block: the IT state goes, the instruction it
+     * moves to is not conditional */
+    {
+        snprintf(what, sizeof(what), "%s a hook moves the pc out of an IT block", be[backend]);
+        uam_machine m;
+        it_machine(&m, backend, true);
+        it_program(&m);
+        t16(&m, t16(&m, CODE + 0x40, T_ADD(6)), T_SPIN);
+        it_hook h = { .move_to = (CODE + 0x40) | 1 };   /* from the first else-instruction */
+        CHECK(uam_machine_add_pc_hook(&m, (CODE + 6) | 1, it_hook_fn, &h) == UAM_OK, "add");
+        run(&m, CODE | 1, 40);
+        EQ64(h.hits, 1, what);
+        EQ64(r(&m, 6), 1, "the instruction moved to ran unconditionally");
+        EQ64(ARM_PRIV_IT(m.cpu.priv), 0, "no IT state");
+        uam_machine_fini(&m);
+    }
+
+    /* stopped at the hook: a debugger writes the same pc (the IT state stays) or another
+     * (it goes); a snapshot taken there resumes in a machine without the hook */
+    {
+        snprintf(what, sizeof(what), "%s stopped at a hook in an IT block", be[backend]);
+        uam_machine m, m2;
+        it_machine(&m, backend, false);
+        it_program(&m);
+        run(&m, CODE | 1, 40);
+        arm_end ref = end_of(&m);
+        uam_machine_fini(&m);
+
+        it_machine(&m, backend, false);
+        it_program(&m);
+        it_hook h = { .stop = true };
+        CHECK(uam_machine_add_pc_hook(&m, (CODE + 6) | 1, it_hook_fn, &h) == UAM_OK, "add");
+        m.cpu.pc = CODE | 1;
+        EQ64(uam_exec_run(&m.exec, 40), UAM_STOP_HOOK, "stops at the hook");
+        uint8_t it = (uint8_t)ARM_PRIV_IT(m.cpu.priv);
+        CHECK(it != 0, "%s: IT state carried to the hook", what);
+        CHECK(m.cpu.isa->gdb->write_reg(&m.cpu, 15, CODE + 6), "gdb pc write");
+        EQ64(ARM_PRIV_IT(m.cpu.priv), it, "the same pc keeps the IT state");
+        uam_snapshot *s = NULL;
+        CHECK(uam_snapshot_take(&m, &s) == UAM_OK && s, "snapshot at the hook");
+        it_machine(&m2, backend, false);
+        it_program(&m2);
+        CHECK(s && uam_snapshot_restore(&m2, s) == UAM_OK, "restore without the hook");
+        uam_exec_run(&m2.exec, 40 - m2.cpu.icount);
+        arm_end e = end_of(&m2);
+        same_end(&e, &ref, "resumed from a snapshot at the hook");
+        uam_machine_fini(&m2);
+        CHECK(m.cpu.isa->gdb->write_reg(&m.cpu, 15, CODE + 0x40), "gdb pc write elsewhere");
+        EQ64(ARM_PRIV_IT(m.cpu.priv), 0, "another pc ends the IT block");
+        uam_snapshot_free(s);
+        uam_machine_fini(&m);
+    }
+
+    /* WFI inside an IT block: the instructions after it keep their conditions, hooked
+     * or not (WFI used to leave the IT state behind) */
+    for (int hooked = 0; hooked < 2; hooked++) {
+        snprintf(what, sizeof(what), "%s wfi inside an IT block%s", be[backend], hooked ? " (hooked)" : "");
+        uam_machine m;
+        it_machine(&m, backend, true);
+        uint32_t a = t16(&m, CODE, T_ITTEE_EQ);
+        t16(&m, t16(&m, t16(&m, t16(&m, t16(&m, t16(&m, a, T_ADD(1)), T_WFI), T_ADD(3)), T_ADD(4)), T_ADD(5)), T_SPIN);
+        to_mode(&m, ARM_MODE_SYS | CPSR_I);
+        it_hook h = { 0 };
+        if (hooked)
+            CHECK(uam_machine_add_pc_hook(&m, (CODE + 6) | 1, it_hook_fn, &h) == UAM_OK, "add");
+        run(&m, CODE | 1, 40);
+        CHECK(m.cpu.waiting, "%s: waits", what);
+        line(&m, UAM_ARM_IRQ, 1);          /* masked: it only wakes the WFI */
+        uam_exec_run(&m.exec, 40);
+        EQ64(r(&m, 1), 1, "the then-instruction before the WFI");
+        EQ64(r(&m, 3) + r(&m, 4), 0, "the else-instructions after it are skipped");
+        EQ64(r(&m, 5), 1, "the instruction after the IT block");
+        if (hooked)
+            EQ64(h.hits, 1, what);
+        uam_machine_fini(&m);
+    }
+}
+
 /* ---- the generic timer -------------------------------------------------------------- */
 
 static int sink_calls, sink_level[2];
@@ -938,6 +1245,8 @@ int main(void)
         test_endian(&uam_isa_arm, jit);
         test_endian(&uam_isa_armeb, jit);
     }
+    for (unsigned backend = 0; backend < 3; backend++)
+        test_it_hooks(backend);
     printf("test_arm: %d/%d checks passed\n", n_checks - n_failed, n_checks);
     return n_failed ? 1 : 0;
 }

@@ -521,6 +521,64 @@ static void test_shadow_cross(bool jit)
     }
 }
 
+static unsigned hook_hits;
+static uint64_t hook_ax;
+static uam_hook_action count_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    (void)ctx; (void)pc;
+    hook_hits++;
+    hook_ax = x86_gpr(cpu, X86_RAX);
+    return UAM_HOOK_CONTINUE;
+}
+
+/* A pc hook on the instruction in a shadow (after STI, MOV SS): the block ends before it
+ * and carries the shadow, so the hook fires there and the interrupt still waits for it. */
+static void test_shadow_hook(bool jit)
+{
+    uam_machine m;
+    plat p;
+    machine(&m, &p, jit);
+    PUT(&m, CODE, 0xFB, 0x40, 0x43, SPIN);   /* sti; inc ax; inc bx */
+    p.vector = 0x20;
+    hook_hits = 0;
+    CHECK(uam_machine_add_pc_hook(&m, CODE + 1, count_hook, NULL) == UAM_OK, "add");
+    line(&m, UAM_X86_IRQ_INTR, 1);
+    run(&m, CODE, 10);
+    EQ64(hook_hits, 1, "sti: the hook on the shadowed instruction fired");
+    EQ64(hook_ax, 0, "before it ran");
+    EQ64(m.cpu.pc, handler(0x20), "sti: the interrupt still came after it");
+    EQ64(gpr(&m, X86_RAX), 1, "sti: the shadowed instruction ran");
+    EQ64(gpr(&m, X86_RBX), 0, "but no further");
+    EQ64(rd(&m, sp(&m), 2), CODE + 2, "the return IP after the shadowed instruction");
+    line(&m, UAM_X86_IRQ_INTR, 0);
+    uam_machine_fini(&m);
+
+    machine(&m, &p, jit);
+    PUT(&m, CODE, 0x8E, 0xD0, 0x40, 0x43, SPIN);   /* mov ss, ax; inc ax; inc bx */
+    hook_hits = 0;
+    CHECK(uam_machine_add_pc_hook(&m, CODE + 2, count_hook, NULL) == UAM_OK, "add");
+    run(&m, CODE, 3);
+    EQ64(hook_hits, 1, "mov ss: the hook fired");
+    EQ64(gpr(&m, X86_RAX), 1, "mov ss: the shadowed instruction ran");
+    EQ64(gpr(&m, X86_RBX), 1, "and the next");
+    CHECK(!(m.cpu.priv & X86_PRIV_SHADOW), "no shadow left");
+    uam_machine_fini(&m);
+
+    /* the same carry without a hook: MOV SS after STI in a block's last slot (it writes a
+     * register, so the shadow must not be carried by a write that may fault) */
+    machine(&m, &p, jit);
+    uint8_t nops[30];
+    memset(nops, 0x90, sizeof(nops));
+    put_bytes(&m, CODE, nops, sizeof(nops));
+    PUT(&m, CODE + 30, 0xFB, 0x8E, 0xD0, 0x40, 0x43, SPIN);   /* sti; mov ss, ax; inc ax; inc bx */
+    setgpr(&m, X86_RAX, 0);
+    m.cpu.pc = CODE;
+    EQ64(uam_exec_run(&m.exec, 34), UAM_STOP_INSN_LIMIT, "mov ss in the last slot after sti");
+    EQ64(gpr(&m, X86_RAX), 1, "the instruction after it ran");
+    EQ64(gpr(&m, X86_RBX), 1, "and the next");
+    uam_machine_fini(&m);
+}
+
 static void test_hlt(bool jit)
 {
     uam_machine m;
@@ -1713,6 +1771,7 @@ int main(void)
         test_nmi(jit);
         test_shadow(jit);
         test_shadow_cross(jit);
+        test_shadow_hook(jit);
         test_hlt(jit);
         test_real_exceptions(jit);
         test_prot_exceptions(jit);
