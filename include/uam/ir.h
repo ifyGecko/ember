@@ -201,7 +201,8 @@ typedef enum uam_exit_kind {
 /*
  * UAM_IMARK_BREAK asks the executor to stop *before* this instruction, as if
  * an asynchronous exit were pending (it is ignored on the first instruction of
- * a block and on CONT boundaries). Lifters never set it: the executor sets it
+ * a block and on CONT boundaries, where a pc hook fails translation instead:
+ * docs/uam-isa.md section 10a). Lifters never set it: the executor sets it
  * on translated blocks to end them at instrumented addresses (PC hooks,
  * breakpoints), so that the hook runs at a block boundary with precise state.
  */

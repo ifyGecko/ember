@@ -289,9 +289,9 @@ depends on the verdict:
 A `--break` that never fires on ARM Thumb code: give the address with bit 0 set. One on
 an instruction inside an IT block works: the run stops there with the instructions
 before it done. Some instructions cannot be stopped at (a MIPS delay slot, AVR after
-`SEI`, the 8051 after an `IE`/`IP` write, Z80 behind a prefix): the run ends at once
-with `a pc hook at 0x... is on an instruction that continues the one before it ...:
-hook 0x... instead` (exit status 126). Put the `--break` on the address it names (for a
+`SEI`, the 8051 after an `IE`/`IP` write, Z80 behind a prefix): when execution first
+reaches that code the run ends with `a pc hook at 0x... is on an instruction that
+continues the one before it ...: hook 0x... instead` (exit status 126). Put the `--break` on the address it names (for a
 delay slot, the branch).
 
 ## Step 7: look around with gdb

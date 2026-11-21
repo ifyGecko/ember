@@ -659,12 +659,13 @@ ARM needed no new IR; these are conventions of its lifter (`isa/arm`).
   byte each, so a condition is one or two pure ops.
 - **IT blocks are continuations.** The instructions an IT instruction covers are
   lifted with `UAM_IMARK_CONT` under their own conditions, so no interrupt is
-  taken inside an IT block, and a fault in one reports the IT instruction as
+  taken inside an IT block within one translated block, and a fault in one reports the IT instruction as
   `parent_pc` (from which the ISA recomputes the IT state for SPSR). When a block
   must stop inside an IT block (its length limit, a fetch that fails, a pc hook on a
   governed instruction), or an exception returns into one, the remaining
   IT state goes into `cpu->priv`, which tags translated code: the next block is
-  lifted for it, one instruction at a time, until the IT block ends. A pc set from
+  lifted for it, one instruction at a time, until the IT block ends. An interrupt may be
+  taken at such a boundary (the IT state goes to SPSR, as on the hardware). A pc set from
   outside the guest (`isa->pc_moved`) ends it.
 
 ## 10c. Condition register fields and lift-time privilege (32-bit PowerPC)
@@ -711,7 +712,8 @@ The AVR needed no new IR either; these are conventions of its lifter (`isa/avr8`
   the half-carry is bit 4 of `a ^ b ^ result` for additions and subtractions alike.
 - **SEI's shadow.** SEI sets SREG.I with a `SYSWR` that requests an exit and lifts the next
   instruction as a continuation (`UAM_IMARK_CONT`), so that instruction runs before any
-  interrupt, as the core promises (`sei; sleep` sleeps).
+  interrupt, as the core promises (`sei; sleep` sleeps). A pc hook on that instruction is
+  an error (section 10a).
 - **Skips** (CPSE, SBRC/SBRS, SBIC/SBIS) end the block with a guarded `EXIT` past the next
   instruction, whose length (one or two words) the lifter reads.
 
@@ -853,7 +855,8 @@ The Z80 needed no new IR; these are conventions of its lifter (`isa/z80`).
   after its loads, stores and system register accesses (the commit rule); conditional
   CALL/RET use guarded stores, loads and writes.
 - **EI's shadow.** EI is a `SYSWR` that requests an exit and lifts the next instruction as a
-  continuation, so it runs before the interrupt. When the block ends at EI, the core's shadow
+  continuation, so it runs before the interrupt. When the block ends at EI (also when the
+  next instruction has a pc hook), the core's shadow
   flag (set by EI, cleared by the next instruction's `SYSWR`) makes `irq_take` let one more
   instruction run. RETN/RETI (IFF1 from IFF2), IM and LD A,I/R's IFF2 are system registers too.
 - **Repeating block instructions** do one iteration and `EXIT` to themselves while they repeat,
