@@ -25,7 +25,10 @@ artefact / ember bug).
 - Result:
       <the replay: line>
 - Repeatable: <yes: the same line twice, and with --jit / no: what differs>
-- Minimal: <yes: removing any byte stops the crash / no: not minimised>
+- Minimal: <yes: removing any byte stops the crash (scripts/minimize.py, or minimized=yes
+  in the .info) / no: not minimised>
+- Other crash groups with the same cause: <the groups that turn ok when the cause is
+  taken away, or "not checked">
 
 ## What
 <the verdict in words: "a 4-byte store to address 0x40000000 raised a bus fault">

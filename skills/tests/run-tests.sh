@@ -264,6 +264,16 @@ if command -v mips-linux-gnu-gcc >/dev/null; then
         && grep -q "^history: " "$P/build/triage/report.md" && grep -q "^backtrace: #0" "$P/build/triage/report.md" \
         && ok "ember-fuzz-triage: triage.py writes the first-pass report" \
         || { bad "ember-fuzz-triage: triage.py (exit $rc)"; cat "$P/build/triage.txt"; }
+    # ember-fuzz-triage: a padded crashing input shrinks to the three bytes that matter
+    printf 'BUGpadding-the-firmware-never-reads' > "$T/long-bug"
+    rc=0; (cd "$P" && IMAGE="$T/fw/fw.bin" python3 "$HERE/../ember-fuzz-triage/scripts/minimize.py" \
+        -o build/min.bin "$T/long-bug" -- ./run.sh -n 5000000 --cov-blocks \
+        --fuzz-begin "$(nm_of fuzz_entry)" --fuzz-crash-pc "$(nm_of fuzz_bug)" --fuzz-input uart0 \
+        --fuzz-iter-insns 100000 > build/minimize.txt 2>&1) || rc=$?
+    [[ "$rc" -eq 0 && "$(cat "$P/build/min.bin" 2>/dev/null)" == "BUG" ]] \
+        && grep -q "removing any one byte changes the result" "$P/build/minimize.txt" \
+        && ok "ember-fuzz-triage: minimize.py shrinks the input to BUG" \
+        || { bad "ember-fuzz-triage: minimize.py (exit $rc)"; cat "$P/build/minimize.txt"; }
     # ember-fuzz: a read guard on the soc_uart RX register, which only fuzz_entry reads:
     # the boot passes, every input is a crash-guard (exit 25), grouped by pc and guard
     rc=0; (cd "$P" && IMAGE="$T/fw/fw.bin" ./run.sh -n 5000000 --fuzz-begin "$(nm_of fuzz_entry)" \

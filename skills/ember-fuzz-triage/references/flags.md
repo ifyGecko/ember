@@ -42,6 +42,9 @@ ends`), then one per input (`trace: input 1`). Read from `trace: input` on.
 | What is at this address: RAM, a device, nothing? | `--map` |
 | Does it depend on memory nobody initialised? | `--fuzz-uninit` |
 | Only the part of the run near the crash | `--trace-after N` |
+| Replays without booting each time | `--fuzz-snapshot FILE` |
+| The smallest input that still does it | `scripts/minimize.py INPUT -- FUZZ` |
+| Is an address written differently on this architecture? | "Addresses on each architecture" |
 
 ## Replay
 
@@ -60,6 +63,13 @@ begin pc). With several inputs it is the most severe one's.
 
 - `--fuzz-iter-insns N`: the per-input budget. Lower it to make a timeout quick to
   reproduce (`--fuzz-iter-insns 20000`).
+- `--fuzz-snapshot FILE`: start from the begin snapshot in FILE if there is one (no
+  boot), else boot and save it there. It makes every replay of a slow-booting firmware
+  quick. FILE is tied to the firmware and the command line: an option that changes the
+  machine (`--backtrace`, `--guard-returns`, `--unknown-mmio`, a board option) makes
+  ember boot again and replace it, so keep a file of your own for triage and leave the
+  campaign's alone. Probes that only observe reuse it. The file also loads in a plain run
+  (`--load-snapshot FILE`, same options): it is the state every input starts from.
 - `--jit`: the same replay on the JIT. The verdict lines must be identical.
 - `--break ADDR` **in a replay** turns ADDR into a crash pc: the input stops there with
   `crash-oracle pc=ADDR insns=N`. Useful to learn how many instructions it takes to reach
@@ -104,6 +114,10 @@ mepc=00000000 mcause=00000000 mtval=00000000
 ```
 This includes the system registers gdb often cannot show (the fault cause and address, the
 trap vector, the status word). In a replay it shows the state at the last input's verdict.
+For a `crash-fault` that state is **before** the exception is taken (the harness stops the
+input there), so the fault registers still hold their old values, 0 in the sample above:
+read the cause and address from the verdict or the `exc:` line. They are filled in a
+plain run, once the firmware's handler has been entered.
 
 ```
 --dump-mem [p:]ADDR+LEN[=FILE]    memory when the run stops; repeatable
@@ -136,6 +150,11 @@ before this instruction". ADDR may be an ELF symbol (`--break parse`, `--break m
 | `link` | message on a `--link` port | `link p0 rx time=.. key=0x0 len=17 data=.. pc=.. icount=N` |
 | `ir` | translated block, as ember's intermediate code | for suspected ember bugs only |
 | `all` | `exc,mmio,sysreg,irq,console,dma,link` | a first look at a short run |
+
+In a replay, `exc` prints the line of the exception that ended an input and then a
+summary saying `0 exceptions taken`: both are right. The harness judged the exception a
+crash and ended the input before the processor took it. An exception the campaign does
+not count as a crash is taken, runs the firmware's handler, and is in the summary.
 
 Narrowing a trace, which you nearly always want:
 
@@ -237,6 +256,14 @@ into the watched range, the value, and when. Watching the input buffer gives the
 reads in order. It does not see instruction fetches, or a device writing memory by itself
 (`-t dma` shows that).
 
+**Firmware with an MMU.** The address of a `--watch`, a `--guard` and the `write=`/`read=`
+of a rule is virtual, and it is translated **once, as processor 0 maps data when the run
+starts** (in a plain run from a snapshot: at the snapshot). The range is then that
+physical memory, whoever touches it and through whatever mapping. If the address is not
+mapped yet at that moment, or you mean another address space (a process, a mode with its
+own view), give the physical address with `p:`. gdb's `x` and `--dump-mem` translate when
+they are used, as the processor maps memory then.
+
 ```
 --guard [p:]ADDR[-BEFORE][+AFTER][:r|w|rw][,stop|,fault|,log][,name=NAME]
 ```
@@ -309,12 +336,38 @@ Tests an emulation-gap theory in one run: if the firmware crashes because a stat
 register reads 0, `--mmio-rule 0xADDR=fixed:0x1` shows whether the crash goes away when it
 reads what hardware would return.
 
+## Addresses on each architecture
+
+The samples on this page are RV32, where an address is an address. Elsewhere:
+
+| Target | What differs |
+|---|---|
+| **ARM Thumb** | ember prints and takes a Thumb address **with bit 0 set**: the verdict's `pc=0x100289`, `--break`, `--on pc=`, `--log-pc`, `--snapshot-at`, and the symbol values `nm` shows. Without the bit the option never fires. `objdump`, `addr2line`, Ghidra, gdb's `break *` and the pc in `-d` use the address **without** it (0x100288). |
+| **Thumb IT blocks** | an `it`/`itt`/`ite...` instruction and the up to four it governs are one unit: a `--break`, rule or `--log-pc` fires only on the IT instruction, not on one inside the group, and `-d` and gdb show the stop there. To look at a faulting instruction inside one, break on the IT instruction (with bit 0) and read the registers there. |
+| **MIPS16e, microMIPS** (PIC32-class) | as Thumb: bit 0 set in everything ember prints and takes. The ELF symbol is even (`readelf -s` marks it `[MIPS16]`/`[MICROMIPS]`): add the bit yourself. |
+| **MIPS** | kseg0 and kseg1 are two virtual addresses of the same memory: a `--break` or rule matches only the one the code runs at. In a plain run, the firmware's `epc` for a fault in a branch's delay slot is the branch, not the instruction after it (`Cause.BD` is set). |
+| **x86** | addresses are linear. An access to nothing reads all ones and does not fault, so wild pointers show up as guards, traps (`trap cause` = the vector in the low byte) or crash pcs. A triple fault is a `hang`; stderr says what shut the processor down. |
+| **8-bit AVR, 8-bit PIC, 8051, 6502, Z80** | no exceptions: in a plain run a wild access halts the core and the run ends as a deadlock (exit status 125) at that pc. With `--fuzz-crash-exc none` in a replay it is a `hang`. |
+| **8-bit AVR, 8-bit PIC** | code and data are separate spaces. Data is on the bus at 0x800000 + the data address. `--guard`, `--watch` and a `mem:` route take the plain data address (an avr-gcc data symbol **minus** 0x800000); `p:`, `--dump-mem` and gdb take the bus address (the symbol's value as it is). On PIC the pc is the program-memory bus address (twice the word address, except PIC18). |
+| **8051** | external data (MOVX) is at 0x1000000 + address. Internal RAM is not on the bus: it cannot be watched or guarded. |
+| **Z80** | I/O ports are at 0x10000 + port, for `-t mmio` and `--mmio-rule`. |
+| **Several processors** (`-o cpus=N`) | every line names its processor (`cpu 1`, `cpu1:`); `--history`, `--backtrace` and `-d` print one section each. A rule takes `cpu=N`. In gdb each processor is a thread. |
+
+The ember-fuzz skill's `references/harness.md` ("Boundaries", "Per ISA") has the full
+list, with what each core does on a bad instruction.
+
 ## Snapshots
 
 ```
 --snapshot-at ADDR --save-snapshot FILE     save the state when ADDR is first reached
 --load-snapshot FILE                        start from it (same board and options)
 ```
+"Same options" includes the `--unknown-mmio` policy, `--backtrace`, `--guard-returns`,
+`--fuzz-uninit`, `--link` ports and rules with `count=` or `delay=`: each adds state to
+the machine. Two errors say so: `snapshot has N core records, state for N devices and N
+extra parts; the machine needs ...` (you gave an option the snapshot was saved without)
+and `snapshot holds state for 'state/frames', which this machine does not have` (the
+snapshot was saved with one you left out; `frames` is `--backtrace`).
 ADDR may be a symbol. Saving at the begin pc gives the state every fuzz input starts from
 (SKILL.md step 6). You can also save one a little before the crash (`--snapshot-at` a
 function on the way) and start each debugging run there.

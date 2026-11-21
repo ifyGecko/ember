@@ -87,6 +87,12 @@ to triage, and it points at the faulty instruction directly.
 Heap lines also name where the block was allocated and freed. `--backtrace` adds the call
 chain of the access.
 
+**In a plain run the guard has to be given again**, or nothing stops: a `--guard` of the
+campaign as it is; a `mem:` route's redzone as `--guard LO+LEN[:r|w]` with the range the
+line shows in brackets; the heap and return guards through the campaign's own options.
+The run then ends before the access with exit status 129, and under gdb with a SIGSEGV at
+that instruction, where `bt` and the registers show who overran what.
+
 **First steps**: the pc is the bug's location or one call below it. Work out which length
 or index the instruction used (the registers in `-d`), and where it came from in the input.
 
@@ -180,8 +186,14 @@ means the boot needs something the campaign gave it (a console script, an image,
 
 ## Depends on memory nothing wrote (`--fuzz-uninit`, exit status 26)
 
+```
+replay: u: ok insns=110 buckets=22
+replay: u: uninit differs=insns,path (filled run: ok, insns=116); read before any write: pc=0x80000244 at 0x80100000;
+```
+
 The input behaved differently when RAM the firmware never wrote was filled with a
-pattern: it reads uninitialised memory. The report names the read (pc and address). On
+pattern: it reads uninitialised memory. The second line names what differed and the read
+(pc and address). The fuzz brain saves such inputs under `uninit/`, each with an `.info`. On
 real hardware that memory holds whatever was there before, so the bug shows up as
 behaviour that "depends on what ran earlier". Find the variable at that address and why
 it is used before being set.

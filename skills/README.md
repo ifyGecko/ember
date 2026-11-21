@@ -119,8 +119,10 @@ skills/
                     scripts/  replay_summary.py
                     references/  harness, lists-and-brain
   ember-fuzz-triage/  SKILL.md
-                    scripts/  triage.py (the first pass on one input, as a report)
-                    references/  flags (every runner option for triage, with its output),
+                    scripts/  triage.py (the first pass on one input, as a report),
+                              minimize.py (the smallest input that still stops the same way)
+                    references/  flags (every runner option for triage, with its output;
+                                 how addresses are written on each architecture),
                                  gdb (connecting, a cheat sheet, scripted sessions, pitfalls),
                                  verdicts (reading each verdict; usual causes), report (the template)
   tests/

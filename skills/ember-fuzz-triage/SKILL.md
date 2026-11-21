@@ -36,7 +36,8 @@ References, read when the step sends you there:
 `references/verdicts.md` (what each verdict and exception means, typical causes),
 `references/flags.md` (every useful runner option, with the output it prints),
 `references/gdb.md` (connecting gdb, a command cheat sheet, scripted sessions, pitfalls),
-`references/report.md` (the report to fill in).
+`references/report.md` (the report to fill in). Two scripts: `scripts/triage.py` (the
+first pass, step 4) and `scripts/minimize.py` (the smallest input, step 8).
 
 ## Rules that keep you out of trouble
 
@@ -58,8 +59,9 @@ References, read when the step sends you there:
 ## Step 1: collect what you need
 
 - The input file or directory. The fuzz brain saves crashes as
-  `crashes/crash_r<reason>_s<status>_<sha1>` with an `.info` note beside each, and hangs
-  and timeouts under `hangs/`.
+  `crashes/crash_r<reason>_s<status>_<sha1>` with an `.info` note beside each, hangs
+  and timeouts under `hangs/`, and (a campaign run with `--fuzz-uninit`) inputs that read
+  memory nothing wrote under `uninit/`.
 - The `FUZZ` command line.
 - The firmware image, as an ELF with symbols if one exists. With a raw image you work
   with addresses and a disassembler (Ghidra) open beside you.
@@ -116,6 +118,14 @@ crash-fault  pc=0x800003a6 (store-fault cause 0x0)  x1         <- one group: ver
 If an input you were told crashes prints `ok`, your options differ from the campaign's
 (rule 3). Fix that before going on.
 
+**A firmware that takes long to boot**: every replay boots it again. Add
+`--fuzz-snapshot triage.snap` to `FUZZ`: the first replay saves the state at the begin pc,
+the later ones start from it (`starting from the begin snapshot ... (no boot)`). Use a
+file of your own, never the campaign's: an option that changes the machine (`--backtrace`,
+`--guard-returns`, `--unknown-mmio`, ...) makes ember boot again and **replace** the file
+(`was made from another firmware or command line: booting and replacing it`). Probes that
+only observe (`--history`, `-t`, `--watch`, `--on ... log`) reuse it.
+
 ## Step 3: confirm it is repeatable
 
 ```bash
@@ -159,6 +169,12 @@ pc=800003a6 ... a5=40000000 ...               <- the registers when it stopped (
 - **How**: `main` called `fuzz_iteration`, which called `parse`; the `history` lines are
   the path through it.
 
+Two things in a replay's output that look wrong and are not. The summary may say
+`exc: 0 exceptions taken` right after an `exc: kind=...` line, and the fault registers in
+the `-d` dump (`mcause`/`mtval`, `cause`/`badvaddr`, `dfsr`/`dfar`) are 0: the harness
+stopped the input **at** the exception, before the processor took it. The cause and the
+address are in the `exc:` line and in the verdict.
+
 That answers three of the five questions. If a line is missing, `references/flags.md`
 says which option prints it and what stops it from appearing.
 
@@ -185,15 +201,30 @@ register held the bad value. In the example the instruction is `sw s0,0(a5)`: it
 through `a5`, and `a5` is 0x40000000. The question for the rest of the triage is now
 precise: **where did `a5` get that value?**
 
+**On ARM, an odd pc is Thumb code.** ember prints and takes Thumb addresses with bit 0
+set (`pc=0x100289`); `objdump`, `addr2line`, Ghidra and gdb use the address without it
+(0x100288). `references/flags.md`, "Addresses on each architecture", has this and the
+other per-architecture differences (cores without exceptions, separate code and data
+spaces); read it once if your target is not a flat 32-bit one.
+
 ## Step 6: reproduce it as a plain run
 
 A replay cannot be paused. To stop the guest and look around, run the same input without
 the fuzz harness, starting from the state every input starts from.
 
+**The plain run must be the campaign's machine.** `RUN` here means the runner with every
+board option the campaign has: the images, `-o` options, `--mmio-rule`s, and above all the
+same `--unknown-mmio` policy. In an ember-dev-build project `run.sh` defaults to
+`UNKNOWN_MMIO=zero` (for bring-up) while `fuzz.sh` sets `fault`: with `zero` a wild access
+reads 0 and nothing crashes. So in a project, every `RUN` below is
+
+```bash
+UNKNOWN_MMIO=fault ./run.sh ...        # or whatever fuzz.sh exports
+```
+
 **6a. Save a snapshot at the begin pc**, once. `BEGIN_PC` is the value the campaign gives
-`--fuzz-begin`, an address or an ELF symbol, copied as it is. Use the `RUN` command with
-the campaign's board options, and add every state-changing option you will want later (see
-the box):
+`--fuzz-begin`, an address or an ELF symbol, copied as it is. Add every state-changing
+option you will want later (see the box):
 
 ```bash
 RUN --backtrace --snapshot-at BEGIN_PC --save-snapshot begin.snap --break BEGIN_PC
@@ -203,10 +234,21 @@ It stops with `breakpoint at ...` (exit status 127); that is the expected result
 campaign needs console input to reach the handler (`fuzz.sh` has a `--console script:` or
 `string:`), give the same here.
 
+If the campaign uses `--fuzz-begin-skip N` or several `--fuzz-begin`, the first arrival at
+that pc is not the state the inputs start from. Let the harness make the snapshot instead,
+with the options you want in the plain run, and load that file:
+
+```bash
+FUZZ --backtrace --fuzz-snapshot begin.snap --fuzz-replay INPUT < /dev/null
+```
+
 > **A snapshot loads only with the options it was saved with.** `--backtrace`,
-> `--guard-returns`, `--fuzz-uninit`, `--link` ports, and `--on` rules with `count=` or
-> `delay=` are part of the saved state. The error reads `snapshot has N core records ...
-> the machine needs ...`. Save the snapshot again with the option, or drop it when loading.
+> `--guard-returns`, `--fuzz-uninit`, the `--unknown-mmio` policy, `--link` ports, and
+> `--on` rules with `count=` or `delay=` are part of the saved state. The error reads
+> `snapshot has N core records ... the machine needs ...` (an option is missing from the
+> snapshot; the hint about a processor count is only a guess) or `snapshot holds state for
+> '...', which this machine does not have` (the snapshot has one you did not give). Save
+> the snapshot again with the option, or load it with the same ones.
 
 **6b. Run the input from the snapshot.** How depends on the campaign's `--fuzz-input`:
 
@@ -227,11 +269,26 @@ the replay's `insns=`*. In the example 419 + 98 = 517, and the plain run prints 
 icount=517`. If it does not match, the input is not arriving the way the fuzzer delivers
 it; fix that before believing anything else.
 
-A plain run does not stop at a crash the way the harness does: the processor takes the
-exception and the firmware's own handler runs, usually into a panic loop, so the run goes
-on until `-n` ends it (exit status 124). That is expected. Stop it yourself where the
-replay said: `--break 0xPC -d` prints the registers just before the faulting instruction
-executes.
+A plain run does not stop at a crash the way the harness does. What it does instead
+depends on the verdict:
+
+- **crash-fault**: the processor takes the exception and the firmware's own handler runs,
+  usually into a panic loop, so the run goes on until `-n` ends it (exit status 124). That
+  is expected. Stop it yourself where the replay said: `--break 0xPC -d` prints the
+  registers just before the faulting instruction executes. On a core that has no
+  exceptions (AVR, 8-bit PIC, 8051, 6502, Z80) the core halts at the faulting instruction
+  and the run ends as a deadlock (exit status 125) with the pc of the fault.
+- **crash-guard**: the harness's guards are not there. Pass the same one: a `--guard`
+  from `FUZZ` as it is, a `mem:` redzone as `--guard LO+LEN` with the range the replay
+  line names (`guard mem-after [LO, HI)`), the guarded heap's `-o` options and
+  `--guard-returns` as the campaign has them (they are part of the snapshot: 6a). The run
+  then stops before the access (exit status 129; under gdb, a SIGSEGV there).
+- **crash-oracle** at a `--fuzz-crash-pc`: `--break` that address.
+- **hang**: the run ends by itself (exit status 125 or 128). **timeout**: `-n` ends it.
+
+A `--break` that never fires on ARM Thumb code: give the address with bit 0 set, and if
+the instruction is inside an IT block (`it`, `itt`, `ite` ... a few lines above it in the
+disassembly), break on the IT instruction: ember stops only at the start of such a group.
 
 ## Step 7: look around with gdb
 
@@ -352,10 +409,33 @@ FUZZ --fuzz-replay try < /dev/null | grep '^replay:'
 ```
 
 If the verdict changes as you predicted, you have the cause. If it does not, your theory
-is wrong: go back, do not adjust the story to fit. Shorten the input the same way: remove
-bytes from the end, then from the front and the middle, replaying each time, until
-removing any one byte makes it stop crashing. That is the minimal reproducer. (The fuzz
-brain has usually minimised it already: `minimized=` in the `.info` note says so.)
+is wrong: go back, do not adjust the story to fit.
+
+**Shrink the input.** The minimal reproducer is the input from which no byte can be
+removed without changing the result. Do not do that by hand:
+
+```bash
+python3 <this skill>/scripts/minimize.py INPUT -- FUZZ        # writes INPUT.min
+```
+```
+minimize: 100 bytes: crash-fault 0x800003a6 store-fault
+minimize: 50 bytes (pieces of 50)
+...
+minimize: INPUT.min: 4 bytes after 10 replay runs; removing any one byte changes the result
+```
+
+It keeps the verdict, its pc and the kind of fault the same. Check the `.info` note
+first: `minimized=yes` means the fuzz brain did it already. The brain minimises only the
+first crash of a campaign at once; `minimized=later` or `peer` is an input as found, and
+worth shrinking before you read it byte by byte. Every byte that is left matters, which
+is half of the "why".
+
+**Does it explain the other groups?** One bug often stops at several pcs, and step 2
+grouped by pc. When you have the cause, replay the whole crash directory with the cause
+taken away, for example a rule that puts a good value in the register just before the bad
+use (`--on 'pc=0xPC,set a5=0x80000530'`, `references/flags.md`) or the `--mmio-rule` that
+closes an emulation gap. The groups that turn `ok` are this bug; the ones that still
+crash are others, to triage on their own.
 
 `references/flags.md` lists the other probes (`--log-pc`, `--guard`, `--guard-returns`,
 `--dump-mem`, `-t mmio`, `-t irq`) and when each is the right one.
@@ -397,7 +477,13 @@ classification with its evidence.
 - **No `backtrace:` lines**: add `--backtrace`. Names need an ELF; otherwise it prints
   addresses, which Ghidra turns into functions.
 - **The plain run does not crash where the replay did**: step 6c. The input is not
-  arriving the same way.
+  arriving the same way, or the machine is not the campaign's: `--unknown-mmio` is `zero`
+  where the campaign has `fault` (a project's `run.sh`), a guard is missing, or the
+  snapshot is not the harness's (`--fuzz-begin-skip`).
+- **A `--break`, `--on pc=` or `--log-pc` never fires**: not an instruction boundary; on
+  ARM Thumb, bit 0 is missing or the instruction is inside an IT block (step 6).
+- **Symbols do not match the addresses** (a bootloader that copies itself, a module
+  loaded at run time): `references/gdb.md`, "Code that is not where the ELF says".
 - **gdb says `Cannot execute this command while the target is running`**: the guest is
   running and has not hit a breakpoint. Press Ctrl-C to stop it, then look at `$pc`.
 - **The crash is far from anything that looks wrong**: memory was corrupted earlier. Turn

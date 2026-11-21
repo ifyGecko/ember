@@ -31,8 +31,9 @@ or in one line: `gdb-multiarch fw.elf -ex 'target remote :1234'`.
   no function names, source lines or `info args`. Keep a disassembler open beside it.
 - ember tells gdb the architecture and the register set, so you do not `set architecture`.
   Two things it cannot tell:
-  - **a big-endian guest** (big-endian MIPS, ARM BE8, PowerPC): give gdb `set endian big`
-    before `target remote`, or memory words print byte-swapped;
+  - **a big-endian guest** (big-endian MIPS, ARM BE8, PowerPC) **when gdb has no ELF**:
+    give gdb `set endian big` before `target remote`, or memory words print byte-swapped.
+    With the ELF loaded gdb takes the byte order from it (`show endian` tells);
   - **x86 code that is not 64-bit**: ember always describes the 64-bit register set, so
     for 32-bit code use `set architecture i386` to disassemble correctly (16-bit:
     `set architecture i8086`).
@@ -42,6 +43,31 @@ or in one line: `gdb-multiarch fw.elf -ex 'target remote :1234'`.
   (SKILL.md step 6).
 
 When you are done: `kill` ends the emulation; `detach` lets it run on without gdb.
+
+### Code that is not where the ELF says
+
+Symbols help only if they sit at the addresses the code runs at. Three common cases where
+they do not, and gdb shows the wrong function or none (`bt` full of `??`, a breakpoint
+on a name that is never hit):
+
+- **A bootloader that copies itself** to the top of RAM and continues there. Find the
+  distance: the pc where it really runs (the replay's `pc=`, a `history:` line) minus the
+  same instruction's address in the ELF (`objdump -d`). Then load the symbols a second
+  time, moved by that much:
+  ```
+  (gdb) add-symbol-file fw.elf -o 0x7f00000        every section moved by that offset
+  (gdb) info symbol 0x87f003a6                     now names the function
+  ```
+- **A second image** (a kernel started by the loader, a module, an application slot):
+  `add-symbol-file other.elf` adds its symbols beside the first; with `-o OFFSET` if it is
+  loaded elsewhere than linked, or `add-symbol-file mod.elf 0xTEXT_ADDR` when you know
+  where its `.text` went.
+- **Only a raw image and a separate ELF or map file.** Give gdb the ELF anyway
+  (`gdb-multiarch fw.elf`): it does not have to be the file ember loaded.
+
+ember's own names (`--backtrace`, `--break SYMBOL`) come from the ELF it was given as the
+image, at the addresses in it; for relocated code its lines carry bare addresses, and
+`info symbol ADDR` in gdb (after the `add-symbol-file` above) names them.
 
 ## What a stop means
 
@@ -293,9 +319,14 @@ wait
   itself, start it with `-n N` **and** tell gdb `handle SIGALRM stop print nopass` before
   `continue`: the limit arrives as SIGALRM, which gdb otherwise passes over silently.
 - **A breakpoint that is never hit.** Check the address is an instruction boundary
-  (`x/3i ADDR-8`), that the code is not in a different mode (on ARM, give a Thumb
-  function's address **without** its low bit), and that execution gets there at all
-  (`--log-pc ADDR` in a plain run, or `--break ADDR` in a replay).
+  (`x/3i ADDR-8`), that the code is not in a different mode, and that execution gets
+  there at all (`--log-pc ADDR` in a plain run, or `--break ADDR` in a replay). On ARM,
+  gdb wants a Thumb address **without** its low bit (`break *0x100288`), while ember's
+  own options and every pc it prints have the bit **set** (`--break 0x100289`). An
+  instruction inside a Thumb IT block is not a place to stop: gdb accepts the breakpoint
+  and the guest stops at the IT instruction in front of it.
+- **Symbols are at the wrong addresses** (relocated or separately loaded code): see "Code
+  that is not where the ELF says".
 - **`bt` shows one frame, or nonsense.** No debug info, or a damaged stack. Use ember's
   `--backtrace`.
 - **`<optimized out>`** for a variable: the compiler kept it in a register or removed it.
@@ -303,7 +334,12 @@ wait
 - **A function name gdb does not know.** The compiler may have renamed it
   (`parse.constprop.0`, `parse.isra.1`) or inlined it. `info functions parse` lists what
   exists; break on an address otherwise.
-- **Words look byte-swapped.** A big-endian guest: `set endian big` before connecting.
+- **Words look byte-swapped.** A big-endian guest and no ELF given to gdb: `set endian
+  big` before connecting.
+- **Data is not where the symbol says, on 8-bit AVR or PIC.** gdb uses bus addresses:
+  data space is at 0x800000 + the data address, which is what an avr-gcc data symbol
+  already holds (`x/4xb &g_buf` works). ember's `--watch` and `--guard` take the data
+  address without that base (`flags.md`, "Addresses on each architecture").
 - **gdb refuses to connect, or times out.** The emulation is not waiting yet (it prints a
   line when it listens), or another one still holds the port. Use a different port.
 - **There are no `monitor` commands and no reverse execution.** To "go back", restart from
