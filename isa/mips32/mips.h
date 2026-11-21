@@ -39,6 +39,16 @@ enum { MIPS_KERNEL = 0, MIPS_SUPERVISOR = 1, MIPS_USER = 2 };
 #define MIPS_PRIV_CU1     (1u << 4)
 #define MIPS_PRIV_FR      (1u << 5)
 #define MIPS_PRIV_MX      (1u << 6)
+/* A delay slot split from its branch (a pc hook on the slot): the branch's block ended
+ * at the slot with the branch's outcome in mips_state.ds_target / ds_kind, and the slot
+ * runs as a block of its own, lifted for that (mips_lift_slot). Bits 9:8: the length of
+ * the branch before it in bytes / 2 (0: not in a split slot); bit 10: a microMIPS branch
+ * that takes a 16-bit slot only. Kept by mode_update; cleared by the slot's block, an
+ * exception in it (exc_adjust), a reset, and a pc set from outside (pc_moved). */
+#define MIPS_PRIV_DS_SHIFT 8
+#define MIPS_PRIV_DS_MASK  (7u << MIPS_PRIV_DS_SHIFT)
+#define MIPS_PRIV_DS_LEN(p) ((((p) >> MIPS_PRIV_DS_SHIFT) & 3u) * 2u)
+#define MIPS_PRIV_DS_SHORT (4u << MIPS_PRIV_DS_SHIFT)
 
 /* CP0 register numbers, encoded as reg*8 + sel (matches mfc0/mtc0 fields). */
 #define CP0(reg, sel) (((reg) << 3) | (sel))
@@ -164,6 +174,9 @@ enum {
     MIPS_HELPER_CFC1,     /* (fs) -> FPU control register */
     MIPS_HELPER_CTC1,     /* (fs, value) */
     MIPS_HELPER_DSP,      /* (MIPS32 DSP word): a DSP ASE operation, operands in the regfile */
+    MIPS_HELPER_DS_ENTER, /* (target, exit kind, priv DS bits): the slot runs next, alone */
+    MIPS_HELPER_DS_KIND,  /* -> the split branch's exit kind (uam_exit_kind) */
+    MIPS_HELPER_DS_LEAVE, /* -> the split branch's target; the slot is done */
     MIPS_HELPER__COUNT
 };
 
@@ -216,6 +229,8 @@ typedef struct mips_state {
     bool            erl_seen; /* last Status.ERL seen (it changes kuseg's mapping) */
     uint8_t         hfault; /* MIPS_HF_*: why the last helper failed */
     mips_eic        eic;    /* the external controller's request (Config3.VEIC) */
+    uint32_t        ds_target; /* a split delay slot (MIPS_PRIV_DS_*): where the branch goes */
+    uint8_t         ds_kind;   /* and its exit kind (uam_exit_kind), for call tracking */
     uam_signal      timer_line, swint_line[2];
     mips_cp0        c;
 } mips_state;
@@ -266,6 +281,14 @@ void    mips_trap(ml *L, uam_ref guard, uint32_t exccode, uam_ref tval);
 void    mips_ri(ml *L);                      /* Reserved Instruction, ends the block */
 uam_ref mips_helper(ml *L, unsigned id, uam_ref a, uam_ref b, uam_ref c);
 uam_ref mips_fcc(ml *L, unsigned cc, bool tf);   /* FCSR condition code cc is tf */
+/* A pc hook on the delay slot at slot_pc (with its ISA bit): end the branch's block with
+ * its outcome kept (MIPS_HELPER_DS_ENTER), the slot to run as a block of its own. cond:
+ * NONE when the branch is taken here; fall: where it goes when not; blen: the branch's
+ * length in bytes. */
+void    mips_enter_slot(ml *L, uam_ref cond, uam_ref target, uint32_t fall, uam_exit_kind kind,
+                        uint32_t slot_pc, unsigned blen, bool short_slot);
+/* The end of a split slot's block: leave to the branch's target with its kind. */
+void    mips_leave_slot(ml *L);
 
 /* mips16.c: one MIPS16e instruction, decoded (mips16_decode is pure: tests use it). */
 typedef enum {
@@ -329,6 +352,9 @@ void umips_decode(uint32_t pc, uint16_t h0, uint16_t h1, um_insn *d);
 /* mips16.c / mips_umips.c: one block in the compressed ISA (lc->pc has bit 0 set). */
 uam_status mips16_lift(uam_lift_ctx *lc);
 uam_status mips_umips_lift(uam_lift_ctx *lc);
+/* The block of a split delay slot (cpu->priv has MIPS_PRIV_DS_*), in each ISA mode. */
+uam_status mips16_lift_slot(uam_lift_ctx *lc);
+uam_status mips_umips_lift_slot(uam_lift_ctx *lc);
 /* microMIPS FPU (POOL32F) and DSP words recoded as their MIPS32 equivalents, or 0. */
 uint32_t mips_umips_fpu32(uint32_t i);
 uint32_t mips_umips_dsp32(uint32_t i);
