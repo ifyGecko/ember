@@ -62,11 +62,11 @@ build/<board>-run --fuzz-begin <sym> --fuzz-crash-pc <sym> --fuzz-input <route> 
     --fuzz-iter-insns <N> --fuzz-net 127.0.0.1:7000 <firmware>
 ```
 Parallel campaign (the launcher sets `--sync-dir`/`--status-file` per worker; pass the rest
-through `--brain-arg`):
+through `--brain-arg`, written with `=` because the value itself starts with `--`):
 ```
 python3 fuzz/tools/fuzz_launch.py -n 4 --out camp --seeds seeds/ \
-    --brain-arg --import-log --brain-arg camp/imports.jsonl \
-    --brain-arg --watch-dict --brain-arg camp/live.dict -- \
+    --brain-arg=--import-log=camp/imports.jsonl \
+    --brain-arg=--watch-dict=camp/live.dict -- \
     build/<board>-run --fuzz-begin <sym> --fuzz-crash-pc <sym> --fuzz-input <route> \
     --fuzz-iter-insns <N> <firmware>
 ```
@@ -85,8 +85,9 @@ Repeat at whatever pace you like. Each pass is cheap for you and free for the ca
   campaign is still finding things on its own; flat `edges` over several cycles means it is
   stuck — your moment. In a parallel campaign read each `SYNC_DIR/<worker>/status.jsonl`.
 - **`SYNC_DIR/main/queue/`** — the live corpus. Names record lineage: `orig:` (a seed),
-  `src:NNNNNN,op:havoc,+cov` (a mutant that reached a new bucket), `sync:llm,src:000003`
-  (one of yours that was kept). Reading the queue tells you what shapes already reach code.
+  `src:NNNNNN,op:havoc,+cov` (a mutant that reached a new bucket),
+  `orig:boot_frame,sync:llm,src:000003` (one of yours that was kept). In a parallel
+  campaign every worker imports your input, so it shows in each worker's queue and log. Reading the queue tells you what shapes already reach code.
 - **`SYNC_DIR/main/crashes/*.info`** — crashes found so far, by `(reason, status)`; a crash
   from your input carries `src_peer=`, `src_id=`, `src_orig=`.
 
@@ -95,7 +96,8 @@ Repeat at whatever pace you like. Each pass is cheap for you and free for the ca
 Block coverage hashes the pc, so the map cannot tell you *which* branch has only gone one
 way. This tool does. It replays the queue read‑only, reads the firmware CFG with rizin, and
 lists every **frontier branch** — a conditional whose block ran but a target did not — with
-the **compare right before it** (usually the value to aim at) and the **smallest queue input
+the **last instructions of its block** (usually the compare and the constant to aim at;
+switch cases come with their case value) and the **smallest queue input
 that reaches it** (the input to mutate or edit).
 
 ```
@@ -146,8 +148,12 @@ the mutator **while it runs**. Write atomically (temp then rename). Merging is a
 never removes a token.
 
 ```
-printf 'u32:0xdeadbeef\n"RESET"\nhex:a55a\n' >> camp/live.dict   # (or write+rename)
+cp camp/live.dict camp/.live.dict.tmp
+printf 'u32:0xdeadbeef\n"RESET"\nhex:a55a\n' >> camp/.live.dict.tmp
+mv camp/.live.dict.tmp camp/live.dict
 ```
+Never append to `camp/live.dict` in place: the brain can read a cut line as a valid but
+wrong token (`u32:0xdead`), and a merged token is never removed.
 
 ### 5. Read back the verdict — `imports.jsonl`
 
@@ -156,11 +162,11 @@ input, with a `verdict`:
 
 | `verdict` | what it means | your next move |
 |---|---|---|
-| `newcov` | reached new coverage; now a queue entry | good shape — write near‑variants of it |
+| `newcov` | reached new coverage (a new bucket or hit-count class); now a queue entry | good shape — write near‑variants of it |
 | `kept` | no new coverage, but `,keep` queued it | a scaffold; mutate the bytes that gate the branch |
 | `nocov` | no new coverage; dropped | the input did not get past an earlier check — fix that first |
 | `crash` | a fault/guard/oracle crash | a finding; see its `file` under `crashes/` and hand to **ember-fuzz-triage** |
-| `hang` / `timeout` | it hung | often a real bug too; triage it |
+| `hang` | it hung or timed out (`reason_name` says which) | often a real bug too; triage it |
 | `rejected` | the route refused it (bad length/checksum) | satisfy the route's fix‑up/length/CRC |
 | `other` | ran abnormally | retry; the connection may have been busy |
 

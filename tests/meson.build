@@ -137,6 +137,7 @@ test('fuzz_dict-selftest', python, args: [files('../fuzz/tools/fuzz_dict.py'), '
 test('status_tui-selftest', python, args: [files('../fuzz/tools/status_tui.py'), '--selftest'],
   suite: 'unit', kwargs: std)
 test('brain_unit', python, args: files('fuzz/brain_unit.py'), suite: 'unit', kwargs: std)
+test('frontier_unit', python, args: files('fuzz/frontier_unit.py'), suite: 'unit', kwargs: std)
 
 # ---------------------------------------------------------------------------------------
 # The firmware runs. Each table row is one check; the registration loops are at the end.
@@ -256,7 +257,7 @@ if have_mips
     suite: 'fuzz', kwargs: std)
   test('uninit-mipsel', sh, args: [uninit_check, uam_run, 'mipsel-ref', fw_mips['fuzztarget-el'], '0x800000'],
     suite: 'fuzz', kwargs: std)
-  foreach k : ['formats', 'gen', 'brain', 'fuzz-net']
+  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'llm']
     lists += {k: lists[k] + [['mips', 'mips-ref', fw_mips['fuzztarget-be']]]}
   endforeach
   foreach k : ['formats', 'gen', 'fuzz-net']
@@ -293,7 +294,7 @@ if have_arm
     suite: 'fuzz', kwargs: std)
   test('uninit-armeb', sh, args: [uninit_check, uam_run, 'armeb-ref', fw_arm['fuzztarget-be'], '0x800000'],
     suite: 'fuzz', kwargs: std)
-  foreach k : ['formats', 'gen', 'brain', 'fuzz-net']
+  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'llm']
     lists += {k: lists[k] + [['arm', 'arm-ref', fw_arm['fuzztarget']]]}
   endforeach
   foreach k : ['formats', 'gen', 'fuzz-net']
@@ -379,7 +380,7 @@ if have_ppc
   fuzzes += [['ppc', 'ppc-ref', [fw_ppc['fuzztarget'], fw_ppc['fuzztarget.bin']], {}, []]]
   test('uninit-ppc', sh, args: [uninit_check, uam_run, 'ppc-ref', fw_ppc['fuzztarget'], '0x800000'],
     suite: 'fuzz', kwargs: std)
-  foreach k : ['formats', 'gen', 'brain', 'fuzz-net']
+  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'llm']
     lists += {k: lists[k] + [['ppc', 'ppc-ref', fw_ppc['fuzztarget']]]}
   endforeach
 endif

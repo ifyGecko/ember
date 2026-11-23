@@ -483,7 +483,9 @@ def main():
         except OSError:
             watch_dict_seen[p] = None          # not there yet: picked up when it appears
         except ValueError as e:
-            sys.exit("brain: --watch-dict: %s" % e)
+            # As in watch_dicts(): a helper may be part way through writing it.
+            watch_dict_seen[p] = None
+            log("watch-dict: %s (left for next time)" % e)
     if args.watch_dict:
         log("watching %d dictionary file(s) every %gs for new tokens (%d so far)"
             % (len(args.watch_dict), args.watch_dict_interval, len(dictionary)))
@@ -583,11 +585,13 @@ def main():
 
     def log_import(record):
         """One line of the import log (--import-log): what became of a peer input. record
-        is a dict; a monotonic-from-start timestamp and the worker name are added here."""
+        is a dict; t (seconds since this session began), time (Unix seconds, which orders
+        lines across sessions) and the worker name are added here."""
         if not import_fp:
             return
         record = dict(record)
         record["t"] = round(time.monotonic() - start, 1)
+        record["time"] = round(time.time(), 3)    # the log spans sessions: t restarts each
         record["worker"] = name
         import_fp.write(json.dumps(record) + "\n")
 
@@ -1273,49 +1277,66 @@ def main():
             after = synced_upto(out, p_name)
             todo, top = new_peer_inputs(args.sync_dir, p_name, after)
             got = 0
-            for eid, path in todo:
-                if stop["flag"]:
-                    return                # .synced stays put: the rest next time
-                try:
-                    with open(path, "rb") as f:
-                        data = f.read()
-                except OSError:
-                    continue
-                base = os.path.basename(path)
-                mo = re.search(r",orig:([^,]*)", base)
-                orig = mo.group(1) if mo else None
-                # ,keep in the name adds the input to the queue even without new coverage:
-                # a helper's structurally-useful input that is not yet a find still becomes
-                # a mutation parent.
-                keep = ",keep" in base
-                origin = {"peer": p_name, "id": eid, "orig": orig}
-                r = run(data, origin=origin)
-                rec = {"peer": p_name, "id": eid, "orig": orig, "size": len(data)}
-                if r[0] == "iter":
-                    nb = r[4]
-                    if nb or keep:
-                        c = add_entry(data, r[1], r[2], r[3], nb, op=None, sync=p_name, src=eid)
-                        got += 1
-                        rec.update(verdict="newcov" if nb else "kept",
-                                   new_buckets=nb, insns=r[2], entry=c.name)
+            done = after                  # the highest id run so far in this pass
+            finished = False
+            try:
+                for eid, path in todo:
+                    if stop["flag"]:
+                        break             # the rest next time
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                    except OSError:
+                        continue
+                    base = os.path.basename(path)
+                    mo = re.search(r",orig:([^,]*)", base)
+                    orig = mo.group(1) if mo else None
+                    # ,keep in the name adds the input to the queue even without new coverage:
+                    # a helper's structurally-useful input that is not yet a find still becomes
+                    # a mutation parent.
+                    keep = "keep" in base.split(",")[1:]
+                    origin = {"peer": p_name, "id": eid, "orig": orig}
+                    r = run(data, origin=origin)
+                    done = eid
+                    rec = {"peer": p_name, "id": eid, "orig": orig, "size": len(data)}
+                    if r[0] == "iter":
+                        nb, nc = r[4], r[5]
+                        # New coverage is a new bucket or a new hit-count class of one, the
+                        # same test as for a seed or a worker's find.
+                        if nc or keep:
+                            c = add_entry(data, r[1], r[2], r[3], nb, op=None, sync=p_name,
+                                          src=eid, orig=orig)
+                            got += 1
+                            rec.update(verdict="newcov" if nc else "kept", new_buckets=nb,
+                                       new_classes=nc, insns=r[2], entry=c.name)
+                        else:
+                            rec.update(verdict="nocov", new_buckets=0, new_classes=0,
+                                       insns=r[2])
+                    elif r[0] == "crash":
+                        reason, status = r[1], r[2]
+                        rec.update(verdict=("rejected" if reason == REJECTED else
+                                            "hang" if reason in HANG_REASONS else "crash"),
+                                   reason_name=reason_name(reason),
+                                   status=fmt_status(reason, status),
+                                   file=last_finding_file[0])
                     else:
-                        rec.update(verdict="nocov", new_buckets=0, insns=r[2])
-                elif r[0] == "crash":
-                    reason, status = r[1], r[2]
-                    rec.update(verdict=("rejected" if reason == REJECTED else
-                                        "hang" if reason in HANG_REASONS else "crash"),
-                               reason_name=reason_name(reason),
-                               status=fmt_status(reason, status),
-                               file=last_finding_file[0])
+                        rec.update(verdict="other")
+                    log_import(rec)
                 else:
-                    rec.update(verdict="other")
-                log_import(rec)
-            if top > after:
-                set_synced(out, p_name, top)
-            if got:
+                    finished = True       # not cut short by a stop
+            finally:
+                # Record what this pass ran even when it stops part way (Ctrl-C, BYE, a
+                # dropped connection), so a restart neither runs those inputs again nor
+                # logs them twice.
+                mark = top if finished else done
+                if mark > after:
+                    set_synced(out, p_name, mark)
                 imported += got
+            if got:
                 log("sync: imported %d of %d new entries from %s" % (got, len(todo), p_name))
                 emit_event("info", "imported %d from %s" % (got, p_name))
+            if not finished:
+                return
 
     last_watch_dict = [0.0]
 

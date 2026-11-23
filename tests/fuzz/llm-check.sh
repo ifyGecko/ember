@@ -4,12 +4,25 @@
 # watched dictionary, and reads back what each input did.
 #
 # FIRMWARE is a build of tests/fuzz/fuzztarget.h. The brain runs with --sync-dir and a
-# peer directory "llm"; a "helper" (this script) drops two inputs into llm/queue:
+# peer directory "llm"; a "helper" (this script) drops inputs into llm/queue. The ones
+# whose verdict depends on coverage are there before the brain starts, so its first import
+# (right after the baseline, before any mutation) judges them against the seed alone --
+# the mutator finds this parser's shallow paths within a second. The crash input comes
+# once the campaign runs (the mutator cannot guess a 32-bit magic value without compare
+# logging, which is off), so a live import is exercised too:
 #   - a crash input (the 'M' magic-value bug, "Mxxx" + the magic little-endian): the
 #     brain must import it, save it as a crash whose .info names src_peer=llm, and write
-#     an import-log line with verdict "crash" and the peer id;
-#   - a ,keep input that runs without new coverage: it must still enter the queue (verdict
-#     "kept" in the import log), because ,keep says so.
+#     an import-log line with verdict "crash" and the peer id (written live, id 5);
+#   - "ZZZZ": on most targets no new bucket, but new hit-count classes (the parser's loop
+#     runs 4 times, not 5): new coverage all the same, verdict "newcov";
+#   - a ,keep input that runs like the seed ("hellk"): it must still enter the queue
+#     (verdict "kept" in the import log), because ,keep says so;
+#   - an input that reaches new code ("FUZx", judged before any mutation
+#     against the seed alone): verdict "newcov", and its queue entry carries
+#     its orig: label;
+#   - an input that runs like the seed ("hellx"): verdict "nocov", not queued;
+#   - one named ,keeper: not the ,keep tag, so also "nocov".
+# Every import-log line carries t and time; .synced/llm records the last id.
 # The helper also appends a token to a --watch-dict file; the brain must merge it live
 # (a log line "watch-dict: merged").
 #
@@ -35,6 +48,12 @@ panic=$(sym fuzz_panic)
 mkdir -p "$tmp/sync/llm/queue" "$tmp/seeds"
 printf 'hello' > "$tmp/seeds/a"
 printf '"XYZ"\n' > "$tmp/live.dict"
+q=$tmp/sync/llm/queue
+printf 'ZZZZ' > "$q/id:000000,orig:classes"
+printf 'FUZx' > "$q/id:000001,orig:fuzx"
+printf 'hellk' > "$q/id:000002,orig:plain,keep"
+printf 'hellx' > "$q/id:000003,orig:same"
+printf 'hellz' > "$q/id:000004,orig:notkeep,keeper"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 
 python3 "$tools/fuzz_brain.py" --listen "127.0.0.1:$port" --seeds "$tmp/seeds" \
@@ -57,14 +76,13 @@ grep -q 'baseline:' "$tmp/brain.log" || { cat "$tmp/brain.log" >&2; fail "the br
 # The helper writes its inputs atomically (temp name, then rename: the brain ignores a
 # name without an id: prefix, so it never reads a half-written file), and a new token.
 python3 -c 'import struct,sys; sys.stdout.buffer.write(b"Mxxx"+struct.pack("<I",0x6A3C91E5))' \
-    > "$tmp/sync/llm/queue/.t1" && mv "$tmp/sync/llm/queue/.t1" "$tmp/sync/llm/queue/id:000000,orig:magic"
-printf 'ZZZZ' > "$tmp/sync/llm/queue/.t2" && mv "$tmp/sync/llm/queue/.t2" "$tmp/sync/llm/queue/id:000001,orig:plain,keep"
+    > "$q/.t1" && mv "$q/.t1" "$q/id:000005,orig:magic"
 printf '"XYZ"\nhex:deadbeef\n' > "$tmp/live.dict.t" && mv "$tmp/live.dict.t" "$tmp/live.dict"
 
-# Wait for both imports to be logged.
+# Wait for all six imports to be logged.
 for _ in $(seq 1 300); do
     cnt=$(grep -c '"verdict"' "$tmp/imports.jsonl" 2> /dev/null || true)
-    [ "${cnt:-0}" -ge 2 ] && break
+    [ "${cnt:-0}" -ge 6 ] && break
     sleep 0.1
 done
 
@@ -75,12 +93,29 @@ brain_pid=
 wait "$ember_pid" 2> /dev/null || true
 ember_pid=
 
-# The import log: one crash from llm, one kept.
-python3 - "$tmp/imports.jsonl" <<'PY' || fail "import log is wrong (see above)"
-import json, sys
+# The import log: one crash from llm, one kept, two new coverage, two dropped.
+python3 - "$tmp/imports.jsonl" "$tmp/sync/main/queue" <<'PY' || fail "import log is wrong (see above)"
+import json, os, sys
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 byorig = {r.get("orig"): r for r in rows}
 ok = True
+if len(rows) != 6:
+    print("llm-check: %d import-log lines, not 6: %r" % (len(rows), rows)); ok = False
+z = byorig.get("classes")
+if not z or z.get("verdict") != "newcov" or not z.get("new_classes"):
+    print("llm-check: 'ZZZZ' (new hit-count classes) was not logged as newcov: %r" % z); ok = False
+for r in rows:
+    if not isinstance(r.get("t"), (int, float)) or not isinstance(r.get("time"), (int, float)):
+        print("llm-check: an import-log line lacks t or time: %r" % r); ok = False
+n = byorig.get("fuzx")
+if not n or n.get("verdict") != "newcov" or "orig:fuzx" not in n.get("entry", ""):
+    print("llm-check: the 'FUZx' input was not logged as newcov with its label: %r" % n); ok = False
+elif not os.path.exists(os.path.join(sys.argv[2], n["entry"])):
+    print("llm-check: the newcov entry %s is not in the queue" % n["entry"]); ok = False
+for o in ("same", "notkeep"):
+    r = byorig.get(o)
+    if not r or r.get("verdict") != "nocov":
+        print("llm-check: the %r input was not logged as nocov: %r" % (o, r)); ok = False
 c = byorig.get("magic")
 if not c or c.get("verdict") != "crash" or c.get("peer") != "llm" or c.get("reason_name") != "FAULT":
     print("llm-check: the magic input was not logged as an llm crash: %r" % c); ok = False
@@ -89,6 +124,9 @@ if not k or k.get("verdict") != "kept":
     print("llm-check: the ,keep input was not logged as kept: %r" % k); ok = False
 sys.exit(0 if ok else 1)
 PY
+
+# The brain recorded the last id it took from the helper.
+[ "$(cat "$tmp/sync/main/.synced/llm" 2> /dev/null)" = 5 ] || fail ".synced/llm is not 5"
 
 # The saved crash names its origin.
 info=$(grep -l 'src_peer=llm' "$tmp/sync/main/crashes/"*.info 2> /dev/null | head -n 1 || true)

@@ -9,12 +9,19 @@ write an input that reaches new code.
 
 It replays a corpus through `uam-run -t blocks` to learn which blocks ran, reads the
 firmware's control-flow graph with rizin (as fuzz/tools/gen_sites.py does), and reports
-every **frontier branch**: a conditional branch whose own block ran but whose taken or
-fall-through target never did. For each it prints the branch instruction and the compare
-before it, the uncovered target (named), and the smallest corpus input that reaches the
-branch -- the input to mutate, and the value to aim the branch at.
+every **frontier branch**: a conditional branch (or a switch's jump table) whose own block
+ran but one of whose targets never did. For each it prints the last instructions of the
+branch's block (usually the compare and the constant it tests), the uncovered target
+(named; for a switch, the case value), and the smallest corpus input that reaches the
+branch -- the input to mutate.
 
-It changes nothing and runs beside a live campaign: it only replays the queue read-only.
+ember's blocks are not rizin's: an ember block runs on past a point another branch jumps to
+(a loop head, the join after an `if`), so its trace line names only where it began. A rizin
+block is counted as run when a traced pc lies inside it, or when a block that ran flows
+into it with no branch of its own.
+
+It changes nothing and runs beside a live campaign: it copies the corpus first and replays
+the copy, so entries the campaign adds meanwhile cannot shift which input is which.
 
 Needs rizin and python3's rzpipe (pip install rzpipe), like gen_sites.py. Without them it
 prints why and exits 2.
@@ -31,11 +38,14 @@ Usage:
   python3 fuzz/tools/fuzz_frontier.py FIRMWARE --corpus run/queue --trace t.txt --range parse
 
 --range SYM | LO-HI | LO+LEN (repeatable) restricts both the CFG and the block trace to
-those pcs (an ELF symbol's name resolves to its [addr, addr+size); hex addresses are
-absolute). Without it the whole image is analysed, which on a large firmware is slow and
+those pcs (an ELF symbol's name resolves to its [addr, addr+size), with an ARM Thumb
+symbol's bit 0 cleared; hex addresses are absolute). Without it the whole image is analysed, which on a large firmware is slow and
 noisy: give the function(s) under test. --module NAME:PATH adds a module's ELF for a
 multi-module image (its base comes from --base NAME=ADDR, default 0). --json prints the
-records as JSON (a list), for a program to read.
+records as JSON (a list), for a program to read. With --trace, the corpus must be the one
+the trace was made from, unchanged: inputs are matched to the trace's `trace: input N`
+sections in ember's replay order (every regular file whose name does not start with '.',
+by name).
 
 Exit: 0 if it ran (frontier branches or none), 1 on a usage or replay error, 2 when rizin
 or rzpipe is missing.
@@ -59,13 +69,18 @@ def die(msg, code=1):
 
 
 def elf_symbols(path):
-    """{name: (addr, size)} from readelf -sW (STT_FUNC and others); empty if unreadable."""
+    """{name: (addr, size)} from readelf -sW (STT_FUNC and others); empty if unreadable.
+    On ARM a Thumb function's symbol has bit 0 set; it is cleared here, so the address is
+    the function's first instruction, as in rizin's CFG."""
     out = {}
     try:
         txt = subprocess.run(["readelf", "-sW", path], capture_output=True, text=True,
                              check=True).stdout
+        hdr = subprocess.run(["readelf", "-hW", path], capture_output=True, text=True,
+                             check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return out
+    arm = re.search(r"Machine:\s+ARM\b", hdr) is not None
     for line in txt.splitlines():
         f = line.split()
         # Num: Value Size Type Bind Vis Ndx Name
@@ -75,6 +90,8 @@ def elf_symbols(path):
             except ValueError:
                 continue
             name = f[7]
+            if arm and f[3] == "FUNC":
+                addr &= ~1
             if name and name not in out:
                 out[name] = (addr, size)
     return out
@@ -111,11 +128,12 @@ def in_ranges(pc, ranges):
 
 
 def corpus_inputs(corpus):
-    """The corpus files in the order ember replays them (name order; dotfiles and .info
-    sidecars skipped), as [(name, size)]."""
+    """The corpus files in the order ember replays a directory (every regular file whose
+    name does not start with '.', by name), as [(name, size)]. A board may declare
+    sidecars that ember skips; a replay (not --trace) learns the real list from ember."""
     out = []
     for n in sorted(os.listdir(corpus)):
-        if n.startswith(".") or n.endswith(".info"):
+        if n.startswith("."):
             continue
         p = os.path.join(corpus, n)
         if os.path.isfile(p):
@@ -123,21 +141,46 @@ def corpus_inputs(corpus):
     return out
 
 
+def snapshot_corpus(corpus, dest):
+    """Copy the corpus's inputs into dest, so a live campaign adding entries cannot change
+    what is replayed. The brain's .info sidecars are not inputs and are left out."""
+    for n in sorted(os.listdir(corpus)):
+        if n.startswith(".") or n.endswith(".info"):
+            continue
+        p = os.path.join(corpus, n)
+        try:
+            if os.path.isfile(p):
+                shutil.copyfile(p, os.path.join(dest, n))
+        except OSError:
+            pass                       # removed meanwhile (a trimmed entry): skip it
+
+
 def run_replay(cmd, corpus, firmware, ranges, trace_path):
     """Run the replay command with block tracing to trace_path. cmd is the uam-run command
-    without the firmware or -t/--fuzz-replay."""
+    without the firmware or -t/--fuzz-replay. Returns [(name, size)] of the inputs in the
+    order ember ran them (input N of the trace is element N-1), from its `replay:` lines."""
     full = list(cmd) + ["-t", "blocks", "--trace-file", trace_path,
                         "--fuzz-replay", corpus]
     for lo, hi in ranges:
         full += ["--trace-range", "0x%x:0x%x" % (lo, hi)]
     full += [firmware]
     try:
-        r = subprocess.run(full, capture_output=True, text=True)
+        r = subprocess.run(full, capture_output=True, text=True, errors="replace")
     except OSError as e:
         die("could not run the replay command (%s): %s" % (full[0], e))
     if not os.path.exists(trace_path):
-        die("the replay wrote no trace file; its output was:\n" + (r.stderr or r.stdout))
-    return full
+        die("the replay wrote no trace file (exit %d); its output was:\n%s"
+            % (r.returncode, r.stderr or r.stdout))
+    prefix = "replay: " + corpus.rstrip("/") + "/"
+    ran = []
+    for line in r.stdout.splitlines():
+        if line.startswith(prefix):
+            n = line[len(prefix):].split(": ", 1)[0]
+            ran.append((n, os.path.getsize(os.path.join(corpus, n))))
+    if not ran:
+        die("the replay ran no input (exit %d); its output was:\n%s"
+            % (r.returncode, r.stderr or r.stdout))
+    return ran
 
 
 def parse_trace(trace_path, ninputs):
@@ -166,10 +209,11 @@ def parse_trace(trace_path, ninputs):
 
 
 class Block:
-    __slots__ = ("addr", "size", "jump", "fail", "func", "tail")
+    __slots__ = ("addr", "size", "jump", "fail", "cases", "func", "tail")
 
-    def __init__(self, addr, size, jump, fail, func, tail):
+    def __init__(self, addr, size, jump, fail, cases, func, tail):
         self.addr, self.size, self.jump, self.fail = addr, size, jump, fail
+        self.cases = cases             # [(value, target)] of a switch's jump table
         self.func, self.tail = func, tail
 
     @property
@@ -218,12 +262,87 @@ def load_cfg(binary, modules, bases, ranges, all_functions):
                         continue
                     jump = b.get("jump")
                     fail = b.get("fail")
+                    sw = b.get("switch_op") or {}
+                    cases = [(c.get("value"), c["jump"]) for c in sw.get("cases") or []
+                             if c.get("jump") is not None]
                     ops = rz.cmdj("pdbj @ 0x%x" % addr) or []
                     tail = [(o.get("offset"), o.get("disasm", "")) for o in ops[-3:]]
-                    blocks.append(Block(addr, size, jump, fail, fname, tail))
+                    blocks.append(Block(addr, size, jump, fail, cases, fname, tail))
         finally:
             rz.quit()
     return blocks
+
+
+def covered_blocks(blocks, pcs):
+    """The starts of the blocks that ran, given the traced pcs (sorted). A block ran when a
+    traced pc lies inside it, or when a block that ran flows into it with no branch of its
+    own (one successor: no fall-through/taken pair, no jump table). An ember block runs on
+    past a point another branch jumps to (a loop head, the join after an `if`), so its trace
+    line names only where it began, and the rizin blocks it ran through after that have no
+    line of their own."""
+    by_addr = {}
+    for b in blocks:
+        by_addr.setdefault(b.addr, b)
+    got = set()
+    for b in blocks:
+        i = bisect.bisect_left(pcs, b.addr)
+        if i < len(pcs) and pcs[i] < b.end:
+            got.add(b.addr)
+    work = list(got)
+    while work:
+        b = by_addr[work.pop()]
+        if b.fail is None and not b.cases and b.jump is not None:
+            t = b.jump
+            if t in by_addr and t not in got:
+                got.add(t)
+                work.append(t)
+    return got
+
+
+def frontier_records(blocks, covered_starts, reaching, syms_by_addr):
+    """The frontier records: for each block that ran and ends in a conditional branch or a
+    switch, one per target that never ran. reaching(b) gives the [(size, name)] of the
+    inputs that ran b, smallest first."""
+    records = []
+    for b in blocks:
+        if b.addr not in covered_starts:
+            continue
+        # Frontier candidates: a conditional branch (a block with both a taken target and a
+        # fall-through) and a switch's jump table. An uncovered target there is a branch to
+        # aim at. A block with one successor is unconditional flow (counted as run above).
+        if b.cases:
+            succs = [(t, "case %s" % v, v) for v, t in b.cases]
+        elif b.fail is not None and b.jump is not None:
+            succs = [(b.fail, "fall-through", None), (b.jump, "taken", None)]
+        else:
+            continue
+        seen = set()
+        frontier = []
+        for t, kind, v in succs:
+            if t not in covered_starts and t not in seen:
+                seen.add(t)
+                frontier.append((t, kind, v))
+        if not frontier:
+            continue
+        hit = reaching(b)
+        for target, kind, value in frontier:
+            rec = {
+                "branch": b.addr,
+                "branch_sym": symbolize(b.addr, syms_by_addr),
+                "func": b.func,
+                "target": target,
+                "target_sym": symbolize(target, syms_by_addr),
+                "edge": kind,
+                "disasm": [d for _a, d in b.tail],
+                "reached_by": len(hit),
+                "smallest_input": hit[0][1] if hit else None,
+                "smallest_size": hit[0][0] if hit else None,
+            }
+            if value is not None:
+                rec["case_value"] = value
+            records.append(rec)
+
+    return records
 
 
 def symbolize(pc, syms_by_addr):
@@ -281,88 +400,48 @@ def main():
         name, _, addr = b.partition("=")
         bases[name] = int(addr, 0)
 
-    inputs = corpus_inputs(args.corpus)
-    if not inputs:
-        die("the corpus is empty (no inputs under %r)" % args.corpus)
-
-    tmp = None
+    tmpdir = tempfile.mkdtemp(prefix="frontier-")
     try:
         if args.trace:
             trace_path = args.trace
+            inputs = corpus_inputs(args.corpus)
         else:
-            tmp = tempfile.NamedTemporaryFile(prefix="frontier-", suffix=".trace",
-                                              delete=False)
-            tmp.close()
-            trace_path = tmp.name
-            run_replay(cmd, args.corpus, args.firmware, ranges, trace_path)
+            snap = os.path.join(tmpdir, "corpus")
+            os.mkdir(snap)
+            snapshot_corpus(args.corpus, snap)
+            if not os.listdir(snap):
+                die("the corpus is empty (no inputs under %r)" % args.corpus)
+            trace_path = os.path.join(tmpdir, "blocks.trace")
+            inputs = run_replay(cmd, snap, args.firmware, ranges, trace_path)
+        if not inputs:
+            die("the corpus is empty (no inputs under %r)" % args.corpus)
         covered, per_input = parse_trace(trace_path, len(inputs))
     finally:
-        if tmp:
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     if not covered:
-        die("the trace shows no blocks (wrong --fuzz-begin, or nothing ran); "
+        die("the trace shows no blocks (wrong --fuzz-begin, --range, or nothing ran); "
             "check the replay command")
 
     blocks = load_cfg(args.firmware, modules, bases, ranges, args.all_functions)
     if not blocks:
         die("rizin found no functions in range; widen --range or pass --all-functions")
 
-    cov_sorted = sorted(covered)
-    covered_starts = set()
+    covered_starts = covered_blocks(blocks, sorted(covered))
+    # input index -> blocks it ran; 1..N are the corpus inputs, as the trace numbers them.
+    reached = [covered_blocks(blocks, sorted(per_input[i])) if i < len(per_input) else set()
+               for i in range(len(inputs) + 1)]
 
-    def block_covered(b):
-        i = bisect.bisect_left(cov_sorted, b.addr)
-        return i < len(cov_sorted) and cov_sorted[i] < b.end
-
-    for b in blocks:
-        if block_covered(b):
-            covered_starts.add(b.addr)
-
-    # input index -> covered pc set; input 0 is the boot, inputs 1..N are the corpus.
     def reaching(b):
-        """corpus inputs (name, size) whose run entered block b, smallest first."""
-        hit = []
-        for idx, (name, size) in enumerate(inputs, 1):
-            s = per_input[idx] if idx < len(per_input) else set()
-            if any(b.addr <= pc < b.end for pc in s):
-                hit.append((size, name))
+        """corpus inputs (size, name) whose run entered block b, smallest first."""
+        hit = [(size, name) for idx, (name, size) in enumerate(inputs, 1)
+               if b.addr in reached[idx]]
         hit.sort()
         return hit
 
     syms_by_addr = sorted((a, n) for n, (a, _sz) in syms.items())
 
-    records = []
-    for b in blocks:
-        if b.addr not in covered_starts:
-            continue
-        # Only conditional branches (a block with both a taken target and a fall-through)
-        # are frontier candidates: for those, an uncovered side is a branch to aim at. A
-        # block with one successor is unconditional flow; an uncovered target there is code
-        # never reached at all, not a branch whose condition we can try to flip.
-        if b.fail is None or b.jump is None:
-            continue
-        succs = [(b.fail, "fall-through"), (b.jump, "taken")]
-        frontier = [(t, kind) for t, kind in succs if t not in covered_starts]
-        if not frontier:
-            continue
-        hit = reaching(b)
-        for target, kind in frontier:
-            records.append({
-                "branch": b.addr,
-                "branch_sym": symbolize(b.addr, syms_by_addr),
-                "func": b.func,
-                "target": target,
-                "target_sym": symbolize(target, syms_by_addr),
-                "edge": kind,
-                "disasm": [d for _a, d in b.tail],
-                "reached_by": len(hit),
-                "smallest_input": hit[0][1] if hit else None,
-                "smallest_size": hit[0][0] if hit else None,
-            })
+    records = frontier_records(blocks, covered_starts, reaching, syms_by_addr)
 
     # Most useful first: branches some input already reaches (so a mutation can flip them),
     # the smallest input first.
@@ -388,8 +467,11 @@ def main():
         for d in r["disasm"]:
             print("       %s" % d)
         print("    %s" % reach)
-    if not records:
-        print("\n(no frontier branches: every conditional in range has gone both ways)")
+    if not records and not cov_blocks:
+        print("\n(no CFG block in range ran: check --range and the replay command)")
+    elif not records:
+        print("\n(no frontier branches: every conditional and switch in range has gone "
+              "every way)")
 
 
 if __name__ == "__main__":

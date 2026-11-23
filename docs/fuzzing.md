@@ -1070,7 +1070,8 @@ as it likes, and a campaign with no helper is unchanged.
 another worker is (see "Parallel workers"). Run the brain (or a `fuzz_launch.py` campaign)
 with `--sync-dir DIR`; the helper writes inputs into its own `DIR/<helper-name>/queue/`,
 and the brain imports them every `--sync-interval` seconds: it runs each once and keeps the
-ones that reach new coverage, mirrors them into ember and mutates from them like any queue
+ones that reach new coverage (a new bucket or a new hit-count class, the test every find
+passes), mirrors them into ember and mutates from them like any queue
 entry. The helper's name is any `[A-Za-z0-9_-]` that is not a worker's (`main`, `w1`, …);
 it needs only the `queue/` subdirectory. The rules the helper must follow:
 
@@ -1085,24 +1086,30 @@ it needs only the `queue/` subdirectory. The rules the helper must follow:
   `mem:…`), bounded by `--max-size`.
 - **To keep an input that does not (yet) add coverage, add `,keep` to the name**
   (`id:000007,orig:crc_frame,keep`). Normally an import that finds nothing is dropped;
-  `,keep` adds it to the queue regardless, so a structurally-right input that is not a find
+  `,keep` (a comma-separated tag of its own) adds it to the queue regardless, so a structurally-right input that is not a find
   on its own still becomes a mutation parent. A `,keep` input that *does* crash is saved as
   a crash as usual.
 
 **Reading back what happened (`--import-log FILE`).** Off unless given (a diagnostic, like
 every ember trace). With it, the brain appends one JSON object per imported input to `FILE`
 (it is appended to, not truncated, so it spans sessions). Each has `t` (seconds since the
-session began), `worker`, `peer`, `id`, `orig`, `size`, and a `verdict`:
+session began; it restarts each session), `time` (Unix seconds, which orders lines across
+sessions), `worker`, `peer`, `id`, `orig`, `size`, and a `verdict`:
 
 | `verdict` | meaning | extra fields |
 |---|---|---|
-| `newcov` | reached new coverage; now a queue entry | `new_buckets`, `insns`, `entry` (its queue name) |
-| `kept` | no new coverage, but `,keep` queued it | `new_buckets` (0), `insns`, `entry` |
-| `nocov` | no new coverage; dropped | `new_buckets` (0), `insns` |
+| `newcov` | reached new coverage; now a queue entry | `new_buckets`, `new_classes`, `insns`, `entry` (its queue name) |
+| `kept` | no new coverage, but `,keep` queued it | `new_buckets` (0), `new_classes` (0), `insns`, `entry` |
+| `nocov` | no new coverage; dropped | `new_buckets` (0), `new_classes` (0), `insns` |
 | `crash` | a fault, guard or oracle crash | `reason_name`, `status`, `file` (under `crashes/`) |
 | `hang` | a hang or timeout | `reason_name`, `status`, `file` (under `hangs/`) |
 | `rejected` | the input route refused it (no bug) | — |
 | `other` | ran abnormally (e.g. the connection was closing) | — |
+
+A brain that stops part way through an import pass records how far it got, so a restart
+neither re-runs nor re-logs those inputs. In a parallel campaign every worker imports the
+helper's inputs on its own (as it does another worker's finds): one input has a line per
+worker, and a kept one is an entry in each worker's queue.
 
 So a helper writes `id:…,orig:X`, waits a sync interval, and reads the line for `orig:X` to
 learn whether X was a find, a dead end or a crash. A crash it caused also names it in the
@@ -1118,19 +1125,24 @@ lineage.
 campaign runs**. So a helper that reads a magic value, a command string or a table of
 opcodes out of the firmware appends them (same format as `--dict`: `"text"`, `hex:…`,
 `u32:…`) and the mutator starts using them within seconds — often the cheapest high-value
-move, since one right token helps every entry. Write the file atomically (temp then
-rename); a parse error mid-write is logged and retried, not fatal. The merge is additive and
+move, since one right token helps every entry. Write the file atomically — copy it, add to
+the copy, rename the copy over it — never by appending in place: a line read half-written
+can parse as a valid but wrong token (`u32:0xdead` for `u32:0xdeadbeef`), which is merged
+for good. A parse error (at startup too, unlike `--dict`) is logged and retried, not fatal. The merge is additive and
 deduplicated; it never removes a token.
 
 **Seeing what is uncovered (`fuzz/tools/fuzz_frontier.py`).** Block coverage buckets a
 hashed pc, so the coverage map cannot say *which* branch has only gone one way — but that is
 exactly what a helper needs to aim an input. `fuzz_frontier.py` answers it: it replays the
-queue through `uam-run -t blocks` (read-only, beside a live campaign), reads the firmware's
-control-flow graph with rizin (as `gen_sites.py` does; needs rizin and `rzpipe`), and lists
-every **frontier branch** — a conditional whose own block ran but whose taken or
-fall-through target never did. For each it prints the branch and the compare before it
-(so the value to aim at is usually right there), the uncovered target by name, and the
-smallest queue input that reaches the branch (the input to mutate or hand-edit):
+queue through `uam-run -t blocks` (it copies the queue first, so a live campaign adding
+entries cannot shift which input is which), reads the firmware's control-flow graph with
+rizin (as `gen_sites.py` does; needs rizin and `rzpipe`), and lists every **frontier
+branch** — a conditional (or a switch's jump table) whose own block ran but one of whose
+targets never did. For each it prints the last instructions of the branch's block (usually
+the compare and the constant to aim at), the uncovered target by name (with the case value
+for a switch), and the smallest queue input that reaches the branch (the input to mutate or
+hand-edit). An ember block runs on past a point another branch jumps to, so a rizin block
+that a run block flows into without a branch counts as run too:
 
 ```
 python3 fuzz/tools/fuzz_frontier.py build/tests/firmware/fuzztarget.elf \
@@ -1144,7 +1156,7 @@ python3 fuzz/tools/fuzz_frontier.py build/tests/firmware/fuzztarget.elf \
 `--range SYM|LO-HI|LO+LEN` (repeatable) narrows the analysis to the code under test (a bare
 symbol also matches the compiler's clones of it, `parse` → `parse.constprop.0`); `--json`
 prints the records for a program to read; `--top N` caps the list; `--trace FILE` parses a
-block trace you already captured instead of replaying. Give the uam-run command after `--`
+block trace you already captured instead of replaying (from the same, unchanged corpus). Give the uam-run command after `--`
 without the firmware positional and without `-t`/`--fuzz-replay` (the tool adds those).
 
 **The loop.** A helper's cycle is: read `status.jsonl` and the frontier report → read the

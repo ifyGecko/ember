@@ -30,10 +30,12 @@ judging (run once, keep if new coverage) as a worker's.
      imported from each peer in `SYNC_DIR/main/.synced/<yourname>` (each worker keeps its own
      `.synced/`), and never re-examines an id at or below it. So reusing or lowering an id
      means the file is silently skipped. Keep a counter; never go back.
-   - **`orig:LABEL`** — `[A-Za-z0-9._-]`, truncated to 40 chars. It rides into the queue
-     entry name, the import log line, and the `.info` of any crash the input causes. Make it
+   - **`orig:LABEL`** — `[A-Za-z0-9._-]` (no comma). It rides into the queue entry name
+     (there cut to 40 characters), the import log line, and the `.info` of any crash the
+     input causes. Make it
      say what the input was (`orig:crc_ok_len8`), so a verdict is self-explaining.
-   - **`,keep`** — optional. With it, the brain adds the input to the queue even if it
+   - **`,keep`** — optional, a tag of its own between commas (`,keep` at the end, or
+     `,keep,` inside; `,keeper` is not it). With it, the brain adds the input to the queue even if it
      reaches no new coverage (verdict `kept`). Without it, a no-coverage import is dropped
      (`nocov`). Use `,keep` for an input that is the right shape but blocked at a check you
      have not satisfied yet: it becomes a mutation parent the campaign will push on.
@@ -43,13 +45,17 @@ judging (run once, keep if new coverage) as a worker's.
 5. The brain imports every `--sync-interval` seconds (default 60). For an interactive
    session, start the campaign with a short interval (e.g. `--sync-interval 5`) so your
    inputs land quickly. It imports in id order, runs each input once, and:
-   - new coverage → queued, verdict `newcov`;
+   - new coverage (a new bucket, or a new hit-count class of a bucket already hit — the
+     same test as for a seed or another worker's find) → queued, verdict `newcov`;
    - no new coverage + `,keep` → queued, verdict `kept`;
    - no new coverage, no `,keep` → dropped, verdict `nocov`;
    - a crash/hang/rejected → handled like any run (saved under `crashes/`/`hangs/`, or
      counted for `rejected`), verdict `crash`/`hang`/`rejected`.
 
-An entry you contributed shows in the queue as `id:NNNNNN,sync:<yourname>,src:<your id>`.
+An entry you contributed shows in the queue as
+`id:NNNNNN,orig:<LABEL>,sync:<yourname>,src:<your id>`. If the brain stops part way through
+an import pass (Ctrl-C, ember's BYE, a dropped connection), it records how far it got, so a
+restart neither runs those inputs again nor logs them twice.
 The brain's own log (`brain.log`, or stdout) prints `sync: imported N of M new entries from
 <yourname>` each interval.
 
@@ -57,20 +63,27 @@ The brain's own log (`brain.log`, or stdout) prints `sync: imported N of M new e
 
 Off unless given. Appended, not truncated (so it spans sessions and restarts). One JSON
 object per imported input, newline-delimited. Always present: `t` (seconds into the
-session), `worker` (which brain imported it — `main` or a `wN`), `peer` (you), `id`, `orig`,
+session; it restarts with each session), `time` (Unix seconds: orders lines across
+sessions), `worker` (which brain imported it — `main` or a `wN`), `peer` (you), `id`, `orig`,
 `size`, `verdict`. Per verdict:
 
-- `newcov` / `kept`: `new_buckets` (how many new coverage buckets; 0 for `kept`), `insns`
-  (instructions the run took), `entry` (the queue entry name it became).
-- `nocov`: `new_buckets` (0), `insns`.
-- `crash` / `hang`: `reason_name` (`FAULT`/`GUARD`/`ORACLE`/`HANG`/`TIMEOUT`), `status` (the
+- `newcov` / `kept`: `new_buckets` (new coverage buckets), `new_classes` (new buckets or
+  new hit-count classes; 0 for `kept`), `insns` (instructions the run took), `entry` (the
+  queue entry name it became).
+- `nocov`: `new_buckets` (0), `new_classes` (0), `insns`.
+- `crash` / `hang`: `crash` is a fault, guard or oracle; `hang` is a hang **or** a timeout
+  (there is no separate `timeout` verdict: `reason_name` tells them apart).
+  `reason_name` (`FAULT`/`GUARD`/`ORACLE`/`HANG`/`TIMEOUT`), `status` (the
   pc for fault/guard/oracle as `0x…`, else a number), `file` (the saved file under
   `crashes/` or `hangs/`; may be absent if the crash was a duplicate the brain did not
   re-save).
 - `rejected` / `other`: no extra fields.
 
 In a parallel campaign each worker imports independently, so one of your inputs can appear in
-several workers' lines (different `worker`). Read the whole file; match your `orig:`/`id`.
+several workers' lines (different `worker`), and a `newcov`/`kept` input becomes a queue
+entry in **each** worker's queue — the same as a worker's own find reaching the others. It
+runs once per worker; that is the price of every worker mutating from it. Read the whole
+file; match your `orig:`/`id`.
 
 Tail it between passes:
 ```
@@ -108,31 +121,43 @@ per line:
   from HELLO); `u16le:`/`u32be:`/… for an explicit order (network fields are big-endian).
 - `# comment` and blank lines are ignored.
 
-Write atomically (temp then rename); a parse error on a half-written file is logged and
-retried, not fatal. Merging is additive and deduplicated — it never removes a token, and the
+Write atomically: copy the file, add your lines to the copy, rename it over the original:
+```
+cp SYNC_DIR/live.dict SYNC_DIR/.live.dict.tmp
+printf 'u32:0xdeadbeef\n"RESET"\n' >> SYNC_DIR/.live.dict.tmp
+mv SYNC_DIR/.live.dict.tmp SYNC_DIR/live.dict
+```
+**Never append to the watched file in place** (`>> live.dict`): the brain may read it part
+way through a line, and a cut line can be a valid but wrong token (`u32:0xdeadbeef` read as
+`u32:0xdead`) that is merged and never removed. A parse error on a half-written file is
+logged and retried, not fatal. Merging is additive and deduplicated — it never removes a token, and the
 brain keeps using the ones already merged. This is often your highest-value move: one correct
 magic value or command string helps every queue entry, where a whole crafted input helps only
 its own lineage. Pull tokens from the firmware: compared immediates, string literals, opcode
 or command tables, struct tags.
 
-Startup load of `--watch-dict` is fatal on a bad file (like `--dict`), so make the initial
-file valid (an empty or comment-only file is fine).
+A bad or missing `--watch-dict` file at startup is not fatal either (unlike `--dict`): it is
+logged and read again once it parses.
 
 ## The frontier report (`fuzz/tools/fuzz_frontier.py`)
 
 Block coverage buckets `mix(pc) & mask`, so you cannot invert the map to addresses. This tool
 reconstructs the uncovered edges a different way:
 
-1. It replays your corpus through `uam-run -t blocks` (read-only, safe beside a live
-   campaign — a separate short replay of the queue dir), collecting the set of block pcs each
-   input ran, with per-input attribution from the `trace: input N` markers.
+1. It copies your corpus (leaving out `.info` sidecars) and replays the copy through
+   `uam-run -t blocks` (read-only, safe beside a live campaign: entries added meanwhile
+   cannot shift which input is which), collecting the block pcs each input ran, attributed
+   by the `trace: input N` markers and ember's own `replay:` lines.
 2. It reads the firmware's CFG with rizin (via `rzpipe`, as `fuzz/tools/gen_sites.py` does):
-   each basic block's start, size, successors (taken/fall-through), and the disassembly of
-   its last few instructions.
-3. A **frontier branch** is a conditional block that ran but whose taken or fall-through
-   target block never did. For each it reports: the branch pc (symbolized), the uncovered
-   target (symbolized), the edge kind, the last ~3 instructions of the block (the compare
-   that gates it — usually the value to aim at is the immediate here), how many corpus inputs
+   each basic block's start, size, successors (taken/fall-through, or a switch's jump-table
+   cases), and the disassembly of its last few instructions. An ember block runs on past a
+   point another branch jumps to (a loop head, the join after an `if`), so a rizin block also
+   counts as run when a block that ran flows into it with no branch of its own.
+3. A **frontier branch** is a conditional block (or a switch) that ran but one of whose
+   targets never did. For each it reports: the branch pc (symbolized), the uncovered target
+   (symbolized), the edge kind (`taken`, `fall-through`, or `case N` with `case_value` in
+   JSON), the last ~3 instructions of the block (usually the compare and its constant — the
+   value to aim at — though the tool does not decode it for you), how many corpus inputs
    reach the branch, and the **smallest** one (the input to mutate or hand-edit).
 
 Invocation (the trailing command is your replay command **minus** the firmware positional and
@@ -152,7 +177,9 @@ Options:
   default.
 - `--top N` (default 40; 0 = all); `--json` (a list of records, for machine reading).
 - `--trace FILE`: parse a block trace you already captured instead of replaying (then no
-  trailing command). Capture one with `uam-run … -t blocks --trace-file FILE --fuzz-replay
+  trailing command). The corpus must be unchanged since: inputs are matched to the trace in
+  ember's replay order (every file not starting with `.`, by name — `.info` files too, if
+  the directory has them). Capture one with `uam-run … -t blocks --trace-file FILE --fuzz-replay
   <corpus> <firmware>`.
 
 Needs rizin on `PATH` and `rzpipe` importable; without them it prints why and exits 2. Then
