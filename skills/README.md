@@ -5,7 +5,7 @@ ember" (the UAM firmware emulator in this repository: guest code lifted into a s
 devices behind explicit interfaces), then fuzzing it there, and then explaining what the
 fuzzer found. They are plain `SKILL.md`
 folders with no harness-specific content, so any agent that reads the Agent Skills format
-can use them; `install.sh` sets them up for Claude Code and Qwen Code. Two skills form the
+can use them; `install.sh` sets them up for Claude Code, Qwen Code and OpenCode. Two skills form the
 pipeline every ember build goes through; the third and fourth are for later, once the
 emulation works:
 
@@ -42,19 +42,22 @@ checkout a project pins is the authority on options and APIs; the skills say whe
 ## Install
 
 ```bash
-skills/install.sh          # symlinks the skills into every harness found: Claude Code, Qwen Code
-skills/install.sh --claude # only Claude Code: $CLAUDE_SKILLS_DIR or ~/.claude/skills
-skills/install.sh --qwen   # only Qwen Code: $QWEN_SKILLS_DIR, $QWEN_HOME/skills or ~/.qwen/skills
-skills/install.sh --agents # the harness-neutral ~/.agents/skills ($AGENTS_SKILLS_DIR), which
-                           # Qwen Code also reads: use it or --qwen, not both
-skills/install.sh --uninstall [--claude|--qwen|--agents]   # remove the links it made
+skills/install.sh            # symlinks the skills into every harness found: Claude Code,
+                             # Qwen Code, OpenCode
+skills/install.sh --claude   # only Claude Code: $CLAUDE_SKILLS_DIR or ~/.claude/skills
+skills/install.sh --qwen     # only Qwen Code: $QWEN_SKILLS_DIR, $QWEN_HOME/skills or ~/.qwen/skills
+skills/install.sh --opencode # only OpenCode: $OPENCODE_SKILLS_DIR or
+                             # ${XDG_CONFIG_HOME:-~/.config}/opencode/skills
+skills/install.sh --agents   # the harness-neutral ~/.agents/skills ($AGENTS_SKILLS_DIR), which
+                             # Qwen Code also reads: use it or --qwen, not both
+skills/install.sh --uninstall [--claude|--qwen|--opencode|--agents]   # remove the links it made
 ```
 The links point into this checkout, so pulling ember updates the skills. Re-running the
 script replaces links left by an earlier install (for example from the former `ember-dev`
 repository) and refuses to touch a real directory of the same name. Before linking it checks
 each `SKILL.md` the way the harnesses do: a `name` equal to the folder name (lowercase
 letters, digits and `-`) and a `description` of 1 to 1024 characters. Restart the harness, or
-run `/skills`, to see them. For another harness, point its skills directory at the three
+run `/skills`, to see them. For another harness, point its skills directory at the four
 folders or copy them.
 
 ## Test against an ember checkout
@@ -92,7 +95,7 @@ Re-run it whenever the ember pin moves.
 | `BOOT_BUDGET` | build | instructions the project's boot test may run (200000000) |
 | `OVMF_DIR` | tests | `/usr/share/OVMF` (an OVMF install for the PC board checks; skipped when absent) |
 | `EMBER_BUILD` | tests | `<ember checkout>/build` (ember's meson build directory, for its test firmware) |
-| `CLAUDE_SKILLS_DIR`, `QWEN_SKILLS_DIR` (`QWEN_HOME`), `AGENTS_SKILLS_DIR` | install | see Install |
+| `CLAUDE_SKILLS_DIR`, `QWEN_SKILLS_DIR` (`QWEN_HOME`), `OPENCODE_SKILLS_DIR` (`XDG_CONFIG_HOME`), `AGENTS_SKILLS_DIR` | install | see Install |
 
 ## Layout
 

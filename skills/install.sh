@@ -3,20 +3,27 @@
 # directory of each agent harness. Idempotent: re-running updates the links, including links
 # left by an earlier install from another checkout. Safe to run from anywhere.
 #
-# Usage: install.sh [--claude] [--qwen] [--agents] [--uninstall]
+# Usage: install.sh [--claude] [--qwen] [--opencode] [--agents] [--uninstall]
 #   no flag     every harness found on this machine (Claude Code if ~/.claude or `claude`
-#               exists, Qwen Code if its home dir or `qwen` exists); Claude Code if none is
+#               exists, Qwen Code if its home dir or `qwen` exists, OpenCode if its config
+#               dir or `opencode` exists); Claude Code if none is
 #   --claude    Claude Code: $CLAUDE_SKILLS_DIR, default ~/.claude/skills
 #   --qwen      Qwen Code:   $QWEN_SKILLS_DIR, default $QWEN_HOME/skills or ~/.qwen/skills
 #               (Qwen reads SKILL.md skills from there and follows symlinked skill dirs)
+#   --opencode  OpenCode:    $OPENCODE_SKILLS_DIR, default
+#               ${XDG_CONFIG_HOME:-~/.config}/opencode/skills (OpenCode also reads
+#               ~/.claude/skills and ~/.agents/skills; its own directory wins on a clash)
 #   --agents    the harness-neutral Agent Skills directory: $AGENTS_SKILLS_DIR, default
-#               ~/.agents/skills (Qwen Code reads it too: use it or --qwen, not both)
+#               ~/.agents/skills (Qwen Code reads it too: use it or --qwen, not both;
+#               OpenCode reads it too)
 #   --uninstall remove the links this script made (only links into this directory)
 set -euo pipefail
 SKILLS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS=(ember-dev-recon ember-dev-build ember-fuzz ember-fuzz-triage)
 CLAUDE_DEST="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 QWEN_DEST="${QWEN_SKILLS_DIR:-${QWEN_HOME:-$HOME/.qwen}/skills}"
+OPENCODE_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+OPENCODE_DEST="${OPENCODE_SKILLS_DIR:-$OPENCODE_HOME/skills}"
 AGENTS_DEST="${AGENTS_SKILLS_DIR:-$HOME/.agents/skills}"
 
 targets=(); uninstall=0
@@ -24,20 +31,22 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --claude) targets+=(claude); shift;;
         --qwen) targets+=(qwen); shift;;
+        --opencode) targets+=(opencode); shift;;
         --agents) targets+=(agents); shift;;
         --uninstall) uninstall=1; shift;;
-        -h|--help) sed -n '2,14p' "$0"; exit 0;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0;;
         *) echo "error: unknown argument: $1 (see --help)" >&2; exit 1;;
     esac
 done
 if [[ ${#targets[@]} -eq 0 ]]; then
     { [[ -d "$HOME/.claude" ]] || command -v claude >/dev/null 2>&1; } && targets+=(claude)
     { [[ -d "${QWEN_HOME:-$HOME/.qwen}" ]] || command -v qwen >/dev/null 2>&1; } && targets+=(qwen)
+    { [[ -d "$OPENCODE_HOME" ]] || command -v opencode >/dev/null 2>&1; } && targets+=(opencode)
     [[ ${#targets[@]} -gt 0 ]] || targets=(claude)
 fi
 
 # Each skill must be a folder whose SKILL.md frontmatter has a name equal to the folder name
-# and a description of 1-1024 characters (the Agent Skills format both harnesses read).
+# and a description of 1-1024 characters (the Agent Skills format every harness reads).
 check_skill() {  # $1 = skill folder
     python3 -I - "$1" <<'EOF' || exit 1
 import os, re, sys
@@ -101,6 +110,7 @@ for t in "${targets[@]}"; do
     case "$t" in
         claude) name="Claude Code"; dest="$CLAUDE_DEST";;
         qwen) name="Qwen Code"; dest="$QWEN_DEST";;
+        opencode) name="OpenCode"; dest="$OPENCODE_DEST";;
         agents) name="Agent Skills"; dest="$AGENTS_DEST";;
     esac
     if [[ $uninstall -eq 1 ]]; then unlink_skills "$name" "$dest"; else link_skills "$name" "$dest"; fi
