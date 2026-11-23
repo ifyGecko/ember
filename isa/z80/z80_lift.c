@@ -944,7 +944,7 @@ uam_status z80_lift(uam_lift_ctx *lc)
             uam_exit(lc->b, NONE, uam_imm(lc->b, pc), UAM_EXIT_JUMP);
             return UAM_OK;
         }
-        z80_lifter L ={ .lc = lc, .b = lc->b, .s = s, .pc = pc, .qv_prev = qv };
+        z80_lifter L = { .lc = lc, .b = lc->b, .s = s, .pc = pc, .qv_prev = qv };
         decode(&L);
         if (L.fault) {
             if (n == 0)
