@@ -32,6 +32,18 @@ are the authority on option details, and a pin older than this skill may lack op
 here. Script paths are relative to this skill's directory; python3 is all
 `scripts/replay_summary.py` needs.
 
+**Standard ember is fully documented here — but the board is custom code.** Everything this
+skill describes (routes, oracles, guards, coverage, the brain) is ember's stock interface,
+and it is complete. The emulation you are fuzzing, though, is an out-of-tree board that may
+add its own: extra input routes or named regions, input fix-ups (a checksum or length the
+board repairs, so you need not), board-specific crash oracles or `--guard` presets, extra
+traces, `--on` shorthands, link ports, or snapshot hooks — and the project may carry a
+`git format-patch` that adds an ember option this skill does not mention. Before you decide
+the stock set is all you have, read `build/<board>-run --help`, the board source
+(`emulation/boards/…`, `run.sh`) and the ember-dev-build `iter-XX.md` journal, and **use any
+board feature that helps the fuzzing or triage** — not only the stock ones. Confirm an option
+exists in `--help` or the source before relying on it; do not invent one.
+
 ## Gate: is the emulation ready to fuzz?
 Fuzzing an emulation that is still missing devices finds emulator gaps, not firmware bugs.
 Before anything else, check and **stop and hand back to ember-dev-build** if one fails:

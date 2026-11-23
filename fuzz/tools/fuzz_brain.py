@@ -55,7 +55,12 @@ The brain
     (fuzz/tools/fuzz_crashes.py; the .info says minimized=...);
   - with --sync-dir and --name, **shares work** with other workers: it imports
     their new queue entries that are new to it (fuzz/tools/fuzz_launch.py runs a
-    whole parallel campaign).
+    whole parallel campaign). An outside helper (an LLM) can act as a peer by the
+    same route -- it writes inputs into its own SYNC_DIR/NAME/queue, which this
+    brain imports; --import-log records what each imported input did (new coverage,
+    none, kept, a crash), and an input named with ,keep is queued even without new
+    coverage. --watch-dict FILE adds dictionary tokens live (see docs/fuzzing.md,
+    "LLM-assisted fuzzing", and fuzz/tools/fuzz_frontier.py for what is uncovered);
   * It runs **until you stop it** (Ctrl-C / SIGTERM) or ember says BYE; --iters N
     caps the mutated executions (in whole batches of at most --batch).
 
@@ -70,7 +75,8 @@ Usage:
                 [--no-calibrate] [--reweight-every N] [--no-cmplog] [--cmplog-max N]
                 [--batch N] [--min-energy N] [--stack LO-HI] [--splice PERMILLE]
                 [--iter-insns N|auto] [--crashes-per-sig N]
-                [--name NAME --sync-dir DIR [--sync-interval S]]
+                [--name NAME --sync-dir DIR [--sync-interval S]] [--import-log FILE]
+                [--watch-dict FILE]... [--watch-dict-interval S]
                 [--max-size N] [--no-minimize] [--minimize-timeouts]
                 [--minimize-share PERCENT]
                 [--max-hangs N] [--seed-rng N] [--accept-timeout S]
@@ -239,6 +245,12 @@ def main():
     ap.add_argument("--dict", action="append", default=[],
                     help="ember dictionary file (fuzz/tools/fuzz_dict.py's format; "
                          "integer tokens follow the target's byte order); repeatable")
+    ap.add_argument("--watch-dict", action="append", default=[], metavar="FILE",
+                    help="a dictionary file re-read while the campaign runs: new tokens are "
+                         "merged into ember's mutator live (for an outside helper, an LLM, "
+                         "that discovers constants); repeatable, same format as --dict")
+    ap.add_argument("--watch-dict-interval", type=float, default=5.0, metavar="S",
+                    help="seconds between re-reads of a --watch-dict file (default 5)")
     ap.add_argument("--no-trim", dest="trim", action="store_false",
                     help="do not trim new queue entries")
     ap.add_argument("--trim-probes", type=int, default=64,
@@ -260,6 +272,11 @@ def main():
                          "are in SYNC_DIR (this one's is SYNC_DIR/NAME)")
     ap.add_argument("--sync-interval", type=float, default=60.0,
                     help="seconds between imports from the other workers (default 60)")
+    ap.add_argument("--import-log", default=None, metavar="FILE",
+                    help="append one JSON line per imported peer input (its verdict: new "
+                         "coverage, no coverage, kept, a crash or a hang), so an outside "
+                         "helper that writes inputs into a peer queue learns what each did. "
+                         "Off unless given; see docs/fuzzing.md")
     ap.add_argument("--no-minimize", dest="minimize", action="store_false",
                     help="skip crash minimization (on by default)")
     ap.add_argument("--minimize-timeouts", action="store_true",
@@ -455,6 +472,21 @@ def main():
                 sys.exit("brain: --dict: %s" % e)
         log("dictionary: %d tokens (%d integers, %s-endian unless marked) from %d file(s)"
             % (len(dictionary), len(dictionary.ints), order, len(args.dict)))
+    # --watch-dict files are read now and again while the campaign runs; remember each
+    # file's mtime+size so an unchanged file is not re-parsed (watch_dicts(), below).
+    watch_dict_seen = {}       # path -> (mtime, size) last read
+    for p in args.watch_dict:
+        try:
+            dictionary.merge(parse_dict(p, order))
+            st = os.stat(p)
+            watch_dict_seen[p] = (st.st_mtime, st.st_size)
+        except OSError:
+            watch_dict_seen[p] = None          # not there yet: picked up when it appears
+        except ValueError as e:
+            sys.exit("brain: --watch-dict: %s" % e)
+    if args.watch_dict:
+        log("watching %d dictionary file(s) every %gs for new tokens (%d so far)"
+            % (len(args.watch_dict), args.watch_dict_interval, len(dictionary)))
 
     rng = random.Random(args.seed_rng)
     edges = [0]            # buckets ever hit, as ember judged (JUDGE, FIND)
@@ -491,6 +523,8 @@ def main():
     # ---- optional JSON-lines status feed (for fuzz/tools/status_tui.py) --
     start = time.monotonic()
     status_fp = open(args.status_file, "w", buffering=1) if args.status_file else None
+    # The import log is appended to (not truncated): a helper reads it across sessions.
+    import_fp = open(args.import_log, "a", buffering=1) if args.import_log else None
     last_status = [0.0]
     stage = ["baseline"]
     running = [0]             # runs of the batch in flight (PROGRESS); execs has the finished ones
@@ -503,8 +537,12 @@ def main():
                   "cmplog": str(cmplog_on)}
     if args.iters:
         run_config["iters_limit"] = args.iters
-    if args.dict:
+    if args.dict or args.watch_dict:
         run_config["dict"] = len(dictionary)
+    if args.watch_dict:
+        run_config["watch_dict"] = len(args.watch_dict)
+    if args.import_log:
+        run_config["import_log"] = True
 
     def emit_status(finished=False):
         if not status_fp:
@@ -542,6 +580,16 @@ def main():
         if now - last_status[0] >= args.status_interval:
             emit_status()
             last_status[0] = now
+
+    def log_import(record):
+        """One line of the import log (--import-log): what became of a peer input. record
+        is a dict; a monotonic-from-start timestamp and the worker name are added here."""
+        if not import_fp:
+            return
+        record = dict(record)
+        record["t"] = round(time.monotonic() - start, 1)
+        record["worker"] = name
+        import_fp.write(json.dumps(record) + "\n")
 
     def save_uninit(payload):
         """An UNINIT frame (ember runs inputs a second time with the memory nothing wrote
@@ -915,9 +963,12 @@ def main():
         execs += 1
         minimize_execs += 1
 
-    def write_finding(where, prefix, data, reason, status, minimized="no"):
+    def write_finding(where, prefix, data, reason, status, minimized="no", origin=None):
         """Write one finding plus its .info sidecar; return the file name. minimized: yes |
-        no (kept as found) | later (in the queue) | peer (another worker holds it minimized)."""
+        no (kept as found) | later (in the queue) | peer (another worker holds it minimized).
+        origin, when set, is the imported input that produced this finding: it is recorded
+        in the sidecar (src_peer, src_id, src_orig) so a crash from a helper's input names
+        the input that found it."""
         fname = "%s_r%d_s%d_%s" % (prefix, reason, status,
                                    hashlib.sha1(data).hexdigest()[:12])
         if read_info(os.path.join(where, fname + ".info")).get("minimized") == "yes":
@@ -932,6 +983,10 @@ def main():
             f.write("minimized=%s\n" % minimized)
             f.write("len=%d\nsig=r%d/s%d\nhex=%s\n"
                     % (len(data), reason, status, data.hex()))
+            if origin:
+                f.write("src_peer=%s\nsrc_id=%d\n" % (origin["peer"], origin["id"]))
+                if origin.get("orig"):
+                    f.write("src_orig=%s\n" % origin["orig"])
         return fname
 
     def drop_finding(where, fname):
@@ -959,11 +1014,16 @@ def main():
         rname, st = reason_name(reason), fmt_status(reason, status)
         if not os.path.exists(os.path.join(crash_dir, fname)):
             return                        # removed by hand: nothing to replace
+        # Carry the provenance the as-found sidecar recorded through re-minimizing, so a
+        # crash from an imported input keeps naming the input that found it.
+        info = read_info(os.path.join(crash_dir, fname + ".info"))
+        origin = ({"peer": info["src_peer"], "id": int(info.get("src_id", -1)),
+                   "orig": info.get("src_orig")} if info.get("src_peer") else None)
         who = triage.held_by(reason, status, on_disk())
         if who == name:
             return                        # queued twice (found again after a restart)
         if who is not None:
-            write_finding(crash_dir, "crash", data, reason, status, "peer")
+            write_finding(crash_dir, "crash", data, reason, status, "peer", origin=origin)
             log("CRASH %s status=%s stays as found: %s holds it minimized (%s)"
                 % (rname, st, who, fname))
             return
@@ -972,17 +1032,22 @@ def main():
         deferred_execs += minimize_execs - before
         if small != data:
             drop_finding(crash_dir, fname)
-        new = write_finding(crash_dir, "crash", small, reason, status, "yes")
+        new = write_finding(crash_dir, "crash", small, reason, status, "yes", origin=origin)
         log("CRASH %s status=%s minimized later, len=%d -> %d (saved %s; %d left for later)"
             % (rname, st, len(data), len(small), new, len(triage)))
 
-    def save_crash(data, reason, status, counted=False, novel=False, nested=False, fresh=0):
+    last_finding_file = [None]   # the file name save_crash last wrote (for the import log)
+
+    def save_crash(data, reason, status, counted=False, novel=False, nested=False, fresh=0,
+                   origin=None):
         """counted: a HAVOC batch's totals already counted it. novel: ember judged that the
         crash has a new (reason, status) or hit a bucket no earlier crash with its (reason,
         status) hit. nested: met while minimizing another crash. fresh: how many buckets it
-        hit that no earlier crash of any (reason, status) had (ember's count). Returns
-        whether it was saved."""
+        hit that no earlier crash of any (reason, status) had (ember's count). origin: the
+        imported input that produced it, recorded in the sidecar. Returns whether it was
+        saved."""
         nonlocal crashes, hangs, rejected
+        last_finding_file[0] = None
         if reason == REJECTED:            # the input route refused it: no bug
             rejected += 0 if counted else 1
             return False
@@ -1018,13 +1083,13 @@ def main():
         prefix = "hang" if is_hang else "crash"
         # Save the input as found first: minimizing re-sends it, and a BYE, a
         # timeout or a dropped connection there must not lose the finding.
-        fname = write_finding(where, prefix, data, reason, status)
+        fname = write_finding(where, prefix, data, reason, status, origin=origin)
         note = ""
         if is_hang:
             small = minimize(data, reason, status)
             if small != data:
                 drop_finding(where, fname)
-                fname = write_finding(where, prefix, small, reason, status, "yes")
+                fname = write_finding(where, prefix, small, reason, status, "yes", origin=origin)
                 data = small
         elif variant or not args.minimize:
             pass   # a variant stays as found: minimizing it would lead back to the first one
@@ -1036,26 +1101,29 @@ def main():
                 if small != data:
                     drop_finding(where, fname)
                     data = small
-                fname = write_finding(where, prefix, data, reason, status, "yes")
+                fname = write_finding(where, prefix, data, reason, status, "yes", origin=origin)
             else:
-                fname = write_finding(where, prefix, data, reason, status, when)
+                fname = write_finding(where, prefix, data, reason, status, when, origin=origin)
                 if when == LATER:
                     triage.defer(fname, data, reason, status, fresh)
                 note = ", as found: " + why
+        last_finding_file[0] = fname
         log("%s #%d %s status=%s NEW len=%d (saved %s%s)"
             % (label, nth, rname, st, len(data), fname, note))
         emit_event(ev, "%s status=%s %s" % (rname, st, fname))
         return True
 
-    def run(data):
+    def run(data, origin=None):
         """Run one input and account for it: ('crash', ...) after saving it, or
-        ('iter', hits, insns, path, new_buckets, new_classes) | ('other', ...)."""
+        ('iter', hits, insns, path, new_buckets, new_classes) | ('other', ...). origin,
+        when set, is where an imported input came from (sync()): it reaches the crash's
+        .info sidecar and the import log."""
         nonlocal execs
         r = probe(data)
         execs += 1
         nb, nc, path, novel = last_judge[0]
         if r[0] == "crash":
-            save_crash(data, r[1], r[2], novel=novel, fresh=nb)
+            save_crash(data, r[1], r[2], novel=novel, fresh=nb, origin=origin)
             return r
         if r[0] != "iter":
             return r
@@ -1213,16 +1281,77 @@ def main():
                         data = f.read()
                 except OSError:
                     continue
-                r = run(data)
-                if r[0] == "iter" and r[5]:
-                    add_entry(data, r[1], r[2], r[3], r[4], op=None, sync=p_name, src=eid)
-                    got += 1
+                base = os.path.basename(path)
+                mo = re.search(r",orig:([^,]*)", base)
+                orig = mo.group(1) if mo else None
+                # ,keep in the name adds the input to the queue even without new coverage:
+                # a helper's structurally-useful input that is not yet a find still becomes
+                # a mutation parent.
+                keep = ",keep" in base
+                origin = {"peer": p_name, "id": eid, "orig": orig}
+                r = run(data, origin=origin)
+                rec = {"peer": p_name, "id": eid, "orig": orig, "size": len(data)}
+                if r[0] == "iter":
+                    nb = r[4]
+                    if nb or keep:
+                        c = add_entry(data, r[1], r[2], r[3], nb, op=None, sync=p_name, src=eid)
+                        got += 1
+                        rec.update(verdict="newcov" if nb else "kept",
+                                   new_buckets=nb, insns=r[2], entry=c.name)
+                    else:
+                        rec.update(verdict="nocov", new_buckets=0, insns=r[2])
+                elif r[0] == "crash":
+                    reason, status = r[1], r[2]
+                    rec.update(verdict=("rejected" if reason == REJECTED else
+                                        "hang" if reason in HANG_REASONS else "crash"),
+                               reason_name=reason_name(reason),
+                               status=fmt_status(reason, status),
+                               file=last_finding_file[0])
+                else:
+                    rec.update(verdict="other")
+                log_import(rec)
             if top > after:
                 set_synced(out, p_name, top)
             if got:
                 imported += got
                 log("sync: imported %d of %d new entries from %s" % (got, len(todo), p_name))
                 emit_event("info", "imported %d from %s" % (got, p_name))
+
+    last_watch_dict = [0.0]
+
+    def watch_dicts(force=False):
+        """Re-read the --watch-dict files; merge any new tokens into ember's mutator live.
+        A file unchanged since its last read (mtime and size) is not re-parsed. A parse
+        error is logged and the file is left for next time, not fatal: a helper may be part
+        way through writing it (it should write atomically: a temp file then a rename)."""
+        if not args.watch_dict:
+            return
+        now = time.monotonic()
+        if not force and now - last_watch_dict[0] < args.watch_dict_interval:
+            return
+        last_watch_dict[0] = now
+        added = 0
+        for p in args.watch_dict:
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue                   # not there (yet / any more): try again later
+            key = (st.st_mtime, st.st_size)
+            if watch_dict_seen.get(p) == key:
+                continue
+            try:
+                d = parse_dict(p, order)
+            except (OSError, ValueError) as e:
+                log("watch-dict: %s: %s (left for next time)" % (p, e))
+                continue
+            watch_dict_seen[p] = key
+            for t in d.tokens:
+                if dictionary.add(t):
+                    added += 1
+        if added:
+            send_mutator()
+            log("watch-dict: merged %d new token(s) live (%d total)" % (added, len(dictionary)))
+            emit_event("info", "dictionary: +%d tokens (%d total)" % (added, len(dictionary)))
 
     last_reweight = [0]
     state_dirty = {}       # id -> entry whose times_chosen changed since its state was saved
@@ -1289,6 +1418,7 @@ def main():
                 "budget of about 5x that catches hangs early (--iter-insns auto, or "
                 "--iter-insns %d)" % (slow, 5 * slow))
         sync(force=True)
+        watch_dicts(force=True)
         if not queue.entries:
             log("no queue entry ran normally (every seed crashed, hung or was rejected); "
                 "fuzzing from an empty input")
@@ -1330,6 +1460,7 @@ def main():
                     maybe_status()
                     maybe_reweight()
                     sync()
+                    watch_dicts()
                     if not limit():
                         minimize_deferred()
                 e.times_chosen += 1
@@ -1371,6 +1502,8 @@ def main():
     emit_status(finished=True)
     if status_fp:
         status_fp.close()
+    if import_fp:
+        import_fp.close()
     conn.close()
     lsock.close()
     return status

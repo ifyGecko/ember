@@ -777,7 +777,10 @@ and runs until stopped (`--iters N` caps the mutated executions). Its campaign l
   `(reason, status)` of a session, with a `.info` note beside it: `reason=`,
   `reason_name=`, `status=`, `status_hex=` (the pc, for fault, guard and oracle),
   `minimized=` (`yes`; `no`: kept as found; `later`:
-  waiting its turn; `peer`: another worker holds it minimized), `len=`, `sig=`, `hex=`.
+  waiting its turn; `peer`: another worker holds it minimized), `len=`, `sig=`, `hex=`, and
+  — when the crash came from an imported input — `src_peer=`, `src_id=` and `src_orig=` (the
+  peer, its queue id and its `orig:` label), so a crash a helper's input found names it
+  ("LLM-assisted fuzzing" below).
 - `hangs/hang_r<reason>_s<status>_<sha1>`: every distinct input that hung or timed out, up to
   `--max-hangs` (64), not minimized unless `--minimize-timeouts`.
 
@@ -1027,7 +1030,11 @@ not without it; of two crashing seeds the first minimized at once and the second
 after a restart when `--minimize-share 0` left it as found; a crash met while minimizing
 another saved as found) and a parallel campaign
 (`tests/fuzz/parallel-check.sh`: two workers import each other's entries, find both planted
-crashes, and survive a killed ember). `meson test -C build --suite unit` runs `tests/fuzz/brain_unit.py` (the
+crashes, and survive a killed ember), and the LLM-assist route
+(`tests/fuzz/llm-check.sh`: a helper's input is imported as a crash that names its origin, a
+`,keep` input is queued without new coverage, a watched token is merged live, and
+`fuzz_frontier.py` reports the parser's uncovered branches with their compare bytes).
+`meson test -C build --suite unit` runs `tests/fuzz/brain_unit.py` (the
 campaign logic and the crash triage on synthetic data), `test_mutate` (the mutator and the input-to-state
 candidates), `test_fuzz`'s checks of the harness's hit lists, compare logging and the
 campaign engine's batches and stages, and
@@ -1045,6 +1052,108 @@ restores its snapshot: only the memory that changed is written back, and transla
 keeps its links and the JIT's data cache its entries for loads unless the input changed
 the processor's address translation or the firmware translates through page tables in its
 memory ([`uam-isa.md`](uam-isa.md), `uam_xlate.regs_only`).
+
+### LLM-assisted fuzzing
+
+The brain's power schedules and the mutator do what a fuzzer is good at: a huge number of
+small, blind, cheap steps. A reader of the code — a person, or an LLM in a harness — is
+good at the opposite: a few expensive, reasoned steps. One can see from the firmware that a
+parser wants `"BOOT"` then a little-endian length then a CRC, and write that input directly,
+where the mutator would need a long time to stumble onto it. **LLM-assisted fuzzing** lets
+the two run together: the campaign fuzzes as always, and a helper, on its own clock, reads
+the campaign's state, crafts inputs the mutator has not reached, and feeds them in — without
+stopping or slowing the campaign. The three pieces below are the whole interface; they are
+additive and read-only toward the running campaign, so a helper can do as little or as much
+as it likes, and a campaign with no helper is unchanged.
+
+**Feeding inputs (the import route).** A helper is a **peer** of the brain, exactly as
+another worker is (see "Parallel workers"). Run the brain (or a `fuzz_launch.py` campaign)
+with `--sync-dir DIR`; the helper writes inputs into its own `DIR/<helper-name>/queue/`,
+and the brain imports them every `--sync-interval` seconds: it runs each once and keeps the
+ones that reach new coverage, mirrors them into ember and mutates from them like any queue
+entry. The helper's name is any `[A-Za-z0-9_-]` that is not a worker's (`main`, `w1`, …);
+it needs only the `queue/` subdirectory. The rules the helper must follow:
+
+- **Name each file `id:NNNNNN,orig:LABEL`** — the `id:NNNNNN` prefix is required (a file
+  without it is ignored, which is how a half-written file is skipped), and the ids must only
+  ever **increase**: the brain records the highest id it has imported from each peer
+  (`DIR/main/.synced/<helper>`) and never looks below it again. `orig:LABEL` is a free label
+  (`[A-Za-z0-9._-]`) that rides along into the queue-entry name, the import log and any
+  crash the input finds — use it to say what the input was for.
+- **Write atomically:** write a temporary name with no `id:` prefix (e.g. `.tmp`), then
+  rename it into place. The content is raw bytes for the board's input route (`uart0`,
+  `mem:…`), bounded by `--max-size`.
+- **To keep an input that does not (yet) add coverage, add `,keep` to the name**
+  (`id:000007,orig:crc_frame,keep`). Normally an import that finds nothing is dropped;
+  `,keep` adds it to the queue regardless, so a structurally-right input that is not a find
+  on its own still becomes a mutation parent. A `,keep` input that *does* crash is saved as
+  a crash as usual.
+
+**Reading back what happened (`--import-log FILE`).** Off unless given (a diagnostic, like
+every ember trace). With it, the brain appends one JSON object per imported input to `FILE`
+(it is appended to, not truncated, so it spans sessions). Each has `t` (seconds since the
+session began), `worker`, `peer`, `id`, `orig`, `size`, and a `verdict`:
+
+| `verdict` | meaning | extra fields |
+|---|---|---|
+| `newcov` | reached new coverage; now a queue entry | `new_buckets`, `insns`, `entry` (its queue name) |
+| `kept` | no new coverage, but `,keep` queued it | `new_buckets` (0), `insns`, `entry` |
+| `nocov` | no new coverage; dropped | `new_buckets` (0), `insns` |
+| `crash` | a fault, guard or oracle crash | `reason_name`, `status`, `file` (under `crashes/`) |
+| `hang` | a hang or timeout | `reason_name`, `status`, `file` (under `hangs/`) |
+| `rejected` | the input route refused it (no bug) | — |
+| `other` | ran abnormally (e.g. the connection was closing) | — |
+
+So a helper writes `id:…,orig:X`, waits a sync interval, and reads the line for `orig:X` to
+learn whether X was a find, a dead end or a crash. A crash it caused also names it in the
+`.info` sidecar (`src_peer`, `src_id`, `src_orig`). The live `status.jsonl` feed
+(`--status-file`, always on under `--sync-dir`) carries the campaign totals the helper
+reads to decide where to spend effort: `corpus`, `edges`, `execs_per_sec`, `cycles`,
+`crashes_unique`, `imported`, and the queue entry names under `queue/` record each entry's
+lineage.
+
+**Updating the dictionary live (`--watch-dict FILE`, repeatable).** The dictionary
+(`--dict`) is read once at startup; `--watch-dict` names a file the brain re-reads every
+`--watch-dict-interval` seconds (5) and merges new tokens into ember's mutator **while the
+campaign runs**. So a helper that reads a magic value, a command string or a table of
+opcodes out of the firmware appends them (same format as `--dict`: `"text"`, `hex:…`,
+`u32:…`) and the mutator starts using them within seconds — often the cheapest high-value
+move, since one right token helps every entry. Write the file atomically (temp then
+rename); a parse error mid-write is logged and retried, not fatal. The merge is additive and
+deduplicated; it never removes a token.
+
+**Seeing what is uncovered (`fuzz/tools/fuzz_frontier.py`).** Block coverage buckets a
+hashed pc, so the coverage map cannot say *which* branch has only gone one way — but that is
+exactly what a helper needs to aim an input. `fuzz_frontier.py` answers it: it replays the
+queue through `uam-run -t blocks` (read-only, beside a live campaign), reads the firmware's
+control-flow graph with rizin (as `gen_sites.py` does; needs rizin and `rzpipe`), and lists
+every **frontier branch** — a conditional whose own block ran but whose taken or
+fall-through target never did. For each it prints the branch and the compare before it
+(so the value to aim at is usually right there), the uncovered target by name, and the
+smallest queue input that reaches the branch (the input to mutate or hand-edit):
+
+```
+python3 fuzz/tools/fuzz_frontier.py build/tests/firmware/fuzztarget.elf \
+    --corpus run/queue --range parse -- \
+    build/uam-run -b rv32-ref --fuzz-begin fuzz_iteration --fuzz-input uart0
+#   -> ... parse+0x42 (0x800002c4) -- taken target uncovered:
+#         li a4, 0x46 ; beq a5, a4, ...      (0x46 = 'F': the input wants an 'F' here)
+#         reached by 1 input(s); smallest b (5 B)
+```
+
+`--range SYM|LO-HI|LO+LEN` (repeatable) narrows the analysis to the code under test (a bare
+symbol also matches the compiler's clones of it, `parse` → `parse.constprop.0`); `--json`
+prints the records for a program to read; `--top N` caps the list; `--trace FILE` parses a
+block trace you already captured instead of replaying. Give the uam-run command after `--`
+without the firmware positional and without `-t`/`--fuzz-replay` (the tool adds those).
+
+**The loop.** A helper's cycle is: read `status.jsonl` and the frontier report → read the
+firmware at a frontier branch → write an input (and any tokens the code reveals) → check the
+import log for the verdict → repeat. It runs as fast or as slow as the helper; the campaign
+never waits on it. `fuzz/tools/fuzz_frontier.py` and the brain's assist options are checked
+by `tests/fuzz/llm-check.sh` (`meson test -C build --suite fuzz-lists`). The
+[`ember-fuzz-llm`](../skills/ember-fuzz-llm/SKILL.md) skill is a step-by-step guide for an
+LLM driving this.
 
 ### The coverage region (`--cov-shm PATH`)
 

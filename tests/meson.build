@@ -150,7 +150,7 @@ covs = []
 # [name, board, images (ELF, raw), environment, targets to build that are not among the images] (fuzz-check.sh)
 fuzzes = []
 # [name, board, image]: the fuzz target for the fuzz-lists checks named
-lists = {'formats': [], 'gen': [], 'brain': [], 'fuzz-net': [], 'parallel': [], 'uninit-net': []}
+lists = {'formats': [], 'gen': [], 'brain': [], 'fuzz-net': [], 'parallel': [], 'uninit-net': [], 'llm': []}
 both = ['interp', 'jit']
 raw0 = ['--raw-base', '0', '--entry', '0']
 snapshot_check = files('snapshot/snapshot-check.sh')
@@ -189,7 +189,7 @@ if have_rv
   # argument is the physical address the target reads.
   test('uninit-rv32', sh, args: [uninit_check, uam_run, 'rv32-ref', rv['fuzztarget'], '0x80100000'],
     suite: 'fuzz', kwargs: std)
-  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'parallel', 'uninit-net']
+  foreach k : ['formats', 'gen', 'brain', 'fuzz-net', 'parallel', 'uninit-net', 'llm']
     lists += {k: lists[k] + [['rv32', 'rv32-ref', rv['fuzztarget']]]}
   endforeach
 

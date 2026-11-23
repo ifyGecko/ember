@@ -17,7 +17,15 @@ developer can act on:
 | **So what?** | firmware bug or emulation gap; what an attacker controls; the smallest input that shows it |
 
 Nothing here depends on a particular board. It uses only what every ember emulation has:
-the runner's options and its gdb stub.
+the runner's options and its gdb stub — and all of that is fully documented here and in the
+ember checkout's `docs/`. **The board itself is custom code, though, and may add triage
+features worth more than the stock ones** on this target: board-specific traces or crash
+oracles, extra `--log-pc` registers or dump regions, `--on` rule shorthands, named regions,
+link ports, or an ember option the project patched in (a `git format-patch` in the project).
+When a board feature would pin down *where* or *why* faster than the generic tools, **use
+it** — check `RUN --help`, the board source, `run.sh`/`fuzz.sh` and the `iter-XX.md` /
+`fuzz-XX.md` journals for what this emulation offers, and confirm an option exists before
+relying on it.
 
 **Words used below**
 
