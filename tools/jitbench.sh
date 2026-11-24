@@ -28,6 +28,10 @@ while [ $# -gt 0 ]; do
 done
 [ $# -gt 0 ] || { echo "usage: jitbench.sh [--runs N] [--label NAME] [--header] -- COMMAND..." >&2; exit 2; }
 
+if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum; }; else sha256() { shasum -a 256; }; fi
+# Seconds since the epoch with a fraction where date has %N (GNU), whole seconds otherwise (BSD).
+now() { d=$(date +%s.%N); case $d in *N) date +%s;; *) echo "$d";; esac; }
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 use_perf=0
@@ -40,13 +44,13 @@ i=0
 : > "$tmp/times"; : > "$tmp/mips"; : > "$tmp/hpg"
 while [ $i -lt "$runs" ]; do
     i=$((i + 1))
-    t0=$(date +%s.%N)
+    t0=$(now)
     if [ $use_perf = 1 ]; then
         perf stat -x, -e instructions:u -o "$tmp/perf" "$@" > "$tmp/out" 2> "$tmp/err" || true
     else
         "$@" > "$tmp/out" 2> "$tmp/err" || true
     fi
-    t1=$(date +%s.%N)
+    t1=$(now)
     line=$(grep -a '^stats: time=' "$tmp/err" | tail -1 || true)
     if [ -n "$line" ]; then
         t=$(echo "$line" | sed -n 's/.*time=\([0-9.]*\)s.*/\1/p')
@@ -73,4 +77,4 @@ field() { grep -a "^stats: $1" "$tmp/err" | tail -1 | sed -n "s/.*$2=\([0-9.]*\)
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$runs" "$(median "$tmp/times")" \
     "$(median "$tmp/mips")" "$(grep -v - "$tmp/hpg" | sort -n | awk '{ a[NR] = $1 } END { print NR ? a[int((NR + 1) / 2)] : "-" }')" \
     "$(field time translate | sed 's/s$//')" "$(field 'jit calls' eval)" "$(field 'jit calls' load)" \
-    "$(field 'jit calls' store)" "$(field time 'code bytes')" "$(sha256sum < "$tmp/out" | cut -c1-12)" "$n"
+    "$(field 'jit calls' store)" "$(field time 'code bytes')" "$(sha256 < "$tmp/out" | cut -c1-12)" "$n"

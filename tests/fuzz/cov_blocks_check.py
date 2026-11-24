@@ -32,7 +32,7 @@ def check(cond, what):
 
 
 def sym(fw, name):
-    out = subprocess.run(["readelf", "-sW", fw], capture_output=True, text=True).stdout
+    out = subprocess.run([os.environ.get("READELF", "readelf"), "-sW", fw], capture_output=True, text=True).stdout
     for line in out.splitlines():
         f = line.split()
         if len(f) >= 8 and f[7] == name:

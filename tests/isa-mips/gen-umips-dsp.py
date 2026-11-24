@@ -63,8 +63,9 @@ def assemble(lines, micro):
                        capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stderr[:2000])
-    out = subprocess.run([CROSS + "objcopy", "-O", "binary", "-j", ".text", obj, "/dev/stdout"],
-                         capture_output=True, check=True).stdout
+    # A file, not /dev/stdout: objcopy writes beside its output (on macOS that is /dev).
+    subprocess.run([CROSS + "objcopy", "-O", "binary", "-j", ".text", obj, obj + ".bin"], check=True)
+    out = open(obj + ".bin", "rb").read()
     words = []
     for k in range(0, len(out), 4):
         h0, h1 = int.from_bytes(out[k:k + 2], "little"), int.from_bytes(out[k + 2:k + 4], "little")

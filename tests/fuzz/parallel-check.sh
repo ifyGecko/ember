@@ -24,7 +24,7 @@ lpid=
 trap '[ -z "$lpid" ] || kill "$lpid" 2> /dev/null || true; rm -rf "$tmp"' EXIT
 fail() { echo "parallel-check: $board: FAIL: $*" >&2; exit 1; }
 
-sym() { printf '0x%x' "0x$(readelf -sW "$fw" | awk -v n="$1" '$NF == n { print $2; exit }')"; }
+sym() { printf '0x%x' "0x$("${READELF:-readelf}" -sW "$fw" | awk -v n="$1" '$NF == n { print $2; exit }')"; }
 begin=$(sym fuzz_iteration)
 panic=$(sym fuzz_panic)
 mkdir "$tmp/seeds"

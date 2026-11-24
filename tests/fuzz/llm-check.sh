@@ -28,6 +28,8 @@
 #
 # Then, if rizin and rzpipe are present, fuzz/tools/fuzz_frontier.py must replay a small
 # corpus and report at least one frontier branch inside the parser with its compare byte.
+# It is skipped where rizin cannot read the machine's branches: no disassembler for it
+# (Homebrew's has no RISC-V), or an analysis that leaves them untyped (rizin 0.9's PowerPC).
 set -eu
 run=$1
 board=$2
@@ -42,7 +44,7 @@ trap '[ -z "$ember_pid" ] || kill "$ember_pid" 2> /dev/null || true
       rm -rf "$tmp"' EXIT
 fail() { echo "llm-check: $board: FAIL: $*" >&2; exit 1; }
 
-sym() { printf '0x%x' "0x$(readelf -sW "$fw" | awk -v n="$1" '$NF == n { print $2; exit }')"; }
+sym() { printf '0x%x' "0x$("${READELF:-readelf}" -sW "$fw" | awk -v n="$1" '$NF == n { print $2; exit }')"; }
 begin=$(sym fuzz_iteration)
 panic=$(sym fuzz_panic)
 mkdir -p "$tmp/sync/llm/queue" "$tmp/seeds"
@@ -145,7 +147,16 @@ if command -v rizin > /dev/null 2>&1 && python3 -c 'import rzpipe' 2> /dev/null;
     printf 'hello' > "$tmp/corp/b"
     out=$(python3 "$tools/fuzz_frontier.py" "$fw" --corpus "$tmp/corp" --range parse -- \
         "$run" -b "$board" --fuzz-begin "$begin" --fuzz-crash-pc "$panic" --fuzz-input uart0 \
-        2> "$tmp/frontier.err") || { cat "$tmp/frontier.err" >&2; fail "fuzz_frontier.py exited nonzero"; }
+        2> "$tmp/frontier.err") || {
+        if grep -q 'this rizin has no disassembler' "$tmp/frontier.err"; then
+            echo "llm-check: $board: frontier report skipped ($(sed -n "s/.*this rizin has no disassembler for \([^ ]*\).*/rizin has no \1 disassembler/p" "$tmp/frontier.err" | head -1))"
+            exit 0
+        fi
+        cat "$tmp/frontier.err" >&2; fail "fuzz_frontier.py exited nonzero"; }
+    if grep -q 'branch(es) in range untyped' "$tmp/frontier.err"; then
+        echo "llm-check: $board: frontier report skipped (this rizin's analysis leaves the parser's branches untyped)"
+        exit 0
+    fi
     echo "$out" | grep -q 'frontier branch target' || { echo "$out" >&2; fail "no frontier branches reported"; }
     # The parser's letter checks must show as frontier targets with their compare bytes.
     echo "$out" | grep -Eq '0x46|0x4c|0x55' || { echo "$out" >&2; fail "no compare byte in the frontier report"; }

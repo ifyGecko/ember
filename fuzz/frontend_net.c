@@ -61,6 +61,11 @@
 #include <time.h>
 #include <unistd.h>
 
+/* macOS names the idle time before the first keepalive probe TCP_KEEPALIVE. */
+#if !defined(TCP_KEEPIDLE) && defined(TCP_KEEPALIVE)
+#define TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
 #include "formats.h"
 #include "cov_formats.h"
 #include "uam/fuzz_campaign.h"

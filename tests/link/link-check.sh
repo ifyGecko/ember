@@ -20,6 +20,7 @@
 #   fuzzing      refused while connected to a hub; an unconnected port is a fuzz input
 #                (--fuzz-input PORT), with the same verdicts as the UART's own input
 set -eu
+. "$(dirname "$0")/../portable.sh"
 HUB=$1
 RUN=$2
 TRUN=$3

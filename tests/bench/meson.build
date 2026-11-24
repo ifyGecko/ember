@@ -38,7 +38,7 @@ bench = files('bench.c')
 
 # RISC-V, MIPS, ARM, PowerPC: the firmware self-tests' start code and link scripts.
 rv_prefixes = get_option('riscv_cross') != '' ? [get_option('riscv_cross')] : [
-  'riscv64-unknown-elf-', 'riscv64-linux-gnu-', 'riscv32-unknown-elf-']
+  'riscv64-unknown-elf-', 'riscv64-linux-gnu-', 'riscv32-unknown-elf-', 'riscv64-elf-']
 rv_gcc = find_program(rv_prefixes[0] + 'gcc', required: false)
 foreach p : rv_prefixes
   if not rv_gcc.found()
@@ -51,7 +51,14 @@ ppc_flags = ['-m32', '-mbig-endian', '-mcpu=powerpc', '-mno-altivec', '-mno-vsx'
   '-Wa,-mregnames']
 mips_gcc = find_program(get_option('mips_cross') + 'gcc', required: false)
 mipsel_gcc = find_program(get_option('mipsel_cross') + 'gcc', required: false)
-arm_gcc = find_program(get_option('arm_cross') + 'gcc', required: false)
+arm_prefixes = get_option('arm_cross') != '' ? [get_option('arm_cross')] : [
+  'arm-linux-gnueabi-', 'arm-none-eabi-']
+arm_gcc = find_program(arm_prefixes[0] + 'gcc', required: false)
+foreach p : arm_prefixes
+  if not arm_gcc.found()
+    arm_gcc = find_program(p + 'gcc', required: false)
+  endif
+endforeach
 ppc_gcc = find_program(get_option('ppc_cross') + 'gcc', required: false)
 # output: [compiler, flags, start code, link script]
 guests = {
@@ -95,7 +102,16 @@ if mipsel_gcc.found()
 endif
 
 # x86-64 (x86_64-ref): a flat image entered in real mode at 0.
-x86_gcc = find_program(get_option('x86_cross') + 'gcc', required: false)
+x86_prefixes = get_option('x86_cross') != '' ? [get_option('x86_cross')] : [
+  'x86_64-linux-gnu-', 'x86_64-elf-']
+x86_prefix = x86_prefixes[0]
+x86_gcc = find_program(x86_prefix + 'gcc', required: false)
+foreach p : x86_prefixes
+  if not x86_gcc.found()
+    x86_gcc = find_program(p + 'gcc', required: false)
+    x86_prefix = p
+  endif
+endforeach
 if x86_gcc.found()
   x86_elf = custom_target('bench-x86.elf',
     output: 'bench-x86.elf', input: files('x86-start.S', 'bench.c'), depend_files: files('x86.ld'),
@@ -103,7 +119,7 @@ if x86_gcc.found()
       '-Wl,-T,' + here / 'x86.ld', '@INPUT@', '-o', '@OUTPUT@'])
   custom_target('bench-x86.bin',
     output: 'bench-x86.bin', input: x86_elf, build_by_default: true,
-    command: [find_program(get_option('x86_cross') + 'objcopy'), '-O', 'binary', '@INPUT@', '@OUTPUT@'])
+    command: [find_program(x86_prefix + 'objcopy'), '-O', 'binary', '@INPUT@', '@OUTPUT@'])
 endif
 
 # AVR (avr-ref, model eplus): the data does not fit a part's SRAM, so the board runs with

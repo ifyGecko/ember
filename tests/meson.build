@@ -24,7 +24,8 @@
 # Targets outside the test run (`meson compile -C build NAME`):
 #   firmware                 every test firmware image
 #   net-check                boot the network test on rv32-test against a real tap and tun
-#                            interface (rootless: in a user+network namespace)
+#                            interface (Linux: rootless, in a user+network namespace;
+#                            macOS: skipped unless root, sudo sh tests/net/net-check.sh ...)
 #   jitdiff-soak             the JIT differential test at length (-Djitdiff_blocks=N)
 #   fuzz-throughput-record   rewrite tests/fuzz/throughput.ref (on a quiet machine)
 #   link-throughput-record   rewrite tests/link/throughput.ref (on a quiet machine)
@@ -62,7 +63,32 @@ subdir('firmware-mcs51')
 subdir('firmware-6502')
 subdir('firmware-z80')
 subdir('firmware-xtensa')
-alias_target('firmware', firmware_all)
+# alias_target needs at least one target: with no guest toolchain at all, `firmware` builds nothing.
+if firmware_all.length() > 0
+  alias_target('firmware', firmware_all)
+else
+  run_target('firmware', command: [python, '-c', ''])
+endif
+
+# The checks read symbols with readelf (READELF in their environment). GNU readelf reads
+# every target's ELF, so where the host has none (macOS) a guest toolchain's will do, or
+# LLVM's.
+readelf_names = ['readelf']
+foreach p : [rv_prefix, get_option('mips_cross'), get_option('mipsel_cross'), get_option('ppc_cross')]
+  readelf_names += p + 'readelf'
+endforeach
+if have_arm
+  readelf_names += arm_prefix + 'readelf'
+endif
+readelf_names += ['llvm-readelf', '/opt/homebrew/opt/llvm/bin/llvm-readelf', '/usr/local/opt/llvm/bin/llvm-readelf']
+readelf = find_program(readelf_names, required: false)
+if readelf.found()
+  add_test_setup('default', env: {'READELF': readelf.full_path()}, is_default: true)
+endif
+
+summary({
+  'readelf': readelf.found() ? readelf.full_path() : 'not found (the fuzz and runner checks need one)',
+}, section: 'Tools')
 
 summary({
   'RISC-V': have_rv,

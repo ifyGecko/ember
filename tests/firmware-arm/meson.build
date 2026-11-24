@@ -1,14 +1,23 @@
 # The bare-metal ARMv7-A self-test (as ARM and as Thumb-2 code), the fuzz target and the
 # multiprocessor self-test, little-endian and big-endian (BE8).
 
-arm_gcc = find_program(get_option('arm_cross') + 'gcc', required: false)
+arm_prefixes = get_option('arm_cross') != '' ? [get_option('arm_cross')] : [
+  'arm-linux-gnueabi-', 'arm-none-eabi-']
+arm_prefix = arm_prefixes[0]
+arm_gcc = find_program(arm_prefix + 'gcc', required: false)
+foreach p : arm_prefixes
+  if not arm_gcc.found()
+    arm_gcc = find_program(p + 'gcc', required: false)
+    arm_prefix = p
+  endif
+endforeach
 have_arm = arm_gcc.found()
 fw_arm = {}
 
 if have_arm
   arm_dir = meson.current_source_dir()
-  arm_objcopy = find_program(get_option('arm_cross') + 'objcopy')
-  arm_objdump = find_program(get_option('arm_cross') + 'objdump')
+  arm_objcopy = find_program(arm_prefix + 'objcopy')
+  arm_objdump = find_program(arm_prefix + 'objdump')
   arm_flags = ['-march=armv7ve', '-mfloat-abi=soft', '-O2', '-g', '-std=gnu11', '-Wall', '-Wextra',
     '-ffreestanding', '-fno-builtin', '-fno-pic', '-fno-stack-protector', '-fno-unwind-tables',
     '-fno-asynchronous-unwind-tables', '-nostdlib', '-nostartfiles',

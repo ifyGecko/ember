@@ -32,7 +32,7 @@ sym() {
     if [ -f "$fw.syms" ]; then
         v=$(awk -v n="$1" '$1 == n { print $2, 0; exit }' "$fw.syms")
     else
-        v=$(readelf -sW "$fw" | awk -v n="$1" '$NF == n { print $2, ($0 ~ /\[(MIPS16|MICROMIPS)\]/); exit }')
+        v=$("${READELF:-readelf}" -sW "$fw" | awk -v n="$1" '$NF == n { print $2, ($0 ~ /\[(MIPS16|MICROMIPS)\]/); exit }')
     fi
     [ -n "$v" ] || { echo "fuzz-check: no symbol $1 in $fw" >&2; exit 1; }
     set -- $v
@@ -156,7 +156,7 @@ if [ $rc -ne 2 ] || ! grep -q 'often enough' "$tmp/err"; then
 fi
 
 if [ -n "${4:-}" ]; then
-    lo=$(readelf -lW "$fw" | awk '$1 == "LOAD" { print $3; exit }')
+    lo=$("${READELF:-readelf}" -lW "$fw" | awk '$1 == "LOAD" { print $3; exit }')
     rc=0
     "$run" -b "$board" ${FUZZ_CHECK_ARGS:-} --raw-base "$lo" --entry "$(sym _start)" --cov-blocks --fuzz-begin "$begin" \
         --fuzz-crash-pc "$panic" --fuzz-input uart0 --fuzz-iter-insns 200000 -n 10000000 \

@@ -42,12 +42,21 @@ project('ember', 'c',
 cc = meson.get_compiler('c')
 
 # Required flags, always applied (to ember's own sources only, also as a subproject).
-add_project_arguments('-D_DEFAULT_SOURCE',
+# _DEFAULT_SOURCE is glibc's (and musl's) name for the BSD and SVID extensions on top of
+# C11; Darwin's headers hide theirs (cfmakeraw, MAP_ANON, ...) whenever a file asks for a
+# POSIX level unless _DARWIN_C_SOURCE is defined.
+platform_args = host_machine.system() == 'darwin' ? ['-D_DARWIN_C_SOURCE'] : []
+add_project_arguments('-D_DEFAULT_SOURCE', platform_args,
   cc.get_supported_arguments('-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes'),
   language: 'c')
 
 uam_inc = include_directories('include')
 m_dep = cc.find_library('m', required: false)   # the x87 model uses long-double libm functions
+# macOS: the tap backend is a vmnet segment (src/host/netdev_backends.c).
+host_deps = [m_dep]
+if host_machine.system() == 'darwin'
+  host_deps += dependency('appleframeworks', modules: ['vmnet'])
+endif
 
 # One list per module, mirroring the dependency rules in docs/architecture.md.
 ir_src = files('src/ir/builder.c', 'src/ir/verify.c', 'src/ir/print.c', 'src/ir/opt.c', 'src/ir/pass.c')
@@ -125,7 +134,7 @@ libuam = static_library('uam',
 uam_dep = declare_dependency(
   link_with: libuam,
   include_directories: uam_inc,
-  dependencies: m_dep,
+  dependencies: host_deps,
   version: meson.project_version())
 meson.override_dependency('uam', uam_dep)
 
@@ -145,7 +154,7 @@ import('pkgconfig').generate(libuam,
   name: 'uam',
   filebase: 'uam',
   description: 'UAM firmware emulator library',
-  libraries: m_dep)
+  libraries: host_deps)
 
 # The tests, their firmware and their check targets: only in ember's own build.
 if get_option('tests') and not meson.is_subproject()

@@ -67,17 +67,21 @@ transcendentals (macOS note below): the x87 model computes in software
 (`isa/x86/x86_f80.c`), and `meson test -C build` passes the same checks on both JIT hosts.
 
 - **Linux on x86-64 and on AArch64**: everything, tested.
-- **macOS** (Apple silicon and Intel): written for and not yet tested there. The code arena
+- **macOS on Apple silicon**: tested; `meson test -C build` passes every check whose
+  firmware toolchain Homebrew has (below). Intel Macs are written for and not yet tested. The code arena
   is a `MAP_JIT` mapping that a thread switches between writable and executable
   (`pthread_jit_write_protect_np`), and the AArch64 code generator leaves `x18`, the
   platform register, alone. A binary signed with the hardened runtime needs the
-  `com.apple.security.cs.allow-jit` entitlement. The tap and tun network backends are
-  Linux-only; x87 transcendentals compute in the host's `long double`, a `double` on Apple
+  `com.apple.security.cs.allow-jit` entitlement. The tap backend is a vmnet host-mode
+  segment and tun a utun interface, both needing root (`net-check` then runs as
+  `sudo sh tests/net/net-check.sh build/tests/uam-test-run build/tests/firmware/nettest.elf`,
+  and skips itself without it); the checks use a cross toolchain's `readelf` (or
+  LLVM's) where the host has none, and stand-ins for GNU `timeout` and `sha256sum`; x87 transcendentals compute in the host's `long double`, a `double` on Apple
   silicon (everything else in the x87 model is exact there too).
 
 To build for another host, give meson a cross file that names its compiler:
 `meson setup build-a64 --cross-file cross/aarch64-linux-gnu.ini` configures an AArch64
-Linux build next to the native one. Run `meson test -C build-a64` on that host (or from the
+Linux build next to the native one (`cross/x86_64-linux-gnu.ini` an x86-64 one). Run `meson test -C build-a64` on that host (or from the
 build machine, once a second cross file tells meson how to run the host's programs: the
 cross file's header says how). The firmware images are host-independent.
 
@@ -130,10 +134,29 @@ The MIPS self-test needs `mips-linux-gnu-gcc` / `mipsel-linux-gnu-gcc` (`-Dmips_
 little-endian.
 
 The ARM self-test (built as ARM and as Thumb-2 code, little-endian and BE8) needs
-`arm-linux-gnueabi-gcc` (`-Darm_cross=`).
+`arm-linux-gnueabi-gcc` or `arm-none-eabi-gcc` (the first found; `-Darm_cross=` names another).
 
-The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc` or
-`riscv64-unknown-elf-gcc` both work; `-Driscv_cross=` names another).
+The firmware self-test needs a RISC-V GCC (`riscv64-linux-gnu-gcc`,
+`riscv64-unknown-elf-gcc` and Homebrew's `riscv64-elf-gcc` all work; `-Driscv_cross=` names another).
+
+On macOS, Homebrew core has the RISC-V, ARM, x86 (the benchmark's `x86_64-elf-gcc`), PIC,
+6502, Z80 and SDCC toolchains and the generator check's rizin: `brew install meson ninja
+riscv64-elf-gcc arm-none-eabi-gcc x86_64-elf-gcc nasm sdcc gputils rizin` (and `pip3 install
+rzpipe`; Homebrew's rizin has no RISC-V disassembler, so that generator check skips RV32).
+The rest come from elsewhere, each named with its option:
+
+- AVR: `brew tap osx-cross/avr && brew install avr-gcc@14` (then `brew link --force
+  avr-gcc@14`; GCC 14, see the AVR paragraph below).
+- MIPS, PIC32 and PowerPC: musl-cross-make's GCC for `mips-linux-musl`, `mipsel-linux-musl`
+  and `powerpc-linux-musl` (`brew install filosottile/musl-cross/musl-cross --with-mips
+  --with-mipsel --with-powerpc` builds them), named with `-Dmips_cross=`, `-Dmipsel_cross=`
+  and `-Dppc_cross=` (e.g. `-Dmips_cross=mips-linux-musl-`). The firmware is freestanding, so
+  the C library does not matter.
+- Xtensa LX6 and LX7: Espressif's `xtensa-esp-elf` release for `aarch64-apple-darwin`
+  (`-Dxtensa_lx6_cross=…/bin/xtensa-esp32-elf-`, `-Dxtensa_lx7_cross=…/bin/xtensa-esp32s3-elf-`).
+  The LX106 toolchain has no Apple-silicon build.
+- 8051: as31 built from source with Debian's patches (below), named with `-Das31=`.
+- AVR32: no toolchain runs on macOS; its checks are left out.
 
 The PowerPC self-test needs a GCC for PowerPC: by default `powerpc64le-linux-gnu-gcc`, which
 builds the 32-bit big-endian code with `-m32 -mbig-endian`; a 32-bit one works too
@@ -148,7 +171,8 @@ route when it finds headless Ghidra with Jython (`GHIDRA_HEADLESS`, `GHIDRA_HOME
 
 The AVR self-tests (one per core family) and the AVR builds of the fuzz target and the
 benchmark need `avr-gcc` and avr-libc (Debian: `gcc-avr`, `binutils-avr`, `avr-libc`), and
-`python3` for their flag vectors.
+`python3` for their flag vectors. The reduced-core self-test only fits the ATtiny40's 4 KiB
+with a GCC that makes small enough code: GCC 14 does (4040 bytes); 9, 15 and 16 do not.
 
 The AVR32 self-tests, fuzz target and benchmark builds need `avr32-gcc`, from the AVR32 GNU
 toolchain (3.4.3, gcc 4.4; no distribution packages it). `-Davr32_cross=PREFIX` points
@@ -161,7 +185,10 @@ The PIC self-tests (one per core family, and PIC18's extended instruction set) a
 fuzz target are assembled with `gpasm` from gputils (Debian: `gputils`) and need `python3`;
 without gpasm they are left out (`-Dgpasm=path` names another). There is no PIC build
 of the benchmark: its data (about 20 KiB) does not fit an 8-bit PIC's data space.
-The 8051 self-tests (one per core model) are assembled with `as31` (Debian: `as31`); the
+The 8051 self-tests (one per core model) are assembled with `as31` (Debian: `as31`; built
+from PJRC's 2.3.1 source it needs Debian's patches, without which it repeats each source's
+last line, and every run uses the same temporary file, so parallel builds read each other's
+input); the
 8051 fuzz target and benchmark build need SDCC (Debian: `sdcc`). Without either, its checks
 are left out (`-Das31=`, `-Dsdcc=` point the build at them).
 The 6502 self-tests (one per core model) are assembled with SDCC's `sdas6500` and linked with
@@ -605,7 +632,8 @@ backend, and a port left out is an unplugged cable. Backends:
 | SPEC | what the guest is attached to |
 |---|---|
 | `tap:[IFNAME]` | a Linux tap interface: a real Ethernet segment (bridge it, or give the tap an address) |
-| `tun:[IFNAME]` | a Linux tun interface (IP only) behind an adapter that answers ARP / IPv6 ND as one host-side station |
+| `tap:[HOSTADDR[/PREFIX]]` | macOS: a new vmnet host-mode segment (root), the host at HOSTADDR on its bridge interface (`tap:10.0.2.2/24`; empty: vmnet's choice) |
+| `tun:[IFNAME]` | a tun interface (IP only) behind an adapter that answers ARP / IPv6 ND as one host-side station: Linux tun, or on macOS a new utun (`tun:utunN`, `tun:` the first free one; root), addressed once it exists |
 | `tap-fd:FD`, `tun-fd:FD` | an interface already attached by a privileged launcher |
 | `udp:LPORT:RHOST:RPORT` | a UDP socket pair: a "cable" or radio "air" to another emulator (frames shorter than 60 bytes arrive padded to 60; nothing is promised about time) |
 | `link:PORT` | a link port (`--link PORT=...`, below): frames at their exact length, to any number of emulations through a hub, with deterministic timing if the hub keeps it |
@@ -618,9 +646,10 @@ ports (not every board of their architecture has one). The test board `rv32-test
 (`-o net0.mac=02:75:61:6d:01:00`).
 
 ```bash
-ip tuntap add dev tap0 mode tap user $USER       # once, as root: then no privilege is needed
+ip tuntap add dev tap0 mode tap user $USER       # Linux, once, as root: then no privilege is needed
 ip addr add 10.0.2.2/24 dev tap0 && ip link set tap0 up
 build/tests/uam-test-run -b rv32-test --nic net0=tap:tap0,pcap=net0.pcap fw.elf
+sudo build/tests/uam-test-run -b rv32-test --nic net0=tap:10.0.2.2/24 fw.elf   # macOS
 ```
 
 A host interface implies `--realtime`, because a guest network stack times out in virtual
@@ -1078,7 +1107,8 @@ tests/runner/      runner-check.sh: --log-pc, --dump-mem, --trace-after, --guard
                    if, stop, count, delay, snapshots)
 tests/bench/       one C benchmark for every guest ISA but the 8-bit PIC, a meson project of
                    its own (meson test -C build --suite bench, meson compile -C build xbench)
-tests/net/         net-check.sh: the network test against real tap/tun interfaces
+tests/net/         net-check.sh: the network test against real tap/tun interfaces (Linux; macOS
+                   as root, utun-launch.py making the utun)
 tests/link/        link-check.sh: a hub and two or three emulations in every mode; throughput.py:
                    what a message costs (meson test -C build --suite link, link-throughput)
 ```

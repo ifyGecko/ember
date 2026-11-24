@@ -7,13 +7,13 @@ option('tests', type: 'boolean', value: true,
 # leaves its firmware out, and with it the tests that need it (the configure summary says
 # which). The *_cross options are prefixes: the compiler is <prefix>gcc.
 option('riscv_cross', type: 'string', value: '',
-  description: 'RISC-V toolchain prefix (empty: riscv64-unknown-elf-, riscv64-linux-gnu- or riscv32-unknown-elf-, the first found)')
+  description: 'RISC-V toolchain prefix (empty: riscv64-unknown-elf-, riscv64-linux-gnu-, riscv32-unknown-elf- or riscv64-elf- (Homebrew), the first found)')
 option('mips_cross', type: 'string', value: 'mips-linux-gnu-',
   description: 'Big-endian MIPS toolchain prefix')
 option('mipsel_cross', type: 'string', value: 'mipsel-linux-gnu-',
   description: 'Little-endian MIPS toolchain prefix (also the PIC32 firmware)')
-option('arm_cross', type: 'string', value: 'arm-linux-gnueabi-',
-  description: 'ARM toolchain prefix')
+option('arm_cross', type: 'string', value: '',
+  description: 'ARM toolchain prefix (empty: arm-linux-gnueabi- or arm-none-eabi-, the first found)')
 option('ppc_cross', type: 'string', value: 'powerpc64le-linux-gnu-',
   description: 'PowerPC toolchain prefix (any GCC for PowerPC, 32- or 64-bit)')
 option('avr_cross', type: 'string', value: 'avr-',

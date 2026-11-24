@@ -15,7 +15,8 @@
  * Ownership: the decision to take a region is made under an exclusive flock, so two
  * ember processes starting at once cannot both claim it, and an owner counts as alive
  * only if its pid exists with the recorded start time (a reused pid has another one),
- * or, without /proc, if the pid exists at all.
+ * or, where no start time can be read, if the pid exists at all. The start time is read
+ * from /proc on Linux and from sysctl(KERN_PROC_PID) on macOS.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -49,6 +50,30 @@ static bool looks_like_file(const char *path)
     return false;
 }
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+
+/* A process's start time in hundredths of a second since boot (the kernel's p_starttime
+ * against kern.boottime), low 32 bits; 0 where that is not available (no such process).
+ * pid 0: this one. macOS has no /proc. */
+static uint32_t start_time(pid_t pid)
+{
+    struct kinfo_proc kp;
+    size_t len = sizeof(kp);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid ? (int)pid : (int)getpid()};
+    memset(&kp, 0, sizeof(kp));
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0)
+        return 0;
+    struct timeval boot;
+    size_t blen = sizeof(boot);
+    int bmib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(bmib, 2, &boot, &blen, NULL, 0) != 0)
+        return 0;
+    const struct timeval *st = &kp.kp_proc.p_starttime;
+    int64_t cs = ((int64_t)st->tv_sec - boot.tv_sec) * 100 + ((int64_t)st->tv_usec - boot.tv_usec) / 10000;
+    return cs > 0 ? (uint32_t)cs : 1;
+}
+#else
 /* A process's start time in clock ticks since boot (field 22 of /proc/PID/stat), low
  * 32 bits; 0 where that is not available (no such process, no /proc). pid 0: this one. */
 static uint32_t start_time(pid_t pid)
@@ -73,6 +98,7 @@ static uint32_t start_time(pid_t pid)
         p = strchr(p + 1, ' ');   /* to the space before field + 1 */
     return p ? (uint32_t)strtoull(p + 1, NULL, 10) : 0;
 }
+#endif
 
 /* The recorded start time decides when /proc has one for the pid; otherwise the pid's existence does (EPERM: it exists, as another user's). */
 static bool owner_alive(uint32_t pid, uint32_t start)

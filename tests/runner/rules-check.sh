@@ -32,11 +32,11 @@ fail() { echo "rules-check: FAIL: $*" >&2; exit 1; }
 # ---- quiet, and a store the guest shows --------------------------------------------------
 $RUN "$FW" </dev/null >"$T/out" 2>"$T/err" || fail "the self-test failed"
 head -1 "$T/out" | grep -q '^UAM self-test' || fail "no banner"
-! grep -q '^rule \|^uam-run: rule ' "$T/err" || fail "rule lines without a rule"
+! grep -Eq '^rule |^uam-run: rule ' "$T/err" || fail "rule lines without a rule"
 $RUN --on 'pc=puts_,count=1,set [a0]:1=0x58' "$FW" </dev/null >"$T/out" 2>"$T/err" ||
     fail "the self-test failed with a set rule"
 head -1 "$T/out" | grep -q '^XAM self-test' || fail "set: the banner's first byte was not replaced"
-! grep -q '^rule \|^uam-run: rule ' "$T/err" || fail "a rule that only stores printed something"
+! grep -Eq '^rule |^uam-run: rule ' "$T/err" || fail "a rule that only stores printed something"
 
 # ---- log: the same on every backend --------------------------------------------------------
 for mode in interp jit nochain; do
@@ -137,7 +137,7 @@ mkdir "$T/in"
 printf 'hello' >"$T/in/1"
 printf 'again' >"$T/in/2"
 printf 'third' >"$T/in/3"
-begin=$(readelf -sW "$FUZZ" | awk '$NF == "fuzz_iteration" { print "0x" $2; exit }')
+begin=$("${READELF:-readelf}" -sW "$FUZZ" | awk '$NF == "fuzz_iteration" { print "0x" $2; exit }')
 $RUN --fuzz-begin "$begin" --fuzz-input uart0 --fuzz-replay "$T/in" \
     --on "pc=$begin+4,count=1,name=once,log" "$FUZZ" </dev/null >/dev/null 2>"$T/err" ||
     fail "replay with a rule failed"
@@ -158,7 +158,7 @@ sed -n 's/^rule tx: cpu 0 pc 0x[0-9a-f]* write 1 at 0x10000000 value \(0x[0-9a-f
 cmp -s "$T/interp.a" "$T/jit.a" || fail "access rule lines differ: interpreter vs --jit"
 cmp -s "$T/interp.a" "$T/nochain.a" || fail "access rule lines differ: interpreter vs --jit --no-chain"
 # puts_ reads the banner's bytes: an address from a rule's log, a length, a condition on the value
-banner=$(readelf -sW "$FW" | awk '$NF == "puts_" { print "0x" $2; exit }')
+banner=$("${READELF:-readelf}" -sW "$FW" | awk '$NF == "puts_" { print "0x" $2; exit }')
 [ -n "$banner" ] || fail "no puts_ symbol"
 $RUN --on 'pc=puts_,count=1,name=at,log a0' "$FW" </dev/null >/dev/null 2>"$T/err"
 str=$(sed -n 's/^rule at: .* a0=\(0x[0-9a-f]*\) icount.*/\1/p' "$T/err")

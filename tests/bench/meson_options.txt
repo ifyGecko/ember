@@ -3,12 +3,14 @@ option('rounds', type: 'integer', value: 0, min: 0,
 option('only', type: 'integer', value: -1, min: -1,
   description: 'Run this kernel only (-1: all)')
 option('riscv_cross', type: 'string', value: '',
-  description: 'RISC-V toolchain prefix (empty: the first of riscv64-unknown-elf-, riscv64-linux-gnu-, riscv32-unknown-elf- found)')
+  description: 'RISC-V toolchain prefix (empty: the first of riscv64-unknown-elf-, riscv64-linux-gnu-, riscv32-unknown-elf-, riscv64-elf- found)')
 option('mips_cross', type: 'string', value: 'mips-linux-gnu-')
 option('mipsel_cross', type: 'string', value: 'mipsel-linux-gnu-')
-option('arm_cross', type: 'string', value: 'arm-linux-gnueabi-')
+option('arm_cross', type: 'string', value: '',
+  description: 'ARM toolchain prefix (empty: the first of arm-linux-gnueabi-, arm-none-eabi- found)')
 option('ppc_cross', type: 'string', value: 'powerpc64le-linux-gnu-')
-option('x86_cross', type: 'string', value: 'x86_64-linux-gnu-')
+option('x86_cross', type: 'string', value: '',
+  description: 'x86-64 toolchain prefix (empty: the first of x86_64-linux-gnu-, x86_64-elf- found)')
 option('avr_cross', type: 'string', value: 'avr-')
 option('avr32_cross', type: 'string', value: 'avr32-')
 option('xtensa_lx106_cross', type: 'string', value: 'xtensa-lx106-elf-')

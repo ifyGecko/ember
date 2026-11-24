@@ -245,6 +245,13 @@ def open_rizin(binary, image=None, entries=(), machine=None):
         rz.quit()
         sys.exit(f"error: {binary}: rizin took the ELF (e_machine {machine}) "
                  f"for {b.get('arch')!r}, not {ELF_MACHINES[machine]!r}")
+    # A rizin built without the arch's disassembler plugin (Homebrew's has no
+    # RISC-V) loads the ELF but keeps another asm.arch, and decodes garbage.
+    if machine is not None and rz.cmd("e asm.arch").strip() != ELF_MACHINES[machine]:
+        rz.quit()
+        sys.exit(f"error: {binary}: this rizin has no disassembler for "
+                 f"{ELF_MACHINES[machine]!r} (built without its plugin; `rz-asm -L` "
+                 f"lists those it has)")
     rz.cmd("aaa")
     for a in sorted(entries):
         rz.cmd(f"af @ 0x{a:x}")       # a no-op where one exists

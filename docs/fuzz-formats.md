@@ -129,7 +129,7 @@ ring_offset      ring_size slots of slot_stride bytes: slot header (24 bytes) + 
 | 40 | bitmap_offset | u64 | |
 | 48 | ring_offset | u64 | |
 | 56 | owner_pid | u32 | the writer's pid |
-| 60 | owner_start | u32 | its start time, clock ticks since boot, low 32 bits |
+| 60 | owner_start | u32 | its start time since boot, low 32 bits: clock ticks (`/proc/PID/stat`) on Linux, hundredths of a second (`sysctl` `KERN_PROC_PID`) on macOS |
 
 Each **slot** header holds `slot_gen` (u64, atomic; 0 while it is being written), `ns` (u64,
 `CLOCK_MONOTONIC` at publish), `kind` (u32: 1 INIT, the boot up to the first BEGIN; 2 ITER,
@@ -148,8 +148,8 @@ iteration that ended normally. Crashes, hangs and timeouts are not published.
 
 **Ownership.** ember refuses a region that another live process owns. It decides under an
 exclusive `flock` on the region, so two ember processes can't both claim it. An owner is
-alive if its pid exists with the recorded start time, or, without `/proc`, if the pid
-exists at all. A PATH with a `/` after its first character is a file. Any other PATH is a
+alive if its pid exists with the recorded start time, or, where no start time can be read,
+if the pid exists at all. A PATH with a `/` after its first character is a file. Any other PATH is a
 POSIX shared-memory name: `/dev/shm` on Linux, at most 31 characters on macOS, where a
 region of another size is made anew under the same name.
 

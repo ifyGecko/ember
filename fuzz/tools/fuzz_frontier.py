@@ -74,9 +74,9 @@ def elf_symbols(path):
     the function's first instruction, as in rizin's CFG."""
     out = {}
     try:
-        txt = subprocess.run(["readelf", "-sW", path], capture_output=True, text=True,
+        txt = subprocess.run([os.environ.get("READELF", "readelf"), "-sW", path], capture_output=True, text=True,
                              check=True).stdout
-        hdr = subprocess.run(["readelf", "-hW", path], capture_output=True, text=True,
+        hdr = subprocess.run([os.environ.get("READELF", "readelf"), "-hW", path], capture_output=True, text=True,
                              check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return out
@@ -208,6 +208,9 @@ def parse_trace(trace_path, ninputs):
     return covered, per_input
 
 
+UNTYPED = []     # (addr, disasm) of instructions in range rizin's analysis gave no type
+
+
 class Block:
     __slots__ = ("addr", "size", "jump", "fail", "cases", "func", "tail")
 
@@ -236,6 +239,13 @@ def load_cfg(binary, modules, bases, ranges, all_functions):
                                                  for n, p in modules]:
         rz = rzpipe.open(path, flags=["-2"])
         try:
+            # A rizin built without the arch's disassembler plugin (Homebrew's has no
+            # RISC-V) loads the ELF but keeps another asm.arch, and decodes garbage.
+            bin_arch = ((rz.cmdj("ij") or {}).get("bin") or {}).get("arch")
+            asm_arch = rz.cmd("e asm.arch").strip()
+            if bin_arch and asm_arch != bin_arch:
+                die("%s: this rizin has no disassembler for %r (built without its "
+                    "plugin; `rz-asm -L` lists those it has)" % (path, bin_arch), 2)
             if base:
                 rz.cmd("omba 0x%x" % base)        # map at the module's base
             rz.cmd("aaa")
@@ -266,6 +276,8 @@ def load_cfg(binary, modules, bases, ranges, all_functions):
                     cases = [(c.get("value"), c["jump"]) for c in sw.get("cases") or []
                              if c.get("jump") is not None]
                     ops = rz.cmdj("pdbj @ 0x%x" % addr) or []
+                    UNTYPED.extend((o.get("offset"), o.get("disasm", "")) for o in ops
+                                   if o.get("type") == "null")
                     tail = [(o.get("offset"), o.get("disasm", "")) for o in ops[-3:]]
                     blocks.append(Block(addr, size, jump, fail, cases, fname, tail))
         finally:
@@ -426,6 +438,17 @@ def main():
     blocks = load_cfg(args.firmware, modules, bases, ranges, args.all_functions)
     if not blocks:
         die("rizin found no functions in range; widen --range or pass --all-functions")
+    # An untyped instruction naming an address in range is a branch rizin did not
+    # recognise (rizin 0.9's PowerPC analysis leaves beq/bne untyped): the blocks run on
+    # through it, and it never shows as a frontier target.
+    spans = ranges or [(min(b.addr for b in blocks), max(b.end for b in blocks))]
+    missed = [(off, dis) for off, dis in UNTYPED
+              if any(lo <= int(h, 16) < hi for h in re.findall(r"0x[0-9a-fA-F]+", dis)
+                     for lo, hi in spans)]
+    if missed:
+        print("frontier: rizin's analysis left %d branch(es) in range untyped (%s at "
+              "0x%x first): its CFG misses them, so the report may be incomplete"
+              % (len(missed), missed[0][1], missed[0][0]), file=sys.stderr)
 
     covered_starts = covered_blocks(blocks, sorted(covered))
     # input index -> blocks it ran; 1..N are the corpus inputs, as the trace numbers them.

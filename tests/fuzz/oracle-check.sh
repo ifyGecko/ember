@@ -21,7 +21,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail() { echo "oracle-check: FAIL: $*" >&2; exit 1; }
 
-sym() { printf '0x%x' "0x$(readelf -sW "$fw" | awk -v n="$1" '$NF == n { print $2; exit }')"; }
+sym() { printf '0x%x' "0x$("${READELF:-readelf}" -sW "$fw" | awk -v n="$1" '$NF == n { print $2; exit }')"; }
 heap="-o heap=$(sym fw_heap)+4096 -o malloc=$(sym fw_malloc) -o free=$(sym fw_free) -o realloc=$(sym fw_realloc)"
 
 mkdir "$tmp/in"

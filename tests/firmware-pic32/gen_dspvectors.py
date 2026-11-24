@@ -459,8 +459,9 @@ def umips_words(ws):
     open(smm, "w").write("\t.set micromips\n\t.set insn32\n\t.set noreorder\n\t.set noat\n\t.text\n"
                          + "".join("\t%s\n" % t.split("<")[0] for t in text))
     subprocess.run([CROSS + "as", "-march=mips32r2", "-mdspr2", "-EL", smm, "-o", smm + ".o"], check=True)
-    out = subprocess.run([CROSS + "objcopy", "-O", "binary", "-j", ".text", smm + ".o", "/dev/stdout"],
-                         capture_output=True, check=True).stdout
+    # A file, not /dev/stdout: objcopy writes beside its output (on macOS that is /dev).
+    subprocess.run([CROSS + "objcopy", "-O", "binary", "-j", ".text", smm + ".o", smm + ".bin"], check=True)
+    out = open(smm + ".bin", "rb").read()
     return [int.from_bytes(out[k:k + 2], "little") << 16 | int.from_bytes(out[k + 2:k + 4], "little")
             for k in range(0, 4 * len(ws), 4)]
 

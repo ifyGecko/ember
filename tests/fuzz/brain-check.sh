@@ -38,7 +38,7 @@ brain_pid=
 trap '[ -z "$brain_pid" ] || kill "$brain_pid" 2> /dev/null || true; rm -rf "$tmp"' EXIT
 
 python3 "$here/mk_lists.py" "$fw" "$tmp" > /dev/null
-panic=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
+panic=$(printf '0x%x' "0x$("${READELF:-readelf}" -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
 mkdir "$tmp/seeds"
 printf 'hello' > "$tmp/seeds/a"
 printf 'FUZ!x' > "$tmp/seeds/b"
@@ -177,7 +177,7 @@ else
 fi
 
 # Compare logging (block coverage).
-begin=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_iteration" { print $2; exit }')")
+begin=$(printf '0x%x' "0x$("${READELF:-readelf}" -sW "$fw" | awk '$8 == "fuzz_iteration" { print $2; exit }')")
 cov="--cov-blocks --fuzz-begin $begin"
 mkdir "$tmp/world"
 printf 'hello world!' > "$tmp/world/a"

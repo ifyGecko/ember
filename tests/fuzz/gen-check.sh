@@ -25,7 +25,7 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
-panic=$(printf '0x%x' "0x$(readelf -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
+panic=$(printf '0x%x' "0x$("${READELF:-readelf}" -sW "$fw" | awk '$8 == "fuzz_panic" { print $2; exit }')")   # unpadded, as the runner prints pcs
 find_headless() {
     if [ -n "${GHIDRA_HEADLESS+set}" ]; then
         echo "$GHIDRA_HEADLESS"
@@ -84,6 +84,9 @@ if ! python3 "$tools/gen_sites.py" --strategy entry "$fw" "$tmp/fw.uams" > "$tmp
             exit 1
         fi
         route=ghidra
+    elif grep -q 'this rizin has no disassembler' "$tmp/gen.log"; then
+        echo "gen-check: $board: skipped ($(sed -n 's/.*this rizin has no disassembler for \([^ ]*\).*/rizin has no \1 disassembler/p' "$tmp/gen.log" | head -1))"
+        exit 0
     else
         echo "gen-check: $board: the generators failed:" >&2
         cat "$tmp/gen.log" >&2

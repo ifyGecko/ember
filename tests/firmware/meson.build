@@ -3,7 +3,7 @@
 # Any riscv64 GCC works (rv64 toolchains build rv32 freestanding code fine).
 
 rv_prefixes = get_option('riscv_cross') != '' ? [get_option('riscv_cross')] : [
-  'riscv64-unknown-elf-', 'riscv64-linux-gnu-', 'riscv32-unknown-elf-']
+  'riscv64-unknown-elf-', 'riscv64-linux-gnu-', 'riscv32-unknown-elf-', 'riscv64-elf-']
 rv_prefix = rv_prefixes[0]
 rv_gcc = find_program(rv_prefix + 'gcc', required: false)
 foreach p : rv_prefixes

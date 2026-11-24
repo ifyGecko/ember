@@ -60,7 +60,10 @@ if [ -z "$variants" ]; then
     [ $check = 0 ] || variants="$variants mcs51 6502 65c02 z80"
 fi
 
+if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum; }; else sha256() { shasum -a 256; }; fi
+
 tmp=$(mktemp -d)
+: > "$tmp/rows"
 trap 'rm -rf "$tmp"' EXIT
 
 # build_bench DIR [KERNEL]: configure tests/bench in DIR (again, if the work changed) and build it.
@@ -86,7 +89,7 @@ build_bench() {
 run_all() {
     out=$base${1:+-k$1}${3:-}
     build_bench "$out" "$1"
-    ref=$("$out/bench-host" | sha256sum | cut -c1-12)
+    ref=$("$out/bench-host" | sha256 | cut -c1-12)
     for v in $variants; do
         extra=
         case $v in

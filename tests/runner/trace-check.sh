@@ -24,6 +24,7 @@
 #   --unknown-mmio stop   the run stops at the instruction (exit 131), interpreter and JIT
 #   dma          virtio-net's descriptor reads on rv32-test
 set -eu
+. "$(dirname "$0")/../portable.sh"
 RUN=$1
 FW=$2
 SMP=$3
@@ -93,7 +94,7 @@ grep -Eq '^irq: entered handler at 0x[0-9a-f]+ from pc=0x[0-9a-f]+ lines=0x80 ic
     fail "interrupt entry without its origin, lines or icount"
 last=$(sed -n 's/^exc: .* icount=\([0-9]*\)$/\1/p' "$T/exc" | tail -1)
 $RUN -t exc --trace-after "$last" "$FW" </dev/null >/dev/null 2>"$T/exc2" || true
-lo=$(sed -n 's/^\(exc\|irq\): .* icount=\([0-9]*\)$/\2/p' "$T/exc2" | sort -n | head -1)
+lo=$(sed -nE 's/^(exc|irq): .* icount=([0-9]*)$/\2/p' "$T/exc2" | sort -n | head -1)
 [ -n "$lo" ] && [ "$lo" -ge "$last" ] || fail "--trace-after $last: an exc/irq line at icount $lo"
 
 # ---- sysreg: the window decides what is first ---------------------------------------
@@ -117,7 +118,7 @@ grep -Eq '^blk 0x[0-9a-f]+ icount=[0-9]+$' "$T/smp" || fail "no block line of pr
 mkdir "$T/in"
 printf 'hello' >"$T/in/1"
 printf 'again' >"$T/in/2"
-begin=$(readelf -sW "$FUZZ" | awk '$NF == "fuzz_iteration" { print "0x" $2; exit }')
+begin=$("${READELF:-readelf}" -sW "$FUZZ" | awk '$NF == "fuzz_iteration" { print "0x" $2; exit }')
 $RUN --fuzz-begin "$begin" --fuzz-input uart0 -t sysreg --fuzz-replay "$T/in" "$FUZZ" </dev/null \
     >/dev/null 2>"$T/rp" || fail "replay with traces failed"
 grep '^trace: ' "$T/rp" >"$T/rp.s"
@@ -162,7 +163,7 @@ grep -Eq '^(exc|mmio|history):' "$T/tfe" && fail "--trace-file: traces still on 
 grep -q '^uam-run: stop requested' "$T/tfe" || fail "--trace-file: the stop line left stderr"
 
 # ---- --log-pc with registers ---------------------------------------------------------
-main=$(readelf -sW "$FW" | awk '$NF == "main" { print "0x" $2; exit }')
+main=$("${READELF:-readelf}" -sW "$FW" | awk '$NF == "main" { print "0x" $2; exit }')
 $RUN --log-pc "$main,a0,ra,sp" "$FW" </dev/null >/dev/null 2>"$T/lp" || true
 grep -Eq "^uam-run: pc $main reached \(hit 1, icount [0-9]+\) a0=0x[0-9a-f]+ ra=0x[0-9a-f]+ sp=0x[0-9a-f]+\$" "$T/lp" ||
     fail "--log-pc: no register values"

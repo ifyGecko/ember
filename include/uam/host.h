@@ -77,18 +77,24 @@ uam_chardev *uam_chardev_open(const char *spec);
 
 /* ---- netdev backends ---- */
 uam_netdev *uam_netdev_null_create(void);
-/* Linux tap interface: Ethernet frames, the guest is a station on the host's
- * interface (bridge it, or give it an address). `ifname` NULL or "" creates a
- * new one (needs CAP_NET_ADMIN); an existing persistent interface owned by
- * the user (`ip tuntap add dev NAME mode tap user $USER`) needs no privilege. */
+/* Tap: Ethernet frames, the guest is a station on the host's interface.
+ * Linux: a tap interface (bridge it, or give it an address). `ifname` NULL or
+ * "" creates a new one (needs CAP_NET_ADMIN); an existing persistent interface
+ * owned by the user (`ip tuntap add dev NAME mode tap user $USER`) needs no
+ * privilege. macOS: a new vmnet host-mode segment (needs root); `ifname` is
+ * the host's address on it, HOSTADDR[/PREFIX] (NULL or "": vmnet's choice). */
 uam_netdev *uam_netdev_tap_create(const char *ifname);
-/* Linux tun interface (IP packets) behind an Ethernet adapter: the guest sees
+/* Tun interface (IP packets) behind an Ethernet adapter: the guest sees
  * one host-side station that answers ARP and IPv6 neighbour solicitations for
  * every address and exchanges IPv4/IPv6 with the host's routing; other
  * ethertypes are dropped. Use tap when the guest needs a real L2 segment. */
+/* Linux: a tun interface, as for tap. macOS: a new utun interface (needs root),
+ * `ifname` "utunN" or NULL/"" for the first free unit; it lasts as long as the
+ * netdev, so it is addressed after it exists. */
 uam_netdev *uam_netdev_tun_create(const char *ifname);
 /* An already attached tap (tun = false) or tun fd, e.g. inherited from a
- * privileged launcher. Ownership of the fd passes to the netdev. */
+ * privileged launcher (on macOS a tun fd is a utun control socket).
+ * Ownership of the fd passes to the netdev. */
 uam_netdev *uam_netdev_tap_fd_create(int fd, bool tun);
 uam_netdev *uam_netdev_udp_create(uint16_t local_port, const char *remote_host, uint16_t remote_port);
 /* Two in-process endpoints wired back to back (deterministic). */

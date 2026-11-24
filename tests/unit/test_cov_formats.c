@@ -581,6 +581,28 @@ static void test_bounds(void)
 
 /* ---- coverage region ownership -------------------------------------------- */
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+
+/* What cov_region.c records on macOS: p_starttime against kern.boottime, in 1/100 s. */
+static uint32_t proc_start(pid_t pid)
+{
+    struct kinfo_proc kp;
+    size_t len = sizeof(kp);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+    memset(&kp, 0, sizeof(kp));
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0)
+        return 0;
+    struct timeval boot;
+    size_t blen = sizeof(boot);
+    int bmib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(bmib, 2, &boot, &blen, NULL, 0) != 0)
+        return 0;
+    const struct timeval *st = &kp.kp_proc.p_starttime;
+    int64_t cs = ((int64_t)st->tv_sec - boot.tv_sec) * 100 + ((int64_t)st->tv_usec - boot.tv_usec) / 10000;
+    return cs > 0 ? (uint32_t)cs : 1;
+}
+#else
 /* Field 22 of /proc/PID/stat, low 32 bits; 0 if unreadable. */
 static uint32_t proc_start(pid_t pid)
 {
@@ -599,6 +621,7 @@ static uint32_t proc_start(pid_t pid)
         p = strchr(p + 1, ' ');
     return p ? (uint32_t)strtoull(p + 1, NULL, 10) : 0;
 }
+#endif
 
 static void set_owner(const char *path, uint32_t pid, uint32_t start)
 {

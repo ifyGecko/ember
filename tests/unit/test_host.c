@@ -423,6 +423,13 @@ static void test_netdev(const char *dir)
 
 /* ---- tun adapter (over a datagram socketpair standing in for /dev/net/tun) -- */
 
+/* On macOS a tun fd is a utun: every packet behind a 4-byte address family. */
+#ifdef __APPLE__
+#define TUN_HDR 4
+#else
+#define TUN_HDR 0
+#endif
+
 typedef struct grab {
     unsigned frames;
     size_t   len;
@@ -497,14 +504,18 @@ static void test_tun_adapter(void)
     f[n + 3] = 28;                   /* total length */
     f[n + 9] = 17;
     CHECK(uam_netdev_send(nd, f, 60), "IPv4 sent");
-    CHECK(recv(sv[1], r, sizeof(r), MSG_DONTWAIT) == 28 && r[0] == 0x45, "tun got the bare packet");
+    CHECK(recv(sv[1], r, sizeof(r), MSG_DONTWAIT) == 28 + TUN_HDR && r[TUN_HDR] == 0x45
+          && (!TUN_HDR || (r[0] == 0 && r[1] == 0 && r[2] == 0 && r[3] == AF_INET)),
+          "tun got the bare packet");
 
     /* Tun packet -> guest frame addressed to the learned MAC. */
-    memset(r, 0, 28);
-    r[0] = 0x45;
-    r[3] = 28;
-    r[16] = 10; r[19] = 2;
-    CHECK(send(sv[1], r, 28, 0) == 28, "host packet");
+    memset(r, 0, 28 + TUN_HDR);
+    if (TUN_HDR)
+        r[3] = AF_INET;
+    r[TUN_HDR] = 0x45;
+    r[TUN_HDR + 3] = 28;
+    r[TUN_HDR + 16] = 10; r[TUN_HDR + 19] = 2;
+    CHECK(send(sv[1], r, 28 + TUN_HDR, 0) == 28 + TUN_HDR, "host packet");
     uam_netdev_poll(nd);
     CHECK(g.frames == 2 && g.len == 60 && !memcmp(g.f, GUEST_MAC, 6) && g.f[12] == 0x08
           && g.f[13] == 0 && g.f[14] == 0x45, "host packet framed for the guest");
