@@ -19,6 +19,12 @@ struct uam_host {
     unsigned     n_nds;
     uam_link_node *links[MAX_SOURCES];
     unsigned     n_links;
+    struct host_fd {
+        int            fd;
+        uam_host_fd_fn fn;
+        void          *ctx;
+    }            fds[MAX_SOURCES];  /* uam_host_add_fd: polled, never wakes the hart */
+    unsigned     n_fds;
     uam_pacing   pacing;
     uint64_t     ticks_per_sec;
     uint64_t     max_ahead;    /* ticks */
@@ -82,6 +88,30 @@ uam_status uam_host_add_netdev(uam_host *h, uam_netdev *nd)
     return UAM_OK;
 }
 
+uam_status uam_host_add_fd(uam_host *h, int fd, uam_host_fd_fn fn, void *ctx)
+{
+    if (fd < 0 || !fn)
+        return UAM_ERR_INVALID;
+    if (h->n_fds == MAX_SOURCES)
+        return UAM_ERR_NOMEM;
+    h->fds[h->n_fds++] = (struct host_fd){ .fd = fd, .fn = fn, .ctx = ctx };
+    return UAM_OK;
+}
+
+void uam_host_remove_fd(uam_host *h, int fd)
+{
+    for (unsigned i = 0; i < h->n_fds; i++)
+        if (h->fds[i].fd == fd) {
+            h->fds[i] = h->fds[--h->n_fds];
+            return;
+        }
+}
+
+void uam_host_resync(uam_host *h)
+{
+    h->started = false;
+}
+
 /* A node waits for its hub: keep the other sources serviced meanwhile, and
  * give up when the run is asked to stop. */
 static bool link_wait(void *ctx, uam_link_node *n)
@@ -143,7 +173,7 @@ static bool has_fds(uam_host *h)
 /* Service every source; wait up to timeout_ms for one with a host fd. */
 void uam_host_poll(uam_host *h, int timeout_ms)
 {
-    struct pollfd pfd[3 * MAX_SOURCES];
+    struct pollfd pfd[4 * MAX_SOURCES];
     unsigned n = 0;
     for (unsigned i = 0; i < h->n_cds; i++) {
         int fd = uam_chardev_fd(h->cds[i]);
@@ -164,10 +194,21 @@ void uam_host_poll(uam_host *h, int timeout_ms)
     }
     if (!n && timeout_ms < 0 && has_fds(h))
         timeout_ms = 100;   /* every source is held back: wait without spinning */
-    if (n || timeout_ms > 0) {
-        int rc = poll(pfd, n, timeout_ms);
-        (void)rc;  /* EINTR (e.g. SIGINT -> uam_exec_stop) simply returns early */
+    /* Owner fds come last, after the sources counted above; a callback may add or
+     * remove them, so it is called from a copy. */
+    const unsigned n_src = n;
+    struct host_fd own[MAX_SOURCES];
+    const unsigned n_own = h->n_fds;
+    for (unsigned i = 0; i < n_own; i++) {
+        own[i] = h->fds[i];
+        pfd[n++] = (struct pollfd){ .fd = own[i].fd, .events = POLLIN };
     }
+    int rc = 0;
+    if (n || timeout_ms > 0)
+        rc = poll(pfd, n, timeout_ms);   /* EINTR (e.g. SIGINT -> uam_exec_stop) returns early */
+    for (unsigned i = 0; rc > 0 && i < n_own; i++)
+        if (pfd[n_src + i].revents)
+            own[i].fn(own[i].ctx, own[i].fd);
     /* Polling a backend with nothing to read is a cheap non-blocking no-op. */
     for (unsigned i = 0; i < h->n_cds; i++)
         uam_chardev_poll(h->cds[i]);

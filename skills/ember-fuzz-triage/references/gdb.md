@@ -347,7 +347,8 @@ wait
   address without that base (`flags.md`, "Addresses on each architecture").
 - **gdb refuses to connect, or times out.** The emulation is not waiting yet (it prints a
   line when it listens), or another one still holds the port. Use a different port.
-- **There are no `monitor` commands and no reverse execution.** To "go back", restart from
+- **gdb has no `monitor` commands, and there is no reverse execution.** (ember's own
+  monitor, `--monitor`, is a separate channel: `docs/monitor.md`.) To "go back", restart from
   the snapshot: the run is deterministic, so you arrive at exactly the same state. Use the
   instruction count as your position (`-n N` stops the run at instruction N).
 - **Changing memory or registers changes the run.** After `set var`, what follows is no

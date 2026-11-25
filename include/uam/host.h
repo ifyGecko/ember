@@ -55,6 +55,22 @@ uam_chardev *uam_chardev_script_create(FILE *out, const uam_chardev_step *steps,
 /* stdin/stdout. raw: put a terminal in raw mode; Ctrl-A x quits, Ctrl-A Ctrl-A
  * sends Ctrl-A. Without raw, EOF on stdin just ends input. */
 uam_chardev *uam_chardev_stdio_create(bool raw);
+/* A raw stdio console shared with an owner (the monitor): Ctrl-A KEY diverts the
+ * terminal to the owner - typed bytes go to `input` instead of the guest, and guest
+ * output is held (up to 1 MiB, the rest counted) - and Ctrl-A KEY again gives it back,
+ * writing out what was held. `enter`/`leave` say which way it went. The owner writes
+ * to stdout itself. False: `cd` is not a raw stdio console (or not a terminal). */
+typedef struct uam_chardev_escape {
+    uint8_t key;
+    void  (*enter)(void *ctx);
+    void  (*leave)(void *ctx);
+    void  (*input)(void *ctx, const uint8_t *buf, size_t len);
+    void   *ctx;
+} uam_chardev_escape;
+bool uam_chardev_stdio_set_escape(uam_chardev *cd, const uam_chardev_escape *e);
+/* Divert (or give back) from the owner's side; no enter/leave call. */
+void uam_chardev_stdio_divert(uam_chardev *cd, bool on);
+bool uam_chardev_stdio_diverted(uam_chardev *cd);
 /* A pseudo-terminal; its path is logged (connect with screen/picocom). */
 uam_chardev *uam_chardev_pty_create(void);
 /* Server socket, one client at a time: "tcp:PORT", "tcp:HOST:PORT", "unix:PATH". */
@@ -283,6 +299,16 @@ uam_status uam_host_add_netdev(uam_host *h, uam_netdev *nd);
 uam_status uam_host_add_link(uam_host *h, uam_link_node *n);
 void       uam_host_set_pacing(uam_host *h, uam_pacing pacing, uint64_t ticks_per_sec,
                                uint64_t max_ahead_ticks);
+/* An owner's own file descriptor (a control channel such as the monitor's): polled
+ * with the others, `fn` called when it is readable or hung up. It never counts as
+ * input that could wake an idle hart, so a run that can only deadlock still ends.
+ * The callback may add or remove fds. */
+typedef void (*uam_host_fd_fn)(void *ctx, int fd);
+uam_status uam_host_add_fd(uam_host *h, int fd, uam_host_fd_fn fn, void *ctx);
+void       uam_host_remove_fd(uam_host *h, int fd);
+/* Real-time pacing: start again from the host clock now (after the machine was held
+ * still, so the pause is not made up for). */
+void       uam_host_resync(uam_host *h);
 /* Install the host loop as the executor's host bridge (uam_exec_set_host). */
 void       uam_host_attach(uam_host *h, uam_exec *x);
 /* Service host I/O once, waiting up to timeout_ms (-1: until something happens). */

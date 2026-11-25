@@ -13,6 +13,7 @@
 #   fuzz-lists    site lists, boundary files, the coverage region, the fuzz brain, the
 #                 network frontend, a parallel campaign
 #   gdb           the gdb stub over the remote protocol
+#   monitor       the monitor (--monitor, uam-mon, Ctrl-A m) on a few bytes of x86 code
 #   runner        uam-run's debugging options, traces and --on rules
 #   link          links between emulations: a hub and two or three uam-test-run processes
 #                 in the free, loose and exact modes (tests/link/link-check.sh)
@@ -327,6 +328,10 @@ if have_arm
     lists += {k: lists[k] + [['armeb', 'armeb-ref', fw_arm['fuzztarget-be']]]}
   endforeach
 endif
+
+# The monitor needs no toolchain: its test writes its own few bytes of x86 code.
+test('monitor', python, args: [files('monitor/monitor-check.py'), uam_run, uam_mon],
+  suite: 'monitor', kwargs: std)
 
 # Flat images entered in real mode at 0. The self-test and the AMD SMM test raise SMIs
 # through the 0xB2 port, and the BIOS boot needs storage, VGA and a printer: x86_64-test

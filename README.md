@@ -7,6 +7,7 @@ with one module per concern.
 
 - [docs/architecture.md](docs/architecture.md): modules, interfaces, dependency rules
 - [docs/uam-isa.md](docs/uam-isa.md): the IR specification (normative)
+- [docs/monitor.md](docs/monitor.md): the monitor, a live command channel into a run (`--monitor`, `uam-mon`, Ctrl-A m)
 
 Status: twelve guest ISAs - RV32IMAC (+Zicsr, Zifencei, M-mode) on the `rv32-ref` board,
 MIPS32r2 big/little-endian (CP0, an R4K-style TLB or fixed mapping, GPR shadow register sets,
@@ -92,7 +93,7 @@ is needed for the library and the runner.
 
 ```bash
 meson setup build                        # configure, once; the options: meson_options.txt
-meson compile -C build                   # build/uam-run, build/uam-link-hub, the libraries (build/libuam.a), the test programs
+meson compile -C build                   # build/uam-run, build/uam-link-hub, build/uam-mon, the libraries (build/libuam.a), the test programs
 meson test -C build                      # everything: unit tests, RISC-V, MIPS, ARM, x86, PowerPC, AVR, AVR32,
                                          # PIC, PIC32, 8051, 6502, Z80 and Xtensa firmware self-tests, the
                                          # external-board example, snapshot split runs (interpreter and JIT),
@@ -113,7 +114,7 @@ meson compile -C build fuzz-throughput-record  # rewrite the figures the fuzz-th
                                          # (tests/fuzz/throughput.ref; on a quiet machine)
 meson compile -C build link-throughput-record  # the same for the link-throughput test (tests/link/throughput.ref)
 meson compile -C build net-check         # ARP/ping between an rv32-test guest and the host kernel over a real tap and tun
-meson install -C build                   # headers, libraries, uam-run, uam-link-hub and uam.pc (meson setup --prefix DIR)
+meson install -C build                   # headers, libraries, uam-run, uam-link-hub, uam-mon and uam.pc (meson setup --prefix DIR)
 ```
 
 `meson configure build` lists the options and `meson configure build -Dname=value` changes
@@ -470,6 +471,8 @@ build/uam-run --break 0x8023f00c --dump-mem p:0x100000+64K=heap.bin fw.elf  # ph
 build/uam-run --guard 0x80100000-16+16:w fw.elf   # stop before any write within 16 bytes of an address
 build/uam-run --watch p:0x3000+4 fw.elf          # log every access to 4 physical bytes
 build/uam-run --gdb 1234 fw.elf               # then: gdb-multiarch fw.elf -ex 'target remote :1234'
+build/uam-run --monitor unix:mon.sock fw.elf  # then: build/uam-mon mon.sock (stop, status, cont, quit;
+                                              # docs/monitor.md); --console stdio-raw: Ctrl-A m
 build/uam-run --console pty fw.elf            # console on a pseudo-terminal (also tcp:PORT, unix:PATH,
                                               # stdio-raw, file:OUT[,in=FILE], string:TEXT,
                                               # script:FILE, null, link:PORT: another
@@ -1034,6 +1037,7 @@ boards/            rv32_ref.c (RISC-V), mips_ref.c (MIPS), arm_ref.c (ARM),
                    per-register rules for any board
 tools/uam-run.c    uam-run: registers the stock boards and calls uam_run_main
 tools/uam-link-hub.c  uam-link-hub: a link hub as a process (docs/link.md)
+tools/uam-mon.c    uam-mon: the monitor's client (docs/monitor.md)
 tools/             also xbench.sh / jitbench.sh (timing),
                    jitprof.py (native-code profiles; docs/jit-perf.md)
 meson.build        the build (meson_options.txt: its options; tests/meson.build: the tests;

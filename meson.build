@@ -111,6 +111,7 @@ modules = {
   'host': files('src/host/chardev_backends.c', 'src/host/netdev_backends.c',
     'src/host/blockdev_file.c', 'src/host/hostloop.c', 'src/host/link_node.c',
     'src/host/link_hub.c', 'src/host/link_adapters.c', 'src/host/link_wire.c', 'src/debug/gdbstub.c',
+    'src/monitor/monitor.c',
     'src/runner/runner.c', 'src/runner/trace.c'),
 }
 
@@ -144,6 +145,10 @@ uam_run = executable('uam-run', 'tools/uam-run.c',
 
 uam_link_hub = executable('uam-link-hub', 'tools/uam-link-hub.c',
   dependencies: uam_dep,
+  install: true)
+
+# The monitor's client (uam-run --monitor SPEC); it needs nothing of libuam.
+uam_mon = executable('uam-mon', 'tools/uam-mon.c',
   install: true)
 
 install_subdir('include/uam', install_dir: get_option('includedir'))

@@ -224,13 +224,32 @@ typedef struct fd_cd {
     bool           restore_tty;
     struct termios saved_tty;
     int            saved_fl;        /* FD_STDIO: stdin's flags (shared with the shell) */
+    /* FD_STDIO raw: uam_chardev_stdio_set_escape / uam_chardev_stdio_divert */
+    uam_chardev_escape esc;
+    bool           has_esc, diverted;
+    uint8_t       *held;            /* guest output while diverted */
+    size_t         held_len, held_dropped;
 } fd_cd;
 
+/* Guest output kept while the terminal is diverted; beyond this it is counted, not kept. */
+#define HELD_MAX (1u << 20)
+
 static fd_cd *to_fd(uam_chardev *cd) { return UAM_CONTAINER_OF(cd, fd_cd, cd); }
+static const uam_chardev_ops fd_ops;
 
 static size_t fd_write(uam_chardev *cd, const void *buf, size_t len)
 {
     fd_cd *f = to_fd(cd);
+    if (f->diverted) {
+        size_t keep = HELD_MAX - f->held_len < len ? HELD_MAX - f->held_len : len;
+        if (keep && !f->held && !(f->held = malloc(HELD_MAX)))
+            keep = 0;
+        if (keep)
+            memcpy(f->held + f->held_len, buf, keep);
+        f->held_len += keep;
+        f->held_dropped += len - keep;
+        return len;
+    }
     if (f->out_fd >= 0)
         write_all(f->out_fd, buf, len);
     return len;
@@ -244,7 +263,9 @@ static int fd_fd(uam_chardev *cd)
     return f->in_fd;
 }
 
-/* stdio raw mode: Ctrl-A x quits, Ctrl-A Ctrl-A sends Ctrl-A. */
+/* stdio raw mode: Ctrl-A x quits, Ctrl-A Ctrl-A sends Ctrl-A, Ctrl-A KEY (an owner's
+ * escape) diverts the terminal to the owner and back. Diverted, typed bytes go to the
+ * owner, not the guest. */
 static void stdio_filter(fd_cd *f, const uint8_t *p, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
@@ -255,14 +276,65 @@ static void stdio_filter(fd_cd *f, const uint8_t *p, size_t n)
                 uam_chardev_quit(&f->cd);
                 continue;
             }
+            if (f->has_esc && (c | 0x20) == (f->esc.key | 0x20)) {
+                bool on = !f->diverted;
+                uam_chardev_stdio_divert(&f->cd, on);
+                if (on ? f->esc.enter : f->esc.leave)
+                    (on ? f->esc.enter : f->esc.leave)(f->esc.ctx);
+                continue;
+            }
             if (c != 0x01)
                 continue;
         } else if (c == 0x01) {
             f->escape = true;
             continue;
         }
-        uam_chardev_input(&f->cd, &c, 1);
+        if (f->diverted) {
+            if (f->esc.input)
+                f->esc.input(f->esc.ctx, &c, 1);
+        } else {
+            uam_chardev_input(&f->cd, &c, 1);
+        }
     }
+}
+
+bool uam_chardev_stdio_set_escape(uam_chardev *cd, const uam_chardev_escape *e)
+{
+    if (!cd || cd->ops != &fd_ops)
+        return false;
+    fd_cd *f = to_fd(cd);
+    if (f->kind != FD_STDIO || !f->raw)
+        return false;
+    f->has_esc = e != NULL;
+    if (e)
+        f->esc = *e;
+    return true;
+}
+
+bool uam_chardev_stdio_diverted(uam_chardev *cd)
+{
+    return cd && cd->ops == &fd_ops && to_fd(cd)->diverted;
+}
+
+void uam_chardev_stdio_divert(uam_chardev *cd, bool on)
+{
+    if (!cd || cd->ops != &fd_ops)
+        return;
+    fd_cd *f = to_fd(cd);
+    if (f->kind != FD_STDIO || f->diverted == on)
+        return;
+    f->diverted = on;
+    if (on || f->out_fd < 0)
+        return;
+    if (f->held_len)
+        write_all(f->out_fd, f->held, f->held_len);
+    if (f->held_dropped) {
+        char note[96];
+        int k = snprintf(note, sizeof(note), "\r\n[%zu bytes of guest output not kept]\r\n",
+                         f->held_dropped);
+        write_all(f->out_fd, note, (size_t)k);
+    }
+    f->held_len = f->held_dropped = 0;
 }
 
 static void fd_poll(uam_chardev *cd)
@@ -338,6 +410,7 @@ static void fd_destroy(uam_chardev *cd)
             fcntl(STDIN_FILENO, F_SETFL, f->saved_fl);
         if (g_raw_stdio == f)
             g_raw_stdio = NULL;
+        free(f->held);
         break;
     case FD_PTY:
         if (f->in_fd >= 0)
@@ -392,7 +465,7 @@ uam_chardev *uam_chardev_stdio_create(bool raw)
             atexit(restore_tty_atexit);
             registered = true;
         }
-        uam_log(UAM_LOG_WARN, "chardev", "console in raw mode: Ctrl-A x to quit");
+        uam_log(UAM_LOG_WARN, "chardev", "console in raw mode: Ctrl-A x to quit, Ctrl-A m for the monitor");
     }
     return &f->cd;
 }

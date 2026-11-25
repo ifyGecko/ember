@@ -32,6 +32,7 @@
 #include "uam/host.h"
 #include "uam/loader.h"
 #include "uam/machine.h"
+#include "uam/monitor.h"
 #include "uam/rules.h"
 #include "uam/runner.h"
 
@@ -545,6 +546,13 @@ static void usage(FILE *out)
         "                          raw to FILE (repeatable). ADDR is virtual, translated as\n"
         "                          processor 0 sees it (as gdb does; x86: linear); p: physical\n"
         "      --gdb PORT          wait for a gdb connection on localhost:PORT\n"
+        "      --monitor SPEC      a live command channel into the run (repeatable): unix:PATH,\n"
+        "                          tcp:PORT (127.0.0.1) or stdio (console elsewhere); connect\n"
+        "                          with uam-mon. --console stdio-raw has it on Ctrl-A m anyway.\n"
+        "                          docs/monitor.md lists the commands\n"
+        "      --monitor-wait      stay stopped before the first instruction until \"cont\"\n"
+        "      --monitor-hold      when the run ends, stay for inspection until \"quit\"\n"
+        "      --monitor-script FILE  monitor commands to run before the first instruction\n"
         "      --load-snapshot FILE  start from a snapshot instead of the reset state (same\n"
         "                          board and options; IMAGE is not needed)\n"
         "      --save-snapshot FILE  save a snapshot when the run stops (-n, --max-ticks,\n"
@@ -1141,7 +1149,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_FUZZ_SNAPSHOT, OPT_FUZZ_UNINIT, OPT_FUZZ_UNINIT_EXCLUDE,
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
            OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_GUARD_RETURNS, OPT_RETURN_OK,
-           OPT_BACKTRACE, OPT_ON, OPT_ON_FILE, OPT_EXT_BASE = 1000 };
+           OPT_BACKTRACE, OPT_ON, OPT_ON_FILE, OPT_MONITOR, OPT_MONITOR_WAIT, OPT_MONITOR_HOLD,
+           OPT_MONITOR_SCRIPT, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -1183,6 +1192,10 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "guard", required_argument, NULL, OPT_GUARD },
         { "watch", required_argument, NULL, OPT_WATCH },
         { "gdb", required_argument, NULL, OPT_GDB },
+        { "monitor", required_argument, NULL, OPT_MONITOR },
+        { "monitor-wait", no_argument, NULL, OPT_MONITOR_WAIT },
+        { "monitor-hold", no_argument, NULL, OPT_MONITOR_HOLD },
+        { "monitor-script", required_argument, NULL, OPT_MONITOR_SCRIPT },
         { "load-snapshot", required_argument, NULL, OPT_LOAD_SNAP },
         { "save-snapshot", required_argument, NULL, OPT_SAVE_SNAP },
         { "snapshot-at", required_argument, NULL, OPT_SNAP_AT },
@@ -1217,6 +1230,9 @@ static int run_main(int argc, char **argv, const ext_set *es)
     };
 
     const char *board_name = "rv32-ref", *console_spec = "stdio", *gdb_port = NULL;
+    const char *monitor_specs[4], *monitor_script = NULL;
+    size_t n_monitor = 0;
+    bool monitor_wait = false, monitor_hold = false;
     const char *load_snap = NULL, *save_snap = NULL, *mmio_input_path = NULL;
     static uam_mmio_rule mmio_rules[UAM_MAX_MMIO_RULES];
     size_t n_mmio_rules = 0;
@@ -1535,6 +1551,16 @@ static int run_main(int argc, char **argv, const ext_set *es)
             break;
         }
         case OPT_GDB: gdb_port = optarg; break;
+        case OPT_MONITOR:
+            if (n_monitor == UAM_ARRAY_LEN(monitor_specs)) {
+                fprintf(stderr, "uam-run: at most %zu --monitor\n", UAM_ARRAY_LEN(monitor_specs));
+                return 2;
+            }
+            monitor_specs[n_monitor++] = optarg;
+            break;
+        case OPT_MONITOR_WAIT: monitor_wait = true; break;
+        case OPT_MONITOR_HOLD: monitor_hold = true; break;
+        case OPT_MONITOR_SCRIPT: monitor_script = optarg; break;
         case OPT_LOAD_SNAP: load_snap = optarg; break;
         case OPT_SAVE_SNAP: save_snap = optarg; break;
         case OPT_SNAP_AT:
@@ -1760,6 +1786,18 @@ static int run_main(int argc, char **argv, const ext_set *es)
         fprintf(stderr, "uam-run: --fuzz-begin does not combine with --gdb or --save-snapshot\n");
         return 2;
     }
+    const bool monitor_asked = n_monitor || monitor_wait || monitor_hold || monitor_script;
+    if (monitor_asked && (fuzzing || gdb_port)) {
+        fprintf(stderr, "uam-run: the monitor does not combine with %s\n",
+                fuzzing ? "fuzzing" : "--gdb");
+        return 2;
+    }
+    for (size_t i = 0; i < n_monitor; i++)
+        if (!strcmp(monitor_specs[i], "stdio") && !strncmp(console_spec, "stdio", 5)) {
+            fprintf(stderr, "uam-run: --monitor stdio: the console is on stdio already; with "
+                    "--console stdio-raw, Ctrl-A m switches the terminal to the monitor\n");
+            return 2;
+        }
     if (cov_out && !cov_blocks && !(provides & UAM_RUNNER_EXT_SITES) && !fuzzing) {
         fprintf(stderr, "uam-run: --cov-out needs a coverage source (--cov-blocks, a site list)\n");
         return 2;
@@ -2303,11 +2341,53 @@ static int run_main(int argc, char **argv, const ext_set *es)
     sigaction(SIGTERM, &sa, &old_term);
 
     uam_stop_reason why = UAM_STOP_NONE;
+    /* The monitor: asked for, or on a raw stdio console (Ctrl-A m) of any run that is
+     * not fuzzing or under gdb. Without one the run below is the plain uam_exec_run. */
+    uam_monitor *mon = NULL;
+    if (!fuzzing && !gdb_port) {
+        mon = uam_monitor_create(&m, host, &(uam_monitor_config){ .wait = monitor_wait,
+                                                                  .hold = monitor_hold });
+        bool reachable = false;
+        for (size_t i = 0; mon && i < n_monitor; i++) {
+            char err[200];
+            if (uam_monitor_listen(mon, monitor_specs[i], err, sizeof(err)) != UAM_OK) {
+                fprintf(stderr, "uam-run: --monitor %s\n", err);
+                why = UAM_STOP_ERROR;
+                break;
+            }
+            reachable = true;
+        }
+        if (mon && uam_monitor_use_console(mon, console))
+            reachable = true;
+        if (why == UAM_STOP_NONE && mon && (monitor_wait || monitor_hold) && !reachable) {
+            fprintf(stderr, "uam-run: --monitor-wait and --monitor-hold need a way in: --monitor "
+                    "SPEC, or --console stdio-raw on a terminal (Ctrl-A m)\n");
+            why = UAM_STOP_ERROR;
+        }
+        if (why == UAM_STOP_NONE && mon && monitor_script) {
+            char err[300];
+            if (uam_monitor_run_script(mon, monitor_script, err, sizeof(err)) != UAM_OK) {
+                fprintf(stderr, "uam-run: --monitor-script %s\n", err);
+                why = UAM_STOP_ERROR;
+            }
+        }
+        if (why == UAM_STOP_NONE && mon && !monitor_asked && !reachable) {
+            uam_monitor_destroy(mon);   /* nothing can reach it */
+            mon = NULL;
+        }
+        if (!mon && monitor_asked && why == UAM_STOP_NONE) {
+            fprintf(stderr, "uam-run: cannot create the monitor\n");
+            why = UAM_STOP_ERROR;
+        }
+    }
+    const bool monitor_failed = why == UAM_STOP_ERROR;
     uam_chardev_hold(console, false);   /* the machine is set up: input may flow */
     struct timespec run_t0, run_t1;
     const uint64_t run_icount0 = uam_machine_icount(&m);
     clock_gettime(CLOCK_MONOTONIC, &run_t0);
-    if (fuzzing) {
+    if (monitor_failed) {
+        /* the monitor could not be set up: rc 2, below */
+    } else if (fuzzing) {
         rc = run_fuzz(&m, &fz, cov_blocks, fuzz_input, mmio_input, fuzz_replay, cov_out,
                       cov_map_size, stats, &xs, es, &rt);
     } else if (gdb_port) {
@@ -2320,9 +2400,13 @@ static int run_main(int argc, char **argv, const ext_set *es)
             why = uam_gdb_serve(g, max_insns);
             uam_gdb_destroy(g);
         }
+    } else if (mon) {
+        why = uam_monitor_serve(mon, max_insns);
     } else {
         why = uam_exec_run(&m.exec, max_insns);
     }
+    uam_monitor_destroy(mon);
+    mon = NULL;
     clock_gettime(CLOCK_MONOTONIC, &run_t1);
     fflush(stdout);
 
@@ -2371,6 +2455,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     }
     if (link_lost)
         fprintf(stderr, "uam-run: the link hub went away\n");
+    if (monitor_failed)
+        rc = 2;
 
     if (!fuzzing && why == UAM_STOP_GUARD && uam_machine_guard_last_hit(&m)) {
         char line[320];
@@ -2402,7 +2488,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
             fprintf(stderr, "uam-run: rule %s: %llu of its conditions and actions could not be "
                     "carried out (-v names the first)\n", rinfo.name,
                     (unsigned long long)rinfo.failed);
-    if (!fuzzing)
+    if (!fuzzing && !monitor_failed)
         fprintf(stderr, "uam-run: %s (status %lld) at pc=0x%llx after %llu instructions\n",
                 uam_stop_reason_str(why), (long long)m.exec.stop_status,
                 (unsigned long long)m.cpu.pc, (unsigned long long)uam_machine_icount(&m));
@@ -2481,7 +2567,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     for (unsigned i = 0; i < n_mem_dumps && !fuzzing; i++)
         if (!dump_memory(&m, &mem_dumps[i]) && rc == 0)
             rc = 2;
-    if (save_snap && !have_snap_at) {
+    if (save_snap && !have_snap_at && !monitor_failed) {
         if (why == UAM_STOP_ERROR || why == UAM_STOP_FAULT_LOOP)
             fprintf(stderr, "uam-run: not saving a snapshot after an internal error\n");
         else if (uam_machine_save_snapshot(&m, save_snap) == UAM_OK)
