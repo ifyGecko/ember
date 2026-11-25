@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,7 @@ int main(int argc, char **argv)
     }
     if (!where)
         usage();
+    signal(SIGPIPE, SIG_IGN);   /* a monitor that went away is exit status 2, not a signal */
     int fd = connect_to(where);
     if (fd < 0) {
         fprintf(stderr, "uam-mon: cannot reach the monitor at %s: %s\n", where, strerror(errno));

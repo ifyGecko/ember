@@ -20,7 +20,6 @@
 
 #define MAX_BREAKS 64u
 #define MAX_GUARDS 64u
-#define MAX_RULES  256u
 
 typedef struct mon_break {
     bool     used;
@@ -47,7 +46,8 @@ struct mon_instr {
     int          next_g;
     bool         observing;
     uam_rules   *rules;
-    bool         deleted[MAX_RULES];
+    bool        *deleted;            /* per rule of the set (it grows with it): "rule del" */
+    size_t       n_deleted;
     uam_rule_symbol_fn rsym;
     void        *rsym_ctx;
     /* the run under way */
@@ -193,10 +193,14 @@ static void observer(void *ctx, uam_machine *m, const uam_guard_hit *hit)
     uam_guard_hit_describe(hit, what, sizeof(what));
     snprintf(id, sizeof(id), "%d", g->id);
     snprintf(pc, sizeof(pc), "0x%llx", (unsigned long long)hit->pc);
-    if (g->watch)
+    /* The hit's action decides, whatever the command was: a ",stop" on a watch stops, a
+     * ",log" on a guard only reports. */
+    if (hit->action == UAM_GUARD_STOP) {
+        if (!in->guard_hit)
+            in->guard_hit = g->id;
+    } else {
         mon_event(in->mon, "watch", "id", id, "pc", pc, "what", what, NULL);
-    else if (!in->guard_hit)
-        in->guard_hit = g->id;
+    }
 }
 
 static void cmd_guard_common(uam_monitor_call *c, mon_instr *in, bool watch)
@@ -290,11 +294,16 @@ static bool have_rules(uam_monitor_call *c, mon_instr *in)
     return true;
 }
 
+static bool is_deleted(const mon_instr *in, size_t i)
+{
+    return i < in->n_deleted && in->deleted[i];
+}
+
 static bool rule_id(uam_monitor_call *c, mon_instr *in, size_t *i)
 {
     uint64_t id;
     if (uam_monitor_argc(c) != 3 || !number(uam_monitor_arg(c, 2), &id) || !in->rules
-        || id >= uam_rules_n(in->rules) || in->deleted[id]) {
+        || id >= uam_rules_n(in->rules) || is_deleted(in, (size_t)id)) {
         uam_monitor_fail(c, "rule %s: no rule %s (rule list)", uam_monitor_arg(c, 1),
                          uam_monitor_arg(c, 2) ? uam_monitor_arg(c, 2) : "");
         return false;
@@ -311,7 +320,7 @@ static void cmd_rule(uam_monitor_call *c, void *ctx)
     if (!sub || !strcmp(sub, "list")) {
         uam_rule_info ri;
         for (size_t i = 0; in->rules && uam_rules_get(in->rules, i, &ri); i++)
-            if (!in->deleted[i])
+            if (!is_deleted(in, i))
                 uam_monitor_print(c, "%zu %s %s arrivals=%llu fired=%llu failed=%llu", i, ri.name,
                                   uam_rules_enabled(in->rules, i) ? "on" : "off",
                                   (unsigned long long)ri.arrivals, (unsigned long long)ri.fired,
@@ -328,10 +337,6 @@ static void cmd_rule(uam_monitor_call *c, void *ctx)
             return;
         size_t before = uam_rules_n(in->rules);
         if (!strcmp(sub, "add")) {
-            if (before >= MAX_RULES) {
-                uam_monitor_fail(c, "rule: at most %u rules", MAX_RULES);
-                return;
-            }
             if (uam_rules_add(in->rules, text, err, sizeof(err)) < 0) {
                 uam_monitor_fail(c, "rule: %s", err);
                 return;
@@ -341,13 +346,6 @@ static void cmd_rule(uam_monitor_call *c, void *ctx)
             /* the lines before the bad one were added: they stay, and are listed */
         }
         size_t after = uam_rules_n(in->rules);
-        if (after > MAX_RULES) {   /* a file took the set past the limit: the rest go */
-            for (size_t i = MAX_RULES; i < after; i++)
-                uam_rules_enable(in->rules, i, false, NULL, 0);
-            uam_monitor_fail(c, "rule: at most %u rules; rules from %u on are off", MAX_RULES,
-                             MAX_RULES);
-            after = MAX_RULES;
-        }
         for (size_t i = before; i < after; i++)
             uam_monitor_field(c, "id", "%zu", i);
         return;
@@ -360,8 +358,20 @@ static void cmd_rule(uam_monitor_call *c, void *ctx)
             uam_monitor_fail(c, "rule: %s", err);
             return;
         }
-        if (!strcmp(sub, "del"))
-            in->deleted[i] = true;   /* it keeps its place: ids do not move */
+        if (!strcmp(sub, "del")) {   /* it keeps its place: ids do not move */
+            if (i >= in->n_deleted) {
+                size_t n = uam_rules_n(in->rules);
+                bool *d = realloc(in->deleted, n * sizeof(*d));
+                if (!d) {
+                    uam_monitor_fail(c, "rule: out of memory");
+                    return;
+                }
+                memset(d + in->n_deleted, 0, (n - in->n_deleted) * sizeof(*d));
+                in->deleted = d;
+                in->n_deleted = n;
+            }
+            in->deleted[i] = true;
+        }
         return;
     }
     uam_monitor_fail(c, "rule add TEXT | load FILE | list | on ID | off ID | del ID");
@@ -511,6 +521,7 @@ void mon_instr_free(uam_monitor *mon)
         uam_rules_detach(in->rules);
         uam_rules_free(in->rules);
     }
+    free(in->deleted);
     free(in);
     *mon_instr_slot(mon) = NULL;
 }

@@ -1438,6 +1438,10 @@ uam_status uam_rules_enable(uam_rules *rs, size_t i, bool on, char *err, size_t 
         r->hooked = false;
         disarm(r);
         r->hit = false;
+        if (r->delay && r->waiting) {   /* stores on their way do not happen either */
+            uam_timer_cancel(&rs->m->sched, &r->timer);
+            r->waiting = false;
+        }
         r->off = true;
         return UAM_OK;
     }

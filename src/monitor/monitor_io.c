@@ -25,7 +25,7 @@
 #define TAP_FLUSH    256u   /* a tapped client gets output in pieces of up to this */
 #define DATA_MAX     4096u  /* bytes "send", "input" and "link inject" take at most */
 #define KEEP         (64u << 10)   /* a chardev's recent output kept for "expect" */
-#define MAX_CURSORS  32u
+#define MAX_CURSORS  (MAX_CHARDEVS * 8u)   /* every client on every chardev: never full */
 
 typedef struct mon_chardev {
     char        *name;
@@ -84,6 +84,11 @@ struct mon_io {
 /* The client's place in chardev k's output (created at the output's end: from now on). */
 static mon_cursor *cursor(mon_io *io, unsigned serial, unsigned k)
 {
+    static mon_cursor scratch;   /* a script or the debugger: no place to keep */
+    if (!serial) {
+        scratch = (mon_cursor){ .cd = k, .at = io->cd[k].total };
+        return &scratch;
+    }
     mon_cursor *free_c = NULL;
     for (unsigned i = 0; i < MAX_CURSORS; i++) {
         if (io->cur[i].serial == serial && io->cur[i].cd == k && serial)
@@ -91,8 +96,10 @@ static mon_cursor *cursor(mon_io *io, unsigned serial, unsigned k)
         if (!io->cur[i].serial && !free_c)
             free_c = &io->cur[i];
     }
-    if (!free_c)
-        free_c = &io->cur[serial % MAX_CURSORS];   /* full: reuse one */
+    if (!free_c) {   /* cannot happen (8 clients, MAX_CHARDEVS chardevs): forget nothing */
+        scratch = (mon_cursor){ .serial = serial, .cd = k, .at = io->cd[k].total };
+        return &scratch;
+    }
     *free_c = (mon_cursor){ .serial = serial, .cd = k, .at = io->cd[k].total };
     return free_c;
 }
@@ -116,6 +123,14 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
+static int nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 /* TEXT with C escapes (\n \r \t \\ \" \0 \xHH), or hex:BYTES. */
 static size_t decode(const char *text, uint8_t *out, size_t cap, const char **why)
 {
@@ -127,12 +142,12 @@ static size_t decode(const char *text, uint8_t *out, size_t cap, const char **wh
             return SIZE_MAX;
         }
         for (; *p; p += 2) {
-            unsigned b;
-            if (n == cap || sscanf(p, "%2x", &b) != 1) {
+            int h = nibble(p[0]), l = nibble(p[1]);
+            if (n == cap || h < 0 || l < 0) {
                 *why = n == cap ? "too long" : "hex: digits only";
                 return SIZE_MAX;
             }
-            out[n++] = (uint8_t)b;
+            out[n++] = (uint8_t)(h << 4 | l);
         }
         return n;
     }
@@ -145,14 +160,15 @@ static size_t decode(const char *text, uint8_t *out, size_t cap, const char **wh
             case 'r': c = '\r'; break;
             case 't': c = '\t'; break;
             case '0': c = 0; break;
-            case 'x': {
-                unsigned b;
-                if (sscanf(p + 1, "%2x", &b) != 1) {
+            case 'x': {   /* one or two hex digits */
+                int h = nibble(p[1]);
+                if (h < 0) {
                     *why = "\\x needs hex digits";
                     return SIZE_MAX;
                 }
-                c = (uint8_t)b;
-                p += (p[2] && strchr("0123456789abcdefABCDEF", p[2])) ? 2 : 1;
+                int l = nibble(p[2]);
+                c = (uint8_t)(l < 0 ? h : h << 4 | l);
+                p += l < 0 ? 1 : 2;
                 break;
             }
             default: c = (uint8_t)*p; break;

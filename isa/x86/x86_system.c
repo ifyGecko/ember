@@ -593,6 +593,8 @@ static void x86_take_exception(uam_cpu *cpu, const uam_exception *exc)
 static void x86_irq_input(uam_cpu *cpu, unsigned line, int level)
 {
     x86_state *s = x86_st(cpu);
+    if (line >= 32)
+        return;   /* no such pin (the lines are bits of irq_lines) */
     uint32_t bit = 1u << line;
     bool rising = level && !(s->irq_lines & bit);
     if (level) s->irq_lines |= bit; else s->irq_lines &= ~bit;

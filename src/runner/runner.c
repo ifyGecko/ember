@@ -1144,6 +1144,8 @@ static void mon_cmd_trace(uam_monitor_call *c, void *ctx)
             return;
         }
         const bool on = !strcmp(sub, "on");
+        if (on && !strcmp(list, "all") && !(cur_rt & RT_LINK))
+            rtf &= ~RT_LINK;   /* "all" but link, which only the start can set */
         if (on && (rtf & RT_LINK) && !(cur_rt & RT_LINK)) {
             uam_monitor_fail(c, "trace: link is set when the run starts (-t link)");
             return;
@@ -1223,16 +1225,19 @@ static void mon_cmd_mmio_rule(uam_monitor_call *c, void *ctx)
         uam_monitor_fail(c, "mmio-rule: cannot create its device");
         return;
     }
-    uam_machine_add_device(r->m, d);
     /* Above every --mmio-rule (UAM_PRIO_STUB + 0..511), later ones above earlier ones,
-     * still below every real device. */
+     * still below every real device. Mapped first: a rule that cannot be mapped leaves
+     * nothing behind in the machine. */
     const uam_map_attrs attrs = { .prio = UAM_PRIO_STUB + (int)UAM_MAX_MMIO_RULES + (int)r->n_mmio,
                                   .endian = r->m->cpu.isa->default_endian };
     if (uam_bus_map_mmio_ex(&r->m->bus, d->name, rule.addr, rule.size, d, &attrs) != UAM_OK) {
+        if (d->ops->destroy)
+            d->ops->destroy(d);
         uam_monitor_fail(c, "mmio-rule: cannot map 0x%llx+0x%llx", (unsigned long long)rule.addr,
                          (unsigned long long)rule.size);
         return;
     }
+    uam_machine_add_device(r->m, d);
     r->n_mmio++;
     uam_monitor_field(c, "device", "%s", d->name);
 }
@@ -2459,6 +2464,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     if (!fuzzing) {
         mon = uam_monitor_create(&m, host, &(uam_monitor_config){ .wait = monitor_wait,
                                                                   .hold = monitor_hold });
+        if (mon)   /* a client that goes away must not take the run with it (SIGPIPE) */
+            signal(SIGPIPE, SIG_IGN);
         if (mon) {   /* before any client: each reads the console's output from its start */
             uam_monitor_add_chardev(mon, "console", console);
             for (unsigned k = 0; k < n_link_nodes; k++)
@@ -2508,6 +2515,12 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 fprintf(stderr, "uam-run: --monitor-script %s\n", err);
                 why = UAM_STOP_ERROR;
             }
+        }
+        if (why == UAM_STOP_NONE && mon && !reachable && !gdb_port
+            && uam_monitor_starts_stopped(mon)) {
+            fprintf(stderr, "uam-run: --monitor-script leaves the machine stopped, and nothing can "
+                    "reach the monitor to let it go on: add --monitor SPEC\n");
+            why = UAM_STOP_ERROR;
         }
         if (why == UAM_STOP_NONE && mon && !monitor_asked && !monitor_log && !reachable) {
             uam_monitor_destroy(mon);   /* nothing can reach it */

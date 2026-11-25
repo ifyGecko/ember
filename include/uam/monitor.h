@@ -140,6 +140,8 @@ uam_status   uam_monitor_offer_command(uam_machine *m, const char *name, const c
 
 /* Is the machine running (not stopped by the monitor, not ended)? */
 bool         uam_monitor_running(const uam_monitor *mon);
+/* Before uam_monitor_serve: will it start stopped (--monitor-wait, a script's "stop")? */
+bool         uam_monitor_starts_stopped(const uam_monitor *mon);
 /* The processor this client looks at ("cpu N"; 0 unless it chose another). */
 unsigned     uam_monitor_cpu_index(const uam_monitor_call *c);
 uam_cpu     *uam_monitor_cpu(const uam_monitor_call *c);

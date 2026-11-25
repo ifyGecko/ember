@@ -756,15 +756,13 @@ for jit in ([], ["--jit"]):
     m.cmd("step 5000")
     m.cmd("write p:0x3000 w4 0xdeadbeef")
     m.cmd("status")             # reads nothing into the log
-    m.cmd("cont")
-    m.cmd("stop")
+    m.cmd("step 1182")          # (a cont; stop here would race the end of a fast run)
     m.cmd("reg rax 0x77")
     m.cmd("cont")
     rc1, _, err1 = finish(p)
     with open(log) as f:
         lines = [l.strip() for l in f if not l.startswith("#")]
-    check(lines[:2] == ["@1000 reg rcx 3", "@6000 write p:0x3000 w4 0xdeadbeef"]
-          and len(lines) == 3 and lines[2].startswith("@") and lines[2].endswith(" reg rax 0x77"),
+    check(lines == ["@1000 reg rcx 3", "@6000 write p:0x3000 w4 0xdeadbeef", "@7182 reg rax 0x77"],
           "%s: --monitor-log records what changed the machine, and when (%s)" % (name, lines))
     r = subprocess.run(BASE + ["--monitor-script", log] + common + [spin], capture_output=True,
                        timeout=60)
@@ -776,6 +774,114 @@ with open(bad, "w") as f:
     f.write("@12x status\n")
 r = subprocess.run(BASE + ["--monitor-script", bad, "-n", "10", spin], capture_output=True, timeout=30)
 check(r.returncode == 2 and b"expected @ICOUNT COMMAND" in r.stderr, "a malformed @ line")
+
+# ---- review fixes: robustness and edge cases ---------------------------------------------
+# a client that never reads does not hold the run (or other clients) up
+p, path = start("-n", "4000000000")
+slow = socket.socket(socket.AF_UNIX)
+slow.connect(path)
+slow.sendall(b"tap console on\n")   # floods it with output events it never reads
+time.sleep(3)
+m = Mon(path)
+ok, out, _ = m.cmd("status")
+check(ok and fields(out).get("state") == "running", "a client that does not read holds nothing up")
+p.send_signal(signal.SIGINT)
+rc, _, _ = finish(p)
+check(rc == 130, "... and SIGINT still ends the run (%s)" % rc)
+slow.close()
+
+# the rest of a too-long line is not a command
+p, path = start("--monitor-wait", "-n", "100000")
+m = Mon(path)
+m.f.write("help " + "x" * 9000 + "quit 9\n")
+m.f.flush()
+ok, out, _ = m.cmd("status")
+check(ok and fields(out).get("state") == "stopped", "a too-long line is dropped whole (status %s)" % ok)
+m.cmd("quit 4")
+rc, _, _ = finish(p)
+check(rc == 4, "... its tail never ran (exit %s)" % rc)
+
+# wait answers at the end of a run without --monitor-hold
+p, path = start("--monitor-wait", "-n", "100000")
+m = Mon(path)
+m.cmd("cont")
+ok, out, err = m.cmd("wait")
+check(ok and fields(out).get("state") == "ended", "wait: the end of the run is its answer (%s)" % err)
+finish(p)
+
+# a script that leaves the machine stopped with no way in: an error, not a spin
+script = os.path.join(tmp, "stuck.mon")
+with open(script, "w") as f:
+    f.write("stop\n")
+r = subprocess.run(BASE + ["--monitor-script", script, "-n", "1000", spin], capture_output=True,
+                   timeout=30)
+check(r.returncode == 2 and b"nothing can reach" in r.stderr,
+      "a stopped machine nothing can reach is an error (exit %s)" % r.returncode)
+
+# --monitor stdio: an expect whose input then ends is still answered, the lines after it run
+r = subprocess.run(BASE + ["--console", "file:/dev/null", "--monitor", "stdio", "-n", "4000000000",
+                           echo], input=b'expect console ZZZ 0.5\nquit 3\n', capture_output=True,
+                   timeout=30)
+check(r.returncode == 3 and b"timed out" in r.stdout,
+      "stdio: an expect still pending at the end of input is answered (exit %s)" % r.returncode)
+
+# rules past 256 from a file, and their del
+many = os.path.join(tmp, "many.rules")
+with open(many, "w") as f:
+    for i in range(300):
+        f.write("pc=0x%x,count=1,name=r%d,log\n" % (0x100000 + 4 * i, i))
+p, path = start("--monitor-wait", "-n", "100000")
+m = Mon(path)
+ok, out, _ = m.cmd("rule load " + many)
+check(ok and len([l for l in out if l.startswith("id:")]) == 300, "rule load takes 300 rules")
+ok, _, _ = m.cmd("rule del 299")
+ok2, _, _ = m.cmd("rule del 150")
+ok3, out, _ = m.cmd("rule list")
+check(ok and ok2 and len(out) == 298 and not any(l.startswith("299 ") for l in out),
+      "rule del past 256")
+ok, _, err = m.cmd("rule del 299")
+check(ok is False, "a deleted rule is gone")
+m.cmd("quit")
+rc, _, _ = finish(p)
+check(rc == 0, "... and the run ends cleanly (exit %s)" % rc)
+
+# a watch with ",stop" stops into the monitor; trace on all; strict hex
+p = subprocess.Popen(BASE + ["--monitor", "unix:" + os.path.join(tmp, "w.sock"), "--monitor-wait",
+                             "-n", "100000000", store],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+m = Mon(os.path.join(tmp, "w.sock"))
+m.cmd("watch add p:0x5000+2:w,stop")
+m.cmd("cont")
+ok, out, _ = m.cmd("wait")
+check(fields(out).get("state") == "stopped" and fields(out).get("reason", "").startswith("guard"),
+      "a watch with ,stop stops into the monitor (%s)" % fields(out))
+ok, out, err = m.cmd("trace on all")
+check(ok, "trace on all (without -t link) (%s)" % err)
+m.cmd("trace off all")
+ok, _, err = m.cmd("send console hex:0x41")
+check(ok is False and "digits" in err, "hex: takes digits only")
+ok, _, err = m.cmd('send console "\\x-1"')
+check(ok is False, "\\x takes hex digits only")
+ok, _, _ = m.cmd("irq 40 1")
+check(ok, "irq on a line the ISA has not is harmless")
+m.cmd("quit")
+finish(p)
+
+# a replayed log keeps the processor a command was for
+p, path = start("--monitor-wait", "--monitor-log", os.path.join(tmp, "cpu.log"), "-o", "cpus=2",
+                "-d", "-n", "20000")
+m = Mon(path)
+m.cmd("cpu 1")
+m.cmd("reg rbx 0x4242")
+m.cmd("cpu 0")
+m.cmd("reg rbx 0x77")
+m.cmd("cont")
+rc1, _, err1 = finish(p)
+r = subprocess.run(BASE + ["--monitor-script", os.path.join(tmp, "cpu.log"), "-o", "cpus=2", "-d",
+                           "-n", "20000", spin], capture_output=True, timeout=60)
+keep = lambda e: [l for l in e.decode().splitlines() if not l.startswith("uam-run: monitor")]
+check(r.returncode == rc1 and keep(r.stderr) == keep(err1) and b"0000000000004242" in r.stderr,
+      "a replayed log writes each register on the processor it was for")
 
 # ---- option checks ----------------------------------------------------------------------
 for args, what in (

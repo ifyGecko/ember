@@ -3,6 +3,7 @@
  * the run loop, and ember's own commands.
  */
 #define _XOPEN_SOURCE 700   /* strndup, strdup */
+#define _DARWIN_C_SOURCE    /* macOS: SO_NOSIGPIPE, which _XOPEN_SOURCE alone hides */
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -26,6 +27,8 @@
 #define MAX_CLIENTS   8u
 #define MAX_ARGS      32u
 #define LINE_MAX_LEN  8192u
+#define OUT_MAX       (1u << 20)   /* a socket client's unsent output; past it, it is dropped */
+#define IN_MAX        (1u << 20)   /* input a waiting client may pile up */
 #define CONSOLE_PROMPT "ember-mon> "
 
 typedef enum { CL_SOCKET, CL_STDIO, CL_CONSOLE, CL_SCRIPT, CL_EXTERNAL } client_kind;
@@ -39,6 +42,11 @@ typedef struct client {
     bool    json;
     bool    waiting_stop;     /* a "stop" not answered yet: later lines wait */
     bool    waiting_io;       /* an "expect" not answered yet: later lines wait */
+    bool    wait_ok_at_end;   /* "wait": the end of the run is an answer, not an error */
+    bool    discarding;       /* a line too long: skip to its end */
+    bool    dead;             /* gone or too slow: freed at the next tick */
+    char   *pend;             /* socket output the client has not taken yet */
+    size_t  pend_len, pend_cap;
     char    stop_id[40];
     unsigned serial;          /* names the client to monitor_io.c */
     bool    active;           /* CL_CONSOLE: the terminal is the monitor's */
@@ -98,6 +106,8 @@ struct uam_monitor {
     mon_state         *mstate;        /* monitor_state.c */
     char               why_buf[96];   /* stop_why when it is a claimed reason */
     unsigned           next_serial;
+    unsigned           log_cpu;       /* --monitor-log: the processor the log's lines are for */
+    bool               last_failed;   /* the last command run_line ran failed */
     mon_io            *io;            /* monitor_io.c */
     FILE              *log;           /* --monitor-log */
     bool               served;        /* uam_monitor_serve has run the machine */
@@ -153,12 +163,60 @@ static void write_fd(int fd, bool sock, const char *p, size_t n)
 
 static bool cl_append(client *cl, const void *p, size_t n);
 
+/* A socket client's output: sent as far as the socket takes it now, the rest kept for
+ * later (cl_flush). Nothing ever waits for a client: one that does not read is dropped
+ * once OUT_MAX bytes wait for it. */
+static void cl_flush(client *c)
+{
+    size_t done = 0;
+    while (done < c->pend_len) {
+        ssize_t k = send(c->out_fd, c->pend + done, c->pend_len - done, MSG_NOSIGNAL);
+        if (k > 0)
+            done += (size_t)k;
+        else if (k < 0 && errno == EINTR)
+            continue;
+        else if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        else {
+            c->dead = true;   /* gone */
+            done = c->pend_len;
+        }
+    }
+    memmove(c->pend, c->pend + done, c->pend_len - done);
+    c->pend_len -= done;
+}
+
 static void cl_write(client *c, const char *p, size_t n)
 {
-    if (c->kind == CL_EXTERNAL)
+    if (c->kind == CL_EXTERNAL) {
         cl_append(c, p, n);   /* uam_monitor_execute: the reply is collected */
-    else if (c->out_fd >= 0)
-        write_fd(c->out_fd, c->kind == CL_SOCKET, p, n);
+        return;
+    }
+    if (c->out_fd < 0 || c->dead)
+        return;
+    if (c->kind != CL_SOCKET) {   /* stdout (a terminal, a pipe): written through */
+        write_fd(c->out_fd, false, p, n);
+        return;
+    }
+    if (c->pend_len + n > OUT_MAX) {
+        c->dead = true;           /* it has not read for a long time: let it go */
+        return;
+    }
+    if (c->pend_len + n > c->pend_cap) {
+        size_t cap = c->pend_cap ? c->pend_cap : 4096;
+        while (cap < c->pend_len + n)
+            cap *= 2;
+        char *b = realloc(c->pend, cap);
+        if (!b) {
+            c->dead = true;
+            return;
+        }
+        c->pend = b;
+        c->pend_cap = cap;
+    }
+    memcpy(c->pend + c->pend_len, p, n);
+    c->pend_len += n;
+    cl_flush(c);
 }
 
 static void cl_puts(client *c, const char *s) { cl_write(c, s, strlen(s)); }
@@ -548,6 +606,7 @@ bool mon_defer_io(uam_monitor_call *c)
 }
 
 static void client_lines(uam_monitor *mon, client *cl);
+static void client_free(uam_monitor *mon, client *c);
 
 static client *by_serial(uam_monitor *mon, unsigned serial)
 {
@@ -578,6 +637,8 @@ void mon_answer_io(uam_monitor *mon, unsigned serial, const char *error, ...)
     reply_send(c, c->stop_id, &call);
     call_free(&call);
     client_lines(mon, c);
+    if (c->kind == CL_STDIO && c->in_fd < 0 && !c->waiting_stop && !c->waiting_io)
+        c->dead = true;   /* its input ended and all is answered: freed at the tick */
 }
 
 void mon_event_to(uam_monitor *mon, unsigned serial, const char *kind, const char *data_key,
@@ -600,7 +661,31 @@ void mon_event_to(uam_monitor *mon, unsigned serial, const char *kind, const cha
         ev_send(c, &e);
 }
 
-static void mon_tick(void *ctx) { mon_io_tick(ctx); }
+/* Every host poll: output that waits is sent; clients that went away or stopped reading
+ * go (here, never inside a device's write or a client's own lines). */
+static void mon_tick(void *ctx)
+{
+    uam_monitor *mon = ctx;
+    mon_io_tick(mon);
+    for (unsigned i = 0; i < MAX_CLIENTS; i++) {
+        client *c = mon->cl[i];
+        if (c && c->pend_len && !c->dead)
+            cl_flush(c);
+        if (c && c->dead)
+            client_free(mon, c);
+    }
+}
+
+/* Can anything reach the monitor: a way in, a client, the console? */
+static bool reachable(const uam_monitor *mon)
+{
+    if (mon->n_ls || mon->console)
+        return true;
+    for (unsigned i = 0; i < MAX_CLIENTS; i++)
+        if (mon->cl[i] && mon->cl[i]->kind != CL_CONSOLE && !mon->cl[i]->dead)
+            return true;
+    return false;
+}
 
 void mon_revive(uam_monitor *mon, const char *why)
 {
@@ -621,6 +706,11 @@ void uam_monitor_set_rule_symbols(uam_monitor *mon,
 }
 
 bool uam_monitor_running(const uam_monitor *mon) { return mon->state == ST_RUNNING; }
+
+bool uam_monitor_starts_stopped(const uam_monitor *mon)
+{
+    return mon->state == ST_STOPPED && !(mon->autostart && !mon->quit);
+}
 
 void uam_monitor_print(uam_monitor_call *c, const char *fmt, ...)
 {
@@ -811,10 +901,16 @@ static void run_line(uam_monitor *mon, client *cl, char *line)
         else
             cmd->fn(&call, cmd->ctx);
         if (cmd && (cmd->flags & UAM_MONITOR_CHANGES) && mon->log && !call.error && !call.deferred) {
-            fprintf(mon->log, "@%llu %s\n", (unsigned long long)uam_machine_icount(mon->m), p);
+            const unsigned long long at = (unsigned long long)uam_machine_icount(mon->m);
+            if (cl->cpu != mon->log_cpu) {   /* which processor it was for, as the replay needs */
+                fprintf(mon->log, "@%llu cpu %u\n", at, cl->cpu);
+                mon->log_cpu = cl->cpu;
+            }
+            fprintf(mon->log, "@%llu %s\n", at, p);
             fflush(mon->log);
         }
     }
+    mon->last_failed = call.error != NULL;
     if (call.deferred) {
         snprintf(cl->stop_id, sizeof(cl->stop_id), "%s", id);
     } else {
@@ -843,9 +939,17 @@ static void client_lines(uam_monitor *mon, client *cl)
         } else {
             if (cl->len >= LINE_MAX_LEN) {
                 cl->len = 0;
+                cl->discarding = true;   /* the rest of it, up to its newline, goes too */
                 reply_send(cl, NULL, &(uam_monitor_call){ .error = "line too long" });
             }
             return;
+        }
+        if (cl->discarding) {
+            size_t used = n + (nl ? 1 : 0);
+            memmove(cl->buf, cl->buf + used, cl->len - used);
+            cl->len -= used;
+            cl->discarding = !nl;
+            continue;
         }
         char *line = strndup(cl->buf, n);
         size_t used = n + (nl ? 1 : 0);
@@ -909,6 +1013,7 @@ static void client_free(uam_monitor *mon, client *c)
     if (mon->console == c)
         mon->console = NULL;
     free(c->buf);
+    free(c->pend);
     free(c);
 }
 
@@ -939,13 +1044,18 @@ static void client_readable(void *ctx, int fd)
         c->eof = true;
         client_lines(mon, c);
         if (c->kind == CL_STDIO) {
-            uam_host_remove_fd(mon->h, c->in_fd);   /* stdin ended: answer nothing more */
+            uam_host_remove_fd(mon->h, c->in_fd);   /* stdin ended: answer what is left */
             c->in_fd = -1;
-            if (!c->waiting_stop)
+            if (!c->waiting_stop && !c->waiting_io)
                 client_free(mon, c);
         } else {
             client_free(mon, c);
         }
+        return;
+    }
+    if (c->len + (size_t)n > IN_MAX) {   /* lines pile up behind a wait: too many */
+        reply_send(c, NULL, &(uam_monitor_call){ .error = "too much input while waiting" });
+        c->dead = true;
         return;
     }
     cl_append(c, buf, (size_t)n);
@@ -959,6 +1069,7 @@ static void listener_readable(void *ctx, int fd)
     if (s < 0)
         return;
     fcntl(s, F_SETFD, FD_CLOEXEC);
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);   /* never wait for a client */
 #ifdef SO_NOSIGPIPE
     int one = 1;
     setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -1184,7 +1295,7 @@ static void answer_stops(uam_monitor *mon, const char *error)
         if (!c || !c->waiting_stop)
             continue;
         uam_monitor_call call = { .mon = mon, .cl = c };
-        if (error) {
+        if (error && !(c->wait_ok_at_end && mon->state == ST_ENDED)) {
             call.error = strdup(error);
         } else {
             uam_monitor_field(&call, "state", "%s", mon->state == ST_ENDED ? "ended" : "stopped");
@@ -1195,6 +1306,7 @@ static void answer_stops(uam_monitor *mon, const char *error)
                               (unsigned long long)uam_machine_icount(mon->m));
         }
         c->waiting_stop = false;
+        c->wait_ok_at_end = false;
         reply_send(c, c->stop_id, &call);
         call_free(&call);
     }
@@ -1208,7 +1320,8 @@ static void run_waiting_lines(uam_monitor *mon)
         if (!c)
             continue;
         client_lines(mon, c);
-        if (mon->cl[i] == c && c->kind == CL_STDIO && c->in_fd < 0 && !c->waiting_stop)
+        if (mon->cl[i] == c && c->kind == CL_STDIO && c->in_fd < 0 && !c->waiting_stop
+            && !c->waiting_io)
             client_free(mon, c);
     }
 }
@@ -1312,9 +1425,14 @@ static void cmd_stop(uam_monitor_call *c, void *ctx)
         uam_monitor_field(c, "state", "stopped");
         return;
     }
-    mon->stop_wanted = true;
-    uam_exec_stop(&mon->m->exec, 0);
+    /* A stop already on its way (a signal, a quit, the firmware's own) keeps its status:
+     * the client hears whatever it turns out to be. */
+    if (!mon->m->exec.stop_request) {
+        mon->stop_wanted = true;
+        uam_exec_stop(&mon->m->exec, 0);
+    }
     c->cl->waiting_stop = true;
+    c->cl->wait_ok_at_end = false;
     c->deferred = true;
 }
 
@@ -1355,6 +1473,7 @@ static void cmd_wait(uam_monitor_call *c, void *ctx)
         return;
     }
     c->cl->waiting_stop = true;   /* answered by the next stop, or the end */
+    c->cl->wait_ok_at_end = true;
     c->deferred = true;
 }
 
@@ -1455,6 +1574,7 @@ static void go_targeted(uam_monitor_call *c, uam_monitor *mon)
 {
     mon->state = ST_RUNNING;
     c->cl->waiting_stop = true;
+    c->cl->wait_ok_at_end = false;
     c->deferred = true;
 }
 
@@ -1571,7 +1691,7 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
           cmd_until },
         { "run-for", "TICKS",    "run for TICKS of virtual time (scheduler ticks), then stop", UAM_MONITOR_SERVE_ONLY,
           cmd_run_for },
-        { "cpu",    "[N]",       "select the processor later commands look at (this client)", UAM_MONITOR_CHANGES,
+        { "cpu",    "[N]",       "select the processor later commands look at (this client)", 0,
           cmd_cpu },
     };
     for (size_t i = 0; i < UAM_ARRAY_LEN(own); i++)
@@ -1639,6 +1759,11 @@ uam_status uam_monitor_run_script(uam_monitor *mon, const char *path, char *err,
         snprintf(err, errlen, "%s: %s", path, strerror(errno));
         return UAM_ERR_FAULT;
     }
+    /* One script client for the whole session, so a "cpu N" carries over to later lines. */
+    if (!mon->timed_cl && !(mon->timed_cl = calloc(1, sizeof(*mon->timed_cl)))) {
+        fclose(f);
+        return UAM_ERR_NOMEM;
+    }
     client sc = { .kind = CL_SCRIPT, .in_fd = -1, .out_fd = -1, .eof = true };
     char line[LINE_MAX_LEN];
     unsigned lineno = 0;
@@ -1679,7 +1804,9 @@ uam_status uam_monitor_run_script(uam_monitor *mon, const char *path, char *err,
         mon->n_timed++;
     }
     fclose(f);
+    sc.cpu = mon->timed_cl->cpu;
     client_lines(mon, &sc);
+    mon->timed_cl->cpu = sc.cpu;
     free(sc.buf);
     if (sc.failed) {
         snprintf(err, errlen, "%s: %s", path, sc.fail_why);
@@ -1708,7 +1835,7 @@ uam_status uam_monitor_execute(uam_monitor *mon, const char *line, char **out)
         && (ex.len == 3 || ex.buf[ex.len - 4] == '\n'))
         ex.len -= 3;
     cl_append(&ex, "", 1);   /* the text's end */
-    bool failed = ex.buf && (strstr(ex.buf, "error: ") == ex.buf || strstr(ex.buf, "\nerror: "));
+    const bool failed = mon->last_failed;
     if (out)
         *out = ex.buf;
     else
@@ -1830,16 +1957,30 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
         mon->state = ST_RUNNING;
     if (mon->state == ST_STOPPED && !mon->quit)
         enter_stopped(mon, mon->stop_why);
+    else if (mon->state == ST_RUNNING)
+        mon_event(mon, "running", NULL);   /* a client that heard "stopped" at its hello */
 
     for (;;) {
-        while (mon->state == ST_STOPPED && !mon->quit && !x->stop_request)
-            uam_host_poll(mon->h, -1);
+        bool waited = false;
+        /* The waits poll with a bound: a signal that lands just before the poll is seen
+         * within a tenth of a second, and output that waits for a slow client goes out. */
+        while (mon->state == ST_STOPPED && !mon->quit && !x->stop_request) {
+            if (!reachable(mon)) {
+                uam_log(UAM_LOG_ERROR, "monitor", "the machine is stopped and nothing can reach "
+                        "the monitor to let it go on (a script's stop with no --monitor?)");
+                return UAM_STOP_ERROR;
+            }
+            uam_host_poll(mon->h, 100);
+            waited = true;
+        }
         if (mon->quit || x->stop_request) {
             /* "quit", or a signal / the console's Ctrl-A x while stopped */
             if (mon->quit)
                 x->stop_status = mon->quit_code;
             return UAM_STOP_REQUEST;
         }
+        if (waited)
+            mon_event(mon, "running", NULL);
 
         uam_host_resync(mon->h);
         uam_stop_reason why;
@@ -1891,8 +2032,11 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
             mine = "run-for";
         }
         if (!mine && (claimed || timed) && why == UAM_STOP_INSN_LIMIT && icount < end)
-            continue;   /* only the step over a guard, or a timed line: the run goes on */
+            continue;   /* only the step over a guard, or a timed line: the run goes on (a
+                         * stop asked for meanwhile is still pending, and comes next) */
         clear_targets(mon);
+        if (mine && mon->stop_wanted && x->stop_status == 0)
+            x->stop_request = false;   /* that stop is this one: it must not end the run */
         mon->stop_wanted = false;
         if (mine) {
             enter_stopped(mon, mine);
@@ -1905,9 +2049,11 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
             return why;
         x->stop_request = false;
         while (mon->state == ST_ENDED && !mon->quit && !x->stop_request)
-            uam_host_poll(mon->h, -1);
+            uam_host_poll(mon->h, 100);
         if (mon->state == ST_STOPPED && !mon->quit && !x->stop_request)
             continue;   /* a snapshot or a reset brought the machine back: it goes on */
+        if (x->stop_request && !mon->quit)
+            return UAM_STOP_REQUEST;   /* SIGINT (130) or Ctrl-A x (0) while held */
         if (mon->quit && mon->quit_has_code) {
             x->stop_status = mon->quit_code;
             return UAM_STOP_REQUEST;
