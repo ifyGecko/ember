@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "uam/debug.h"
 #include "uam/gdbstub.h"
 #include "uam/guard.h"
 
@@ -198,8 +199,6 @@ static bool get_reg(uam_gdb *g, const char **pp, unsigned bytes, uint64_t *v)
 
 static uam_cpu *cur_cpu(uam_gdb *g) { return uam_machine_cpu(g->m, g->cur); }
 
-#define WIDE_MAX 16u   /* bytes in the widest register a description may have */
-
 static unsigned reg_size(const uam_gdb_arch *a, unsigned r)
 {
     return a->reg_sizes ? a->reg_sizes[r] : a->reg_bytes;
@@ -208,32 +207,27 @@ static unsigned reg_size(const uam_gdb_arch *a, unsigned r)
 /* Register r as hex at p; NULL if the ISA cannot read it. */
 static char *read_one(uam_gdb *g, uam_cpu *cpu, char *p, unsigned r)
 {
-    const uam_gdb_arch *a = cpu->isa->gdb;
-    unsigned n = reg_size(a, r);
-    if (n > 8) {
-        uint8_t buf[WIDE_MAX];
-        if (n > WIDE_MAX || !a->read_wide || !a->read_wide(cpu, r, buf))
-            return NULL;
-        for (unsigned i = 0; i < n; i++) {
-            *p++ = hexd[buf[i] >> 4];
-            *p++ = hexd[buf[i] & 15];
-        }
-        return p;
-    }
+    unsigned n = uam_debug_reg_size(cpu, r);
+    uint8_t buf[UAM_DEBUG_REG_MAX];
     uint64_t v = 0;
-    if (!a->read_reg(cpu, r, &v))
+    if (!uam_debug_reg_read(cpu, r, &v, buf))
         return NULL;
-    return put_reg(g, p, v, n);
+    if (n <= 8)
+        return put_reg(g, p, v, n);
+    for (unsigned i = 0; i < n; i++) {
+        *p++ = hexd[buf[i] >> 4];
+        *p++ = hexd[buf[i] & 15];
+    }
+    return p;
 }
 
 /* Register r from the hex at *pp (advanced); false if malformed or not writable. */
 static bool write_one(uam_gdb *g, uam_cpu *cpu, const char **pp, unsigned r)
 {
-    const uam_gdb_arch *a = cpu->isa->gdb;
-    unsigned n = reg_size(a, r);
+    unsigned n = uam_debug_reg_size(cpu, r);
     if (n > 8) {
-        uint8_t buf[WIDE_MAX];
-        if (n > WIDE_MAX)
+        uint8_t buf[UAM_DEBUG_REG_MAX];
+        if (n > UAM_DEBUG_REG_MAX)
             return false;
         for (unsigned i = 0; i < n; i++) {
             int h = hexval((*pp)[0]), l = hexval((*pp)[1]);
@@ -242,43 +236,26 @@ static bool write_one(uam_gdb *g, uam_cpu *cpu, const char **pp, unsigned r)
             buf[i] = (uint8_t)((h << 4) | l);
             *pp += 2;
         }
-        return a->write_wide && a->write_wide(cpu, r, buf);
+        return uam_debug_reg_write(cpu, r, 0, buf);
     }
     uint64_t v;
-    return get_reg(g, pp, n, &v) && a->write_reg(cpu, r, v);
-}
-
-static bool vtop(uam_gdb *g, uint64_t va, uint64_t *pa)
-{
-    uam_cpu *cpu = cur_cpu(g);
-    if (!cpu->isa->translate) {
-        *pa = va;
-        return true;
-    }
-    uam_xlate xl = { 0 };
-    if (cpu->isa->translate(cpu, va, UAM_XLATE_DEBUG, &xl) != UAM_OK)
-        return false;
-    *pa = xl.paddr;
-    return true;
+    return get_reg(g, pp, n, &v) && uam_debug_reg_write(cpu, r, v, NULL);
 }
 
 static void read_mem(uam_gdb *g, uint64_t addr, uint64_t len)
 {
+    uint8_t buf[(PKT_MAX - 4) / 2];
+    if (len > sizeof(buf))
+        len = sizeof(buf);
+    uint64_t got = uam_debug_read(g->m, cur_cpu(g), addr, false, buf, len, NULL, 0);
+    if (!got) {
+        put_packet(g, "E14");
+        return;
+    }
     char *p = g->out;
-    if (len > (PKT_MAX - 4) / 2)
-        len = (PKT_MAX - 4) / 2;
-    for (uint64_t i = 0; i < len; i++) {
-        uint64_t pa, b;
-        if (!vtop(g, addr + i, &pa)
-            || uam_bus_read(&g->m->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK) {
-            if (i == 0) {
-                put_packet(g, "E14");
-                return;
-            }
-            break;
-        }
-        *p++ = hexd[(b >> 4) & 15];
-        *p++ = hexd[b & 15];
+    for (uint64_t i = 0; i < got; i++) {
+        *p++ = hexd[buf[i] >> 4];
+        *p++ = hexd[buf[i] & 15];
     }
     *p = 0;
     put_packet(g, g->out);
@@ -288,10 +265,8 @@ static void write_mem(uam_gdb *g, uint64_t addr, uint64_t len, const char *hex)
 {
     for (uint64_t i = 0; i < len; i++) {
         int h = hexval(hex[2 * i]), l = hexval(hex[2 * i + 1]);
-        uint64_t pa;
-        if (h < 0 || l < 0 || !vtop(g, addr + i, &pa)
-            || uam_bus_write(&g->m->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG,
-                             (uint64_t)((h << 4) | l)) != UAM_OK) {
+        uint8_t b = (uint8_t)((h << 4) | l);
+        if (h < 0 || l < 0 || uam_debug_write(g->m, cur_cpu(g), addr + i, false, &b, 1, NULL, 0) != 1) {
             put_packet(g, "E14");
             return;
         }
@@ -385,7 +360,7 @@ static bool set_point(uam_gdb *g, int type, uint64_t addr, uint64_t len, bool in
         gdb_wp *w = &g->wp[i];
         if (insert && !w->used) {
             uint64_t pa;
-            if (!vtop(g, addr, &pa))
+            if (!uam_debug_vtop(cur_cpu(g), addr, &pa))
                 return false;
             unsigned kinds = type == 2 ? UAM_WATCH_WRITE : type == 3 ? UAM_WATCH_READ
                                                                      : UAM_WATCH_READ | UAM_WATCH_WRITE;

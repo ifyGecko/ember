@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "uam/monitor.h"
+#include "monitor_int.h"
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0      /* macOS: SO_NOSIGPIPE on the socket instead */
@@ -42,6 +43,7 @@ typedef struct client {
     char    edit[512];        /* CL_CONSOLE: the line being typed */
     size_t  edit_len;
     int     esc_seq;          /* CL_CONSOLE: inside an escape sequence (1: ESC, 2: CSI) */
+    unsigned cpu;             /* the processor "cpu N" selected */
     bool    failed;           /* CL_SCRIPT: a command failed */
     char    fail_why[256];
 } client;
@@ -79,9 +81,17 @@ struct uam_monitor {
     bool               quit;
     int64_t            quit_code;
     bool               quit_has_code;
-    const char        *stop_why;      /* why it is stopped: "start", "monitor" */
+    const char        *stop_why;      /* why it is stopped: "start", "monitor", "step", ... */
     uam_stop_reason    end_why;       /* ST_ENDED */
     int64_t            end_status;
+    /* what the next run is for (a client waits for it): step, until, run-for */
+    uint64_t           step_end;      /* machine icount to stop at; 0: none */
+    bool               until_on, until_hit;
+    uint64_t           until_pc, until_from;   /* hooked pc; machine icount when it began */
+    bool               runfor_on;
+    uint64_t           runfor_end, saved_max_time;
+    uam_symbolize_fn   sym;
+    void              *sym_ctx;
 };
 
 struct uam_monitor_call {
@@ -92,9 +102,8 @@ struct uam_monitor_call {
     const char  *rest[MAX_ARGS];
     char        *out;           /* output lines, '\n'-separated */
     size_t       out_len, out_cap;
-    char        *names[32];
-    char        *values[32];
-    unsigned     n_fields;
+    char       **names, **values;
+    unsigned     n_fields, cap_fields;
     char        *error;
     bool         deferred;      /* answered later ("stop") */
 };
@@ -365,6 +374,8 @@ static void call_free(uam_monitor_call *c)
         free(c->names[i]);
         free(c->values[i]);
     }
+    free(c->names);
+    free(c->values);
     free(c->error);
 }
 
@@ -386,6 +397,31 @@ uam_monitor *uam_monitor_of(const uam_monitor_call *c) { return c->mon; }
 
 uam_machine *uam_monitor_machine(const uam_monitor *mon) { return mon->m; }
 
+unsigned uam_monitor_cpu_index(const uam_monitor_call *c)
+{
+    return c->cl ? c->cl->cpu : 0;
+}
+
+uam_cpu *uam_monitor_cpu(const uam_monitor_call *c)
+{
+    uam_cpu *cpu = uam_machine_cpu(c->mon->m, uam_monitor_cpu_index(c));
+    return cpu ? cpu : &c->mon->m->cpu;
+}
+
+void uam_monitor_set_symbolizer(uam_monitor *mon, uam_symbolize_fn fn, void *ctx)
+{
+    mon->sym = fn;
+    mon->sym_ctx = ctx;
+}
+
+uam_symbolize_fn mon_symbolizer(const uam_monitor *mon, void **ctx)
+{
+    *ctx = mon->sym_ctx;
+    return mon->sym;
+}
+
+bool mon_stopped(const uam_monitor *mon) { return mon->state != ST_RUNNING; }
+
 bool uam_monitor_running(const uam_monitor *mon) { return mon->state == ST_RUNNING; }
 
 void uam_monitor_print(uam_monitor_call *c, const char *fmt, ...)
@@ -406,10 +442,28 @@ void uam_monitor_print(uam_monitor_call *c, const char *fmt, ...)
     free(s);
 }
 
+size_t uam_monitor_lines(const uam_monitor_call *c)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < c->out_len; i++)
+        n += c->out[i] == '\n';
+    return n;
+}
+
 void uam_monitor_field(uam_monitor_call *c, const char *name, const char *fmt, ...)
 {
-    if (c->n_fields == UAM_ARRAY_LEN(c->names))
-        return;
+    if (c->n_fields == c->cap_fields) {
+        unsigned cap = c->cap_fields ? 2 * c->cap_fields : 16;
+        char **n = realloc(c->names, cap * sizeof(*n));
+        if (n)
+            c->names = n;
+        char **v = n ? realloc(c->values, cap * sizeof(*v)) : NULL;
+        if (v)
+            c->values = v;
+        if (!n || !v)
+            return;
+        c->cap_fields = cap;
+    }
     va_list ap;
     va_start(ap, fmt);
     char *v = vfmt(fmt, ap);
@@ -924,7 +978,9 @@ static void answer_stops(uam_monitor *mon, const char *error)
         if (error) {
             call.error = strdup(error);
         } else {
-            uam_monitor_field(&call, "state", "stopped");
+            uam_monitor_field(&call, "state", "%s", mon->state == ST_ENDED ? "ended" : "stopped");
+            uam_monitor_field(&call, "reason", "%s", mon->state == ST_ENDED
+                              ? uam_stop_reason_str(mon->end_why) : mon->stop_why);
             uam_monitor_field(&call, "pc", "0x%llx", (unsigned long long)cur_cpu(mon)->pc);
             uam_monitor_field(&call, "icount", "%llu",
                               (unsigned long long)uam_machine_icount(mon->m));
@@ -1104,6 +1160,152 @@ static void cmd_json(uam_monitor_call *c, void *ctx)
         uam_monitor_fail(c, "json: on or off");
 }
 
+/* ---- run control: step, until, run-for, cpu -------------------------------- */
+
+static uam_hook_action until_hook(void *ctx, uam_cpu *cpu, uint64_t pc)
+{
+    uam_monitor *mon = ctx;
+    (void)cpu;
+    (void)pc;
+    /* Where it already stands does not count: "until" means reached again. */
+    if (!mon->until_on || uam_machine_icount(mon->m) == mon->until_from)
+        return UAM_HOOK_CONTINUE;
+    mon->until_hit = true;
+    return UAM_HOOK_STOP;
+}
+
+static void until_hooks(uam_monitor *mon, bool add)
+{
+    const uint64_t sb = uam_isa_pc_state_bits(mon->m->cpu.isa);
+    if (add) {
+        uam_machine_add_pc_hook(mon->m, mon->until_pc, until_hook, mon);
+        if (sb)
+            uam_machine_add_pc_hook(mon->m, mon->until_pc | sb, until_hook, mon);
+    } else {
+        uam_machine_remove_pc_hook(mon->m, mon->until_pc, until_hook, mon);
+        if (sb)
+            uam_machine_remove_pc_hook(mon->m, mon->until_pc | sb, until_hook, mon);
+    }
+}
+
+/* The run that was for a step, an until or a run-for is over, however it ended. */
+static void clear_targets(uam_monitor *mon)
+{
+    mon->step_end = 0;
+    if (mon->until_on) {
+        until_hooks(mon, false);
+        mon->until_on = false;
+    }
+    mon->until_hit = false;
+    if (mon->runfor_on) {
+        mon->m->exec.max_time = mon->saved_max_time;
+        mon->runfor_on = false;
+    }
+}
+
+/* Start a run a client waits for; false (and the call fails) if it cannot. */
+static bool begin_targeted(uam_monitor_call *c, uam_monitor *mon)
+{
+    if (mon->state != ST_STOPPED) {
+        uam_monitor_fail(c, "%s: the machine %s", c->argv[0],
+                         mon->state == ST_ENDED ? "has ended" : "is running (stop it first)");
+        return false;
+    }
+    if (c->cl->kind == CL_SCRIPT) {
+        uam_monitor_fail(c, "%s: not in a script (the machine has not started)", c->argv[0]);
+        return false;
+    }
+    if (mon->step_end || mon->until_on || mon->runfor_on) {
+        uam_monitor_fail(c, "%s: another client's step is under way", c->argv[0]);
+        return false;
+    }
+    return true;
+}
+
+static void go_targeted(uam_monitor_call *c, uam_monitor *mon)
+{
+    mon->state = ST_RUNNING;
+    c->cl->waiting_stop = true;
+    c->deferred = true;
+}
+
+static bool parse_u64(const char *s, uint64_t *v)
+{
+    char *end;
+    if (!s || !*s || *s == '-')
+        return false;
+    *v = strtoull(s, &end, 0);
+    return !*end;
+}
+
+static void cmd_step(uam_monitor_call *c, void *ctx)
+{
+    uam_monitor *mon = ctx;
+    uint64_t n = 1;
+    if (c->argc > 1 && (!parse_u64(c->argv[1], &n) || !n)) {
+        uam_monitor_fail(c, "step: N is a count of instructions, at least 1");
+        return;
+    }
+    if (!begin_targeted(c, mon))
+        return;
+    mon->step_end = uam_machine_icount(mon->m) + n;
+    go_targeted(c, mon);
+}
+
+static void cmd_until(uam_monitor_call *c, void *ctx)
+{
+    uam_monitor *mon = ctx;
+    uint64_t pc;
+    if (c->argc != 2 || !parse_u64(c->argv[1], &pc)) {
+        uam_monitor_fail(c, "until: PC, an address");
+        return;
+    }
+    if (!begin_targeted(c, mon))
+        return;
+    mon->until_pc = pc & ~uam_isa_pc_state_bits(mon->m->cpu.isa);
+    mon->until_from = uam_machine_icount(mon->m);
+    mon->until_on = true;
+    until_hooks(mon, true);
+    go_targeted(c, mon);
+}
+
+static void cmd_run_for(uam_monitor_call *c, void *ctx)
+{
+    uam_monitor *mon = ctx;
+    uint64_t ticks;
+    if (c->argc != 2 || !parse_u64(c->argv[1], &ticks) || !ticks) {
+        uam_monitor_fail(c, "run-for: TICKS, scheduler ticks of virtual time (status: time)");
+        return;
+    }
+    if (!begin_targeted(c, mon))
+        return;
+    uam_exec *x = &mon->m->exec;
+    uint64_t now = uam_sched_now(&mon->m->sched);
+    uint64_t until = ticks < UAM_SCHED_TIME_MAX - now ? now + ticks : UAM_SCHED_TIME_MAX;
+    mon->saved_max_time = x->max_time;
+    mon->runfor_end = until;
+    mon->runfor_on = true;
+    if (!x->max_time || until < x->max_time)
+        x->max_time = until;
+    go_targeted(c, mon);
+}
+
+static void cmd_cpu(uam_monitor_call *c, void *ctx)
+{
+    uam_monitor *mon = ctx;
+    unsigned n = uam_machine_ncpus(mon->m);
+    if (c->argc > 1) {
+        uint64_t i;
+        if (!parse_u64(c->argv[1], &i) || i >= n) {
+            uam_monitor_fail(c, "cpu: 0 to %u", n - 1);
+            return;
+        }
+        c->cl->cpu = (unsigned)i;
+    }
+    uam_monitor_field(c, "cpu", "%u", c->cl->cpu);
+    uam_monitor_field(c, "cpus", "%u", n);
+}
+
 /* ---- create, script, serve ------------------------------------------------- */
 
 uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_config *cfg)
@@ -1132,6 +1334,13 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
         { "cont",   "",          "let a stopped machine go on", 0, cmd_cont },
         { "quit",   "[STATUS]",  "end the run (uam-run exits with STATUS, 0-123)", 0, cmd_quit },
         { "json",   "on|off",    "answer this client in JSON, one object per line", 0, cmd_json },
+        { "step",   "[N]",       "run N instructions (1), then stop (answers then)", 0, cmd_step },
+        { "until",  "PC",        "run until a processor reaches PC again, then stop", 0,
+          cmd_until },
+        { "run-for", "TICKS",    "run for TICKS of virtual time (scheduler ticks), then stop", 0,
+          cmd_run_for },
+        { "cpu",    "[N]",       "select the processor later commands look at (this client)", 0,
+          cmd_cpu },
     };
     for (size_t i = 0; i < UAM_ARRAY_LEN(own); i++)
         if (uam_monitor_add_command(mon, own[i].name, own[i].usage, own[i].help, own[i].flags,
@@ -1139,6 +1348,10 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
             uam_monitor_destroy(mon);
             return NULL;
         }
+    if (mon_add_inspect_commands(mon) != UAM_OK) {
+        uam_monitor_destroy(mon);
+        return NULL;
+    }
     return mon;
 }
 
@@ -1146,6 +1359,7 @@ void uam_monitor_destroy(uam_monitor *mon)
 {
     if (!mon)
         return;
+    clear_targets(mon);
     for (unsigned i = 0; i < MAX_CLIENTS; i++)
         if (mon->cl[i])
             client_free(mon, mon->cl[i]);
@@ -1212,26 +1426,43 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
         uam_host_resync(mon->h);
         uam_stop_reason why;
         uint64_t done = uam_machine_icount(mon->m);
-        if (end != UINT64_MAX && done >= end) {
+        uint64_t limit = mon->step_end && mon->step_end < end ? mon->step_end : end;
+        if (limit != UINT64_MAX && done >= limit) {
             why = UAM_STOP_INSN_LIMIT;
         } else {
             mon->in_run = true;
-            why = uam_exec_run(x, end == UINT64_MAX ? 0 : end - done);
+            why = uam_exec_run(x, limit == UINT64_MAX ? 0 : limit - done);
             mon->in_run = false;
         }
         if (mon->quit) {
+            clear_targets(mon);
             x->stop_request = false;
             x->stop_status = mon->quit_code;
             answer_stops(mon, "the run was ended");
             return UAM_STOP_REQUEST;
         }
+        /* Stopped for the monitor, or for good? */
+        const uint64_t icount = uam_machine_icount(mon->m);
+        const uint64_t now = uam_sched_now(&mon->m->sched);
+        const char *mine = NULL;
         if (why == UAM_STOP_REQUEST && mon->stop_wanted && x->stop_status == 0) {
-            mon->stop_wanted = false;
+            mine = "monitor";
             x->stop_request = false;
-            enter_stopped(mon, "monitor");
+        } else if (why == UAM_STOP_INSN_LIMIT && mon->step_end && icount >= mon->step_end
+                   && icount < end) {
+            mine = "step";
+        } else if (why == UAM_STOP_HOOK && mon->until_hit) {
+            mine = "until";
+        } else if (why == UAM_STOP_TIME_LIMIT && mon->runfor_on && now >= mon->runfor_end
+                   && (!mon->saved_max_time || now < mon->saved_max_time)) {
+            mine = "run-for";
+        }
+        clear_targets(mon);
+        mon->stop_wanted = false;
+        if (mine) {
+            enter_stopped(mon, mine);
             continue;
         }
-        mon->stop_wanted = false;
 
         const int64_t status = x->stop_status;
         enter_ended(mon, why, status, mon->cfg.hold);

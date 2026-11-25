@@ -105,8 +105,17 @@ void         uam_monitor_field(uam_monitor_call *c, const char *name, const char
     __attribute__((format(printf, 3, 4)));
 void         uam_monitor_fail(uam_monitor_call *c, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
+/* Output lines printed so far in this call. */
+size_t       uam_monitor_lines(const uam_monitor_call *c);
 
 /* Is the machine running (not stopped by the monitor, not ended)? */
 bool         uam_monitor_running(const uam_monitor *mon);
+/* The processor this client looks at ("cpu N"; 0 unless it chose another). */
+unsigned     uam_monitor_cpu_index(const uam_monitor_call *c);
+uam_cpu     *uam_monitor_cpu(const uam_monitor_call *c);
+/* How "bt" names an address (an image's symbols); NULL: addresses only. */
+void         uam_monitor_set_symbolizer(uam_monitor *mon,
+                                        bool (*fn)(void *ctx, uint64_t pc, char *buf, size_t n),
+                                        void *ctx);
 
 #endif /* UAM_MONITOR_H */

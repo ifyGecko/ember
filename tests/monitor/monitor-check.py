@@ -267,6 +267,106 @@ r = subprocess.run([uam_mon, os.path.join(tmp, "none.sock"), "-c", "status"],
                    capture_output=True, text=True, timeout=10)
 check(r.returncode == 2, "uam-mon exits 2 with no monitor there")
 
+# ---- phase 1: step, until, run-for, cpu; registers and memory; map, history, bt ----------
+for jit in ([], ["--jit"]):
+    name = "jit" if jit else "interp"
+    p, path = start(*jit, "--monitor-wait", "--history", "8", "--backtrace", "-n", "100000000")
+    m = Mon(path)
+    ok, out, _ = m.cmd("step")
+    st = fields(out)
+    check(ok and st.get("reason") == "step" and st.get("icount") == "1" and st.get("pc") == "0x3",
+          "%s: step runs one instruction (%s)" % (name, st))
+    ok, out, _ = m.cmd("step 3")
+    st = fields(out)
+    check(st.get("icount") == "4" and st.get("pc") == "0x9", "%s: step 3" % name)
+    ok, out, _ = m.cmd("reg rcx")
+    check(ok and fields(out).get("rcx") == "0x0000000000001000", "%s: reg reads" % name)
+    ok, out, _ = m.cmd("reg rcx 5")
+    check(ok and fields(out).get("rcx") == "0x0000000000000005", "%s: reg writes" % name)
+    ok, out, _ = m.cmd("until 0x6")
+    st = fields(out)
+    # five turns of 'loop $' (rcx 5), the jmp, then mov dx / mov al / out: at 0x6
+    check(st.get("reason") == "until" and st.get("pc") == "0x6" and st.get("icount") == "13",
+          "%s: until PC (%s)" % (name, st))
+    ok, out, _ = m.cmd("until 0x6")
+    st = fields(out)
+    check(st.get("pc") == "0x6" and int(st.get("icount", 0)) > 13,
+          "%s: until where it stands runs to the next arrival" % name)
+    ok, out, _ = m.cmd("status")
+    t0 = int(fields(out)["time"])
+    ok, out, _ = m.cmd("run-for 1000")
+    ok2, out2, _ = m.cmd("status")
+    check(fields(out).get("reason") == "run-for" and int(fields(out2)["time"]) == t0 + 1000,
+          "%s: run-for 1000 ticks" % name)
+    ok, out, _ = m.cmd("x p:0 16")
+    check(ok and out and out[0].startswith("0000000000000000: ba f8 03 b0 41 ee b9 00 10 e2 fe eb f3"),
+          "%s: x shows bytes (%s)" % (name, out[:1]))
+    ok, out, _ = m.cmd("x 0 8 w4")
+    check(ok and out == ["0000000000000000: 0xb003f8ba 0x00b9ee41"], "%s: x w4 in target order" % name)
+    ok, _, _ = m.cmd("write p:0x2000 w2 0x1234 0xabcd")
+    ok2, out, _ = m.cmd("x p:0x2000 4")
+    check(ok and out and " 34 12 cd ab " in out[0], "%s: write w2" % name)
+    ok, _, err = m.cmd("write p:0x2000 w1 0x100")
+    check(ok is False and "1-byte" in err, "%s: write refuses a value too wide" % name)
+    blob = os.path.join(tmp, "blob.bin")
+    with open(blob, "wb") as f:
+        f.write(b"ember!")
+    ok, out, _ = m.cmd("load p:0x3000 " + blob)
+    ok2, out2, _ = m.cmd("x p:0x3000 6")
+    check(ok and fields(out).get("written") == "6" and "|ember!|" in out2[0], "%s: load" % name)
+    dumped = os.path.join(tmp, "dump.bin")
+    ok, out, _ = m.cmd("dump p:0+13=" + dumped)
+    with open(dumped, "rb") as f, open(spin, "rb") as g:
+        check(ok and f.read() == g.read(), "%s: dump to a file" % name)
+    ok, _, err = m.cmd("x p:0x7fffffffffff 4")
+    check(ok is False and "nothing is mapped" in err, "%s: x where nothing is mapped (%s)" % (name, err))
+    o = m.jcmd("json on")
+    o = m.jcmd("regs")
+    check(o["ok"] and o["data"].get("rip") == "0x0000000000000009" and "eflags" in o["data"]
+          and len(o["data"]) > 20, "%s: regs (as JSON data)" % name)
+    m.cmd("json off")
+    ok, _, err = m.cmd("reg nope")
+    check(ok is False and "rax" in err, "%s: reg names the registers when it has no such" % name)
+    ok, out, _ = m.cmd("map")
+    check(ok and any("com1" in l for l in out) and any(l.split()[1] == "ram" for l in out),
+          "%s: map" % name)
+    ok, out, _ = m.cmd("history 3")
+    check(ok and len(out) == 3 and all(l.startswith("blk ") for l in out), "%s: history 3 (%s)" % (name, out))
+    ok, out, _ = m.cmd("bt")
+    check(ok and out == ["(no calls)"], "%s: bt with no calls" % name)
+    ok, out, _ = m.cmd("cpu")
+    check(ok and fields(out).get("cpu") == "0", "%s: cpu" % name)
+    ok, _, err = m.cmd("cpu 1")
+    check(ok is False, "%s: cpu refuses a processor the machine has not" % name)
+    m.cmd("cont")
+    ok, _, err = m.cmd("regs")
+    check(ok is False and "running" in err, "%s: regs refused while running" % name)
+    ok, _, err = m.cmd("step")
+    check(ok is False and "running" in err, "%s: step refused while running" % name)
+    ok, out, _ = m.cmd("map")
+    check(ok, "%s: map works while running" % name)
+    m.cmd("quit")
+    finish(p)
+
+# history and bt say how to have them
+p, path = start("--monitor-wait", "-n", "1000")
+m = Mon(path)
+ok, _, err = m.cmd("history")
+check(ok is False and "--history" in err, "history: says to start with --history")
+ok, _, err = m.cmd("bt")
+check(ok is False and "--backtrace" in err, "bt: says to start with --backtrace")
+ok, _, err = m.cmd("step 2000")   # past the end of the run (no --monitor-hold): it ends
+check(ok is False and "ended" in (err or ""), "a step past the end is answered: %s" % err)
+rc, _, _ = finish(p)
+check(rc == 124, "... and the run ends at its limit (%s)" % rc)
+script = os.path.join(tmp, "step.mon")
+with open(script, "w") as f:
+    f.write("step\n")
+rc, _, err = finish(subprocess.Popen(BASE + ["--monitor-script", script, "-n", "1000", spin],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE))
+check(rc == 2 and b"not in a script" in err, "script: step is refused there")
+
 # ---- option checks ----------------------------------------------------------------------
 for args, what in (
         (["--monitor", "stdio"], "--monitor stdio with the console on stdio"),

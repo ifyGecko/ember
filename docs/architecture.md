@@ -69,6 +69,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `loader.h` | ELF / raw images into guest memory | `src/loader` |
 | `exec.h` | Run a hart: translation cache, block execution (interpreter, or JIT with optional block chaining), result handling, spin-loop skipping, reset requests, PC hooks, IR passes, edge coverage (`uam_exec_set_coverage`), compare logging (`uam_exec_set_cmp`, `uam_exec_cmp_attach`: the compare pass and the state `CMPLOG` reports to), the exception and interrupt observers (`uam_exec_set_exc_hook`, `uam_exec_set_irq_hook`), an execution history ring (`uam_exec_set_history`: `--history N`), stops at the faulting instruction, requested from inside a refused access (`uam_exec_request_fault_stop`, `uam_exec_request_stop_at_fault`: guards with `UAM_STOP_GUARD`, `--unknown-mmio stop`), a callback at the next instruction boundary, requested from inside an access (`uam_exec_request_call`: access rules), the host bridge (polling, idle), instruction / virtual-time / stall (livelock) bounds, statistics, the `uam_origin` provider while it runs; with several processors, processor 0's executor interleaves them deterministically in instruction slices on the shared clock (idle skips only when all wait); where the interleaving stands is machine state, so split and restored runs interleave as one run, and a processor's load-reserved reservation ends with its slice | `src/exec/interp`, `src/exec/jit` (code generators `jit_x86`, `jit_a64`) |
 | `host.h` | Host side: chardev/netdev backends, host loop, virtual and real-time pacing; for links: a node's binding to its machine (clock, snapshot state, a named input per port), the hub (buses and their media, granting in the loose and exact modes, members), the connection of a node to a hub in another process and the server side of it, several machines on one thread (`uam_link_world_run`), a port as a chardev or a netdev, the host loop's part (servicing the connection; where an idle machine waits for its grant) | `src/host` |
+| `debug.h` | A debugger's access to a machine: memory read and written without device side effects (virtual through a processor's translation, or physical), the `[p:]ADDR+LEN` range syntax, registers of the ISA's debugger view; used by the gdb stub, `--dump-mem` and the monitor | `src/debug` |
 | `gdbstub.h` | gdb remote protocol server on top of hooks, watchpoints and `isa->gdb`; every processor is a thread (all-stop) | `src/debug` |
 | `monitor.h` | The monitor: a live command channel into a run (Unix socket, loopback TCP, stdio, Ctrl-A m on a raw stdio console), its line / JSON protocol, the run loop that stops and goes on (`uam_monitor_serve`), and commands a board adds (`uam_monitor_add_command`); `docs/monitor.md` | `src/monitor` |
 | `runner.h` | The stock command line as a library entry point (`uam_run_main`), and runner extensions: options plus setup/attach/finish callbacks that contribute coverage sites, iteration boundaries or a fuzz frontend without the runner knowing what they are for | `src/runner`; stock extensions in `fuzz/stock_exts.c` |
@@ -154,7 +155,7 @@ Implemented:
 
 ```
 include/uam/      common.h access.h ir.h isa.h cpu.h bus.h device.h signal.h sched.h exec.h
-                  loader.h machine.h chardev.h netdev.h link.h host.h gdbstub.h monitor.h runner.h boards.h
+                  loader.h machine.h chardev.h netdev.h link.h host.h debug.h gdbstub.h monitor.h runner.h boards.h
                   state.h snapshot.h pass.h cov.h cmp.h blockdev.h guard.h rules.h frames.h heap.h
                   uninit.h
                   fuzz.h fuzz_campaign.h fuzz_mutate.h fuzz_i2s.h
@@ -180,8 +181,9 @@ src/host/         chardev_backends.c netdev_backends.c blockdev_file.c hostloop.
                   link_node.c (a node in a machine) link_hub.c (the hub: routing, granting; several
                   machines on one thread) link_wire.c (the wire protocol, the node's transport,
                   the hub's server) link_adapters.c (a port as a chardev or a netdev)
-src/debug/        gdbstub.c
-src/monitor/      monitor.c (clients, ways in, the protocol, the run loop, ember's own commands)
+src/debug/        gdbstub.c debug.c (memory and registers as a debugger sees them)
+src/monitor/      monitor.c (clients, ways in, the protocol, the run loop and run control)
+                  monitor_inspect.c (registers, memory, map, history, bt) monitor_int.h
 src/runner/       runner.c trace.c trace.h (the --trace kinds, --history, the summaries)
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips16.c (MIPS16e) mips_umips.c (microMIPS)

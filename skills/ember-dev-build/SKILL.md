@@ -185,8 +185,9 @@ built, not the project's `subprojects/ember`).
      as gdb names them (RISC-V `a0,a1,ra`; MIPS `r4,r5,r31`; ARM `r0,r1,lr`; an unknown name
      lists them all), `--break ADDR -d`, `-n N -d`, `--dump-mem`, gdb (`--gdb`,
      `scripts/gdb_trace_calls.py`); *is it stuck, where is it now?* the monitor
-     (`--monitor unix:mon.sock`, then `uam-mon mon.sock -c "stop; status"`; on `--console
-     stdio-raw`, Ctrl-A m; `docs/monitor.md`); *who called this?* `--backtrace` (the call chain at the
+     (`--monitor unix:mon.sock`, then `uam-mon mon.sock -c "stop; status; regs; bt"`, then
+     `step`, `until PC`, `x ADDR`; on `--console stdio-raw`, Ctrl-A m; `docs/monitor.md`);
+     *who called this?* `--backtrace` (the call chain at the
      stop; names need an ELF image, a raw image gets addresses);
    - *what reads or writes this address or range?* a device register or x86 port:
      `-t mmio --trace-mmio-range LO:HI`; RAM, ROM or flash data (or a register):

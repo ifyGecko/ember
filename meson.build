@@ -110,8 +110,8 @@ modules = {
     'fuzz/cov_region.c', 'fuzz/mutate.c', 'fuzz/campaign.c', 'fuzz/i2s.c'),
   'host': files('src/host/chardev_backends.c', 'src/host/netdev_backends.c',
     'src/host/blockdev_file.c', 'src/host/hostloop.c', 'src/host/link_node.c',
-    'src/host/link_hub.c', 'src/host/link_adapters.c', 'src/host/link_wire.c', 'src/debug/gdbstub.c',
-    'src/monitor/monitor.c',
+    'src/host/link_hub.c', 'src/host/link_adapters.c', 'src/host/link_wire.c', 'src/debug/gdbstub.c', 'src/debug/debug.c',
+    'src/monitor/monitor.c', 'src/monitor/monitor_inspect.c',
     'src/runner/runner.c', 'src/runner/trace.c'),
 }
 

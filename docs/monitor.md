@@ -5,10 +5,10 @@ machine and steer it while it runs, without restarting. It does not touch the gu
 serial line, and a run without it does exactly what it did before (`include/uam/monitor.h`
 says why).
 
-This page covers the first set of commands: run control (`stop`, `cont`, `quit`),
-`status`, `help` and `json`. Inspection, live rules and traces, snapshots and I/O commands
-come in later phases. Boards can add their own commands
-(`uam_monitor_add_command`, below).
+Commands so far: run control (`stop`, `cont`, `step`, `until`, `run-for`, `quit`), the
+machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`) and its memory
+(`x`, `write`, `load`, `dump`). Live rules and traces, snapshots and I/O commands come in
+later phases. Boards can add their own commands (`uam_monitor_add_command`, below).
 
 ## Connecting
 
@@ -88,7 +88,13 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 ### When commands take effect
 
 - **While the machine runs,** commands are read between blocks: every 1024 blocks, and
-  whenever the guest idles.
+  whenever the guest idles. Commands that read or change the machine's state (registers,
+  memory, `step`, `history`, `bt`) need it stopped and say so otherwise. `map`, `status`,
+  `cpu` and `help` work at any time.
+- **Memory and registers** are accessed the way a debugger does (`include/uam/debug.h`,
+  which the gdb stub and `--dump-mem` use as well). A device region answers a read only
+  through its side-effect-free read (`uam_device_ops.peek`); otherwise the command says
+  why it could not read.
 - **`stop`** replies only once the machine has actually stopped. Lines the same client
   sends after it wait until then, so `stop; status` always shows a stopped machine.
 - **A machine stopped by the monitor** keeps its whole state. `cont` goes on as if nothing
@@ -105,6 +111,19 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 | `status` | `state` (`running`, `stopped`, `ended`), `reason` (why it is stopped: `start`, `monitor`; or how the run ended, with `status`), `board`, `icount`, `time` (scheduler ticks), `cpus`, and one line per processor: `cpu N pc=0x... icount=N [waiting]`. |
 | `stop` | Stops the machine at the next block boundary. The reply carries `state`, `pc` and `icount`. Before the start, it keeps the machine stopped. |
 | `cont` | A stopped machine goes on. Refused once the run has ended. |
+| `step [N]` | Runs N instructions (default 1) in all, across every processor, then stops. Replies once it has stopped (`reason: step`). Needs the machine stopped; not in a script. |
+| `until PC` | Runs until a processor reaches PC again (where one stands now does not count), then stops (`reason: until`). An ARM Thumb address can be given with or without bit 0. |
+| `run-for TICKS` | Runs for TICKS of virtual time (scheduler ticks, as `status` shows `time`), then stops (`reason: run-for`). A `--max-ticks` limit still ends the run. |
+| `cpu [N]` | Selects the processor that `regs`, `reg`, the memory commands and `bt` look at, for this client (0 unless chosen). Shows the selection. |
+| `regs` | Every register in the ISA's debugger view, as `name: 0x...`, padded to the register's width. In JSON, the members of `data`. |
+| `reg NAME [VALUE]` | One register by its debugger name (`a0`, `r3`, `rax`, `pc`). With VALUE, it is set first. Registers wider than 64 bits can be read but not set. An unknown name lists the registers. |
+| `x [p:]ADDR [LEN] [w1\|w2\|w4\|w8]` | Shows LEN bytes (64 by default, at most 64 KiB) as bytes with text, or as 2-, 4- or 8-byte words in the guest's byte order. ADDR is virtual, as the selected processor maps it; `p:` makes it physical. A read that stops early shows what it got, with `short: WHY`. |
+| `write [p:]ADDR w1\|w2\|w4\|w8 VALUE...` | Writes the values one after another, in the guest's byte order. |
+| `load [p:]ADDR FILE` | Writes a file's bytes (at most 64 MiB) to memory. |
+| `dump [p:]ADDR+LEN[=FILE]` | Memory as `--dump-mem` takes it: shown (at most 64 KiB), or the raw bytes written to FILE. |
+| `map` | The bus: every region with its range, kind (ram, rom, mmio, romd, alias), priority and name. Works while the machine runs. |
+| `history [N]` | The last N events (all kept, by default) of the selected processor: blocks, exceptions, interrupts. Needs `--history N` on the command line. |
+| `bt` | The selected processor's call chain, innermost first, named from an ELF image's symbols as `--backtrace` names them. Needs `--backtrace`. |
 | `quit [STATUS]` | Ends the run. uam-run exits with STATUS (0-123). Without STATUS: 0, or after the end of the run under `--monitor-hold`, the run's own status. |
 | `json on\|off` | JSON replies and events for this client. |
 

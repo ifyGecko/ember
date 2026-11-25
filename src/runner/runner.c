@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "uam/boards.h"
+#include "uam/debug.h"
 #include "uam/fuzz.h"
 #include "uam/gdbstub.h"
 #include "uam/guard.h"
@@ -227,74 +228,20 @@ static bool pc_list_add(pc_list *l, uint64_t pc)
     return true;
 }
 
-/* --dump-mem: guest memory shown or saved when the run stops. */
-typedef struct mem_dump {
-    uint64_t    addr, len;
-    bool        phys;
-    const char *file;   /* raw bytes to this file; NULL: hex dump on stderr */
-} mem_dump;
+/* --dump-mem: guest memory shown or saved when the run stops ([p:]ADDR+LEN[=FILE]). */
+typedef uam_debug_range mem_dump;
 
-/* [p:]ADDR+LEN[=FILE]; LEN takes K/M/G suffixes. */
 static bool parse_mem_dump(char *s, mem_dump *d)
 {
-    char *end;
-    *d = (mem_dump){ 0 };
-    if (!strncmp(s, "p:", 2)) {
-        d->phys = true;
-        s += 2;
-    }
-    d->addr = strtoull(s, &end, 0);
-    if (end == s || *end != '+')
-        return false;
-    s = end + 1;
-    d->len = strtoull(s, &end, 0);
-    if (end == s)
-        return false;
-    switch (*end) {
-    case 'k': case 'K': d->len <<= 10; end++; break;
-    case 'm': case 'M': d->len <<= 20; end++; break;
-    case 'g': case 'G': d->len <<= 30; end++; break;
-    default: break;
-    }
-    if (*end == '=' && end[1])
-        d->file = end + 1;
-    else if (*end)
-        return false;
-    return d->len > 0 && d->len <= (UINT64_C(1) << 30);
+    return uam_debug_parse_range(s, d);
 }
 
-/* Read d's bytes the way a debugger does (no device side effects). Returns how many
- * leading bytes were readable; if not all, `why` says what stopped it. */
+/* Read d's bytes the way a debugger does (no device side effects), as processor 0
+ * sees a virtual address. */
 static uint64_t read_mem_dump(uam_machine *m, const mem_dump *d, uint8_t *buf, char *why,
                               size_t why_len)
 {
-    uam_cpu *cpu = uam_machine_cpu(m, 0);
-    for (uint64_t i = 0; i < d->len; i++) {
-        uint64_t pa = d->addr + i, b;
-        if (!d->phys && cpu->isa->translate) {
-            uam_xlate xl = { 0 };
-            if (cpu->isa->translate(cpu, d->addr + i, UAM_XLATE_DEBUG, &xl) != UAM_OK) {
-                snprintf(why, why_len, "processor 0 does not map this virtual address");
-                return i;
-            }
-            pa = xl.paddr;
-        }
-        if (uam_bus_read(&m->bus, pa, 1, UAM_ACC_LE | UAM_ACC_DEBUG, &b) != UAM_OK) {
-            const uam_region *r = uam_bus_find(&m->bus, pa);
-            if (!r)
-                snprintf(why, why_len, "nothing is mapped at physical 0x%llx", (unsigned long long)pa);
-            else if (r->kind == UAM_REGION_MMIO && r->dev && !r->dev->ops->peek)
-                snprintf(why, why_len, "physical 0x%llx is device region '%s', whose device (%s) has "
-                         "no side-effect-free read (uam_device_ops.peek)", (unsigned long long)pa,
-                         r->name, r->dev->ops->type);
-            else
-                snprintf(why, why_len, "region '%s' refused a debug read at physical 0x%llx",
-                         r->name, (unsigned long long)pa);
-            return i;
-        }
-        buf[i] = (uint8_t)b;
-    }
-    return d->len;
+    return uam_debug_read(m, uam_machine_cpu(m, 0), d->addr, d->phys, buf, d->len, why, why_len);
 }
 
 static bool dump_memory(uam_machine *m, const mem_dump *d)
@@ -2359,6 +2306,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         if (mon && uam_monitor_use_console(mon, console))
             reachable = true;
+        if (mon)
+            uam_monitor_set_symbolizer(mon, bt_name, &g_bt);   /* "bt" names what --backtrace does */
         if (why == UAM_STOP_NONE && mon && (monitor_wait || monitor_hold) && !reachable) {
             fprintf(stderr, "uam-run: --monitor-wait and --monitor-hold need a way in: --monitor "
                     "SPEC, or --console stdio-raw on a terminal (Ctrl-A m)\n");
