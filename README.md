@@ -472,7 +472,8 @@ build/uam-run --guard 0x80100000-16+16:w fw.elf   # stop before any write within
 build/uam-run --watch p:0x3000+4 fw.elf          # log every access to 4 physical bytes
 build/uam-run --gdb 1234 fw.elf               # then: gdb-multiarch fw.elf -ex 'target remote :1234'
 build/uam-run --monitor unix:mon.sock fw.elf  # then: build/uam-mon mon.sock (stop, step, until, regs,
-                                              # x, cont...; docs/monitor.md); --console stdio-raw: Ctrl-A m
+                                              # x, break, guard, rule, trace, cont...; docs/monitor.md);
+                                              # --console stdio-raw: Ctrl-A m
 build/uam-run --console pty fw.elf            # console on a pseudo-terminal (also tcp:PORT, unix:PATH,
                                               # stdio-raw, file:OUT[,in=FILE], string:TEXT,
                                               # script:FILE, null, link:PORT: another

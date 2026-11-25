@@ -113,6 +113,10 @@ bool         uam_monitor_running(const uam_monitor *mon);
 /* The processor this client looks at ("cpu N"; 0 unless it chose another). */
 unsigned     uam_monitor_cpu_index(const uam_monitor_call *c);
 uam_cpu     *uam_monitor_cpu(const uam_monitor_call *c);
+/* What symbols the monitor's rules ("rule add") can name, as uam_rules_set_symbols. */
+void         uam_monitor_set_rule_symbols(uam_monitor *mon,
+                                          bool (*fn)(void *ctx, const char *name, uint64_t *value),
+                                          void *ctx);
 /* How "bt" names an address (an image's symbols); NULL: addresses only. */
 void         uam_monitor_set_symbolizer(uam_monitor *mon,
                                         bool (*fn)(void *ctx, uint64_t pc, char *buf, size_t n),

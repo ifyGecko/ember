@@ -118,6 +118,7 @@ struct rule {
     action    *act;
     uint32_t   n_act;
     bool       hooked;
+    bool       off;       /* uam_rules_enable(.., false): neither hooked nor watching */
     bool       told;      /* its first failure has been logged */
     uint64_t   arrivals, fired, failed;
 };
@@ -863,7 +864,7 @@ void uam_rules_arm_later(uam_rules *rs)
 uam_status uam_rules_arm(uam_rules *rs, char *err, size_t errlen)
 {
     for (uint32_t i = 0; i < rs->n; i++)
-        if (rs->r[i]->on_access && !arm(rs->r[i], err, errlen))
+        if (rs->r[i]->on_access && !rs->r[i]->off && !arm(rs->r[i], err, errlen))
             return UAM_ERR_INVALID;
     return UAM_OK;
 }
@@ -1410,4 +1411,45 @@ bool uam_rules_last_stop(const uam_rules *rs, uam_rule_stop *out)
         return false;
     *out = rs->stop;
     return true;
+}
+
+void uam_rules_clear_stop(uam_rules *rs)
+{
+    rs->stopped = false;
+}
+
+bool uam_rules_enabled(const uam_rules *rs, size_t i)
+{
+    return i < rs->n && !rs->r[i]->off;
+}
+
+uam_status uam_rules_enable(uam_rules *rs, size_t i, bool on, char *err, size_t errlen)
+{
+    if (i >= rs->n) {
+        set_err(err, errlen, "no rule %zu", i);
+        return UAM_ERR_INVALID;
+    }
+    rule *r = rs->r[i];
+    if (r->off == !on)
+        return UAM_OK;
+    if (!on) {
+        if (r->hooked)
+            uam_machine_remove_pc_hook(rs->m, r->pc, pc_hook, r);
+        r->hooked = false;
+        disarm(r);
+        r->hit = false;
+        r->off = true;
+        return UAM_OK;
+    }
+    if (r->on_access) {
+        if (!rs->arm_later && !arm(r, err, errlen))
+            return UAM_ERR_INVALID;
+    } else if (uam_machine_add_pc_hook(rs->m, r->pc, pc_hook, r) != UAM_OK) {
+        set_err(err, errlen, "rule %s: cannot hook 0x%llx", r->name, (unsigned long long)r->pc);
+        return UAM_ERR_NOMEM;
+    } else {
+        r->hooked = true;
+    }
+    r->off = false;
+    return UAM_OK;
 }

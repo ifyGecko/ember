@@ -5,10 +5,11 @@ machine and steer it while it runs, without restarting. It does not touch the gu
 serial line, and a run without it does exactly what it did before (`include/uam/monitor.h`
 says why).
 
-Commands so far: run control (`stop`, `cont`, `step`, `until`, `run-for`, `quit`), the
-machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`) and its memory
-(`x`, `write`, `load`, `dump`). Live rules and traces, snapshots and I/O commands come in
-later phases. Boards can add their own commands (`uam_monitor_add_command`, below).
+Commands so far: run control (`stop`, `cont`, `wait`, `step`, `until`, `run-for`,
+`quit`), the machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`), its
+memory (`x`, `write`, `load`, `dump`), and live instrumentation (`break`, `guard`, `watch`,
+`rule`, `trace`, `mmio-rule`). Snapshots and I/O commands come in later phases. Boards
+can add their own commands (`uam_monitor_add_command`, below).
 
 ## Connecting
 
@@ -89,8 +90,13 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 
 - **While the machine runs,** commands are read between blocks: every 1024 blocks, and
   whenever the guest idles. Commands that read or change the machine's state (registers,
-  memory, `step`, `history`, `bt`) need it stopped and say so otherwise. `map`, `status`,
-  `cpu` and `help` work at any time.
+  memory, `step`, `history`, `bt`, `break`, `guard`, `watch`, `rule`, `mmio-rule`) need it
+  stopped and say so otherwise. `map`, `status`, `cpu`, `wait`, `trace` (but `blocks` and
+  `ir`) and `help` work at any time.
+- **What the monitor adds stops into the monitor.** A breakpoint, guard or rule added
+  here stops the run into the monitor, where `cont` goes on. The ones uam-run was started
+  with (`--break`, `--guard`, `--on`) still end the run, as without a monitor
+  (`--monitor-hold` keeps it there for a look).
 - **Memory and registers** are accessed the way a debugger does (`include/uam/debug.h`,
   which the gdb stub and `--dump-mem` use as well). A device region answers a read only
   through its side-effect-free read (`uam_device_ops.peek`); otherwise the command says
@@ -111,6 +117,7 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 | `status` | `state` (`running`, `stopped`, `ended`), `reason` (why it is stopped: `start`, `monitor`; or how the run ended, with `status`), `board`, `icount`, `time` (scheduler ticks), `cpus`, and one line per processor: `cpu N pc=0x... icount=N [waiting]`. |
 | `stop` | Stops the machine at the next block boundary. The reply carries `state`, `pc` and `icount`. Before the start, it keeps the machine stopped. |
 | `cont` | A stopped machine goes on. Refused once the run has ended. |
+| `wait` | Replies once the machine stops (a breakpoint, a guard, a rule, another client's `stop`) or the run ends, with the same fields as `stop`. At once if it is not running. For scripts: `cont; wait; regs`. |
 | `step [N]` | Runs N instructions (default 1) in all, across every processor, then stops. Replies once it has stopped (`reason: step`). Needs the machine stopped; not in a script. |
 | `until PC` | Runs until a processor reaches PC again (where one stands now does not count), then stops (`reason: until`). An ARM Thumb address can be given with or without bit 0. |
 | `run-for TICKS` | Runs for TICKS of virtual time (scheduler ticks, as `status` shows `time`), then stops (`reason: run-for`). A `--max-ticks` limit still ends the run. |
@@ -122,8 +129,15 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 | `load [p:]ADDR FILE` | Writes a file's bytes (at most 64 MiB) to memory. |
 | `dump [p:]ADDR+LEN[=FILE]` | Memory as `--dump-mem` takes it: shown (at most 64 KiB), or the raw bytes written to FILE. |
 | `map` | The bus: every region with its range, kind (ram, rom, mmio, romd, alias), priority and name. Works while the machine runs. |
-| `history [N]` | The last N events (all kept, by default) of the selected processor: blocks, exceptions, interrupts. Needs `--history N` on the command line. |
+| `history [N]` | The last N events (all kept, by default) of the selected processor: blocks, exceptions, interrupts. Needs a history: `--history N`, or `history on`. |
+| `history on [N] \| off \| clear` | Keep the last N events per processor (64 by default), keep none, or forget what is kept. |
 | `bt` | The selected processor's call chain, innermost first, named from an ELF image's symbols as `--backtrace` names them. Needs `--backtrace`. |
+| `break add PC \| del ID\|all \| list` | Breakpoints: the run stops into the monitor when a processor reaches PC (`reason: break ID`), and `cont` goes on from there. `list` shows each with its hits. |
+| `guard add SPEC \| del ID\|all \| list` | Guards as `--guard` takes them (`[p:]ADDR[-BEFORE][+AFTER][:r\|w\|rw][,stop\|,fault\|,log][,name=NAME]`). A hit stops the run into the monitor at the access, before it happens (`reason: guard ID`). `cont` lets that one access happen: the guard is lifted for one instruction, then it is back. |
+| `watch add SPEC \| del ID\|all \| list` | Watches as `--watch` takes them: every access is an event, `! watch id=ID pc=0x... what=...`, and the run goes on. |
+| `rule add TEXT \| load FILE \| list \| on ID \| off ID \| del ID` | Rules as `--on` and `--on-file` take them (`include/uam/rules.h`), with the image's symbols. A rule's `stop` stops the run into the monitor (`reason: rule NAME`). `list` shows each rule's id, name, whether it is on, and its counts. A deleted rule keeps its id. Rules with `count=` or `delay=` become part of the snapshot state (as `rules-monitor`). |
+| `trace [on LIST \| off LIST \| file PATH\|-]` | The `-t` traces (LIST as `-t` takes it; `off all` turns every one off): on, off, and where they go (`-` is stderr). Without arguments, which are on. `blocks` and `ir` change how code is translated and need the machine stopped; `link` can only be set when the run starts. |
+| `mmio-rule RULE` | Answers an unmodelled register, as `--mmio-rule` does, from now on (above every `--mmio-rule`, below every real device). Not `input`. |
 | `quit [STATUS]` | Ends the run. uam-run exits with STATUS (0-123). Without STATUS: 0, or after the end of the run under `--monitor-hold`, the run's own status. |
 | `json on\|off` | JSON replies and events for this client. |
 

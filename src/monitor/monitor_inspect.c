@@ -431,6 +431,29 @@ static void cmd_history(uam_monitor_call *c, void *ctx)
     uam_machine *m = uam_monitor_machine(uam_monitor_of(c));
     uam_exec *x = uam_machine_exec(m, uam_monitor_cpu_index(c));
     uint64_t n = 0;
+    const char *sub = uam_monitor_arg(c, 1);
+    if (sub && (!strcmp(sub, "on") || !strcmp(sub, "off") || !strcmp(sub, "clear"))) {
+        if (!strcmp(sub, "clear")) {
+            uam_machine_history_clear(m);
+            return;
+        }
+        uint64_t keep = 0;
+        if (!strcmp(sub, "on")) {
+            char *end;
+            const char *t = uam_monitor_arg(c, 2);
+            keep = t ? strtoull(t, &end, 0) : 64;
+            if ((t && (end == t || *end)) || !keep || keep > (1u << 20)) {
+                uam_monitor_fail(c, "history on [N]: N events kept per processor, 1 to %u",
+                                 1u << 20);
+                return;
+            }
+        }
+        if (uam_machine_set_history(m, (uint32_t)keep) != UAM_OK)
+            uam_monitor_fail(c, "history: out of memory");
+        else
+            uam_monitor_field(c, "kept", "%llu", (unsigned long long)keep);
+        return;
+    }
     if (uam_monitor_argc(c) > 1) {
         char *end;
         const char *t = uam_monitor_arg(c, 1);
@@ -441,7 +464,7 @@ static void cmd_history(uam_monitor_call *c, void *ctx)
         }
     }
     if (!x || !x->hist_cap) {
-        uam_monitor_fail(c, "history: none is kept (start the run with --history N)");
+        uam_monitor_fail(c, "history: none is kept (history on N, or --history N)");
         return;
     }
     print_from(c, history_to, x, "  ", (size_t)n);
@@ -496,7 +519,8 @@ uam_status mon_add_inspect_commands(uam_monitor *mon)
         { "dump", "[p:]ADDR+LEN[=FILE]", "memory as --dump-mem: shown, or raw to FILE",
           UAM_MONITOR_STOPPED_ONLY, cmd_dump },
         { "map", "", "the bus: every region, its kind, priority and name", 0, cmd_map },
-        { "history", "[N]", "the last N blocks, exceptions and interrupts (--history)",
+        { "history", "[N] | on [N] | off | clear",
+          "the last N blocks, exceptions and interrupts; keep them (on), or not",
           UAM_MONITOR_STOPPED_ONLY, cmd_history },
         { "bt", "", "the call chain (--backtrace)", UAM_MONITOR_STOPPED_ONLY, cmd_bt },
     };

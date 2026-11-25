@@ -173,5 +173,13 @@ typedef struct uam_rule_stop {
     uint64_t    pc, icount;
 } uam_rule_stop;
 bool       uam_rules_last_stop(const uam_rules *rs, uam_rule_stop *out);
+/* Forget the last stop, so that uam_rules_last_stop says whether one happens after this. */
+void       uam_rules_clear_stop(uam_rules *rs);
+
+/* Turn rule i off (its pc is no longer hooked, its range no longer watched; stores of a
+ * delay already on their way still happen) or on again. A rule that is off keeps its
+ * place, its counts and its part of the set's snapshot state. Rules are on when added. */
+uam_status uam_rules_enable(uam_rules *rs, size_t i, bool on, char *err, size_t errlen);
+bool       uam_rules_enabled(const uam_rules *rs, size_t i);
 
 #endif /* UAM_RULES_H */

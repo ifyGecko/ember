@@ -92,6 +92,8 @@ struct uam_monitor {
     uint64_t           runfor_end, saved_max_time;
     uam_symbolize_fn   sym;
     void              *sym_ctx;
+    mon_instr         *instr;         /* monitor_instr.c */
+    char               why_buf[96];   /* stop_why when it is a claimed reason */
 };
 
 struct uam_monitor_call {
@@ -271,6 +273,19 @@ static const uam_cpu *cur_cpu(uam_monitor *mon)
     return cpu ? cpu : &mon->m->cpu;
 }
 
+void mon_event(uam_monitor *mon, const char *kind, ...)
+{
+    event e = { .kind = kind };
+    va_list ap;
+    va_start(ap, kind);
+    for (const char *k; (k = va_arg(ap, const char *));) {
+        const char *v = va_arg(ap, const char *);
+        ev_add(&e, k, "%s", v ? v : "");
+    }
+    va_end(ap);
+    ev_broadcast(mon, &e);
+}
+
 static void ev_where(uam_monitor *mon, event *e)
 {
     unsigned cur = uam_machine_current_cpu(mon->m);
@@ -421,6 +436,15 @@ uam_symbolize_fn mon_symbolizer(const uam_monitor *mon, void **ctx)
 }
 
 bool mon_stopped(const uam_monitor *mon) { return mon->state != ST_RUNNING; }
+
+mon_instr **mon_instr_slot(uam_monitor *mon) { return &mon->instr; }
+
+void uam_monitor_set_rule_symbols(uam_monitor *mon,
+                                  bool (*fn)(void *ctx, const char *name, uint64_t *value),
+                                  void *ctx)
+{
+    mon_instr_set_rule_symbols(mon, fn, ctx);
+}
 
 bool uam_monitor_running(const uam_monitor *mon) { return mon->state == ST_RUNNING; }
 
@@ -1129,6 +1153,25 @@ static void cmd_cont(uam_monitor_call *c, void *ctx)
     }
 }
 
+static void cmd_wait(uam_monitor_call *c, void *ctx)
+{
+    uam_monitor *mon = ctx;
+    if (mon->state != ST_RUNNING) {
+        uam_monitor_field(c, "state", "%s", mon->state == ST_ENDED ? "ended" : "stopped");
+        uam_monitor_field(c, "reason", "%s", mon->state == ST_ENDED
+                          ? uam_stop_reason_str(mon->end_why) : mon->stop_why);
+        uam_monitor_field(c, "pc", "0x%llx", (unsigned long long)cur_cpu(mon)->pc);
+        uam_monitor_field(c, "icount", "%llu", (unsigned long long)uam_machine_icount(mon->m));
+        return;
+    }
+    if (c->cl->kind == CL_SCRIPT) {
+        uam_monitor_fail(c, "wait: not in a script (the machine has not started)");
+        return;
+    }
+    c->cl->waiting_stop = true;   /* answered by the next stop, or the end */
+    c->deferred = true;
+}
+
 static void cmd_quit(uam_monitor_call *c, void *ctx)
 {
     uam_monitor *mon = ctx;
@@ -1332,6 +1375,8 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
           cmd_status },
         { "stop",   "",          "stop the machine (answers once it has stopped)", 0, cmd_stop },
         { "cont",   "",          "let a stopped machine go on", 0, cmd_cont },
+        { "wait",   "",          "answer once the machine stops (a breakpoint, a guard...) or "
+          "the run ends", 0, cmd_wait },
         { "quit",   "[STATUS]",  "end the run (uam-run exits with STATUS, 0-123)", 0, cmd_quit },
         { "json",   "on|off",    "answer this client in JSON, one object per line", 0, cmd_json },
         { "step",   "[N]",       "run N instructions (1), then stop (answers then)", 0, cmd_step },
@@ -1348,7 +1393,7 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
             uam_monitor_destroy(mon);
             return NULL;
         }
-    if (mon_add_inspect_commands(mon) != UAM_OK) {
+    if (mon_add_inspect_commands(mon) != UAM_OK || mon_add_instr_commands(mon) != UAM_OK) {
         uam_monitor_destroy(mon);
         return NULL;
     }
@@ -1360,6 +1405,7 @@ void uam_monitor_destroy(uam_monitor *mon)
     if (!mon)
         return;
     clear_targets(mon);
+    mon_instr_free(mon);
     for (unsigned i = 0; i < MAX_CLIENTS; i++)
         if (mon->cl[i])
             client_free(mon, mon->cl[i]);
@@ -1427,6 +1473,8 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
         uam_stop_reason why;
         uint64_t done = uam_machine_icount(mon->m);
         uint64_t limit = mon->step_end && mon->step_end < end ? mon->step_end : end;
+        mon_instr_before_run(mon);
+        limit = mon_instr_limit(mon, limit);
         if (limit != UINT64_MAX && done >= limit) {
             why = UAM_STOP_INSN_LIMIT;
         } else {
@@ -1444,19 +1492,24 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
         /* Stopped for the monitor, or for good? */
         const uint64_t icount = uam_machine_icount(mon->m);
         const uint64_t now = uam_sched_now(&mon->m->sched);
-        const char *mine = NULL;
+        const char *mine = NULL, *claimed = mon_instr_claim(mon, why);
         if (why == UAM_STOP_REQUEST && mon->stop_wanted && x->stop_status == 0) {
             mine = "monitor";
             x->stop_request = false;
         } else if (why == UAM_STOP_INSN_LIMIT && mon->step_end && icount >= mon->step_end
                    && icount < end) {
             mine = "step";
+        } else if (claimed && *claimed) {
+            snprintf(mon->why_buf, sizeof(mon->why_buf), "%s", claimed);
+            mine = mon->why_buf;
         } else if (why == UAM_STOP_HOOK && mon->until_hit) {
             mine = "until";
         } else if (why == UAM_STOP_TIME_LIMIT && mon->runfor_on && now >= mon->runfor_end
                    && (!mon->saved_max_time || now < mon->saved_max_time)) {
             mine = "run-for";
         }
+        if (!mine && claimed && why == UAM_STOP_INSN_LIMIT && icount < end)
+            continue;   /* only the step over a guard: the run goes on (targets stay) */
         clear_targets(mon);
         mon->stop_wanted = false;
         if (mine) {

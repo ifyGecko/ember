@@ -595,7 +595,7 @@ static uint64_t parse_size(const char *s)
 /* The executor's trace flags go to *t, the runner's own (trace.h, RT_*) to *rt. False
  * (after saying which) for a token that names no trace: a run that would trace nothing
  * of what was asked for is not worth starting. */
-static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
+static bool parse_trace_err(const char *s, unsigned *t, unsigned *rt, char *err, size_t errlen)
 {
     bool ok = true;
     char *copy = strdup(s);
@@ -612,14 +612,23 @@ static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
                                           *rt |= RT_EXC_SUM | RT_MMIO | RT_SYSREG | RT_IRQ
                                                | RT_CONSOLE | RT_DMA | RT_LINK; }
         else if (rtrace_flag(tok))      *rt |= rtrace_flag(tok);
-        else {
-            fprintf(stderr, "uam-run: unknown trace '%s' (traces: blocks, ir, exc, mmio, "
-                    "mmio-summary, sysreg, sysreg-all, irq, console, dma, link, all)\n", tok);
+        else if (ok) {
+            snprintf(err, errlen, "unknown trace '%s' (traces: blocks, ir, exc, mmio, "
+                     "mmio-summary, sysreg, sysreg-all, irq, console, dma, link, all)", tok);
             ok = false;
         }
     }
     free(copy);
     return ok;
+}
+
+static bool parse_trace(const char *s, unsigned *t, unsigned *rt)
+{
+    char err[200];
+    if (parse_trace_err(s, t, rt, err, sizeof(err)))
+        return true;
+    fprintf(stderr, "uam-run: %s\n", err);
+    return false;
 }
 
 /* Split "KEY=VALUE" in place. */
@@ -1084,6 +1093,146 @@ out:
     return rc;
 }
 
+/* ---- the runner's own monitor commands: trace, mmio-rule -------------------------- */
+
+typedef struct mon_run {
+    uam_machine *m;
+    rtrace      *rt;
+    uam_chardev *console;
+    uam_rules   *rules;     /* --on: their log follows the trace output */
+    FILE        *own_fp;    /* "trace file": opened here, closed at the end */
+    unsigned     n_mmio;    /* "mmio-rule" stubs added */
+} mon_run;
+
+static const struct { const char *name; unsigned exec, rt; } trace_names[] = {
+    { "blocks", UAM_TRACE_BLOCKS, 0 }, { "ir", UAM_TRACE_IR, 0 },
+    { "exc", UAM_TRACE_EXC, RT_EXC_SUM }, { "mmio", 0, RT_MMIO },
+    { "mmio-summary", 0, RT_MMIO_SUM }, { "sysreg", 0, RT_SYSREG },
+    { "sysreg-all", 0, RT_SYSREG_ALL }, { "irq", 0, RT_IRQ }, { "console", 0, RT_CONSOLE },
+    { "dma", 0, RT_DMA }, { "link", 0, RT_LINK },
+};
+
+static void mon_trace_apply(mon_run *r, unsigned exec_t, unsigned rt_t)
+{
+    rtrace_detach(r->rt);
+    r->rt->flags = rt_t;
+    rtrace_attach(r->rt, r->m, r->console, r->m->exec.trace_out);
+    bool retranslate = (exec_t ^ r->m->exec.trace) & (UAM_TRACE_BLOCKS | UAM_TRACE_IR);
+    for (unsigned i = 0; i < uam_machine_ncpus(r->m); i++) {
+        uam_exec *x = uam_machine_exec(r->m, i);
+        x->trace = exec_t;
+        if (retranslate)   /* blocks are chained, and ir printed, as they are translated */
+            uam_tcache_flush(&x->tc);
+    }
+}
+
+static void mon_cmd_trace(uam_monitor_call *c, void *ctx)
+{
+    mon_run *r = ctx;
+    const char *sub = uam_monitor_arg(c, 1);
+    unsigned cur_t = r->m->exec.trace, cur_rt = r->rt->flags;
+    if (sub && (!strcmp(sub, "on") || !strcmp(sub, "off")) && uam_monitor_argc(c) == 3) {
+        unsigned t = 0, rtf = 0;
+        char err[200];
+        const char *list = uam_monitor_arg(c, 2);
+        if (!parse_trace_err(list, &t, &rtf, err, sizeof(err))) {
+            uam_monitor_fail(c, "trace: %s", err);
+            return;
+        }
+        const bool on = !strcmp(sub, "on");
+        if (on && (rtf & RT_LINK) && !(cur_rt & RT_LINK)) {
+            uam_monitor_fail(c, "trace: link is set when the run starts (-t link)");
+            return;
+        }
+        if (!on && !strcmp(list, "all")) {   /* every trace, blocks and ir included */
+            t = ~0u;
+            rtf = ~0u;
+        }
+        if (!on)
+            rtf &= ~RT_LINK;   /* it stays: the taps belong to the link nodes */
+        unsigned nt = on ? cur_t | t : cur_t & ~t, nrt = on ? cur_rt | rtf : cur_rt & ~rtf;
+        if (((nt ^ cur_t) & (UAM_TRACE_BLOCKS | UAM_TRACE_IR)) && uam_monitor_running(uam_monitor_of(c))) {
+            uam_monitor_fail(c, "trace: blocks and ir change how code is translated: stop first");
+            return;
+        }
+        mon_trace_apply(r, nt, nrt);
+        cur_t = nt;
+        cur_rt = nrt;
+    } else if (sub && !strcmp(sub, "file") && uam_monitor_argc(c) == 3) {
+        const char *path = uam_monitor_arg(c, 2);
+        FILE *f = strcmp(path, "-") ? fopen(path, "w") : NULL;
+        if (strcmp(path, "-") && !f) {
+            uam_monitor_fail(c, "trace: %s: %s", path, strerror(errno));
+            return;
+        }
+        FILE *out = f ? f : stderr;
+        r->m->exec.trace_out = out;
+        for (unsigned i = 0; i < uam_machine_ncpus(r->m); i++)
+            uam_machine_exec(r->m, i)->trace_out = out;
+        uam_machine_set_guard_log(r->m, out);
+        if (r->rules)
+            uam_rules_set_log(r->rules, out);
+        r->rt->out = out;
+        if (r->own_fp)
+            fclose(r->own_fp);
+        r->own_fp = f;
+        uam_monitor_field(c, "file", "%s", f ? path : "stderr");
+    } else if (sub) {
+        uam_monitor_fail(c, "trace [on LIST | off LIST | file PATH|-]");
+        return;
+    }
+    char names[256] = "";
+    for (size_t i = 0; i < UAM_ARRAY_LEN(trace_names); i++)
+        if ((trace_names[i].exec && (cur_t & trace_names[i].exec))
+            || (!trace_names[i].exec && (cur_rt & trace_names[i].rt)))
+            snprintf(names + strlen(names), sizeof(names) - strlen(names), "%s%s",
+                     names[0] ? "," : "", trace_names[i].name);
+    uam_monitor_field(c, "traces", "%s", names[0] ? names : "none");
+}
+
+static void mon_cmd_mmio_rule(uam_monitor_call *c, void *ctx)
+{
+    mon_run *r = ctx;
+    uam_mmio_rule rule;
+    char err[160];
+    const char *text = uam_monitor_rest(c, 1);
+    if (!text) {
+        uam_monitor_fail(c, "mmio-rule ADDR[+SIZE]=POLICY[,width=N][,set=MASK][,clear=MASK]");
+        return;
+    }
+    if (uam_mmio_rule_parse(text, &rule, err, sizeof(err)) != UAM_OK) {
+        uam_monitor_fail(c, "mmio-rule: %s", err);
+        return;
+    }
+    if (rule.policy == UAM_MMIO_INPUT) {
+        uam_monitor_fail(c, "mmio-rule: input rules are set when the run starts (--mmio-rule)");
+        return;
+    }
+    if (r->n_mmio >= 300) {
+        uam_monitor_fail(c, "mmio-rule: at most 300 from the monitor");
+        return;
+    }
+    char name[48];
+    snprintf(name, sizeof(name), "rule@0x%llx#mon%u", (unsigned long long)rule.addr, r->n_mmio);
+    uam_device *d = uam_mmio_stub_create(name, &rule, NULL);
+    if (!d) {
+        uam_monitor_fail(c, "mmio-rule: cannot create its device");
+        return;
+    }
+    uam_machine_add_device(r->m, d);
+    /* Above every --mmio-rule (UAM_PRIO_STUB + 0..511), later ones above earlier ones,
+     * still below every real device. */
+    const uam_map_attrs attrs = { .prio = UAM_PRIO_STUB + (int)UAM_MAX_MMIO_RULES + (int)r->n_mmio,
+                                  .endian = r->m->cpu.isa->default_endian };
+    if (uam_bus_map_mmio_ex(&r->m->bus, d->name, rule.addr, rule.size, d, &attrs) != UAM_OK) {
+        uam_monitor_fail(c, "mmio-rule: cannot map 0x%llx+0x%llx", (unsigned long long)rule.addr,
+                         (unsigned long long)rule.size);
+        return;
+    }
+    r->n_mmio++;
+    uam_monitor_field(c, "device", "%s", d->name);
+}
+
 static int run_main(int argc, char **argv, const ext_set *es)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
@@ -1203,6 +1352,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     uam_rules *rules = NULL;
     const char *trace_file = NULL;
     FILE *trace_fp = NULL;
+    mon_run mrun = { 0 };   /* the runner's monitor commands (trace, mmio-rule) */
     uint32_t history = 0;
     bool guard_returns = false, backtrace = false;
     uam_guard_action returns_action = UAM_GUARD_STOP;
@@ -2306,8 +2456,18 @@ static int run_main(int argc, char **argv, const ext_set *es)
         }
         if (mon && uam_monitor_use_console(mon, console))
             reachable = true;
-        if (mon)
+        if (mon) {
             uam_monitor_set_symbolizer(mon, bt_name, &g_bt);   /* "bt" names what --backtrace does */
+            if (image)
+                uam_monitor_set_rule_symbols(mon, rule_symbol, (void *)image);
+            mrun = (mon_run){ .m = &m, .rt = &rt, .console = console, .rules = rules };
+            uam_monitor_add_command(mon, "trace", "[on LIST | off LIST | file PATH|-]",
+                                    "the -t traces on or off (LIST as -t takes it), and where "
+                                    "they go", 0, mon_cmd_trace, &mrun);
+            uam_monitor_add_command(mon, "mmio-rule", "RULE",
+                                    "answer an unmodelled register (as --mmio-rule; not input)",
+                                    UAM_MONITOR_STOPPED_ONLY, mon_cmd_mmio_rule, &mrun);
+        }
         if (why == UAM_STOP_NONE && mon && (monitor_wait || monitor_hold) && !reachable) {
             fprintf(stderr, "uam-run: --monitor-wait and --monitor-hold need a way in: --monitor "
                     "SPEC, or --console stdio-raw on a terminal (Ctrl-A m)\n");
@@ -2560,6 +2720,8 @@ out_host:
     uam_rules_free(rules);   /* after the machine: its hooks pointed into it */
     free(rule_args);
     free(su);         /* after the machine: it was the bus's unmapped device */
+    if (mrun.own_fp)
+        fclose(mrun.own_fp);   /* a monitor's "trace file" */
     if (trace_fp && fclose(trace_fp) != 0 && rc == 0) {
         fprintf(stderr, "uam-run: writing --trace-file %s failed\n", trace_file);
         rc = 2;

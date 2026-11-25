@@ -352,7 +352,7 @@ for jit in ([], ["--jit"]):
 p, path = start("--monitor-wait", "-n", "1000")
 m = Mon(path)
 ok, _, err = m.cmd("history")
-check(ok is False and "--history" in err, "history: says to start with --history")
+check(ok is False and "history on" in err, "history: says how to keep it")
 ok, _, err = m.cmd("bt")
 check(ok is False and "--backtrace" in err, "bt: says to start with --backtrace")
 ok, _, err = m.cmd("step 2000")   # past the end of the run (no --monitor-hold): it ends
@@ -366,6 +366,136 @@ rc, _, err = finish(subprocess.Popen(BASE + ["--monitor-script", script, "-n", "
                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE))
 check(rc == 2 and b"not in a script" in err, "script: step is refused there")
+
+# ---- phase 2: break, guard, watch, rule, history on/off, trace, mmio-rule, wait ------------
+# mov [0x5000],ax; jmp 0: a store on every turn
+store = os.path.join(tmp, "store.bin")
+with open(store, "wb") as f:
+    f.write(bytes.fromhex("a30050ebfb"))
+for jit in ([], ["--jit"]):
+    name = "jit" if jit else "interp"
+    p, path = start(*jit, "--monitor-wait", "-n", "100000000")
+    m = Mon(path)
+    ok, out, _ = m.cmd("break add 0x6")
+    check(ok and fields(out).get("id") == "1", "%s: break add" % name)
+    ok, _, err = m.cmd("break add 0x6")
+    check(ok is False and "already" in err, "%s: one breakpoint per pc" % name)
+    m.cmd("cont")
+    ok, out, _ = m.cmd("wait")
+    st = fields(out)
+    check(st.get("reason") == "break 1" and st.get("pc") == "0x6" and st.get("icount") == "3",
+          "%s: the breakpoint stops the run into the monitor (%s)" % (name, st))
+    m.cmd("cont")
+    ok, out, _ = m.cmd("wait")
+    st = fields(out)
+    check(st.get("reason") == "break 1" and int(st.get("icount")) > 3,
+          "%s: cont from a breakpoint goes on to its next hit" % name)
+    ok, out, _ = m.cmd("break list")
+    check(out == ["1 pc=0x6 hits=2"], "%s: break list counts hits (%s)" % (name, out))
+    m.cmd("break del 1")
+    ok, out, _ = m.cmd("break list")
+    check(ok and out == [], "%s: break del" % name)
+    ok, out, _ = m.cmd("rule add pc=0x9,if rcx==0x800,name=half,stop")
+    check(ok and fields(out).get("id") == "0", "%s: rule add" % name)
+    m.cmd("cont")
+    ok, out, _ = m.cmd("wait")
+    ok2, out2, _ = m.cmd("reg rcx")
+    check(fields(out).get("reason") == "rule half" and fields(out2).get("rcx") == "0x0000000000000800",
+          "%s: a rule's stop stops into the monitor, its condition held" % name)
+    ok, out, _ = m.cmd("rule list")
+    check(ok and out and out[0].startswith("0 half on ") and "fired=1" in out[0],
+          "%s: rule list (%s)" % (name, out))
+    m.cmd("rule off 0")
+    ok, out, _ = m.cmd("rule list")
+    check(out and out[0].startswith("0 half off "), "%s: rule off" % name)
+    ok, _, err = m.cmd("rule add pc=nosuch,stop")
+    check(ok is False, "%s: a bad rule is refused (%s)" % (name, err))
+    m.cmd("rule del 0")
+    ok, out, _ = m.cmd("rule list")
+    check(out == [], "%s: rule del" % name)
+    ok, out, _ = m.cmd("history on 4")
+    check(ok and fields(out).get("kept") == "4", "%s: history on" % name)
+    m.cmd("step 10")
+    ok, out, _ = m.cmd("history")
+    check(ok and len(out) == 5 and out[0].startswith("cpu0: the last 4"), "%s: history kept" % name)
+    m.cmd("history clear")
+    ok, out, _ = m.cmd("history off")
+    ok2, _, err = m.cmd("history")
+    check(ok and ok2 is False, "%s: history off" % name)
+    ok, out, _ = m.cmd("trace")
+    check(fields(out).get("traces") == "none", "%s: trace shows none" % name)
+    tracef = os.path.join(tmp, "trace-%s.txt" % name)
+    m.cmd("trace file " + tracef)
+    ok, out, _ = m.cmd("trace on mmio,blocks")
+    check(fields(out).get("traces") == "blocks,mmio", "%s: trace on (%s)" % (name, out))
+    m.cmd("reg rcx 1")   # out of the delay loop at once: the next turn writes to COM1
+    m.cmd("step 20")
+    m.cmd("trace off all")
+    ok, out, _ = m.cmd("trace")
+    check(fields(out).get("traces") == "none", "%s: trace off all" % name)
+    m.cmd("trace file -")
+    with open(tracef) as f:
+        t = f.read()
+    check("com1" in t and "blk" in t, "%s: the traces went to the trace file" % name)
+    ok, _, err = m.cmd("trace on nonsense")
+    check(ok is False and "unknown trace" in err, "%s: an unknown trace" % name)
+    ok, out, _ = m.cmd("mmio-rule 0x90000000+8=fixed:0x55")
+    ok2, out2, _ = m.cmd("map")
+    check(ok and any("rule@0x90000000#mon0" in l for l in out2), "%s: mmio-rule maps a stub" % name)
+    ok, _, err = m.cmd("mmio-rule 0x90000000=input")
+    check(ok is False and "input" in err, "%s: mmio-rule refuses input" % name)
+    m.cmd("cont")
+    ok, _, err = m.cmd("break add 0x0")
+    check(ok is False and "running" in err, "%s: break refused while running" % name)
+    ok, out, _ = m.cmd("trace on irq")
+    check(ok, "%s: trace on irq works while running" % name)
+    ok, _, err = m.cmd("trace on blocks")
+    check(ok is False and "stop first" in err, "%s: trace on blocks needs it stopped" % name)
+    m.cmd("quit")
+    finish(p)
+
+    # guards and watches on a store
+    sock = os.path.join(tmp, "g%s.sock" % name)
+    p = subprocess.Popen(BASE + jit + ["--monitor", "unix:" + sock, "--monitor-wait",
+                                       "-n", "100000000", store],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(200):
+        if os.path.exists(sock):
+            break
+        time.sleep(0.01)
+    m = Mon(sock)
+    ok, out, _ = m.cmd("guard add p:0x5000+2:w")
+    check(ok and fields(out).get("id") == "1", "%s: guard add" % name)
+    m.cmd("reg rax 0x1234")
+    m.cmd("cont")
+    ok, out, _ = m.cmd("wait")
+    st = fields(out)
+    # the store that was refused counts in icount, its effect does not happen
+    ok2, out2, _ = m.cmd("x p:0x5000 2")
+    check(st.get("reason") == "guard 1" and st.get("pc") == "0x0" and st.get("icount") == "1"
+          and " 00 00 " in out2[0], "%s: a guard stops at the store, before it (%s)" % (name, st))
+    m.cmd("cont")
+    ok, out, _ = m.cmd("wait")
+    st = fields(out)
+    ok2, out2, _ = m.cmd("x p:0x5000 2")
+    check(st.get("reason") == "guard 1" and st.get("pc") == "0x0" and st.get("icount") == "4"
+          and " 34 12 " in out2[0],
+          "%s: cont steps over the guarded store (it happens), the next one stops again (%s)"
+          % (name, st))
+    ok, out, _ = m.cmd("guard list")
+    check(out and "hits=2" in out[0], "%s: guard list (%s)" % (name, out))
+    m.cmd("guard del 1")
+    ok, out, _ = m.cmd("watch add p:0x5000+2:w")
+    check(ok and fields(out).get("id") == "2", "%s: watch add" % name)
+    m.cmd("step 6")
+    ev = m.event("watch")
+    check(ev is not None and "id=2" in ev and "write" in ev, "%s: a watch is an event (%s)" % (name, ev))
+    ok, out, _ = m.cmd("watch list")
+    check(out and "hits=3" in out[0], "%s: watch counts its hits (%s)" % (name, out))
+    ok, _, err = m.cmd("guard del 7")
+    check(ok is False, "%s: guard del of none" % name)
+    m.cmd("quit")
+    finish(p)
 
 # ---- option checks ----------------------------------------------------------------------
 for args, what in (
