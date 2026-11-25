@@ -159,6 +159,12 @@ when all stand at TIME), then a new hub and `--load-snapshot FILE` on each.
 | a guest timeout under `free` | guest clocks drift apart | `--realtime` on both, or `--sync loose` |
 | a full-duplex or acknowledged transfer is off by one step under `exact` | nothing crosses a link in zero time | make the responder a device in the same board, or hold the guest in the controller model until the answer is in |
 
+On a live run the monitor (`monitor.md`) shows the same without a rerun: `link` (is each
+port up, messages sent, received, dropped, late, waiting), `link tap on` (every message as
+an event, unless `-t link` already has the node's tap), and `link inject PORT DATA` (hand
+the device a message as if the hub had sent it: test a frontend before the other side
+exists).
+
 `--trace link` prints one line per message sent (`tx`) and handed to the device (`rx`),
 with its time (in picoseconds unless the hub has another unit), key, flags, length, first
 bytes, and the guest pc; under `exact` the two

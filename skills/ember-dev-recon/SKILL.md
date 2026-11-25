@@ -350,7 +350,9 @@ cheaper to observe than to derive. Once the architecture, the *Ember support* ve
 the reset-stage base are known, a run on a bare board (ember-dev-build's
 `new-emulation.sh` makes one in minutes; a stock `uam-run -b <arch>-ref` when the image
 fits its fixed map) settles these directly. `references/dynamic-recon.md` has the
-commands, what each proves and what it does not.
+commands, what each proves and what it does not, and how to keep one run up and look at a
+moment of it with the monitor (`--monitor`, `uam-mon`: the entry state, a structure in
+RAM, the poll a bare board is stuck in) instead of a rerun per guess.
 
 | instead of | run |
 |---|---|

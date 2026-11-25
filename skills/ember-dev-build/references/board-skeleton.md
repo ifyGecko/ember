@@ -411,6 +411,13 @@ extra state; `snapshots.md` has the whole picture. What the board itself must do
   `,after=PATTERN` and `script:FILE` release it only as the guest prints its prompts.
 - `--mmio-rule` needs nothing from the board; a board that always wants some rules can map
   them itself with `uam_board_add_mmio_rules` (`uam/boards.h`), but prefer a device.
+- **Monitor commands of the board's own** (a button pressed, a strap changed, a device's
+  hidden state shown): offer them from `build()` with `uam_monitor_offer_command(m, NAME,
+  USAGE, HELP, FLAGS, fn, ctx)` (`uam/monitor.h`); every monitor created over the machine
+  then has them. Flags: `UAM_MONITOR_STOPPED_ONLY` (refused while it runs),
+  `UAM_MONITOR_CHANGES` (it changes the machine: `--monitor-log` records it). The command
+  does what the board says; ember names no device. ember's
+  `examples/external-board/emulation/ext_board.c` (`ext-id`) is the pattern.
 
 ## API checklist for your pinned commit
 Ember is young and its API moves. Before writing code against a new pin, run these in the
@@ -425,6 +432,7 @@ grep -n "uam_bus_map_\|uam_map_attrs\|UAM_PRIO_\|dirty" include/uam/bus.h      #
 grep -n "impl_min\|write_masked\|endian\|save\|STATELESS" include/uam/device.h  # device ops contract
 grep -n "uam_state_put_\|uam_state_get_" include/uam/state.h       # snapshot streams
 grep -n "uam_board_add_" include/uam/boards.h                     # board helpers (MMIO rules)
+grep -n "uam_monitor_offer_command\|UAM_MONITOR_" include/uam/monitor.h  # board monitor commands (if present)
 grep -n "_configure\|_ref;\|_BASE" include/uam/isa/mips32.h      # CPU models, address spaces (your ISA's header:
                                                                   # the second table of "Per ISA")
 sed -n '/^static uam_status .*build/,/^}/p' boards/mips_ref.c     # how ember wires that ISA (its reference board)

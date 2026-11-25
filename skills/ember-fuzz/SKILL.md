@@ -62,6 +62,24 @@ Before anything else, check and **stop and hand back to ember-dev-build** if one
   report, not something to fuzz around. (`--jit` compiles on x86-64 and AArch64 hosts;
   elsewhere it falls back to the interpreter and this check proves nothing.)
 
+**Check the gate, the begin pc and the route on a live run.** The monitor (ember-dev-build's
+`references/monitor.md`) answers the questions before a campaign on one plain run of the
+campaign's machine (`fuzz.sh`'s options, without the `--fuzz-*` ones; the harness itself
+refuses the monitor):
+
+```bash
+./run.sh -n 2000000000 --monitor unix:build/mon.sock --monitor-wait --monitor-hold ... &
+M=build/subprojects/ember/uam-mon
+$M build/mon.sock -c "break add BEGIN_PC; cont; wait; status; bt"   # the boot reaches the begin pc?
+$M build/mon.sock -c "snap save begin; input uart0 \"help\\n\"; until END_PC; status"   # the route delivers;
+                                         # the icount difference is what an ordinary input takes
+$M build/mon.sock -c "snap load begin; input uart0 hex:ffff; cont"  # another input from the same point
+```
+
+`snap save` / `snap load` give a cheap loop over hand-made inputs from the begin pc, with
+`regs`, `x` and `bt` at any point; what the harness then reports for them is the smoke
+test of step 5.
+
 All board and device changes below follow ember-dev-build's organization rules: the project
 is the same meson project in the same layout, the board only wires, one device per file
 (listed in `emulation/meson.build`), `scripts/rebuild.sh` after edits (it ends in
@@ -127,7 +145,10 @@ own: the harness is part of ember's library, which the project already links.
    `--jit`. A `hang` on an ordinary input usually means a device still missing on that path:
    back to ember-dev-build. To see why an input crashed or hung, replay it alone with
    `--history 64` (its last blocks, exceptions and interrupt entries) and, as needed,
-   `-t mmio,exc`: each input gets its own `trace: input ID` section and summaries.
+   `-t mmio,exc`: each input gets its own `trace: input ID` section and summaries. A hang
+   is quicker to see on a plain run with the monitor: the input through the route from the
+   begin snapshot (ember-fuzz-triage, step 6), then `stop; history 32; bt; regs` while it
+   hangs instead of waiting for the budget.
 6. **Check coverage moves**: `--cov-out` with two different inputs must give different
    maps; identical maps mean the input never reaches the handler (begin pc after the read,
    wrong route, input dropped by a full FIFO). Fuzzing collects **ember's block coverage by

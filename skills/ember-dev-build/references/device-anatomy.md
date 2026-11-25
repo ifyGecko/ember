@@ -43,6 +43,7 @@ static const uam_device_ops soc_uart_ops = {
     .restore = uart_restore,      /* ... and read it back in the same order */
     /* .flags = UAM_DEVICE_STATELESS   instead of save/restore, only if it holds no state */
     /* .peek: optional side-effect-free read, so --dump-mem and gdb can read the region */
+    /* .describe: optional, its state as text lines, for the monitor's "dev NAME" (below) */
 };
 
 uam_device *soc_uart_create(const char *name, uam_chardev *cd);   /* calloc + uam_device_init */
@@ -64,6 +65,13 @@ registers to model at all, which are plain configuration storage, which are poll
 (`diagnostics.md`, section 4). A device
 that wants to say which code touched it (a first-access log) appends `uam_origin_format()`
 (`uam/common.h`: " pc=0x... icount=N"); it never asks for the processor itself.
+
+**Give it a `describe`.** `describe(dev, line, ctx)` calls `line(ctx, text)` once per line
+of text saying what state the model is in (registers by name, FIFO fill, what is pending,
+the mode it is in); it must change nothing. The monitor's `dev NAME` prints it
+(`monitor.md`), so on a live run "what does the model think?" is one command instead of a
+print and a rebuild. Ember's 16550 (`devices/uart16550.c`, `uart_describe`) is the pattern.
+(It needs an ember pin with ABI 34 or later.)
 
 `uam/device.h` does not include `uam/access.h`: include it yourself for `UAM_ACC_BE`.
 

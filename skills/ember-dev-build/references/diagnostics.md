@@ -4,7 +4,9 @@ Ember tells you what the firmware wants from the hardware, if you ask the right 
 This page lists every logging and tracing mechanism the runner has (`uam-run`, and every
 board runner built on `uam_run_main`, so `run.sh` takes all of them), what each line means,
 and which one answers which bring-up question. `iteration-loop.md` says *when* in the loop
-to use them; this page says *which* and *how*.
+to use them; this page says *which* and *how*. All of these are chosen before a run starts;
+to stop a run that is already going, look at it and change it without restarting, use the
+monitor (`monitor.md`).
 
 ## Ground rules
 
@@ -67,6 +69,9 @@ Each of these has been done the slow way. The switch on the right already exists
 | reading the decompiler to guess whether a function ever runs | `--log-pc ADDR`, or `-t blocks --trace-range` over it |
 | rebuilding the board to try a register value | `--mmio-rule ADDR=fixed:V` |
 | re-running a long boot for every experiment | `--snapshot-at PC --save-snapshot F`, then `--load-snapshot F` |
+| restarting a long run for each look at the state it is stuck in | `--monitor unix:S --monitor-hold`, then `uam-mon S -c "stop; status; regs; history 32; bt"` on the same run (`monitor.md`) |
+| a rebuild or a rerun per register value tried on a stuck boot | the monitor's `mmio-rule ADDR=fixed:V; cont` on the live run (`snap save` first, `snap load` between tries) |
+| giving up on breakpoints where gdb cannot drive the core (6502, 8051, PIC, Z80, Xtensa, AVR32) | the monitor's `break add`, `step`, `regs`, `x` work on every ISA |
 | guessing which interrupt is missing from the firmware's tables | `-t irq,exc`: which lines rose, what is pending and enabled at the stop |
 | capturing a guest's network traffic with host tools | `--nic PORT=SPEC,pcap=FILE` |
 | patching ember to print something | section 7: the board can log, hook a pc and watch the bus itself |
@@ -134,6 +139,7 @@ addresses in [LO, HI); given without either, it turns the `mmio` trace on.
 | `--dump-mem ...=FILE` | the same bytes written raw to FILE | code or data the firmware built in RAM (a stage it decompressed or relocated), to load into Ghidra at that address |
 | `--nic PORT=SPEC,pcap=FILE` | records every frame of that network port in a pcap file | what the guest sent and received, read with any pcap tool |
 | `-t link` | one line per message of a `--link` port: `link bus0 tx time=.. key=0x.. flags=0x.. kind=0 len=N data=.. pc=.. icount=N` when the guest sends, `rx ... at=..` when the device gets it (`at`: this emulation's time; `time`: when it took effect; bit 2 of `flags`: it came late) | what two emulations said to each other and when; under an exact hub the trace is the same every run, so `diff` two runs (`links.md`) |
+| `--monitor unix:PATH` (`--monitor-wait`, `--monitor-hold`, `--monitor-log FILE`; client `uam-mon PATH -c "CMD; CMD"`) | a live command channel into the run: stop, step, run to a pc; registers, memory, devices, the call chain, the history; breakpoints, guards, watches, rules, traces and `mmio-rule`s added and removed while it runs; snapshots taken and restored; console input sent and output awaited. `monitor.md` | everything about one moment of a long run, without a rerun per question; trying a fix on the stuck run itself; a recorded session (`--monitor-log`) that replays exactly |
 | `--gdb PORT` (`scripts/gdb_trace_calls.py`) | a gdb remote stub: breakpoints, `watch`/`rwatch`/`awatch` (on RAM and on device registers), single-step, reading **and writing** registers and memory, one gdb thread per processor | interactive digging; call tracing without stopping the guest; changing a register or a RAM word by hand to test "would it get past if this were V" |
 | `-v` / `-v -v` | more logging: `-v` shows `info` lines (`mmio-stub` first accesses), `-v -v` `debug` lines (POST codes on a PC); your own `uam_log` lines follow the same levels (section 7) | |
 

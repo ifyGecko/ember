@@ -696,6 +696,8 @@ cat > "$PROJ/run.sh" <<EOF
 #   -n 200000000 (instruction budget)  --gdb 1234  --log-pc 0x...[,REG,...]  --break 0x... -d  --jit
 #   -t mmio-summary  -t mmio --trace-mmio-range LO:HI  -t irq,sysreg,dma,console  --history 64
 #   --trace-file build/trace.txt  (diagnostics: the skill's references/diagnostics.md)
+#   --monitor unix:build/mon.sock --monitor-hold   (a live run you ask with
+#     build/subprojects/ember/uam-mon build/mon.sock -c "stop; status; regs": references/monitor.md)
 # Env: UNKNOWN_MMIO=zero|echo|fault|stop (stop: halt at the first unmodelled access, exit 131),
 #      TRACE=exc (the default; TRACE= for none, TRACE=exc,mmio-summary ...)
 # Console on stdout, diagnostics (catch-all logs, --trace exc, exit line, stats) on stderr:

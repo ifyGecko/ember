@@ -5,12 +5,36 @@ machine and steer it while it runs, without restarting. It does not touch the gu
 serial line, and a run without it does exactly what it did before (`include/uam/monitor.h`
 says why).
 
-Commands so far: run control (`stop`, `cont`, `wait`, `step`, `until`, `run-for`,
-`quit`), the machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`), its
-memory (`x`, `write`, `load`, `dump`), live instrumentation (`break`, `guard`, `watch`,
-`rule`, `trace`, `mmio-rule`), the machine as a whole (`snap`, `reset`, `devices`, `dev`,
-`heap`, `irq`, `cpustate`), and its ways in and out (`send`, `expect`, `tap`, `input`,
-`link`). Boards can add their own commands (`uam_monitor_add_command`, below).
+The commands: run control (`stop`, `cont`, `wait`, `step`, `until`, `run-for`, `quit`),
+the machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`), its memory
+(`x`, `write`, `load`, `dump`), live instrumentation (`break`, `guard`, `watch`, `rule`,
+`trace`, `mmio-rule`), the machine as a whole (`snap`, `reset`, `devices`, `dev`, `heap`,
+`irq`, `cpustate`), and its ways in and out (`send`, `expect`, `tap`, `input`, `link`).
+Boards add their own (`uam_monitor_offer_command`, below).
+
+## When it is the right tool
+
+Every other diagnostic (`-t`, `--watch`, `--break`, `--on`, `--history`, ...) is chosen
+before the run starts. The monitor is for what you cannot choose in advance: **a moment of
+a long run** (where a boot hangs, what memory and the devices hold there) and **changing a
+run while it goes** (a register value tried, a breakpoint or a guard added, a snapshot
+taken where you are). One run answers question after question instead of one rerun per
+question:
+
+| work | what the monitor gives |
+|---|---|
+| bring-up: a boot that hangs or loops after a long run-up | `stop; status; regs; history 32; bt; cpustate` on the hung run; `x`, `dev NAME` for the register it polls and the model behind it |
+| bring-up: "does it get past if this register reads V?" | `mmio-rule ADDR=fixed:V; cont` on the same run; `snap save` / `snap load` between tries |
+| recon on a bare board | the entry state (`until ENTRY; regs`), a stage the loader built (`dump ADDR+LEN=FILE`), the windows (`map`) |
+| a console dialog before the interesting part | `send console "...\n"; expect console "PROMPT"` |
+| before a fuzz campaign | `break add BEGIN; cont; wait` (the boot reaches the begin pc), `input uart0 ...` (the route delivers), `snap save` / `snap load` to try hand-made inputs from one point |
+| triage of a crash | the plain run held at the crash (`--monitor-hold`), breakpoints and guards that stop into the monitor, `snap load` to go back |
+| a core gdb cannot drive (6502, 8051, PIC, Z80, Xtensa, AVR32) | breakpoints, stepping, registers and memory on every ISA |
+| a reproducible record of an interactive session | `--monitor-log`, replayed by `--monitor-script` |
+
+What a whole-run trace answers (every register access in order, a summary of a run,
+whether code ever runs) stays a switch. The skills say where the monitor fits their
+workflows: `skills/ember-dev-build/references/monitor.md`.
 
 ## Connecting
 
@@ -20,6 +44,23 @@ uam-mon mon.sock                               # a prompt; or plain socat - UNIX
 uam-mon mon.sock -c "stop; status; cont"       # one shot, for scripts
 ```
 
+`uam-mon WHERE [-j] [-c "CMD; CMD"]...`: WHERE is `unix:PATH`, a plain `PATH`, `tcp:PORT`
+or `tcp:HOST:PORT`. `-c` runs the commands in order, each after the last one's reply, and
+exits: 0 if all succeeded, 1 if one failed (its `error:` on stderr), 2 if the monitor
+could not be reached or went away. `-j` gives JSON replies. Without `-c` it reads commands
+from stdin (a prompt on a terminal). From a script or an agent, start the run in the
+background and wait for the socket:
+
+```bash
+uam-run ... --monitor unix:mon.sock --monitor-hold > console.txt 2> run.log < /dev/null &
+while [ ! -S mon.sock ]; do sleep 0.1; done
+uam-mon mon.sock -c "break add 0x80001234; cont; wait; regs; bt"
+uam-mon mon.sock -c "quit"
+```
+
+After `cont`, `wait` holds the batch until the machine stops again (a breakpoint, a
+guard, a rule, the end), so the commands after it see a stopped machine.
+
 | Way in | What it is |
 |---|---|
 | `--monitor unix:PATH` | a Unix socket. File permissions decide who gets in. A stale socket file at PATH is replaced; the file is removed when the run ends. |
@@ -28,7 +69,9 @@ uam-mon mon.sock -c "stop; status; cont"       # one shot, for scripts
 | `--console stdio-raw` | **Ctrl-A m** switches the terminal between the guest and the monitor. |
 
 `--monitor` can be given up to four times, and several clients can be connected at once.
-Every client sees the events.
+Every client sees the events. Nothing ever waits for a client: what a socket client has
+not read yet is kept for it, and a client that lets 1 MiB pile up is dropped. A line
+longer than 8 KiB is refused whole.
 
 ### Guest serial on stdin/stdout
 
@@ -55,7 +98,7 @@ second window.
 |---|---|
 | `--monitor-wait` | Stopped before the first instruction; `cont` starts it. |
 | `--monitor-hold` | When the run ends (any reason), stay for inspection until `quit`. The exit status is the run's own, unless `quit N` gives one. |
-| `--monitor-script FILE` | Commands to run before the first instruction, one per line. Output goes to stderr, prefixed `uam-run: monitor:`. A failing command stops the script and the run (exit 2). The machine starts afterwards, unless the script said `stop` or `--monitor-wait` is set. A line `@N COMMAND` runs when the machine reaches instruction N instead (a failure there is reported, and the run goes on). |
+| `--monitor-script FILE` | Commands to run before the first instruction, one per line. Output goes to stderr, prefixed `uam-run: monitor:`. A failing command stops the script and the run (exit 2). The machine starts afterwards, unless the script said `stop` or `--monitor-wait` is set (and then something must reach the monitor to let it go on: a `--monitor`, or the run is refused, exit 2). A line `@N COMMAND` runs when the machine reaches instruction N instead (a failure there is reported, and the run goes on). |
 | `--monitor-log FILE` | Records every command that changed the machine, from any client, as `@N COMMAND` (N: the instruction count when it took effect). Given back to `--monitor-script`, with the same command line otherwise, it plays the session again: the same commands at the same instructions, so the same run. |
 
 The monitor does not combine with fuzzing. With `--gdb`, gdb runs the machine and the
@@ -91,9 +134,16 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 - **Named results** are shown as `name: value` lines.
 - **Events** are lines starting `! `. They arrive between replies, never inside one:
   - `! hello protocol=1 state=running` — when a client connects
-  - `! stopped reason=monitor pc=0x9 icount=370118` — when the machine stops
+  - `! running` — when a stopped machine goes on
+  - `! stopped reason=monitor pc=0x9 icount=370118` — when the machine stops (`reason`:
+    `monitor`, `step`, `until`, `run-for`, `break-N`, `guard-N`, `rule-NAME`, `snap`,
+    `reset`, `start`)
   - `! ended reason=instruction-limit-reached status=0 pc=0x9 icount=50000000` — when the
     run ends
+  - `! watch id=N pc=0x... what=...` — an access to a `watch`
+  - `! output chardev=console text="..."` — guest output, to a client that has `tap` on
+  - `! link port=P dir=in|out kind=K key=0x.. len=N data="..."` — to a client with
+    `link tap on`
 
   Each value is one word: spaces in it are written as `-`.
 - **Comments:** a line starting `# ` (a `#` that is not an id) is ignored.
@@ -125,8 +175,10 @@ replay the same.
 - **While the machine runs,** commands are read between blocks: every 1024 blocks, and
   whenever the guest idles. Commands that read or change the machine's state (registers,
   memory, `step`, `history`, `bt`, `break`, `guard`, `watch`, `rule`, `mmio-rule`) need it
-  stopped and say so otherwise. `map`, `status`, `cpu`, `wait`, `trace` (but `blocks` and
-  `ir`) and `help` work at any time.
+  stopped and say so otherwise. `map`, `status`, `cpu`, `wait`, `send`, `expect`, `tap`,
+  `link`, `trace` (but `blocks` and `ir`) and `help` work at any time. A command sent while
+  the machine runs takes effect between blocks, not at an exact instruction: `break`,
+  `until` and `step` are exact.
 - **What the monitor adds stops into the monitor.** A breakpoint, guard or rule added
   here stops the run into the monitor, where `cont` goes on. The ones uam-run was started
   with (`--break`, `--guard`, `--on`) still end the run, as without a monitor
@@ -148,10 +200,10 @@ replay the same.
 | Command | What it does |
 |---|---|
 | `help [COMMAND]` | Lists the commands, or says what one does. |
-| `status` | `state` (`running`, `stopped`, `ended`), `reason` (why it is stopped: `start`, `monitor`; or how the run ended, with `status`), `board`, `icount`, `time` (scheduler ticks), `cpus`, and one line per processor: `cpu N pc=0x... icount=N [waiting]`. |
+| `status` | `state` (`running`, `stopped`, `ended`), `reason` (why it is stopped: `start`, `monitor`, `step`, `until`, `run-for`, `break N`, `guard N`, `rule NAME`, `snap`, `reset`, `debugger` under gdb; or how the run ended, with `status`), `board`, `icount`, `time` (scheduler ticks), `cpus`, and one line per processor: `cpu N pc=0x... icount=N [waiting]`. |
 | `stop` | Stops the machine at the next block boundary. The reply carries `state`, `pc` and `icount`. Before the start, it keeps the machine stopped. |
 | `cont` | A stopped machine goes on. Refused once the run has ended. |
-| `wait` | Replies once the machine stops (a breakpoint, a guard, a rule, another client's `stop`) or the run ends, with the same fields as `stop`. At once if it is not running. For scripts: `cont; wait; regs`. |
+| `wait` | Replies once the machine stops (a breakpoint, a guard, a rule, another client's `stop`) or the run ends (with or without `--monitor-hold`; `state: ended` and how), with the same fields as `stop`. At once if it is not running. For scripts: `cont; wait; regs`. |
 | `step [N]` | Runs N instructions (default 1) in all, across every processor, then stops. Replies once it has stopped (`reason: step`). Needs the machine stopped; not in a script. |
 | `until PC` | Runs until a processor reaches PC again (where one stands now does not count), then stops (`reason: until`). An ARM Thumb address can be given with or without bit 0. |
 | `run-for TICKS` | Runs for TICKS of virtual time (scheduler ticks, as `status` shows `time`), then stops (`reason: run-for`). A `--max-ticks` limit still ends the run. |
@@ -167,9 +219,9 @@ replay the same.
 | `history on [N] \| off \| clear` | Keep the last N events per processor (64 by default), keep none, or forget what is kept. |
 | `bt` | The selected processor's call chain, innermost first, named from an ELF image's symbols as `--backtrace` names them. Needs `--backtrace`. |
 | `break add PC \| del ID\|all \| list` | Breakpoints: the run stops into the monitor when a processor reaches PC (`reason: break ID`), and `cont` goes on from there. `list` shows each with its hits. |
-| `guard add SPEC \| del ID\|all \| list` | Guards as `--guard` takes them (`[p:]ADDR[-BEFORE][+AFTER][:r\|w\|rw][,stop\|,fault\|,log][,name=NAME]`). A hit stops the run into the monitor at the access, before it happens (`reason: guard ID`). `cont` lets that one access happen: the guard is lifted for one instruction, then it is back. |
-| `watch add SPEC \| del ID\|all \| list` | Watches as `--watch` takes them: every access is an event, `! watch id=ID pc=0x... what=...`, and the run goes on. |
-| `rule add TEXT \| load FILE \| list \| on ID \| off ID \| del ID` | Rules as `--on` and `--on-file` take them (`include/uam/rules.h`), with the image's symbols. A rule's `stop` stops the run into the monitor (`reason: rule NAME`). `list` shows each rule's id, name, whether it is on, and its counts. A deleted rule keeps its id. Rules with `count=` or `delay=` become part of the snapshot state (as `rules-monitor`). |
+| `guard add SPEC \| del ID\|all \| list` | Guards as `--guard` takes them (`[p:]ADDR[-BEFORE][+AFTER][:r\|w\|rw][,stop\|,fault\|,log][,name=NAME]`). A hit stops the run into the monitor at the access, before it happens (`reason: guard ID`). `cont` lets that one access happen: the guard is lifted for one instruction, then it is back. (With several processors that one instruction is the machine's next; if another processor's slice comes first, the guard stops once more at the same access, and `cont` again goes on.) An action in SPEC decides: `,log` makes it report like a watch. |
+| `watch add SPEC \| del ID\|all \| list` | Watches as `--watch` takes them: every access is an event, `! watch id=ID pc=0x... what=...`, and the run goes on (`,stop` in SPEC makes it stop like a guard). |
+| `rule add TEXT \| load FILE \| list \| on ID \| off ID \| del ID` | Rules as `--on` and `--on-file` take them (`include/uam/rules.h`), with the image's symbols. A rule's `stop` stops the run into the monitor (`reason: rule NAME`). `list` shows each rule's id, name, whether it is on, and its counts. A deleted rule keeps its id. `off` and `del` also drop the stores of a `delay=` rule still on their way. Rules with `count=` or `delay=` become part of the snapshot state (as `rules-monitor`). |
 | `trace [on LIST \| off LIST \| file PATH\|-]` | The `-t` traces (LIST as `-t` takes it; `off all` turns every one off): on, off, and where they go (`-` is stderr). Without arguments, which are on. `blocks` and `ir` change how code is translated and need the machine stopped; `link` can only be set when the run starts. |
 | `mmio-rule RULE` | Answers an unmodelled register, as `--mmio-rule` does, from now on (above every `--mmio-rule`, below every real device). Not `input`. |
 | `snap save NAME [FILE]` | Keeps the machine as it is now, in memory as NAME (and in FILE, as `--save-snapshot` writes it). |
@@ -220,13 +272,15 @@ static void press(uam_monitor_call *c, void *ctx)
     uam_monitor_field(c, "button", "%s", uam_monitor_arg(c, 1));
 }
 
-uam_monitor_add_command(mon, "press", "BUTTON", "press and release a button", 0, press, b);
+/* in the board's build(), before any monitor exists */
+uam_monitor_offer_command(m, "press", "BUTTON", "press and release a button",
+                          UAM_MONITOR_STOPPED_ONLY | UAM_MONITOR_CHANGES, press, b);
 ```
 
-A board offers its commands from its build, before any monitor exists, with
-`uam_monitor_offer_command(m, ...)` (same arguments, the machine first): every monitor
-created over that machine has them. The example board does
-(`examples/external-board/emulation/ext_board.c`, `ext-id [scratch VALUE]`).
+Every monitor created over that machine then has the command (the example board's
+`ext-id [scratch VALUE]`, `examples/external-board/emulation/ext_board.c`). A program that
+holds the monitor itself adds commands with `uam_monitor_add_command(mon, ...)`, the same
+arguments without the machine (uam-run adds `trace` and `mmio-rule` that way).
 
 - `UAM_MONITOR_STOPPED_ONLY` refuses a command while the machine runs.
 - `UAM_MONITOR_CHANGES` says it changes the machine: `--monitor-log` records it.

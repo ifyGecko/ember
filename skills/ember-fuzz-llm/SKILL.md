@@ -134,6 +134,14 @@ printf 'BOOT\x10\x00...' > camp/llm/queue/.tmp
 mv camp/llm/queue/.tmp 'camp/llm/queue/id:000000,orig:boot_frame'
 ```
 
+**Check a hard guess before you feed it** (optional, outside the campaign): a plain run of
+the campaign's machine from its begin snapshot with ember's monitor shows whether the bytes
+get past the gate you aimed at, without waiting for the brain's verdict:
+`input uart0 hex:424f4f541000...; break add GATE_TARGET; cont; wait` answers `break 1`
+when they do; `bt` and `regs` show where they stopped when they do not; `snap load begin`
+starts the next guess from the same point (ember-dev-build's `references/monitor.md`;
+ember-fuzz-triage, step 7b, for the run's command line). The campaign is not touched.
+
 The brain imports on its `--sync-interval` (default 60 s; a campaign you start for this can
 use a shorter one). Write a **batch** of related guesses at once (vary the length field, the
 magic, the command byte) rather than one at a time.

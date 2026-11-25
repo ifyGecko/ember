@@ -69,6 +69,12 @@ Once a boot is long, stop re-running it every iteration:
 
 - `--snapshot-at PC` saves on the first arrival and keeps running; add `--break PC` to stop
   there. Without it the snapshot is taken when the run stops (budget, `--break`, Ctrl-C).
+- When the right point is easier to see than to name, take it from the live run with the
+  monitor (`monitor.md`): `stop; snap save booted build/booted.snap` writes the same file
+  `--save-snapshot` does. Within one run, `snap save NAME` / `snap load NAME` go back and
+  forth between experiments (`snap load` also brings back a run that ended under
+  `--monitor-hold`). A snapshot does not fit any more once a monitor `mmio-rule`, or a rule
+  with `count=`/`delay=`, was added after it.
 - A snapshot belongs to one board build. **Changing a device that is part of it invalidates
   it** when its saved layout changes, and always risks stale state: re-take the snapshot
   whenever the iteration touched anything that ran before the snapshot point. Journal which

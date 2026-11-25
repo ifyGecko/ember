@@ -1,6 +1,6 @@
 ---
 name: ember-dev-build
-description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, connect emulations over any channel (--link, uam-link-hub: serial, bus, radio), make a board snapshot-capable, or debug a stalled bring-up (exit 124-132, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (meson project, one file per device); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
+description: "Build an ember (UAM) board for a firmware image and bring it up, iteratively. Use to emulate/boot firmware with ember (uam-run, libuam), write an ember board or device model (UART, timer, interrupt controller, flash; PC chipset: LPC, SMI, SPI, SMBus, Super I/O), boot UEFI/BIOS on an x86-64 PC, answer unmodelled registers (--mmio-rule), hook a firmware function, run -o cpus=N, connect emulations (--link, uam-link-hub), make a board snapshot-capable, steer a live run (--monitor, uam-mon), or debug a stalled bring-up (exit 124-132, livelock, triple fault, abi error). ISAs: MIPS32 BE/LE, RV32IMAC, ARMv7-A LE/BE8, x86-64, PowerPC (classic, Book E), AVR, AVR32, PIC, PIC32, 8051, 6502, Z80, Xtensa LE/BE. Input: RECON.md from ember-dev-recon. Keeps emulation code out of ember (meson project, one file per device); one blocker per iteration, journaled. Triggers: 'emulate this firmware with ember', 'boot this BIOS/UEFI on ember', 'write an ember board/device', 'it hangs in ember'. Fuzzing a working board: ember-fuzz."
 ---
 
 # ember-dev-build: iterative firmware bring-up on ember
@@ -15,7 +15,9 @@ Two things make this work: the **organization discipline** (non-negotiable) and 
 **iteration loop** (how progress is made). Read `references/organization.md` and
 `references/iteration-loop.md` before writing code, and `references/diagnostics.md` before
 the first run: every log, trace and probe ember has, what its lines mean, and which one
-answers which bring-up question. Use `references/board-skeleton.md`
+answers which bring-up question. `references/monitor.md` is the other half: keeping one run
+up and stopping, inspecting and changing it live (`--monitor`, `uam-mon`) instead of a
+rerun per question. Use `references/board-skeleton.md`
 and `references/device-anatomy.md` (with its tested models in `references/examples/`) while
 writing it. **For a PC (x86-64: UEFI, coreboot or a legacy BIOS) also read
 `references/pc-platform.md`** before the first run: the PC template, the chipset layer, the
@@ -144,7 +146,11 @@ built, not the project's `subprojects/ember`).
    `IMAGE=fw.bin timeout -k 5 300 ./run.sh -n 200000000 > build/console.txt 2> build/emu.log < /dev/null`
    (a PC: `FLASH=bios.bin ...`), then `python3 scripts/log_summary.py build/emu.log`. Runs
    are deterministic: the same inputs give the same run, instruction for instruction, also
-   with several processors.
+   with several processors. When the questions are about one moment of a long run (where
+   it is stuck, what a device or a structure holds there, whether a register value gets it
+   further), keep the run up instead: add `--monitor unix:build/mon.sock --monitor-hold`,
+   run it in the background, and ask with `build/subprojects/ember/uam-mon build/mon.sock
+   -c "stop; status; regs; history 32; bt"` (`references/monitor.md`).
 2. **Pick the single next blocker**: the first failure in time order, not the loudest line.
    Read the exit code from the stop line in `build/emu.log` (`... (status N) at pc=...`;
    `log_summary.py` prints it), not from `$?`: `timeout` also returns 124 when it kills the
@@ -184,10 +190,10 @@ built, not the project's `subprojects/ember`).
    - *which call fails, what does a loop check?* `--log-pc ADDR,REG,...` with the registers
      as gdb names them (RISC-V `a0,a1,ra`; MIPS `r4,r5,r31`; ARM `r0,r1,lr`; an unknown name
      lists them all), `--break ADDR -d`, `-n N -d`, `--dump-mem`, gdb (`--gdb`,
-     `scripts/gdb_trace_calls.py`); *is it stuck, where is it now?* the monitor
-     (`--monitor unix:mon.sock`, then `uam-mon mon.sock -c "stop; status; regs; bt"`, then
-     `step`, `until PC`, `x ADDR`; on `--console stdio-raw`, Ctrl-A m; `docs/monitor.md`);
-     *who called this?* `--backtrace` (the call chain at the
+     `scripts/gdb_trace_calls.py`); *is it stuck, where is it now, what is in memory or a
+     device there?* the monitor on a live run (`references/monitor.md`: `stop; status; regs;
+     bt`, `x ADDR`, `dev NAME`, `cpustate`, `break add PC; cont; wait`, `until PC`, `step`;
+     it works on every ISA, also those gdb cannot drive); *who called this?* `--backtrace` (the call chain at the
      stop; names need an ELF image, a raw image gets addresses);
    - *what reads or writes this address or range?* a device register or x86 port:
      `-t mmio --trace-mmio-range LO:HI`; RAM, ROM or flash data (or a register):
@@ -206,7 +212,8 @@ built, not the project's `subprojects/ember`).
    Turn on one or two for the question at hand, not `-t all` on a long boot; narrow with
    `--trace-mmio-range`, `--trace-after N` and `--trace-range`. Test a register hypothesis
    with `--mmio-rule ADDR=fixed:V` before writing C (an x86 I/O port is
-   `0x10000000000 + port`). Once the boot is long, start runs from a snapshot
+   `0x10000000000 + port`), or on the live run with the monitor's `mmio-rule` (`snap save`
+   before, `snap load` between tries), and record such a session with `--monitor-log`. Once the boot is long, start runs from a snapshot
    (`--snapshot-at PC --save-snapshot`, then `--load-snapshot`) and aim `--trace-after` at
    the stretch you are working on.
 4. **Resolve exactly that blocker** in the **one** device that owns it (its own file, device

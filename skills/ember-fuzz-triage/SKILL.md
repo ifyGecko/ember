@@ -1,6 +1,6 @@
 ---
 name: ember-fuzz-triage
-description: "Work out what a crashing fuzz input does to firmware running on an ember (UAM) emulation: where it crashes, how execution got there, why (which input bytes, which values), and whether it is a firmware bug or an emulation gap. Use when a fuzz campaign (ember-fuzz, the fuzz brain, --fuzz-replay) left crash, hang or timeout inputs and someone has to explain them. Generic to every ember board and ISA: replaying one input, reading verdict lines (crash-fault, crash-guard, crash-oracle, hang, timeout), --history, --backtrace, traces, --watch/--guard, --on rules, --log-pc, --dump-mem, reproducing the crash as a plain run from a snapshot, and driving it from gdb (--gdb, target remote, breakpoints, watchpoints, stepping, memory and registers, scripted sessions). Step by step for a newcomer or a small model; ends in a report. Triggers: 'triage this crash', 'why does this input crash', 'debug a fuzz crash', 'connect gdb to ember', 'what does this crash-fault mean', 'reproduce a fuzz crash'. Finding crashes: ember-fuzz."
+description: "Work out what a crashing fuzz input does to firmware running on an ember (UAM) emulation: where it crashes, how execution got there, why (which input bytes, which values), and whether it is a firmware bug or an emulation gap. Use when a fuzz campaign (ember-fuzz, the fuzz brain, --fuzz-replay) left crash, hang or timeout inputs and someone has to explain them. Generic to every ember board and ISA: replaying one input, reading verdict lines (crash-fault/-guard/-oracle, hang, timeout), --history, --backtrace, traces, --watch/--guard, --on rules, --log-pc, --dump-mem, reproducing the crash as a plain run from a snapshot, and driving it from gdb (--gdb: breakpoints, watchpoints, stepping, memory, registers, scripts) or ember's monitor (--monitor, uam-mon). Step by step for a newcomer or small model; ends in a report. Triggers: 'triage this crash', 'why does this input crash', 'debug a fuzz crash', 'connect gdb to ember', 'what does this crash-fault mean', 'reproduce a fuzz crash'. Finding crashes: ember-fuzz."
 ---
 
 # ember-fuzz-triage: from a crashing input to an explanation
@@ -342,7 +342,7 @@ Three things to know before you step:
   `s0`, on RISC-V); a wrong name in `--log-pc` or `--on` makes ember list the valid ones.
   A function may be `parse.constprop.0` in the image; `nm fw.elf | grep parse` shows it.
 - **Fault registers are often not in gdb's view** (`mcause`, `mtval`, `ESR`, ...). ember's
-  `-d` and `-t exc` print them.
+  `-d` and `-t exc` print them, and so does `monitor cpustate` at gdb's prompt.
 
 **Loading the input for a `mem:` route**, at the snapshot, before `continue`:
 
@@ -350,6 +350,37 @@ Three things to know before you step:
 (gdb) restore INPUT binary 0xADDR                      copy the file into guest memory
 (gdb) set {unsigned int}0xLADDR = 123                  its length, where len= points
 ```
+
+## Step 7b: or look around with the monitor (no gdb needed)
+
+ember's monitor does the same looking around on any core, including the ones gdb cannot
+drive (6502, 8051, PIC, Z80, Xtensa, AVR32), and it keeps the run after the crash. Start
+the plain run of step 6 stopped and held, then ask it with `uam-mon`
+(`build/subprojects/ember/uam-mon` in a project; ember-dev-build's
+`references/monitor.md` has the whole picture):
+
+```bash
+RUN --backtrace --history 64 --load-snapshot begin.snap --console file:/dev/null,in=INPUT \
+    --monitor unix:mon.sock --monitor-wait --monitor-hold > console.txt 2> run.log < /dev/null &
+while [ ! -S mon.sock ]; do sleep 0.1; done
+uam-mon mon.sock -c "break add 0x800003a6; cont; wait"   # stop before the faulting instruction
+uam-mon mon.sock -c "regs; bt; history 16; x 0x80000530 16; cpustate"
+uam-mon mon.sock -c "snap save here; step 1; regs"       # step over it, look, ...
+uam-mon mon.sock -c "snap load here"                     # ... and go back, as often as needed
+uam-mon mon.sock -c "cont; wait; status"                 # let it crash: the machine stays there
+uam-mon mon.sock -c "quit"
+```
+
+- `wait` answers when the run stops at a breakpoint, a guard, a rule, or its end; with
+  `--monitor-hold` the crashed machine stays for `regs`, `bt`, `x`, `history`.
+- Breakpoints, guards (`guard add ADDR+LEN:w`) and rules (`rule add pc=parse,if
+  a1>0x400,stop`) added here stop *into the monitor*; `cont` goes on past them.
+- `snap save` / `snap load` are the way back: there is no reverse execution, but going
+  back to a saved point is instant and exact.
+- For a `mem:` route, at the snapshot: `load 0xADDR INPUT` and `write 0xLADDR w4 123` do
+  what gdb's `restore` and `set` do.
+- `--monitor-log triage.log` records what you changed, with the instruction it happened
+  at; `--monitor-script triage.log` replays it, so the report can carry the session.
 
 ## Step 8: follow the bad value back to the input
 
@@ -500,6 +531,8 @@ classification with its evidence.
   loaded at run time): `references/gdb.md`, "Code that is not where the ELF says".
 - **gdb says `Cannot execute this command while the target is running`**: the guest is
   running and has not hit a breakpoint. Press Ctrl-C to stop it, then look at `$pc`.
+- **gdb cannot drive this core** (6502, 8051, PIC, Z80, Xtensa, AVR32): step 7b, the
+  monitor, has breakpoints, stepping, registers and memory on every ISA.
 - **The crash is far from anything that looks wrong**: memory was corrupted earlier. Turn
   the corruption into an immediate stop: `--guard-returns` for a smashed return address,
   `--guard ADDR-16+16:w` around a variable that changes unexpectedly, the campaign's

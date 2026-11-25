@@ -61,6 +61,10 @@ input give **the same run, instruction for instruction**. Consequences:
   with both logs instead of working around it. To narrow it for the report, `--no-chain`,
   `--no-opt` and `--block-insns 1` each change only how blocks are formed and run, and
   `--trace ir` prints what was translated.
+- A live session is reproducible too: `--monitor-log FILE` records each monitor command
+  that changed the machine with its icount, and `--monitor-script FILE` replays them at the
+  same instructions (`monitor.md`). Keep that file with the iteration's journal when a live
+  experiment found the answer.
 - A run can be cut anywhere with `--save-snapshot` and resumed with `--load-snapshot`,
   bit-identically. Once the boot is long, take a snapshot past the part you are no longer
   changing and start every run from it (`snapshots.md`, section 2); re-take it
@@ -222,6 +226,25 @@ also stores writes); if the guest gets past, the semantics go into the owning de
 step (4). Rules are probes: one left in `run.sh` past the iteration is journaled like an HLE
 hook, and goes when the block gets a device.
 
+**Or ask the run itself, while it runs: the monitor** (`monitor.md`). When the boot hangs
+after a long run-up, or you want several looks at one moment, keep one run up rather than
+rerunning per question:
+
+```bash
+./run.sh -n 2000000000 --monitor unix:build/mon.sock --monitor-hold --history 64 --backtrace \
+    > build/console.txt 2> build/emu.log < /dev/null &
+M=build/subprojects/ember/uam-mon
+$M build/mon.sock -c "stop; status; regs; history 32; bt; cpustate"   # where, how, why
+$M build/mon.sock -c "x 0x80301234 64 w4; dev uart0"                  # memory, a device
+$M build/mon.sock -c "mmio-rule 0x18040010=fixed:0x1; cont"           # a fix, on this run
+$M build/mon.sock -c "break add 0x8023f00c; cont; wait; regs"         # stop at a pc
+$M build/mon.sock -c "quit"
+```
+
+It works on every ISA, including those gdb cannot drive. Breakpoints, guards and rules
+added this way stop the run into the monitor (`cont` goes on); the command line's own
+still end it.
+
 **Find which call fails (or what loops) with gdb, without stopping the guest.** Ember's
 runner waits for gdb before executing the first instruction; breakpoints are PC hooks and
 watchpoints are bus watches (`watch *(int *)0xb8000014` traps the guest's MMIO accesses).
@@ -246,7 +269,7 @@ lines: the default is the Microsoft x64 one (UEFI DXE and later), `trace-abi i38
   There, use ember's own probes (`--log-pc`, `--break -d`, `--dump-mem`, `--watch`).
 - Write gdb output to a file, not a pipe. Batch sessions killed by `timeout` lose piped output.
 - For a hang: interrupt or `--break` at a pc in the loop, `x/12i $pc-24`, then trace the
-  callers. The repeating call and its arguments name the register being polled.
+  callers (without gdb: the monitor's `stop; history 32; bt`). The repeating call and its arguments name the register being polled.
 - For a value that goes wrong (a size, a pointer, a status the guest computed), set a
   watchpoint on the RAM holding it: `watch`, `rwatch` and `awatch` all work, also with
   `--jit`, and stop at the instruction that made the access - often faster than tracing
@@ -367,3 +390,5 @@ ended still blocked, say so and carry the problem forward.
 - HLE hooks that hide a device you could model.
 - Chasing garbage addresses that really come from a wrong base. Re-validate recon instead.
 - Unbounded runs (`-n` missing) from an automated session.
+- Rerunning a 10-minute boot five times to look at the state it ends up in: keep it up with
+  `--monitor` and ask it five things (`monitor.md`).

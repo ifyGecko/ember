@@ -27,8 +27,8 @@ project for each (`new-emulation.sh --isa ... [--model ...]`, defaults from the 
 Everything about building, running, diagnosing and modelling follows ember's own design:
 out-of-tree boards on `libuam`, `uam_device` models behind ember's layering rules,
 deterministic virtual time, instruction and virtual-time budgets, per-register MMIO rules,
-guarded memory, scripted console input, machine snapshots, ember's diagnostics and its gdb
-stub; and, for ember-fuzz, its coverage and fuzz harness, fuzz brain and (opt-in) site lists. The ember
+guarded memory, scripted console input, machine snapshots, ember's diagnostics, its gdb
+stub and its monitor (a live run stopped, inspected and changed without a restart); and, for ember-fuzz, its coverage and fuzz harness, fuzz brain and (opt-in) site lists. The ember
 checkout a project pins is the authority on options and APIs; the skills say where to look.
 
 ## Requirements
