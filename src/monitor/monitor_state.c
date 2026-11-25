@@ -434,21 +434,25 @@ uam_status mon_add_state_commands(uam_monitor *mon)
     static const struct {
         const char *name, *usage, *help;
         uam_monitor_fn fn;
+        unsigned    flags;
     } cmds[] = {
         { "snap", "save NAME [FILE] | load NAME|FILE | list | write NAME FILE | read NAME FILE | "
-          "drop NAME", "snapshots: keep the machine as it is, and go back to it", cmd_snap },
+          "drop NAME", "snapshots: keep the machine as it is, and go back to it", cmd_snap,
+          UAM_MONITOR_CHANGES },
         { "reset", "[system|cpu]", "reset the machine (or the processors only), as the guest "
-          "asking would", cmd_reset },
-        { "devices", "", "the machine's devices: name, type, regions mapped", cmd_devices },
-        { "dev", "NAME", "one device: its regions, and what state it is in", cmd_dev },
-        { "heap", "[ADDR]", "the board's guarded heaps; with ADDR, the block it lies in", cmd_heap },
-        { "irq", "[LINE 0|1]", "drive an interrupt input line of the processor (cpu N)", cmd_irq },
+          "asking would", cmd_reset, UAM_MONITOR_CHANGES },
+        { "devices", "", "the machine's devices: name, type, regions mapped", cmd_devices, 0 },
+        { "dev", "NAME", "one device: its regions, and what state it is in", cmd_dev, 0 },
+        { "heap", "[ADDR]", "the board's guarded heaps; with ADDR, the block it lies in", cmd_heap, 0 },
+        { "irq", "[LINE 0|1]", "drive an interrupt input line of the processor (cpu N)", cmd_irq,
+          UAM_MONITOR_CHANGES },
         { "cpustate", "", "the processor's whole state, system registers too, as -d dumps it",
-          cmd_cpustate },
+          cmd_cpustate, 0 },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         uam_status s = uam_monitor_add_command(mon, cmds[i].name, cmds[i].usage, cmds[i].help,
-                                               UAM_MONITOR_STOPPED_ONLY, cmds[i].fn, mon);
+                                               UAM_MONITOR_STOPPED_ONLY | cmds[i].flags,
+                                               cmds[i].fn, mon);
         if (s != UAM_OK)
             return s;
     }

@@ -46,6 +46,8 @@ struct uam_gdb {
     uint8_t      rbuf[512];
     size_t       rpos, rlen;
     bool         big;            /* target byte order for registers */
+    uam_gdb_rcmd_fn rcmd;        /* "monitor CMD" */
+    void        *rcmd_ctx;
     gdb_bp       bp[MAX_BP];
     gdb_wp       wp[MAX_BP];
     bool         watch_hit;
@@ -567,6 +569,8 @@ static void handle_qxfer(uam_gdb *g, const char *args)
     put_packet(g, g->out);
 }
 
+static void handle_rcmd(uam_gdb *g, const char *hex);
+
 uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
 {
     const uam_gdb_arch *a = g->m->cpu.isa->gdb;
@@ -736,6 +740,8 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
                 thread_list(g);
             else if (!strncmp(p, "qThreadExtraInfo,", 17))
                 thread_info(g, p + 17);
+            else if (!strncmp(p, "qRcmd,", 6) && g->rcmd)
+                handle_rcmd(g, p + 6);
             else if (!strcmp(p, "qsThreadInfo"))
                 put_packet(g, "l");
             else
@@ -746,6 +752,43 @@ uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns)
             break;
         }
     }
+}
+
+/* "monitor CMD": the hex-encoded command to the handler, its text back as O packets. */
+static void handle_rcmd(uam_gdb *g, const char *hex)
+{
+    size_t n = strlen(hex) / 2;
+    char *cmd = malloc(n + 1);
+    if (!cmd) {
+        put_packet(g, "E01");
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int h = hexval(hex[2 * i]), l = hexval(hex[2 * i + 1]);
+        cmd[i] = (char)(h < 0 || l < 0 ? '?' : (h << 4) | l);
+    }
+    cmd[n] = 0;
+    char *text = g->rcmd(g->rcmd_ctx, cmd);
+    free(cmd);
+    const size_t chunk = (PKT_MAX - 8) / 2;
+    for (size_t off = 0, len = text ? strlen(text) : 0; off < len; off += chunk) {
+        char *o = g->out;
+        *o++ = 'O';
+        for (size_t i = off; i < len && i < off + chunk; i++) {
+            *o++ = hexd[(unsigned char)text[i] >> 4];
+            *o++ = hexd[(unsigned char)text[i] & 15];
+        }
+        *o = 0;
+        put_packet(g, g->out);
+    }
+    free(text);
+    put_packet(g, "OK");
+}
+
+void uam_gdb_set_rcmd(uam_gdb *g, uam_gdb_rcmd_fn fn, void *ctx)
+{
+    g->rcmd = fn;
+    g->rcmd_ctx = ctx;
 }
 
 /* ---- lifecycle ------------------------------------------------------------- */

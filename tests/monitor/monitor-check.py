@@ -686,6 +686,97 @@ check(ok is False and "-t link" in err, "link tap: taken by -t link")
 m.cmd("quit")
 finish(p)
 
+# ---- phase 5: gdb's "monitor CMD", --monitor-log and its replay ---------------------------
+gport = 46000 + (os.getpid() % 9000)
+p = subprocess.Popen(BASE + ["--gdb", str(gport), spin], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+gs = None
+for _ in range(200):
+    try:
+        gs = socket.create_connection(("127.0.0.1", gport), timeout=10)
+        break
+    except OSError:
+        time.sleep(0.02)
+
+
+def rsp_send(d):
+    gs.sendall(b"$" + d.encode() + b"#%02x" % (sum(d.encode()) & 0xff))
+
+
+def rsp_get():
+    buf = b""
+    while gs.recv(1) != b"$":
+        pass
+    while True:
+        c = gs.recv(1)
+        if c == b"#":
+            gs.recv(2)
+            gs.sendall(b"+")
+            return buf.decode()
+        buf += c
+
+
+def rcmd(cmd):
+    rsp_send("qRcmd," + cmd.encode().hex())
+    out = ""
+    while True:
+        r = rsp_get()
+        if r.startswith("O") and r != "OK":
+            out += bytes.fromhex(r[1:]).decode()
+        else:
+            return out, r
+
+
+out, r = rcmd("status")
+check(r == "OK" and "state: stopped" in out and "reason: debugger" in out and not out.endswith("ok\n"),
+      "gdb: monitor status (%r)" % out[:60])
+out, r = rcmd("x p:0 4")
+check(out.startswith("0000000000000000: ba f8 03 b0"), "gdb: monitor x")
+out, r = rcmd("reg rcx 0x99")
+rsp_send("p2")   # gdb register 2 on amd64: rcx
+check("rcx: 0x0000000000000099" in out and rsp_get().startswith("99000000"),
+      "gdb: monitor reg sets what gdb then reads")
+out, r = rcmd("step")
+check("not from here" in out and r == "OK", "gdb: run control stays gdb's (%r)" % out)
+out, r = rcmd("snap save a")
+check("snapshot: a" in out, "gdb: monitor snap save")
+out, r = rcmd("nonsense")
+check(out.startswith("error: unknown command"), "gdb: an unknown monitor command")
+rsp_send("k")
+finish(p)
+
+for jit in ([], ["--jit"]):
+    name = "jit" if jit else "interp"
+    log = os.path.join(tmp, "session-%s.log" % name)
+    common = jit + ["-d", "--dump-mem", "p:0x3000+4", "-n", "300000"]
+    p, path = start("--monitor-wait", "--monitor-log", log, *common)
+    m = Mon(path)
+    m.cmd("step 1000")
+    m.cmd("reg rcx 3")
+    m.cmd("step 5000")
+    m.cmd("write p:0x3000 w4 0xdeadbeef")
+    m.cmd("status")             # reads nothing into the log
+    m.cmd("cont")
+    m.cmd("stop")
+    m.cmd("reg rax 0x77")
+    m.cmd("cont")
+    rc1, _, err1 = finish(p)
+    with open(log) as f:
+        lines = [l.strip() for l in f if not l.startswith("#")]
+    check(lines[:2] == ["@1000 reg rcx 3", "@6000 write p:0x3000 w4 0xdeadbeef"]
+          and len(lines) == 3 and lines[2].startswith("@") and lines[2].endswith(" reg rax 0x77"),
+          "%s: --monitor-log records what changed the machine, and when (%s)" % (name, lines))
+    r = subprocess.run(BASE + ["--monitor-script", log] + common + [spin], capture_output=True,
+                       timeout=60)
+    keep = lambda e: [l for l in e.decode().splitlines() if not l.startswith("uam-run: monitor")]
+    check(r.returncode == rc1 and keep(r.stderr) == keep(err1),
+          "%s: --monitor-script replays it: the same end, registers and memory" % name)
+bad = os.path.join(tmp, "bad.log")
+with open(bad, "w") as f:
+    f.write("@12x status\n")
+r = subprocess.run(BASE + ["--monitor-script", bad, "-n", "10", spin], capture_output=True, timeout=30)
+check(r.returncode == 2 and b"expected @ICOUNT COMMAND" in r.stderr, "a malformed @ line")
+
 # ---- option checks ----------------------------------------------------------------------
 for args, what in (
         (["--monitor", "stdio"], "--monitor stdio with the console on stdio"),

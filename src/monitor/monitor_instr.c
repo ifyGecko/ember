@@ -469,20 +469,25 @@ uam_status mon_add_instr_commands(uam_monitor *mon)
     static const struct {
         const char *name, *usage, *help;
         uam_monitor_fn fn;
+        unsigned    flags;
     } cmds[] = {
         { "break", "add PC | del ID|all | list",
-          "breakpoints: the run stops into the monitor when a processor reaches PC", cmd_break },
+          "breakpoints: the run stops into the monitor when a processor reaches PC", cmd_break,
+          UAM_MONITOR_SERVE_ONLY },
         { "guard", "add SPEC | del ID|all | list",
           "guards as --guard takes them: an access stops the run into the monitor before it "
-          "happens", cmd_guard },
+          "happens", cmd_guard, UAM_MONITOR_SERVE_ONLY },
         { "watch", "add SPEC | del ID|all | list",
-          "watches as --watch takes them: each access is an event (! watch)", cmd_watch },
+          "watches as --watch takes them: each access is an event (! watch)", cmd_watch,
+          UAM_MONITOR_SERVE_ONLY },
         { "rule", "add TEXT | load FILE | list | on ID | off ID | del ID",
-          "rules as --on takes them; a rule's stop stops the run into the monitor", cmd_rule },
+          "rules as --on takes them; a rule's stop stops the run into the monitor", cmd_rule,
+          UAM_MONITOR_CHANGES },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         uam_status st = uam_monitor_add_command(mon, cmds[i].name, cmds[i].usage, cmds[i].help,
-                                                UAM_MONITOR_STOPPED_ONLY, cmds[i].fn, mon);
+                                                UAM_MONITOR_STOPPED_ONLY | cmds[i].flags,
+                                                cmds[i].fn, mon);
         if (st != UAM_OK)
             return st;
     }

@@ -602,7 +602,7 @@ if have_example
   example_files = files(example / 'meson.build', example / 'emulation/meson.build',
     example / 'emulation/main.c', example / 'emulation/ext_board.c', example / 'emulation/ext_board.h',
     example / 'emulation/ext_id.c', example / 'emulation/ext_id.h', example / 'tests/meson.build',
-    example / 'tests/registered.sh', example / 'tests/boot.sh', 'build-external.sh')
+    example / 'tests/registered.sh', example / 'tests/boot.sh', example / 'tests/monitor.sh', 'build-external.sh')
   ext_run = custom_target('ext-run',
     output: 'ext-run',
     depends: libuam,
@@ -620,6 +620,9 @@ if have_example
   expect_ok = [files('expect-exit.sh'), '0']
   test('ext-mips', sh, args: expect_ok + [ext_run] + ext_args, suite: 'example', kwargs: std)
   test('ext-mips-pkgconfig', sh, args: expect_ok + [ext_run_pc] + ext_args, suite: 'example', kwargs: std)
+  # The board's own monitor command (ext_board.c offers "ext-id").
+  test('ext-mips-monitor', sh, args: [files(example / 'tests/monitor.sh'), ext_run, 'ext-mips'],
+    suite: 'example', kwargs: std)
   snapshots += [['example-ext-mips', ext_run, 'ext-mips', fw_mips['selftest-be'], ['4000']]]
 endif
 

@@ -347,8 +347,12 @@ wait
   address without that base (`flags.md`, "Addresses on each architecture").
 - **gdb refuses to connect, or times out.** The emulation is not waiting yet (it prints a
   line when it listens), or another one still holds the port. Use a different port.
-- **gdb has no `monitor` commands, and there is no reverse execution.** (ember's own
-  monitor, `--monitor`, is a separate channel: `docs/monitor.md`.) To "go back", restart from
+- **`monitor CMD` runs ember's monitor commands** (`monitor help`, `monitor dev NAME`,
+  `monitor snap save NAME`, `monitor rule add ...`; `docs/monitor.md`). Run control stays
+  gdb's. After `monitor reg`, `monitor snap load` or `monitor reset`, run `maintenance
+  flush register-cache`.
+- **There is no reverse execution.** `monitor snap save NAME` and later `monitor snap load
+  NAME` take you back within one session. Otherwise restart from
   the snapshot: the run is deterministic, so you arrive at exactly the same state. Use the
   instruction count as your position (`-n N` stops the run at instruction N).
 - **Changing memory or registers changes the run.** After `set var`, what follows is no

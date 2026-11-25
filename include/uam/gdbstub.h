@@ -28,5 +28,10 @@ uam_status      uam_gdb_listen(uam_gdb *g, const char *port);
 /* Serve the session; returns how the guest finally stopped. */
 uam_stop_reason uam_gdb_serve(uam_gdb *g, uint64_t max_insns);
 void            uam_gdb_destroy(uam_gdb *g);
+/* gdb's "monitor CMD" (qRcmd): fn gets CMD and returns the text to show (malloc'd, the
+ * stub frees it; NULL: nothing). Without one, gdb hears the packet is not supported.
+ * uam-run hands it to the monitor (uam_monitor_execute). */
+typedef char *(*uam_gdb_rcmd_fn)(void *ctx, const char *cmd);
+void            uam_gdb_set_rcmd(uam_gdb *g, uam_gdb_rcmd_fn fn, void *ctx);
 
 #endif /* UAM_GDBSTUB_H */

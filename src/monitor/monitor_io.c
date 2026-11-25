@@ -555,7 +555,7 @@ static void cmd_link(uam_monitor_call *c, void *ctx)
         const bool on = !strcmp(uam_monitor_arg(c, 2), "on");
         unsigned serial = mon_call_serial(c);
         if (!serial) {
-            uam_monitor_fail(c, "link: not in a script");
+            uam_monitor_fail(c, "link: tap is for a client (not a script, not the debugger)");
             return;
         }
         if (on) {
@@ -649,16 +649,18 @@ uam_status mon_add_io_commands(uam_monitor *mon)
         unsigned    flags;
         uam_monitor_fn fn;
     } cmds[] = {
-        { "send", "CHARDEV TEXT", "type TEXT into a console, as if on its host end", 0, cmd_send },
+        { "send", "CHARDEV TEXT", "type TEXT into a console, as if on its host end", UAM_MONITOR_CHANGES,
+          cmd_send },
         { "expect", "CHARDEV PATTERN [SECONDS]",
-          "answer once the guest has written PATTERN to the console", 0, cmd_expect },
+          "answer once the guest has written PATTERN to the console", UAM_MONITOR_SERVE_ONLY,
+          cmd_expect },
         { "tap", "CHARDEV on|off", "the guest's output on a console as events to this client",
-          0, cmd_tap },
+          UAM_MONITOR_SERVE_ONLY, cmd_tap },
         { "input", "[NAME DATA]", "hand DATA to a named input of the board (a UART's FIFO...)",
-          UAM_MONITOR_STOPPED_ONLY, cmd_input },
+          UAM_MONITOR_STOPPED_ONLY | UAM_MONITOR_CHANGES, cmd_input },
         { "link", "[status] | inject PORT DATA | tap on|off",
-          "link ports: their state, a message handed in, every message as an event", 0,
-          cmd_link },
+          "link ports: their state, a message handed in, every message as an event",
+          UAM_MONITOR_CHANGES, cmd_link },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         uam_status st = uam_monitor_add_command(mon, cmds[i].name, cmds[i].usage, cmds[i].help,

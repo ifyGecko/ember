@@ -10,12 +10,14 @@ subprojects/ember.wrap   where ember comes from and the revision the project is 
 emulation/
   meson.build            the list of sources
   main.c                 registers the board, runs ember's stock command line
-  ext_board.c  .h        the board "ext-mips": processor, memory, images, wiring
+  ext_board.c  .h        the board "ext-mips": processor, memory, images, wiring, and a
+                         monitor command of its own ("ext-id")
   ext_id.c     .h        a device of the project: one hardware component, one file
 firmware/                the firmware images the board runs (README.md: where they come from)
 tests/
   meson.build            the board's checks
   registered.sh          the runner lists the board
+  monitor.sh             the board's monitor command answers
   boot.sh  boot.expect   the firmware boots to the console lines in boot.expect
 ```
 
@@ -24,6 +26,8 @@ meson setup build            # fetches ember at the revision in subprojects/embe
 meson compile -C build       # ember's libraries and build/ext-run
 meson test -C build          # registered; boot, once firmware/selftest-be.elf is there
 build/ext-run -b ext-mips -o banner=hello firmware/selftest-be.elf
+build/ext-run -b ext-mips --monitor unix:mon.sock firmware/selftest-be.elf  # then, from another
+                                                    # shell: ember's uam-mon mon.sock -c ext-id
 ```
 
 To make it yours: rename the project and the board in `meson.build` and the sources

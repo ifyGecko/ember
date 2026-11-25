@@ -28,7 +28,7 @@
 #define LINE_MAX_LEN  8192u
 #define CONSOLE_PROMPT "ember-mon> "
 
-typedef enum { CL_SOCKET, CL_STDIO, CL_CONSOLE, CL_SCRIPT } client_kind;
+typedef enum { CL_SOCKET, CL_STDIO, CL_CONSOLE, CL_SCRIPT, CL_EXTERNAL } client_kind;
 
 typedef struct client {
     client_kind kind;
@@ -99,7 +99,26 @@ struct uam_monitor {
     char               why_buf[96];   /* stop_why when it is a claimed reason */
     unsigned           next_serial;
     mon_io            *io;            /* monitor_io.c */
+    FILE              *log;           /* --monitor-log */
+    bool               served;        /* uam_monitor_serve has run the machine */
+    /* --monitor-script lines "@N COMMAND", in order; next is the one due next */
+    struct timed { uint64_t at; char *line; } *timed;
+    size_t             n_timed, next_timed;
+    client            *timed_cl;      /* runs them: a script client that lives on (its cpu) */
 };
+
+/* uam_monitor_offer_command: offered per machine, before a monitor exists. */
+typedef struct offered {
+    uam_machine   *m;
+    char          *name, *usage, *help;
+    unsigned       flags;
+    uam_monitor_fn fn;
+    void          *ctx;
+    struct offered *next;
+} offered;
+static offered *g_offered;
+static uam_status take_offered(uam_monitor *mon);
+static void       forget_offered(const uam_machine *m);
 
 struct uam_monitor_call {
     uam_monitor *mon;
@@ -132,9 +151,13 @@ static void write_fd(int fd, bool sock, const char *p, size_t n)
     }
 }
 
+static bool cl_append(client *cl, const void *p, size_t n);
+
 static void cl_write(client *c, const char *p, size_t n)
 {
-    if (c->out_fd >= 0)
+    if (c->kind == CL_EXTERNAL)
+        cl_append(c, p, n);   /* uam_monitor_execute: the reply is collected */
+    else if (c->out_fd >= 0)
         write_fd(c->out_fd, c->kind == CL_SOCKET, p, n);
 }
 
@@ -782,8 +805,15 @@ static void run_line(uam_monitor *mon, client *cl, char *line)
             uam_monitor_fail(&call, "unknown command '%s' (help lists them)", call.argv[0]);
         else if ((cmd->flags & UAM_MONITOR_STOPPED_ONLY) && mon->state == ST_RUNNING)
             uam_monitor_fail(&call, "%s: the machine is running (stop it first)", cmd->name);
+        else if ((cmd->flags & UAM_MONITOR_SERVE_ONLY) && cl->kind == CL_EXTERNAL)
+            uam_monitor_fail(&call, "%s: not from here (the debugger runs the machine: use its "
+                             "own commands)", cmd->name);
         else
             cmd->fn(&call, cmd->ctx);
+        if (cmd && (cmd->flags & UAM_MONITOR_CHANGES) && mon->log && !call.error && !call.deferred) {
+            fprintf(mon->log, "@%llu %s\n", (unsigned long long)uam_machine_icount(mon->m), p);
+            fflush(mon->log);
+        }
     }
     if (call.deferred) {
         snprintf(cl->stop_id, sizeof(cl->stop_id), "%s", id);
@@ -1529,18 +1559,19 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
         { "help",   "[COMMAND]", "list the commands, or say what one does", 0, cmd_help },
         { "status", "",          "the machine's state: running, stopped or ended, and where", 0,
           cmd_status },
-        { "stop",   "",          "stop the machine (answers once it has stopped)", 0, cmd_stop },
-        { "cont",   "",          "let a stopped machine go on", 0, cmd_cont },
+        { "stop",   "",          "stop the machine (answers once it has stopped)", UAM_MONITOR_SERVE_ONLY, cmd_stop },
+        { "cont",   "",          "let a stopped machine go on", UAM_MONITOR_SERVE_ONLY, cmd_cont },
         { "wait",   "",          "answer once the machine stops (a breakpoint, a guard...) or "
-          "the run ends", 0, cmd_wait },
-        { "quit",   "[STATUS]",  "end the run (uam-run exits with STATUS, 0-123)", 0, cmd_quit },
+          "the run ends", UAM_MONITOR_SERVE_ONLY, cmd_wait },
+        { "quit",   "[STATUS]",  "end the run (uam-run exits with STATUS, 0-123)", UAM_MONITOR_SERVE_ONLY, cmd_quit },
         { "json",   "on|off",    "answer this client in JSON, one object per line", 0, cmd_json },
-        { "step",   "[N]",       "run N instructions (1), then stop (answers then)", 0, cmd_step },
-        { "until",  "PC",        "run until a processor reaches PC again, then stop", 0,
+        { "step",   "[N]",       "run N instructions (1), then stop (answers then)", UAM_MONITOR_SERVE_ONLY,
+          cmd_step },
+        { "until",  "PC",        "run until a processor reaches PC again, then stop", UAM_MONITOR_SERVE_ONLY,
           cmd_until },
-        { "run-for", "TICKS",    "run for TICKS of virtual time (scheduler ticks), then stop", 0,
+        { "run-for", "TICKS",    "run for TICKS of virtual time (scheduler ticks), then stop", UAM_MONITOR_SERVE_ONLY,
           cmd_run_for },
-        { "cpu",    "[N]",       "select the processor later commands look at (this client)", 0,
+        { "cpu",    "[N]",       "select the processor later commands look at (this client)", UAM_MONITOR_CHANGES,
           cmd_cpu },
     };
     for (size_t i = 0; i < UAM_ARRAY_LEN(own); i++)
@@ -1551,6 +1582,10 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
         }
     if (mon_add_inspect_commands(mon) != UAM_OK || mon_add_instr_commands(mon) != UAM_OK
         || mon_add_state_commands(mon) != UAM_OK || mon_add_io_commands(mon) != UAM_OK) {
+        uam_monitor_destroy(mon);
+        return NULL;
+    }
+    if (take_offered(mon) != UAM_OK) {
         uam_monitor_destroy(mon);
         return NULL;
     }
@@ -1580,6 +1615,14 @@ void uam_monitor_destroy(uam_monitor *mon)
         uam_chardev_stdio_divert(mon->console_cd, false);
         uam_chardev_stdio_set_escape(mon->console_cd, NULL);
     }
+    forget_offered(mon->m);
+    for (size_t i = 0; i < mon->n_timed; i++)
+        free(mon->timed[i].line);
+    free(mon->timed);
+    if (mon->timed_cl) {
+        free(mon->timed_cl->buf);
+        free(mon->timed_cl);
+    }
     for (unsigned i = 0; i < mon->n_cmds; i++) {
         free(mon->cmds[i].name);
         free(mon->cmds[i].usage);
@@ -1597,10 +1640,44 @@ uam_status uam_monitor_run_script(uam_monitor *mon, const char *path, char *err,
         return UAM_ERR_FAULT;
     }
     client sc = { .kind = CL_SCRIPT, .in_fd = -1, .out_fd = -1, .eof = true };
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-        cl_append(&sc, buf, n);
+    char line[LINE_MAX_LEN];
+    unsigned lineno = 0;
+    const uint64_t now = uam_machine_icount(mon->m);
+    /* "@N COMMAND": when the machine reaches instruction N; the rest at once. */
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        if (line[0] != '@' || (mon->n_timed == 0 && strtoull(line + 1, NULL, 0) <= now
+                               && line[1] >= '0' && line[1] <= '9')) {
+            char *text = line[0] == '@' ? strpbrk(line, " \t") : line;
+            if (text)
+                cl_append(&sc, text, strlen(text));
+            continue;
+        }
+        char *end;
+        uint64_t at = strtoull(line + 1, &end, 0);
+        if (end == line + 1 || (*end != ' ' && *end != '\t')) {
+            snprintf(err, errlen, "%s:%u: expected @ICOUNT COMMAND", path, lineno);
+            fclose(f);
+            free(sc.buf);
+            return UAM_ERR_REJECTED;
+        }
+        struct timed *t = realloc(mon->timed, (mon->n_timed + 1) * sizeof(*t));
+        if (!t) {
+            fclose(f);
+            free(sc.buf);
+            return UAM_ERR_NOMEM;
+        }
+        mon->timed = t;
+        t[mon->n_timed].at = at;
+        end[strcspn(end, "\r\n")] = 0;
+        t[mon->n_timed].line = strdup(end + 1);
+        if (!t[mon->n_timed].line) {
+            fclose(f);
+            free(sc.buf);
+            return UAM_ERR_NOMEM;
+        }
+        mon->n_timed++;
+    }
     fclose(f);
     client_lines(mon, &sc);
     free(sc.buf);
@@ -1611,10 +1688,144 @@ uam_status uam_monitor_run_script(uam_monitor *mon, const char *path, char *err,
     return UAM_OK;
 }
 
+/* ---- uam_monitor_execute, the log, offered commands, timed lines ---------------- */
+
+uam_status uam_monitor_execute(uam_monitor *mon, const char *line, char **out)
+{
+    client ex = { .kind = CL_EXTERNAL, .in_fd = -1, .out_fd = -1 };
+    if (!mon->served && mon->state == ST_STOPPED)
+        mon->stop_why = "debugger";
+    char *copy = strdup(line ? line : "");
+    if (!copy)
+        return UAM_ERR_NOMEM;
+    size_t n = strlen(copy);
+    if (n && copy[n - 1] == '\n')
+        copy[n - 1] = 0;
+    run_line(mon, &ex, copy);
+    free(copy);
+    /* The closing "ok" says nothing a debugger's user needs. */
+    if (ex.len >= 3 && !memcmp(ex.buf + ex.len - 3, "ok\n", 3)
+        && (ex.len == 3 || ex.buf[ex.len - 4] == '\n'))
+        ex.len -= 3;
+    cl_append(&ex, "", 1);   /* the text's end */
+    bool failed = ex.buf && (strstr(ex.buf, "error: ") == ex.buf || strstr(ex.buf, "\nerror: "));
+    if (out)
+        *out = ex.buf;
+    else
+        free(ex.buf);
+    return failed ? UAM_ERR_REJECTED : UAM_OK;
+}
+
+void uam_monitor_set_log(uam_monitor *mon, FILE *out)
+{
+    mon->log = out;
+    if (out) {
+        fprintf(out, "# monitor log: give it to --monitor-script with the same command line "
+                "to run the session again\n");
+        fflush(out);
+    }
+}
+
+uam_status uam_monitor_offer_command(uam_machine *m, const char *name, const char *usage,
+                                     const char *help, unsigned flags, uam_monitor_fn fn,
+                                     void *ctx)
+{
+    if (!m || !name || !fn)
+        return UAM_ERR_INVALID;
+    offered *o = calloc(1, sizeof(*o));
+    if (!o)
+        return UAM_ERR_NOMEM;
+    *o = (offered){ .m = m, .name = strdup(name), .usage = strdup(usage ? usage : ""),
+                    .help = strdup(help ? help : ""), .flags = flags, .fn = fn, .ctx = ctx };
+    if (!o->name || !o->usage || !o->help) {
+        free(o->name);
+        free(o->usage);
+        free(o->help);
+        free(o);
+        return UAM_ERR_NOMEM;
+    }
+    offered **tail = &g_offered;
+    while (*tail)
+        tail = &(*tail)->next;
+    *tail = o;
+    return UAM_OK;
+}
+
+/* The board's offered commands, once the monitor's own are in (a board may replace one). */
+static uam_status take_offered(uam_monitor *mon)
+{
+    for (offered *o = g_offered; o; o = o->next)
+        if (o->m == mon->m) {
+            uam_status st = uam_monitor_add_command(mon, o->name, o->usage, o->help, o->flags,
+                                                    o->fn, o->ctx);
+            if (st != UAM_OK)
+                return st;
+        }
+    return UAM_OK;
+}
+
+/* The machine's offered commands go with its monitor. */
+static void forget_offered(const uam_machine *m)
+{
+    for (offered **p = &g_offered; *p;) {
+        offered *o = *p;
+        if (o->m != m) {
+            p = &o->next;
+            continue;
+        }
+        *p = o->next;
+        free(o->name);
+        free(o->usage);
+        free(o->help);
+        free(o);
+    }
+}
+
+/* The next timed line's instruction count (UINT64_MAX: none). */
+static uint64_t next_timed_at(const uam_monitor *mon)
+{
+    return mon->next_timed < mon->n_timed ? mon->timed[mon->next_timed].at : UINT64_MAX;
+}
+
+/* Run the timed lines that are due. True if one ran. */
+static bool run_timed(uam_monitor *mon)
+{
+    bool ran = false;
+    while (mon->next_timed < mon->n_timed
+           && uam_machine_icount(mon->m) >= mon->timed[mon->next_timed].at) {
+        if (!mon->timed_cl && !(mon->timed_cl = calloc(1, sizeof(*mon->timed_cl))))
+            return ran;
+        client *c = mon->timed_cl;
+        c->kind = CL_SCRIPT;
+        c->in_fd = c->out_fd = -1;
+        c->failed = false;
+        char *line = mon->timed[mon->next_timed++].line;
+        /* The machine stands still between two runs here: as stopped, for the line. */
+        const run_state was = mon->state;
+        const char *was_why = mon->stop_why;
+        if (was == ST_RUNNING) {
+            mon->state = ST_STOPPED;
+            mon->stop_why = "script";
+        }
+        run_line(mon, c, line);
+        if (mon->state == ST_STOPPED && was == ST_RUNNING) {
+            mon->state = ST_RUNNING;
+            mon->stop_why = was_why;
+        }
+        if (c->failed)
+            fprintf(stderr, "uam-run: monitor: @%llu: %s (the session goes on)\n",
+                    (unsigned long long)uam_machine_icount(mon->m), c->fail_why);
+        ran = true;
+    }
+    return ran;
+}
+
 uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
 {
     uam_exec *x = &mon->m->exec;
     const uint64_t end = max_insns ? uam_machine_icount(mon->m) + max_insns : UINT64_MAX;
+    mon->served = true;
+    run_timed(mon);   /* lines due at the start (and those of a log replayed) */
     if (mon->state == ST_STOPPED && mon->autostart && !mon->quit)
         mon->state = ST_RUNNING;
     if (mon->state == ST_STOPPED && !mon->quit)
@@ -1636,6 +1847,8 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
         uint64_t limit = mon->step_end && mon->step_end < end ? mon->step_end : end;
         mon_instr_before_run(mon);
         limit = mon_instr_limit(mon, limit);
+        if (next_timed_at(mon) > done && next_timed_at(mon) < limit)
+            limit = next_timed_at(mon);
         if (limit != UINT64_MAX && done >= limit) {
             why = UAM_STOP_INSN_LIMIT;
         } else {
@@ -1648,6 +1861,14 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
             x->stop_request = false;
             x->stop_status = mon->quit_code;
             answer_stops(mon, "the run was ended");
+            return UAM_STOP_REQUEST;
+        }
+        /* Lines of a replayed session that were due here (after instruction N). */
+        const bool timed = run_timed(mon);
+        if (mon->quit) {
+            clear_targets(mon);
+            x->stop_request = false;
+            x->stop_status = mon->quit_code;
             return UAM_STOP_REQUEST;
         }
         /* Stopped for the monitor, or for good? */
@@ -1669,8 +1890,8 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
                    && (!mon->saved_max_time || now < mon->saved_max_time)) {
             mine = "run-for";
         }
-        if (!mine && claimed && why == UAM_STOP_INSN_LIMIT && icount < end)
-            continue;   /* only the step over a guard: the run goes on (targets stay) */
+        if (!mine && (claimed || timed) && why == UAM_STOP_INSN_LIMIT && icount < end)
+            continue;   /* only the step over a guard, or a timed line: the run goes on */
         clear_targets(mon);
         mon->stop_wanted = false;
         if (mine) {

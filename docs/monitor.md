@@ -55,9 +55,29 @@ second window.
 |---|---|
 | `--monitor-wait` | Stopped before the first instruction; `cont` starts it. |
 | `--monitor-hold` | When the run ends (any reason), stay for inspection until `quit`. The exit status is the run's own, unless `quit N` gives one. |
-| `--monitor-script FILE` | Commands to run before the first instruction, one per line. Output goes to stderr, prefixed `uam-run: monitor:`. A failing command stops the script and the run (exit 2). The machine starts afterwards, unless the script said `stop` or `--monitor-wait` is set. |
+| `--monitor-script FILE` | Commands to run before the first instruction, one per line. Output goes to stderr, prefixed `uam-run: monitor:`. A failing command stops the script and the run (exit 2). The machine starts afterwards, unless the script said `stop` or `--monitor-wait` is set. A line `@N COMMAND` runs when the machine reaches instruction N instead (a failure there is reported, and the run goes on). |
+| `--monitor-log FILE` | Records every command that changed the machine, from any client, as `@N COMMAND` (N: the instruction count when it took effect). Given back to `--monitor-script`, with the same command line otherwise, it plays the session again: the same commands at the same instructions, so the same run. |
 
-The monitor does not combine with fuzzing or with `--gdb`.
+The monitor does not combine with fuzzing. With `--gdb`, gdb runs the machine and the
+monitor is reached through gdb instead (below); `--monitor` is refused then.
+
+### From gdb
+
+Under `--gdb`, gdb's `monitor CMD` runs a monitor command while gdb has the machine
+stopped, and shows its reply:
+
+```
+(gdb) monitor help
+(gdb) monitor dev com1
+(gdb) monitor snap save before
+(gdb) monitor rule add pc=0x8000123c,log a0 a1
+```
+
+Run control stays gdb's: `stop`, `cont`, `step`, `until`, `run-for`, `wait`, `quit`,
+`break`, `guard`, `watch`, `expect` and `tap` answer that they are not available from
+there (use gdb's own `continue`, `stepi`, `break`, `watch`). After a command that changes
+registers behind gdb's back (`reg`, `snap load`, `reset`), tell gdb to read them again:
+`maintenance flush register-cache`.
 
 ## Protocol
 
@@ -86,6 +106,19 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 ```
 
   In `data`, every value is a string.
+
+### Replaying a session
+
+```
+uam-run -b BOARD --monitor unix:mon.sock --monitor-log session.log fw.bin   # explore
+uam-run -b BOARD --monitor-script session.log fw.bin                         # the same run again
+```
+
+What the log holds: `reg` and `write`, `load`, `snap`, `reset`, `irq`, `input`, `send`,
+`link`, `rule`, `cpu`, `mmio-rule`, and a board's commands that say they change the
+machine (`UAM_MONITOR_CHANGES`). Run control is not in it: the instruction counts are the
+timeline. A run that depends on the host clock (`--realtime`, a host network) does not
+replay the same.
 
 ### When commands take effect
 
@@ -190,7 +223,15 @@ static void press(uam_monitor_call *c, void *ctx)
 uam_monitor_add_command(mon, "press", "BUTTON", "press and release a button", 0, press, b);
 ```
 
+A board offers its commands from its build, before any monitor exists, with
+`uam_monitor_offer_command(m, ...)` (same arguments, the machine first): every monitor
+created over that machine has them. The example board does
+(`examples/external-board/emulation/ext_board.c`, `ext-id [scratch VALUE]`).
+
 - `UAM_MONITOR_STOPPED_ONLY` refuses a command while the machine runs.
+- `UAM_MONITOR_CHANGES` says it changes the machine: `--monitor-log` records it.
+- `UAM_MONITOR_SERVE_ONLY` says it needs the monitor to run the machine: it is refused
+  from gdb.
 - `uam_monitor_rest(c, i)` gives the line from argument `i` on, as typed (for text with its
   own syntax).
 - A name that is already taken is replaced.

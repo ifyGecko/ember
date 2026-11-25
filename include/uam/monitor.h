@@ -82,6 +82,11 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns);
 /* ---- commands ---- */
 enum {
     UAM_MONITOR_STOPPED_ONLY = 1u << 0,   /* refused while the machine runs */
+    /* Needs the monitor to run the machine (uam_monitor_serve): refused through
+     * uam_monitor_execute, where something else (gdb) has run control. */
+    UAM_MONITOR_SERVE_ONLY   = 1u << 1,
+    /* Changes the machine: recorded by --monitor-log (uam_monitor_set_log). */
+    UAM_MONITOR_CHANGES      = 1u << 2,
 };
 typedef void (*uam_monitor_fn)(uam_monitor_call *c, void *ctx);
 /* `usage`: the arguments ("ADDR LEN"); `help`: one line. A name already taken is
@@ -107,6 +112,31 @@ void         uam_monitor_fail(uam_monitor_call *c, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 /* Output lines printed so far in this call. */
 size_t       uam_monitor_lines(const uam_monitor_call *c);
+
+/*
+ * Run one command line where something else runs the machine and has it stopped now (the
+ * gdb stub's "monitor CMD"): *out gets the reply as text (output lines, named results,
+ * then "error: WHY" if it failed; the caller frees it). Commands flagged
+ * UAM_MONITOR_SERVE_ONLY are refused. UAM_ERR_REJECTED: the command failed.
+ */
+uam_status   uam_monitor_execute(uam_monitor *mon, const char *line, char **out);
+
+/*
+ * --monitor-log: every command that changes the machine (UAM_MONITOR_CHANGES) and
+ * succeeded, written to `out` as "@ICOUNT LINE", ICOUNT the machine's instruction count
+ * when it took effect. Given to uam_monitor_run_script, such a file plays the session
+ * again: a line "@N COMMAND" runs when the machine reaches instruction N (at the start,
+ * if it is there already), in the order written. NULL: no log.
+ */
+void         uam_monitor_set_log(uam_monitor *mon, FILE *out);
+
+/*
+ * A board's own command, offered before any monitor exists (from the board's build): a
+ * monitor created over m later has it, as if uam_monitor_add_command had added it there.
+ */
+uam_status   uam_monitor_offer_command(uam_machine *m, const char *name, const char *usage,
+                                       const char *help, unsigned flags, uam_monitor_fn fn,
+                                       void *ctx);
 
 /* Is the machine running (not stopped by the monitor, not ended)? */
 bool         uam_monitor_running(const uam_monitor *mon);

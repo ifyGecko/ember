@@ -70,3 +70,7 @@ uam_device *ext_id_create(const char *name, uint32_t id)
     s->id = id;
     return &s->dev;
 }
+
+uint32_t ext_id_value(uam_device *dev) { return to_id(dev)->id; }
+uint32_t ext_id_scratch(uam_device *dev) { return to_id(dev)->scratch; }
+void     ext_id_set_scratch(uam_device *dev, uint32_t v) { to_id(dev)->scratch = v; }

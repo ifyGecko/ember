@@ -11,5 +11,9 @@
 
 /* `id` is what the ID register reads; the board knows which chip this is. */
 uam_device *ext_id_create(const char *name, uint32_t id);
+/* For the board's monitor command: the ID, and the scratch register read and set. */
+uint32_t    ext_id_value(uam_device *dev);
+uint32_t    ext_id_scratch(uam_device *dev);
+void        ext_id_set_scratch(uam_device *dev, uint32_t v);
 
 #endif

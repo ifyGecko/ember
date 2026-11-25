@@ -499,7 +499,11 @@ static void usage(FILE *out)
         "                          docs/monitor.md lists the commands\n"
         "      --monitor-wait      stay stopped before the first instruction until \"cont\"\n"
         "      --monitor-hold      when the run ends, stay for inspection until \"quit\"\n"
-        "      --monitor-script FILE  monitor commands to run before the first instruction\n"
+        "      --monitor-script FILE  monitor commands to run before the first instruction;\n"
+        "                          a line \"@N COMMAND\" runs when instruction N is reached\n"
+        "      --monitor-log FILE  record the monitor commands that change the machine as\n"
+        "                          \"@N COMMAND\": --monitor-script FILE plays the session again\n"
+        "                          (with --gdb, gdb's \"monitor CMD\" runs monitor commands)\n"
         "      --load-snapshot FILE  start from a snapshot instead of the reset state (same\n"
         "                          board and options; IMAGE is not needed)\n"
         "      --save-snapshot FILE  save a snapshot when the run stops (-n, --max-ticks,\n"
@@ -1233,6 +1237,14 @@ static void mon_cmd_mmio_rule(uam_monitor_call *c, void *ctx)
     uam_monitor_field(c, "device", "%s", d->name);
 }
 
+/* gdb's "monitor CMD": the monitor's commands, from the debugger's stop. */
+static char *gdb_monitor_cmd(void *ctx, const char *cmd)
+{
+    char *out = NULL;
+    uam_monitor_execute(ctx, cmd, &out);
+    return out;
+}
+
 static int run_main(int argc, char **argv, const ext_set *es)
 {
     enum { OPT_RAW_BASE = 256, OPT_RAM, OPT_UNKNOWN, OPT_UART_IN, OPT_NO_VERIFY, OPT_NO_OPT, OPT_JIT, OPT_NO_CHAIN, OPT_BLOCK_INSNS,
@@ -1246,7 +1258,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
            OPT_DUMP_MEM, OPT_PERF_MAP, OPT_JIT_OPMAP, OPT_TRACE_MMIO_RANGE,
            OPT_LOG_STAMP, OPT_TRACE_FILE, OPT_HISTORY, OPT_GUARD_RETURNS, OPT_RETURN_OK,
            OPT_BACKTRACE, OPT_ON, OPT_ON_FILE, OPT_MONITOR, OPT_MONITOR_WAIT, OPT_MONITOR_HOLD,
-           OPT_MONITOR_SCRIPT, OPT_EXT_BASE = 1000 };
+           OPT_MONITOR_SCRIPT, OPT_MONITOR_LOG, OPT_EXT_BASE = 1000 };
     static const struct option opts[] = {
         { "board", required_argument, NULL, 'b' },
         { "raw-base", required_argument, NULL, OPT_RAW_BASE },
@@ -1292,6 +1304,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         { "monitor-wait", no_argument, NULL, OPT_MONITOR_WAIT },
         { "monitor-hold", no_argument, NULL, OPT_MONITOR_HOLD },
         { "monitor-script", required_argument, NULL, OPT_MONITOR_SCRIPT },
+        { "monitor-log", required_argument, NULL, OPT_MONITOR_LOG },
         { "load-snapshot", required_argument, NULL, OPT_LOAD_SNAP },
         { "save-snapshot", required_argument, NULL, OPT_SAVE_SNAP },
         { "snapshot-at", required_argument, NULL, OPT_SNAP_AT },
@@ -1326,7 +1339,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
     };
 
     const char *board_name = "rv32-ref", *console_spec = "stdio", *gdb_port = NULL;
-    const char *monitor_specs[4], *monitor_script = NULL;
+    const char *monitor_specs[4], *monitor_script = NULL, *monitor_log = NULL;
+    FILE *monitor_log_fp = NULL;
     size_t n_monitor = 0;
     bool monitor_wait = false, monitor_hold = false;
     const char *load_snap = NULL, *save_snap = NULL, *mmio_input_path = NULL;
@@ -1658,6 +1672,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
         case OPT_MONITOR_WAIT: monitor_wait = true; break;
         case OPT_MONITOR_HOLD: monitor_hold = true; break;
         case OPT_MONITOR_SCRIPT: monitor_script = optarg; break;
+        case OPT_MONITOR_LOG: monitor_log = optarg; break;
         case OPT_LOAD_SNAP: load_snap = optarg; break;
         case OPT_SAVE_SNAP: save_snap = optarg; break;
         case OPT_SNAP_AT:
@@ -2441,7 +2456,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
     /* The monitor: asked for, or on a raw stdio console (Ctrl-A m) of any run that is
      * not fuzzing or under gdb. Without one the run below is the plain uam_exec_run. */
     uam_monitor *mon = NULL;
-    if (!fuzzing && !gdb_port) {
+    if (!fuzzing) {
         mon = uam_monitor_create(&m, host, &(uam_monitor_config){ .wait = monitor_wait,
                                                                   .hold = monitor_hold });
         if (mon) {   /* before any client: each reads the console's output from its start */
@@ -2449,7 +2464,15 @@ static int run_main(int argc, char **argv, const ext_set *es)
             for (unsigned k = 0; k < n_link_nodes; k++)
                 uam_monitor_add_link(mon, link_nodes[k], !(rt.flags & RT_LINK));
         }
-        bool reachable = false;
+        bool reachable = gdb_port != NULL;   /* gdb's "monitor CMD" */
+        if (mon && monitor_log) {
+            if (!(monitor_log_fp = fopen(monitor_log, "w"))) {
+                fprintf(stderr, "uam-run: --monitor-log %s: %s\n", monitor_log, strerror(errno));
+                why = UAM_STOP_ERROR;
+            } else {
+                uam_monitor_set_log(mon, monitor_log_fp);
+            }
+        }
         for (size_t i = 0; mon && i < n_monitor; i++) {
             char err[200];
             if (uam_monitor_listen(mon, monitor_specs[i], err, sizeof(err)) != UAM_OK) {
@@ -2459,7 +2482,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
             }
             reachable = true;
         }
-        if (mon && uam_monitor_use_console(mon, console))
+        if (mon && !gdb_port && uam_monitor_use_console(mon, console))
             reachable = true;
         if (mon) {
             uam_monitor_set_symbolizer(mon, bt_name, &g_bt);   /* "bt" names what --backtrace does */
@@ -2471,7 +2494,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
                                     "they go", 0, mon_cmd_trace, &mrun);
             uam_monitor_add_command(mon, "mmio-rule", "RULE",
                                     "answer an unmodelled register (as --mmio-rule; not input)",
-                                    UAM_MONITOR_STOPPED_ONLY, mon_cmd_mmio_rule, &mrun);
+                                    UAM_MONITOR_STOPPED_ONLY | UAM_MONITOR_CHANGES,
+                                    mon_cmd_mmio_rule, &mrun);
         }
         if (why == UAM_STOP_NONE && mon && (monitor_wait || monitor_hold) && !reachable) {
             fprintf(stderr, "uam-run: --monitor-wait and --monitor-hold need a way in: --monitor "
@@ -2485,7 +2509,7 @@ static int run_main(int argc, char **argv, const ext_set *es)
                 why = UAM_STOP_ERROR;
             }
         }
-        if (why == UAM_STOP_NONE && mon && !monitor_asked && !reachable) {
+        if (why == UAM_STOP_NONE && mon && !monitor_asked && !monitor_log && !reachable) {
             uam_monitor_destroy(mon);   /* nothing can reach it */
             mon = NULL;
         }
@@ -2511,6 +2535,8 @@ static int run_main(int argc, char **argv, const ext_set *es)
             uam_gdb_destroy(g);
             why = UAM_STOP_ERROR;
         } else {
+            if (mon)
+                uam_gdb_set_rcmd(g, gdb_monitor_cmd, mon);
             why = uam_gdb_serve(g, max_insns);
             uam_gdb_destroy(g);
         }
@@ -2727,6 +2753,10 @@ out_host:
     free(su);         /* after the machine: it was the bus's unmapped device */
     if (mrun.own_fp)
         fclose(mrun.own_fp);   /* a monitor's "trace file" */
+    if (monitor_log_fp && fclose(monitor_log_fp) != 0 && rc == 0) {
+        fprintf(stderr, "uam-run: writing --monitor-log %s failed\n", monitor_log);
+        rc = 2;
+    }
     if (trace_fp && fclose(trace_fp) != 0 && rc == 0) {
         fprintf(stderr, "uam-run: writing --trace-file %s failed\n", trace_file);
         rc = 2;

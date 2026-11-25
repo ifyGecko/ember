@@ -5,18 +5,22 @@
  * on it), plus what out-of-tree boards typically need: a CPU identity of the
  * board's own (here derived from the reference identity), a catch-all window for the not-yet-modelled peripheral block
  * under the real devices, a device of the project's own (ext_id.c), a board option
- * (-o banner=TEXT) and a named image slot (--image rom=FILE, loaded at the reset vector).
+ * (-o banner=TEXT), a named image slot (--image rom=FILE, loaded at the reset vector) and
+ * a monitor command of the board's own ("ext-id", for uam-run --monitor).
  *
  * The board wires: it creates the processor, maps memory, places images, instantiates
  * devices and connects their lines. Device behaviour lives in the device files.
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "uam/dev/test_finisher.h"
 #include "uam/dev/uart16550.h"
 #include "uam/dev/unimp.h"
 #include "uam/isa/mips32.h"
 #include "uam/loader.h"
+#include "uam/monitor.h"
 
 #include "ext_board.h"
 #include "ext_id.h"
@@ -34,6 +38,27 @@ static uam_status attach(uam_machine *m, uam_device *dev, uint64_t base, uint64_
         return UAM_ERR_NOMEM;
     uam_machine_add_device(m, dev);
     return uam_bus_map_mmio(&m->bus, dev->name, base, size, dev);
+}
+
+/* "ext-id [scratch VALUE]" in the monitor: the ID block's registers, and the scratch
+ * register set. Ember knows nothing of this device; the board offers the command. */
+static void cmd_ext_id(uam_monitor_call *c, void *ctx)
+{
+    uam_device *id = ctx;
+    if (uam_monitor_argc(c) == 3 && !strcmp(uam_monitor_arg(c, 1), "scratch")) {
+        char *end;
+        unsigned long v = strtoul(uam_monitor_arg(c, 2), &end, 0);
+        if (*end || v > 0xffffffffu) {
+            uam_monitor_fail(c, "ext-id: scratch takes a 32-bit value");
+            return;
+        }
+        ext_id_set_scratch(id, (uint32_t)v);
+    } else if (uam_monitor_argc(c) != 1) {
+        uam_monitor_fail(c, "ext-id [scratch VALUE]");
+        return;
+    }
+    uam_monitor_field(c, "id", "0x%08x", (unsigned)ext_id_value(id));
+    uam_monitor_field(c, "scratch", "0x%08x", (unsigned)ext_id_scratch(id));
 }
 
 static uam_status build(uam_machine *m, const uam_board_config *cfg)
@@ -68,6 +93,12 @@ static uam_status build(uam_machine *m, const uam_board_config *cfg)
         || (st = attach(m, uam_test_finisher_create("test", uam_machine_stop_cb, m), TEST_PHYS, 0x10))
                != UAM_OK
         || (st = attach(m, ext_id_create("id", 0x45585431 /* "EXT1" */), ID_PHYS, EXT_ID_SIZE)) != UAM_OK)
+        return st;
+    st = uam_monitor_offer_command(m, "ext-id", "[scratch VALUE]",
+                                   "the ID block: its ID, and its scratch register (set it)",
+                                   UAM_MONITOR_STOPPED_ONLY | UAM_MONITOR_CHANGES, cmd_ext_id,
+                                   uam_machine_find_device(m, "id"));
+    if (st != UAM_OK)
         return st;
     uam_signal_connect(uam_uart16550_irq_line(uart), uam_cpu_irq_sink, &m->cpu, UAM_MIPS_IRQ_HW0);
 
