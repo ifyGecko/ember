@@ -113,6 +113,11 @@ bool         uam_monitor_running(const uam_monitor *mon);
 /* The processor this client looks at ("cpu N"; 0 unless it chose another). */
 unsigned     uam_monitor_cpu_index(const uam_monitor_call *c);
 uam_cpu     *uam_monitor_cpu(const uam_monitor_call *c);
+/* The machine's ways in and out that "send", "expect", "tap" and "link" reach: a chardev
+ * by the name commands use for it (uam-run: "console"; the monitor taps its output), and
+ * a link node (tap_free: its one tap is not taken, "link tap" may have it). */
+uam_status   uam_monitor_add_chardev(uam_monitor *mon, const char *name, uam_chardev *cd);
+uam_status   uam_monitor_add_link(uam_monitor *mon, uam_link_node *n, bool tap_free);
 /* What symbols the monitor's rules ("rule add") can name, as uam_rules_set_symbols. */
 void         uam_monitor_set_rule_symbols(uam_monitor *mon,
                                           bool (*fn)(void *ctx, const char *name, uint64_t *value),

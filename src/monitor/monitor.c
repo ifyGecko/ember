@@ -38,7 +38,9 @@ typedef struct client {
     bool    eof;              /* no more input will come */
     bool    json;
     bool    waiting_stop;     /* a "stop" not answered yet: later lines wait */
+    bool    waiting_io;       /* an "expect" not answered yet: later lines wait */
     char    stop_id[40];
+    unsigned serial;          /* names the client to monitor_io.c */
     bool    active;           /* CL_CONSOLE: the terminal is the monitor's */
     char    edit[512];        /* CL_CONSOLE: the line being typed */
     size_t  edit_len;
@@ -95,6 +97,8 @@ struct uam_monitor {
     mon_instr         *instr;         /* monitor_instr.c */
     mon_state         *mstate;        /* monitor_state.c */
     char               why_buf[96];   /* stop_why when it is a claimed reason */
+    unsigned           next_serial;
+    mon_io            *io;            /* monitor_io.c */
 };
 
 struct uam_monitor_call {
@@ -201,7 +205,57 @@ typedef struct event {
     unsigned    n;
     const char *k[10];
     char        v[10][96];
+    const char *data_key;     /* one value of any length, quoted in text (C escapes) */
+    const uint8_t *data;
+    size_t      data_len;
 } event;
+
+static void sb_c_str(sbuf *b, const uint8_t *p, size_t n)
+{
+    sb_add(b, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = p[i];
+        char esc[8];
+        if (c == '"' || c == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)c;
+            sb_add(b, esc, 2);
+        } else if (c == '\n') {
+            sb_add(b, "\\n", 2);
+        } else if (c == '\r') {
+            sb_add(b, "\\r", 2);
+        } else if (c == '\t') {
+            sb_add(b, "\\t", 2);
+        } else if (c < 0x20 || c >= 0x7f) {
+            snprintf(esc, sizeof(esc), "\\x%02x", c);
+            sb_str(b, esc);
+        } else {
+            sb_add(b, (const char *)&c, 1);
+        }
+    }
+    sb_add(b, "\"", 1);
+}
+
+/* JSON: the bytes as a string (\u00XX for what is not printable ASCII). */
+static void sb_json_bytes(sbuf *b, const uint8_t *p, size_t n)
+{
+    sb_add(b, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = p[i];
+        char esc[8];
+        if (c == '"' || c == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)c;
+            sb_add(b, esc, 2);
+        } else if (c < 0x20 || c >= 0x7f) {
+            snprintf(esc, sizeof(esc), "\\u%04x", c);
+            sb_str(b, esc);
+        } else {
+            sb_add(b, (const char *)&c, 1);
+        }
+    }
+    sb_add(b, "\"", 1);
+}
 
 static void ev_add(event *e, const char *k, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
@@ -234,6 +288,12 @@ static void ev_send(client *c, const event *e)
             sb_str(&b, ":");
             sb_json_str(&b, e->v[i]);
         }
+        if (e->data_key) {
+            sb_str(&b, ",");
+            sb_json_str(&b, e->data_key);
+            sb_str(&b, ":");
+            sb_json_bytes(&b, e->data, e->data_len);
+        }
         sb_str(&b, "}\n");
     } else {
         sb_str(&b, "! ");
@@ -244,6 +304,12 @@ static void ev_send(client *c, const event *e)
             sb_str(&b, "=");
             for (const char *v = e->v[i]; *v; v++)   /* one word: "instruction-limit-reached" */
                 sb_add(&b, *v == ' ' ? "-" : v, 1);
+        }
+        if (e->data_key) {
+            sb_str(&b, " ");
+            sb_str(&b, e->data_key);
+            sb_str(&b, "=");
+            sb_c_str(&b, e->data, e->data_len);
         }
         sb_str(&b, "\n");
     }
@@ -441,6 +507,77 @@ bool mon_stopped(const uam_monitor *mon) { return mon->state != ST_RUNNING; }
 mon_instr **mon_instr_slot(uam_monitor *mon) { return &mon->instr; }
 
 mon_state **mon_state_slot(uam_monitor *mon) { return &mon->mstate; }
+
+mon_io **mon_io_slot(uam_monitor *mon) { return &mon->io; }
+
+unsigned mon_call_serial(const uam_monitor_call *c)
+{
+    return c->cl && c->cl->kind != CL_SCRIPT ? c->cl->serial : 0;
+}
+
+bool mon_defer_io(uam_monitor_call *c)
+{
+    if (!c->cl || c->cl->kind == CL_SCRIPT)
+        return false;
+    c->cl->waiting_io = true;
+    c->deferred = true;
+    return true;
+}
+
+static void client_lines(uam_monitor *mon, client *cl);
+
+static client *by_serial(uam_monitor *mon, unsigned serial)
+{
+    for (unsigned i = 0; i < MAX_CLIENTS; i++)
+        if (mon->cl[i] && mon->cl[i]->serial == serial)
+            return mon->cl[i];
+    return NULL;
+}
+
+void mon_answer_io(uam_monitor *mon, unsigned serial, const char *error, ...)
+{
+    client *c = by_serial(mon, serial);
+    if (!c || !c->waiting_io)
+        return;
+    uam_monitor_call call = { .mon = mon, .cl = c };
+    if (error) {
+        call.error = strdup(error);
+    } else {
+        va_list ap;
+        va_start(ap, error);
+        for (const char *k; (k = va_arg(ap, const char *));) {
+            const char *v = va_arg(ap, const char *);
+            uam_monitor_field(&call, k, "%s", v ? v : "");
+        }
+        va_end(ap);
+    }
+    c->waiting_io = false;
+    reply_send(c, c->stop_id, &call);
+    call_free(&call);
+    client_lines(mon, c);
+}
+
+void mon_event_to(uam_monitor *mon, unsigned serial, const char *kind, const char *data_key,
+                  const uint8_t *data, size_t len, ...)
+{
+    event e = { .kind = kind, .data_key = data_key, .data = data, .data_len = len };
+    va_list ap;
+    va_start(ap, len);
+    for (const char *k; (k = va_arg(ap, const char *));) {
+        const char *v = va_arg(ap, const char *);
+        ev_add(&e, k, "%s", v ? v : "");
+    }
+    va_end(ap);
+    if (!serial) {
+        ev_broadcast(mon, &e);
+        return;
+    }
+    client *c = by_serial(mon, serial);
+    if (c && !(c->kind == CL_CONSOLE && !c->active))
+        ev_send(c, &e);
+}
+
+static void mon_tick(void *ctx) { mon_io_tick(ctx); }
 
 void mon_revive(uam_monitor *mon, const char *why)
 {
@@ -665,7 +802,8 @@ static void run_line(uam_monitor *mon, client *cl, char *line)
 /* Run every complete line a client has sent, unless it waits for a stop. */
 static void client_lines(uam_monitor *mon, client *cl)
 {
-    while (!cl->waiting_stop && !(cl->kind == CL_SCRIPT && cl->failed) && !mon->quit) {
+    while (!cl->waiting_stop && !cl->waiting_io && !(cl->kind == CL_SCRIPT && cl->failed)
+           && !mon->quit) {
         char *nl = memchr(cl->buf, '\n', cl->len);
         size_t n;
         if (nl) {
@@ -720,7 +858,9 @@ static client *client_new(uam_monitor *mon, client_kind kind, int in_fd, int out
         c->kind = kind;
         c->in_fd = in_fd;
         c->out_fd = out_fd;
+        c->serial = ++mon->next_serial;
         mon->cl[i] = c;
+        mon_io_client_new(mon, c->serial);
         return c;
     }
     return NULL;
@@ -728,6 +868,7 @@ static client *client_new(uam_monitor *mon, client_kind kind, int in_fd, int out
 
 static void client_free(uam_monitor *mon, client *c)
 {
+    mon_io_client_gone(mon, c->serial);
     for (unsigned i = 0; i < MAX_CLIENTS; i++)
         if (mon->cl[i] == c)
             mon->cl[i] = NULL;
@@ -1065,6 +1206,7 @@ static void enter_ended(uam_monitor *mon, uam_stop_reason why, int64_t status, b
     char what[96];
     snprintf(what, sizeof(what), "the run ended (%s)", uam_stop_reason_str(why));
     answer_stops(mon, hold ? NULL : what);
+    mon_io_ended(mon);
     event e = { .kind = "ended" };
     ev_add(&e, "reason", "%s", uam_stop_reason_str(why));
     ev_add(&e, "status", "%lld", (long long)status);
@@ -1408,10 +1550,11 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
             return NULL;
         }
     if (mon_add_inspect_commands(mon) != UAM_OK || mon_add_instr_commands(mon) != UAM_OK
-        || mon_add_state_commands(mon) != UAM_OK) {
+        || mon_add_state_commands(mon) != UAM_OK || mon_add_io_commands(mon) != UAM_OK) {
         uam_monitor_destroy(mon);
         return NULL;
     }
+    uam_host_set_tick(h, mon_tick, mon);
     return mon;
 }
 
@@ -1420,6 +1563,7 @@ void uam_monitor_destroy(uam_monitor *mon)
     if (!mon)
         return;
     clear_targets(mon);
+    uam_host_set_tick(mon->h, NULL, NULL);
     mon_instr_free(mon);
     mon_state_free(mon);
     for (unsigned i = 0; i < MAX_CLIENTS; i++)
@@ -1431,6 +1575,7 @@ void uam_monitor_destroy(uam_monitor *mon)
         if (mon->ls[i].is_unix)
             unlink(mon->ls[i].path);
     }
+    mon_io_free(mon);   /* after the clients: their expects and taps went with them */
     if (mon->console_cd) {
         uam_chardev_stdio_divert(mon->console_cd, false);
         uam_chardev_stdio_set_escape(mon->console_cd, NULL);

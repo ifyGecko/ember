@@ -32,6 +32,7 @@
 #include "uam/common.h"
 
 #define UAM_CHARDEV_RXBUF 4096u
+#define UAM_CHARDEV_TAPS  4u
 
 typedef struct uam_chardev uam_chardev;
 
@@ -63,6 +64,11 @@ struct uam_chardev {
     /* uam_chardev_set_tap: sees every byte the guest writes, before the backend */
     void   (*tap)(void *ctx, const uint8_t *buf, size_t len);
     void    *tap_ctx;
+    /* uam_chardev_add_tap: more observers of the same (the monitor's send/expect/tap) */
+    struct {
+        void (*fn)(void *ctx, const uint8_t *buf, size_t len);
+        void  *ctx;
+    }        taps[UAM_CHARDEV_TAPS];
 };
 
 void   uam_chardev_init(uam_chardev *cd, const uam_chardev_ops *ops);
@@ -85,6 +91,12 @@ void   uam_chardev_set_quit_handler(uam_chardev *cd, void (*fn)(void *ctx), void
 /* One observer of guest output (tracing: the runner's --trace console); NULL removes it. */
 void   uam_chardev_set_tap(uam_chardev *cd, void (*fn)(void *ctx, const uint8_t *buf, size_t len),
                            void *ctx);
+/* Further observers of guest output, besides the tap (at most UAM_CHARDEV_TAPS): add
+ * returns false when there is no room; remove takes away the one with that fn and ctx. */
+bool   uam_chardev_add_tap(uam_chardev *cd, void (*fn)(void *ctx, const uint8_t *buf, size_t len),
+                           void *ctx);
+void   uam_chardev_remove_tap(uam_chardev *cd,
+                              void (*fn)(void *ctx, const uint8_t *buf, size_t len), void *ctx);
 int    uam_chardev_fd(uam_chardev *cd);
 /* Hold input back from the frontend (it stays queued), or release it and
  * deliver what is queued. */

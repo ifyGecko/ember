@@ -60,7 +60,7 @@ plus opaque handles. Implementations are selected at run time by the board.
 | `sched.h` | Instruction-count clock (saturating at a 2^62-tick horizon), event queue with a per-call firing budget, a kick when the earliest deadline moves (the machine turns it into an exit request), cancel-all, list consistency checks | the core |
 | `signal.h` | Interrupt, GPIO and reset lines: connect a line to one sink, set its level (the sink is called on a change; a sink that needs edges detects them) | the core |
 | `blockdev.h` | Fixed-size sectors between a storage controller (AHCI, NVMe, IDE, floppy) and the host: read, write, flush; read-only and volatile (in-memory overlay) modes | core interface; the file backend in `src/host` |
-| `chardev.h` | Byte streams between a device and the host (UART consoles); input can be held back until the run starts (`uam_chardev_hold`); one tap on guest output (`uam_chardev_set_tap`: `--trace console`) | core plumbing; backends in `src/host` |
+| `chardev.h` | Byte streams between a device and the host (UART consoles); input can be held back until the run starts (`uam_chardev_hold`); one tap on guest output, plus a few more observers (`uam_chardev_set_tap`: `--trace console`; `uam_chardev_add_tap`: the monitor's expect and tap) | core plumbing; backends in `src/host` |
 | `netdev.h` | Ethernet frames between a device and the host (NICs, switches, radio "air") | core plumbing; backends in `src/host` |
 | `link.h` | Links: timestamped messages (a payload of exact length, a key, flags, a kind; no protocol) between a device model and whatever it is connected to. Ports with a frontend and an unbounded queue; a node per machine with its clock (ticks to the hub's time unit and back), delivery at a message's time as the last thing at its tick, the grant it may run to and the waiting for more (an idle machine's promise to stay quiet), its saved state; the transport interface a hub connection implements. Three ways of keeping time, the hub's choice: free (default), loose, exact (see [`link.md`](link.md)) | `src/core/link.c`; hubs and transports in `src/host` |
 | `machine.h` | Composition: machine lifecycle, resets (device reset line, board reset hook), board registry, board config (RAM, unknown-MMIO policy, console, options, named images, named network ports, named link ports), extra snapshot state (`uam_machine_add_state`), named inputs a board publishes (`uam_machine_add_input`: a UART FIFO, a DMA buffer), extra processors (`uam_machine_add_cpus`: each with its own translation cache, sharing bus and clock; `uam_machine_current_cpu` for per-processor devices) and observers on all of them (`uam_machine_add_pc_hook`, `_set_exc_hook`, `_set_irq_hook`, `_add_pass`, `_set_coverage` with a coverage history per processor, `_get_stats`), ABI handshake | `src/machine`, `boards/*` |
@@ -185,7 +185,8 @@ src/debug/        gdbstub.c debug.c (memory and registers as a debugger sees the
 src/monitor/      monitor.c (clients, ways in, the protocol, the run loop and run control)
                   monitor_inspect.c (registers, memory, map, history, bt) monitor_instr.c
                   (breakpoints, guards, watches, rules) monitor_state.c (snapshots, reset,
-                  devices, heaps, interrupt lines) monitor_int.h
+                  devices, heaps, interrupt lines) monitor_io.c (consoles, inputs, links)
+                  monitor_int.h
 src/runner/       runner.c trace.c trace.h (the --trace kinds, --history, the summaries)
 isa/riscv/        rv_lift.c rv_system.c rv.h (private)
 isa/mips32/       mips_lift.c mips_system.c mips16.c (MIPS16e) mips_umips.c (microMIPS)

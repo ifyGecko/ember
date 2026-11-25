@@ -586,6 +586,106 @@ check(ok is False and "no block" in err, "heap ADDR: in no block")
 m.cmd("quit")
 finish(p)
 
+# ---- phase 4: send, expect, tap, input, link -------------------------------------------------
+# wait for COM1 to have a byte, read it, write it back: an echo
+echo = os.path.join(tmp, "echo.bin")
+with open(echo, "wb") as f:
+    f.write(bytes.fromhex("bafd03eca80174f8baf803eceeebf1"))
+
+
+def start_on(binary, *extra):
+    path = os.path.join(tmp, "e%d.sock" % time.monotonic_ns())
+    p = subprocess.Popen(BASE + ["--monitor", "unix:" + path] + list(extra) + [binary],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(200):
+        if os.path.exists(path):
+            break
+        time.sleep(0.01)
+    return p, path
+
+
+for jit in ([], ["--jit"]):
+    name = "jit" if jit else "interp"
+    p, path = start_on(echo, *jit, "-n", "4000000000")
+    m = Mon(path)
+    ok, out, _ = m.cmd('send console "hello\\n"')
+    check(ok and fields(out).get("sent") == "6", "%s: send" % name)
+    ok, out, _ = m.cmd('expect console llo 5')
+    check(ok and fields(out).get("matched") == "yes", "%s: expect sees the echo that came before it" % name)
+    ok, _, err = m.cmd('expect console llo 0.3')
+    check(ok is False and "timed out" in err, "%s: a match is used up; expect times out" % name)
+    ok, _, err = m.cmd('send nosuch x')
+    check(ok is False and "console" in err, "%s: send to no such chardev names the ones there are" % name)
+    m.cmd("tap console on")
+    m.cmd('send console hex:6f6b0a')   # "ok\n"
+    ev = m.event("output")
+    check(ev == '! output chardev=console text="ok\\n"', "%s: tap: the output as an event (%s)" % (name, ev))
+    m.cmd("tap console off")
+    o = m.jcmd("json on")
+    m.jcmd("tap console on")
+    m.jcmd('send console "a b"')
+    o = m.jcmd("expect console b 5")
+    seen = [e for e in m.events if isinstance(e, dict) and e.get("event") == "output"]
+    while not seen:
+        line = json.loads(m.f.readline())
+        if line.get("event") == "output":
+            seen.append(line)
+    check(o.get("ok") and seen[0].get("chardev") == "console" and "a" in seen[0].get("text", ""),
+          "%s: tap in JSON (%s)" % (name, seen[:1]))
+    m.jcmd("tap console off")
+    m.cmd("json off")
+    ok, out, _ = m.cmd("stop")
+    ok, out, _ = m.cmd("input")
+    check(ok and "com1" in out, "%s: input lists the board's inputs (%s)" % (name, out))
+    ok, out, _ = m.cmd("input com1 xyz")
+    check(ok and fields(out).get("delivered") == "3", "%s: input" % name)
+    ok, _, err = m.cmd("input nosuch x")
+    check(ok is False and "no input" in err, "%s: input of none" % name)
+    m.cmd("cont")
+    ok, out, _ = m.cmd("expect console xyz 5")
+    check(ok, "%s: what input handed in comes back" % name)
+    ok, _, err = m.cmd("input com1 x")
+    check(ok is False and "running" in err, "%s: input needs it stopped" % name)
+    m.cmd("quit")
+    finish(p)
+
+# an expect the run's end beats
+p, path = start_on(spin, "--monitor-wait", "-n", "300000")
+m = Mon(path)
+m.cmd("cont")
+ok, _, err = m.cmd("expect console neverprinted")
+check(ok is False and "ended" in (err or ""), "expect: the run ended first (%s)" % err)
+finish(p)
+
+# links: the console on a link port with no hub
+p, path = start_on(echo, "--link", "p0=none", "--console", "link:p0", "-n", "4000000000")
+m = Mon(path)
+ok, out, _ = m.cmd("link")
+check(ok and out and out[0].startswith("node ") and out[1].startswith("port p0 bus=p0 down "),
+      "link: status (%s)" % out)
+m.cmd("link tap on")
+ok, out, _ = m.cmd('link inject p0 "hi\\n"')
+check(ok and fields(out).get("injected") == "3", "link inject")
+ev_in = m.event("link port=p0 dir=in")
+ev_out = m.event("link port=p0 dir=out")
+check(ev_in is not None and 'data="hi\\n"' in ev_in and ev_out is not None,
+      "link tap: in and out as events (%s / %s)" % (ev_in, ev_out))
+ok, _, _ = m.cmd("expect console hi 5")
+check(ok, "expect on a console that is a link port")
+ok, out, _ = m.cmd("link")
+check(any("rx=1" in l for l in out), "link: counts what came in")
+ok, _, err = m.cmd("link inject nosuch x")
+check(ok is False and "no port" in err, "link inject to no such port")
+m.cmd("quit")
+finish(p)
+p, path = start_on(echo, "--link", "p0=none", "--console", "link:p0", "-t", "link",
+                   "-n", "4000000000")
+m = Mon(path)
+ok, _, err = m.cmd("link tap on")
+check(ok is False and "-t link" in err, "link tap: taken by -t link")
+m.cmd("quit")
+finish(p)
+
 # ---- option checks ----------------------------------------------------------------------
 for args, what in (
         (["--monitor", "stdio"], "--monitor stdio with the console on stdio"),

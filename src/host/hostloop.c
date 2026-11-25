@@ -25,6 +25,8 @@ struct uam_host {
         void          *ctx;
     }            fds[MAX_SOURCES];  /* uam_host_add_fd: polled, never wakes the hart */
     unsigned     n_fds;
+    void       (*tick)(void *ctx);  /* uam_host_set_tick */
+    void        *tick_ctx;
     uam_pacing   pacing;
     uint64_t     ticks_per_sec;
     uint64_t     max_ahead;    /* ticks */
@@ -105,6 +107,12 @@ void uam_host_remove_fd(uam_host *h, int fd)
             h->fds[i] = h->fds[--h->n_fds];
             return;
         }
+}
+
+void uam_host_set_tick(uam_host *h, void (*fn)(void *ctx), void *ctx)
+{
+    h->tick = fn;
+    h->tick_ctx = ctx;
 }
 
 void uam_host_resync(uam_host *h)
@@ -216,6 +224,8 @@ void uam_host_poll(uam_host *h, int timeout_ms)
         uam_netdev_poll(h->nds[i]);
     for (unsigned i = 0; i < h->n_links; i++)
         uam_link_node_poll(h->links[i]);
+    if (h->tick)
+        h->tick(h->tick_ctx);
 }
 
 /* ---- real-time pacing ------------------------------------------------------ */

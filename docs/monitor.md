@@ -8,9 +8,9 @@ says why).
 Commands so far: run control (`stop`, `cont`, `wait`, `step`, `until`, `run-for`,
 `quit`), the machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`), its
 memory (`x`, `write`, `load`, `dump`), live instrumentation (`break`, `guard`, `watch`,
-`rule`, `trace`, `mmio-rule`), and the machine as a whole (`snap`, `reset`, `devices`,
-`dev`, `heap`, `irq`, `cpustate`). I/O commands come in a later phase. Boards can add their
-own commands (`uam_monitor_add_command`, below).
+`rule`, `trace`, `mmio-rule`), the machine as a whole (`snap`, `reset`, `devices`, `dev`,
+`heap`, `irq`, `cpustate`), and its ways in and out (`send`, `expect`, `tap`, `input`,
+`link`). Boards can add their own commands (`uam_monitor_add_command`, below).
 
 ## Connecting
 
@@ -148,6 +148,13 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 | `heap [ADDR]` | The board's guarded heaps (`include/uam/heap.h`): arena and counts. With ADDR, the block it lies in, live or freed, and where it was allocated and freed. |
 | `irq [LINE 0\|1]` | Drives an interrupt input line of the selected processor, as a device would (the next device that drives it decides again). Without arguments, the lines the monitor drove. |
 | `cpustate` | The selected processor's whole state as the ISA dumps it (`-d`): system and control registers too. |
+| `send CHARDEV TEXT` | Types TEXT into a console as if on its host end (uam-run's console is `console`, whatever its backend: stdio, a socket, a link port). TEXT takes `\n`, `\r`, `\t`, `\0`, `\xHH`, `"quotes"` for blanks; or `hex:BYTES`. At most 4 KiB. Works while the machine runs. |
+| `expect CHARDEV PATTERN [SECONDS]` | Replies once the guest has written PATTERN (escapes as for `send`) to the console. What it wrote since this client last matched (or connected; the last 64 KiB) counts, so `send` then `expect` sees the answer even when it came first. A match is used up: the next `expect` looks after it. SECONDS (host time) bounds the wait: `error: expect: timed out`. It fails when the run ends first. Not in a script. |
+| `tap CHARDEV on\|off` | The guest's output on a console, as events to this client only: `! output chardev=console text="..."` (C escapes; a line at a time, or what has come by the next host poll). |
+| `input [NAME DATA]` | Hands DATA (as for `send`) to one of the board's named inputs (a UART's receive FIFO, a DMA buffer: `uam_machine_add_input`), as the fuzz harness does. Without arguments, the names. Needs the machine stopped. |
+| `link [status]` | The link nodes (`--link`): connected or not, and each port's bus, whether it is up, messages sent, received, dropped and late, and those waiting for the device. |
+| `link inject PORT DATA` | Hands the port a DATA message (as for `send`) now, as if it had come from the hub. |
+| `link tap on\|off` | Every message of every port as an event to this client: `! link port=p0 dir=in\|out kind=0 key=0x0 len=N data="..."` (the first 256 bytes). Not with `-t link`, which has the links' tap. |
 | `quit [STATUS]` | Ends the run. uam-run exits with STATUS (0-123). Without STATUS: 0, or after the end of the run under `--monitor-hold`, the run's own status. |
 | `json on\|off` | JSON replies and events for this client. |
 

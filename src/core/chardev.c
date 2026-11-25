@@ -19,6 +19,9 @@ size_t uam_chardev_write(uam_chardev *cd, const void *buf, size_t len)
         return len; /* no backend: output is discarded */
     if (cd->tap)
         cd->tap(cd->tap_ctx, buf, len);
+    for (unsigned i = 0; i < UAM_CHARDEV_TAPS; i++)
+        if (cd->taps[i].fn)
+            cd->taps[i].fn(cd->taps[i].ctx, buf, len);
     return cd->ops->write ? cd->ops->write(cd, buf, len) : len;
 }
 
@@ -124,4 +127,26 @@ void uam_chardev_set_tap(uam_chardev *cd, void (*fn)(void *ctx, const uint8_t *b
 {
     cd->tap = fn;
     cd->tap_ctx = fn ? ctx : NULL;
+}
+
+bool uam_chardev_add_tap(uam_chardev *cd, void (*fn)(void *ctx, const uint8_t *buf, size_t len),
+                         void *ctx)
+{
+    for (unsigned i = 0; fn && i < UAM_CHARDEV_TAPS; i++)
+        if (!cd->taps[i].fn) {
+            cd->taps[i].fn = fn;
+            cd->taps[i].ctx = ctx;
+            return true;
+        }
+    return false;
+}
+
+void uam_chardev_remove_tap(uam_chardev *cd,
+                            void (*fn)(void *ctx, const uint8_t *buf, size_t len), void *ctx)
+{
+    for (unsigned i = 0; i < UAM_CHARDEV_TAPS; i++)
+        if (cd->taps[i].fn == fn && cd->taps[i].ctx == ctx) {
+            cd->taps[i].fn = NULL;
+            cd->taps[i].ctx = NULL;
+        }
 }

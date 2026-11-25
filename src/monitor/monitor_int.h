@@ -41,4 +41,25 @@ void             mon_state_free(uam_monitor *mon);
  * run had ended; `why` is the reason "status" gives. */
 void             mon_revive(uam_monitor *mon, const char *why);
 
+/* monitor_io.c: send, expect, tap, input, link */
+typedef struct mon_io mon_io;
+mon_io         **mon_io_slot(uam_monitor *mon);
+uam_status       mon_add_io_commands(uam_monitor *mon);
+void             mon_io_free(uam_monitor *mon);
+void             mon_io_tick(uam_monitor *mon);          /* every host poll */
+void             mon_io_ended(uam_monitor *mon);         /* the run ended */
+void             mon_io_client_gone(uam_monitor *mon, unsigned serial);
+void             mon_io_client_new(uam_monitor *mon, unsigned serial);   /* reads from now */
+
+/* The client a call came from, by a number that is never reused (0: a script). */
+unsigned         mon_call_serial(const uam_monitor_call *c);
+/* Answer the call later (mon_answer_io); the client's later lines wait. */
+bool             mon_defer_io(uam_monitor_call *c);
+/* Answer a deferred call: error, or ok with key/value string pairs, then NULL. */
+void             mon_answer_io(uam_monitor *mon, unsigned serial, const char *error, ...);
+/* An event to one client (serial; 0: every client), with one quoted data value
+ * (data_key NULL: none), then key/value string pairs, then NULL. */
+void             mon_event_to(uam_monitor *mon, unsigned serial, const char *kind,
+                              const char *data_key, const uint8_t *data, size_t len, ...);
+
 #endif /* UAM_MONITOR_INT_H */

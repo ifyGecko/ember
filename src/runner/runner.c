@@ -2444,6 +2444,11 @@ static int run_main(int argc, char **argv, const ext_set *es)
     if (!fuzzing && !gdb_port) {
         mon = uam_monitor_create(&m, host, &(uam_monitor_config){ .wait = monitor_wait,
                                                                   .hold = monitor_hold });
+        if (mon) {   /* before any client: each reads the console's output from its start */
+            uam_monitor_add_chardev(mon, "console", console);
+            for (unsigned k = 0; k < n_link_nodes; k++)
+                uam_monitor_add_link(mon, link_nodes[k], !(rt.flags & RT_LINK));
+        }
         bool reachable = false;
         for (size_t i = 0; mon && i < n_monitor; i++) {
             char err[200];

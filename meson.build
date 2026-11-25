@@ -113,6 +113,7 @@ modules = {
     'src/host/link_hub.c', 'src/host/link_adapters.c', 'src/host/link_wire.c', 'src/debug/gdbstub.c', 'src/debug/debug.c',
     'src/monitor/monitor.c', 'src/monitor/monitor_inspect.c',
     'src/monitor/monitor_instr.c', 'src/monitor/monitor_state.c',
+    'src/monitor/monitor_io.c',
     'src/runner/runner.c', 'src/runner/trace.c'),
 }
 

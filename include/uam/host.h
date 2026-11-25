@@ -306,6 +306,9 @@ void       uam_host_set_pacing(uam_host *h, uam_pacing pacing, uint64_t ticks_pe
 typedef void (*uam_host_fd_fn)(void *ctx, int fd);
 uam_status uam_host_add_fd(uam_host *h, int fd, uam_host_fd_fn fn, void *ctx);
 void       uam_host_remove_fd(uam_host *h, int fd);
+/* Called at the end of every host poll (every few thousand blocks while the machine
+ * runs, and each wait): an owner's periodic work, such as timeouts. One per host. */
+void       uam_host_set_tick(uam_host *h, void (*fn)(void *ctx), void *ctx);
 /* Real-time pacing: start again from the host clock now (after the machine was held
  * still, so the pause is not made up for). */
 void       uam_host_resync(uam_host *h);
