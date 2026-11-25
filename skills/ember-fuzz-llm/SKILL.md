@@ -94,11 +94,11 @@ Repeat at whatever pace you like. Each pass is cheap for you and free for the ca
 ### 2. Find what is uncovered — `fuzz_frontier.py`
 
 Block coverage hashes the pc, so the map cannot tell you *which* branch has only gone one
-way. This tool does. It replays the queue read‑only, reads the firmware CFG with rizin, and
-lists every **frontier branch** — a conditional whose block ran but a target did not — with
-the **last instructions of its block** (usually the compare and the constant to aim at;
-switch cases come with their case value) and the **smallest queue input
-that reaches it** (the input to mutate or edit).
+way. This tool does. It replays the queue read‑only, reads the firmware CFG, and lists every
+**frontier branch** — a conditional whose block ran but a target did not — with the **last
+instructions of its block** (usually the compare and the constant to aim at; switch cases
+come with their case value) and the **smallest queue input that reaches it** (the input to
+mutate or edit).
 
 ```
 python3 fuzz/tools/fuzz_frontier.py <firmware> --corpus camp/main/queue --range <fn> -- \
@@ -107,9 +107,23 @@ python3 fuzz/tools/fuzz_frontier.py <firmware> --corpus camp/main/queue --range 
 (The uam-run command after `--` is your replay command **without** the firmware positional
 and **without** `-t`/`--fuzz-replay`; the tool adds those.) `--range <fn>` narrows it to the
 code under test — use it, or the report is huge and noisy. `--json` for machine reading,
-`--top N` to cap, `--trace FILE` to parse a trace you already captured. Needs rizin and
-`rzpipe`; without them it exits 2 and you fall back to reading the disassembly yourself
-(Ghidra MCP, `objdump`, the recon project).
+`--top N` to cap, `--trace FILE` to parse a trace you already captured.
+
+**The image is whatever your board runs — give it the same way you give it to ember.** An
+ELF is just the path. A **raw / bare‑metal image** loads directly, no turning it into an ELF
+first: `--raw --base <ADDR> --arch <A> --bits <N> --endian <big|little>` (the same flags
+`gen_sites.py` takes; `--cpu` for a CPU variant, `--symbols FILE` to name its functions from
+an `nm`/CSV export). For a raw image `--range` takes an address range (`LO-HI` or `LO+LEN`),
+since a symbols file carries no sizes. Extra modules: `--module NAME:PATH --base NAME=ADDR`.
+
+**The CFG comes from whatever is installed** (`--cfg-from`, default `auto`): `rizin` (driven
+directly — no `rzpipe` module needed), or headless **`ghidra`** (reads raw images, ARM BE8,
+AVR32, 8‑bit PIC and MIPS16e/microMIPS that rizin cannot), or **`ghidra-project`** (a program
+already analysed in a Ghidra project — the recon project, `--ghidra-project PATH.gpr`). `auto`
+tries rizin, then Ghidra. If you already have a graph, `--cfg FILE` reads it (and
+`--save-cfg FILE` writes one to reuse). No loader option is out of reach: `--rizin-arg` /
+`--rizin-cmd` / `--ghidra-arg` pass straight through. If none works it exits 2; fall back to
+reading the disassembly yourself (Ghidra MCP, `objdump`, the recon project).
 
 Read a frontier branch, then read the firmware around its address to learn what input makes
 it go the other way.

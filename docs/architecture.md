@@ -227,7 +227,9 @@ fuzz/             harness.c frontend_replay.c (the harness and the replay fronte
                   cov_formats.h
 fuzz/tools/       gen_sites.py gen_boundaries.py image_resolve.py (site lists and boundary files
                   from rizin's analysis; opt-in, block coverage is the default) ghidra/ (the
-                  same two from headless Ghidra, Jython)
+                  same two from headless Ghidra, Jython; ExportCfg.java, a CFG for the frontier)
+                  fuzz_frontier.py frontier_cfg.py (the coverage frontier: uncovered branch
+                  targets of a corpus; the CFG from rizin, Ghidra or a CFG file -- any image)
                   fuzz_brain.py fuzz_dict.py (the coverage-guided brain and its dictionaries;
                   ember mutates: fuzz/mutate.c)
                   fuzz_queue.py (its campaign: queue, favored set, power schedules, sync)

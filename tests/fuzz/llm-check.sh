@@ -140,27 +140,75 @@ grep -q 'watch-dict: merged' "$tmp/brain.log" || { cat "$tmp/brain.log" >&2; fai
 
 echo "llm-check: $board: brain assist OK (import log, keep, provenance, live dictionary)"
 
-# The frontier tool (rizin + rzpipe, else skipped).
-if command -v rizin > /dev/null 2>&1 && python3 -c 'import rzpipe' 2> /dev/null; then
-    mkdir "$tmp/corp"
-    printf 'ok' > "$tmp/corp/a"
-    printf 'hello' > "$tmp/corp/b"
-    out=$(python3 "$tools/fuzz_frontier.py" "$fw" --corpus "$tmp/corp" --range parse -- \
+# The frontier tool. Its CFG is backend-neutral (fuzz/tools/frontier_cfg.py): rizin driven
+# directly (no rzpipe module), headless Ghidra, a Ghidra project, or a ready CFG file. This
+# checks the rizin backend where rizin can read the machine, and -- when headless Ghidra with
+# the Jython-free ExportCfg.java is around -- the Ghidra backend too, so the frontier does
+# not depend on one disassembler. The ELF loads as an ELF; the raw-image route is exercised
+# by fuzz-check.sh's images and does not need repeating per board here.
+mkdir "$tmp/corp"
+printf 'ok' > "$tmp/corp/a"
+printf 'hello' > "$tmp/corp/b"
+
+# run_frontier BACKEND CFG_FROM: run the report with that CFG source; write it to
+# $tmp/frontier.out and its stderr to $tmp/frontier.err. Return 0 on a good report, 2 on a
+# skip (a machine this backend cannot decode -- reason in $skip), or call fail (which exits
+# the whole script) on any other error. Not run in a subshell, so fail propagates.
+skip=
+run_frontier() {
+    cf=$2
+    if python3 "$tools/fuzz_frontier.py" "$fw" --corpus "$tmp/corp" --range parse \
+        --cfg-from "$cf" -- \
         "$run" -b "$board" --fuzz-begin "$begin" --fuzz-crash-pc "$panic" --fuzz-input uart0 \
-        2> "$tmp/frontier.err") || {
-        if grep -q 'this rizin has no disassembler' "$tmp/frontier.err"; then
-            echo "llm-check: $board: frontier report skipped ($(sed -n "s/.*this rizin has no disassembler for \([^ ]*\).*/rizin has no \1 disassembler/p" "$tmp/frontier.err" | head -1))"
-            exit 0
+        > "$tmp/frontier.out" 2> "$tmp/frontier.err"; then
+        :
+    else
+        # A backend that cannot read this machine (rizin has no disassembler for it, or an
+        # ARM BE8 ELF it decodes the wrong way) prints "could not read the firmware's CFG"
+        # and exits: a skip, not a test failure. Any other nonzero exit is a real failure.
+        if grep -q "could not read the firmware's CFG" "$tmp/frontier.err"; then
+            skip="$1 cannot read this machine ($(sed -n 's/^  '"$cf"': //p' "$tmp/frontier.err" | head -1))"
+            return 2
         fi
-        cat "$tmp/frontier.err" >&2; fail "fuzz_frontier.py exited nonzero"; }
-    if grep -q 'branch(es) in range untyped' "$tmp/frontier.err"; then
-        echo "llm-check: $board: frontier report skipped (this rizin's analysis leaves the parser's branches untyped)"
-        exit 0
+        cat "$tmp/frontier.err" >&2; fail "fuzz_frontier.py (--cfg-from $cf) exited nonzero"
     fi
-    echo "$out" | grep -q 'frontier branch target' || { echo "$out" >&2; fail "no frontier branches reported"; }
+    if grep -q 'branch(es) in range untyped' "$tmp/frontier.err"; then
+        skip="$1 leaves the parser's branches untyped"; return 2
+    fi
+    grep -q 'frontier branch target' "$tmp/frontier.out" || { cat "$tmp/frontier.out" >&2; fail "no frontier branches reported ($1)"; }
     # The parser's letter checks must show as frontier targets with their compare bytes.
-    echo "$out" | grep -Eq '0x46|0x4c|0x55' || { echo "$out" >&2; fail "no compare byte in the frontier report"; }
-    echo "llm-check: $board: frontier report OK"
+    grep -Eq '0x46|0x4c|0x55' "$tmp/frontier.out" || { cat "$tmp/frontier.out" >&2; fail "no compare byte in the frontier report ($1)"; }
+    return 0
+}
+
+# rizin, if installed and it can read this machine.
+if command -v rizin > /dev/null 2>&1; then
+    if run_frontier rizin rizin; then
+        echo "llm-check: $board: frontier report OK (rizin)"
+    else
+        echo "llm-check: $board: frontier report skipped, rizin ($skip)"
+    fi
 else
-    echo "llm-check: $board: frontier report skipped (needs rizin and rzpipe)"
+    echo "llm-check: $board: frontier report skipped, rizin (not installed)"
+fi
+
+# headless Ghidra (ExportCfg.java is plain Java, no Jython), if one is found.
+gh=${GHIDRA_HEADLESS:-}
+if [ -z "${GHIDRA_HEADLESS+set}" ]; then
+    for c in "${GHIDRA_HOME:+$GHIDRA_HOME/support/analyzeHeadless}" \
+             "${GHIDRA_INSTALL_DIR:+$GHIDRA_INSTALL_DIR/support/analyzeHeadless}" \
+             "$(command -v analyzeHeadless 2> /dev/null || true)" \
+             $(ls -d "$HOME"/ghidra*/support/analyzeHeadless /opt/ghidra*/support/analyzeHeadless 2> /dev/null || true); do
+        [ -n "$c" ] && [ -x "$c" ] && { gh=$c; break; }
+    done
+fi
+if [ -n "$gh" ]; then
+    GHIDRA_HEADLESS="$gh"; export GHIDRA_HEADLESS
+    if run_frontier "headless Ghidra" ghidra; then
+        echo "llm-check: $board: frontier report OK (headless Ghidra)"
+    else
+        echo "llm-check: $board: frontier report skipped, Ghidra ($skip)"
+    fi
+else
+    echo "llm-check: $board: frontier report skipped, Ghidra (no headless Ghidra found)"
 fi

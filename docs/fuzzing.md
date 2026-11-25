@@ -1135,14 +1135,14 @@ deduplicated; it never removes a token.
 hashed pc, so the coverage map cannot say *which* branch has only gone one way — but that is
 exactly what a helper needs to aim an input. `fuzz_frontier.py` answers it: it replays the
 queue through `uam-run -t blocks` (it copies the queue first, so a live campaign adding
-entries cannot shift which input is which), reads the firmware's control-flow graph with
-rizin (as `gen_sites.py` does; needs rizin and `rzpipe`), and lists every **frontier
-branch** — a conditional (or a switch's jump table) whose own block ran but one of whose
-targets never did. For each it prints the last instructions of the branch's block (usually
-the compare and the constant to aim at), the uncovered target by name (with the case value
-for a switch), and the smallest queue input that reaches the branch (the input to mutate or
-hand-edit). An ember block runs on past a point another branch jumps to, so a rizin block
-that a run block flows into without a branch counts as run too:
+entries cannot shift which input is which), reads the firmware's control-flow graph, and
+lists every **frontier branch** — a conditional (or a switch's jump table) whose own block
+ran but one of whose targets never did. For each it prints the last instructions of the
+branch's block (usually the compare and the constant to aim at), the uncovered target by
+name (with the case value for a switch), and the smallest queue input that reaches the
+branch (the input to mutate or hand-edit). An ember block runs on past a point another
+branch jumps to, so a CFG block that a run block flows into without a branch counts as run
+too:
 
 ```
 python3 fuzz/tools/fuzz_frontier.py build/tests/firmware/fuzztarget.elf \
@@ -1153,10 +1153,24 @@ python3 fuzz/tools/fuzz_frontier.py build/tests/firmware/fuzztarget.elf \
 #         reached by 1 input(s); smallest b (5 B)
 ```
 
+The image is any ember firmware, given as it is to ember: an ELF is just the path; a **raw /
+bare-metal image loads directly** (`--raw --base ADDR --arch A --bits N --endian E`, with
+`--cpu`/`--symbols` as `gen_sites.py` takes them — no turning it into an ELF first); extra
+modules with `--module NAME:PATH` and `--base NAME=ADDR`. The CFG comes from whatever is
+installed (`--cfg-from`, default `auto`): `rizin` driven over its own pipe (no `rzpipe`
+module needed), headless `ghidra` (which also reads raw images, ARM BE8, AVR32, 8-bit PIC and
+MIPS16e/microMIPS that rizin cannot), or `ghidra-project` (a program already analysed in a
+Ghidra project, `--ghidra-project PATH.gpr`). `--cfg FILE` reads a graph exported any other
+way (the format is in `fuzz/tools/frontier_cfg.py`; `fuzz/tools/ghidra/ExportCfg.java` writes
+one from the Ghidra GUI or headless), and `--save-cfg FILE` writes one to reuse.
+`--rizin-arg`/`--rizin-cmd`/`--ghidra-arg` pass options straight through, so no loader
+setting is out of reach.
+
 `--range SYM|LO-HI|LO+LEN` (repeatable) narrows the analysis to the code under test (a bare
-symbol also matches the compiler's clones of it, `parse` → `parse.constprop.0`); `--json`
-prints the records for a program to read; `--top N` caps the list; `--trace FILE` parses a
-block trace you already captured instead of replaying (from the same, unchanged corpus). Give the uam-run command after `--`
+symbol also matches the compiler's clones of it, `parse` → `parse.constprop.0`; a raw image
+has no symbol sizes, so use `LO-HI`/`LO+LEN` there); `--json` prints the records for a program
+to read; `--top N` caps the list; `--trace FILE` parses a block trace you already captured
+instead of replaying (from the same, unchanged corpus). Give the uam-run command after `--`
 without the firmware positional and without `-t`/`--fuzz-replay` (the tool adds those).
 
 **The loop.** A helper's cycle is: read `status.jsonl` and the frontier report → read the

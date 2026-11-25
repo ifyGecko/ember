@@ -148,11 +148,11 @@ reconstructs the uncovered edges a different way:
    `uam-run -t blocks` (read-only, safe beside a live campaign: entries added meanwhile
    cannot shift which input is which), collecting the block pcs each input ran, attributed
    by the `trace: input N` markers and ember's own `replay:` lines.
-2. It reads the firmware's CFG with rizin (via `rzpipe`, as `fuzz/tools/gen_sites.py` does):
-   each basic block's start, size, successors (taken/fall-through, or a switch's jump-table
-   cases), and the disassembly of its last few instructions. An ember block runs on past a
-   point another branch jumps to (a loop head, the join after an `if`), so a rizin block also
-   counts as run when a block that ran flows into it with no branch of its own.
+2. It reads the firmware's control-flow graph — each basic block's start, size, successors
+   (taken/fall-through, or a switch's jump-table cases), and the disassembly of its last few
+   instructions. An ember block runs on past a point another branch jumps to (a loop head,
+   the join after an `if`), so a CFG block also counts as run when a block that ran flows
+   into it with no branch of its own.
 3. A **frontier branch** is a conditional block (or a switch) that ran but one of whose
    targets never did. For each it reports: the branch pc (symbolized), the uncovered target
    (symbolized), the edge kind (`taken`, `fall-through`, or `case N` with `case_value` in
@@ -160,31 +160,85 @@ reconstructs the uncovered edges a different way:
    value to aim at — though the tool does not decode it for you), how many corpus inputs
    reach the branch, and the **smallest** one (the input to mutate or hand-edit).
 
-Invocation (the trailing command is your replay command **minus** the firmware positional and
-**minus** any `-t`/`--fuzz-replay`; the tool adds `-t blocks --fuzz-replay <corpus>
---trace-file <tmp>` and `--trace-range` from `--range`):
+Nothing in it is tied to one firmware format or one disassembler.
+
+### The image
+
+Give the firmware exactly as you give it to ember and the other fuzz tools — the tool does
+not care what format it is, only that ember runs it:
+
+- **an ELF** (or anything the analyser's own loader reads): just the path.
+- **a raw / bare-metal image** (a boot ROM, an RTOS or flash dump): `--raw --base ADDR
+  --arch A --bits N --endian big|little`, the same flags `gen_sites.py` takes. The code runs
+  at `--base`. `--cpu C` for an arch with variants; `--symbols FILE` names its functions from
+  an `nm` / `ADDR NAME` / Ghidra-CSV export (as `gen_sites.py --symbols`). **It loads
+  directly — you never turn it into an ELF first.** For a raw image `--range` must be an
+  address range (`LO-HI` / `LO+LEN`), because a symbols file carries no function sizes to
+  resolve a bare `SYM` to.
+- **extra modules**: `--module NAME:PATH` (another ELF) and `--base NAME=ADDR` (its load
+  base). `--base ADDR` on its own (no `NAME=`) is the raw image's load address.
+
+### Where the CFG comes from (`--cfg-from`, default `auto`)
+
+| `--cfg-from` | what it uses |
+|---|---|
+| `rizin` | the `rizin` program, driven over its own pipe — **no `rzpipe` module needed** |
+| `ghidra` | headless Ghidra importing the image (`fuzz/tools/ghidra/ExportCfg.java`). Reads raw images, ARM BE8, AVR32, 8-bit PIC, MIPS16e/microMIPS — what rizin cannot decode |
+| `ghidra-project` | a program already analysed in a Ghidra project: `--ghidra-project PATH.gpr` (the ember-dev-recon project, or your own), `--ghidra-program NAME` to pick one. No re-analysis, read-only |
+| `auto` (default) | a CFG file if `--cfg` is given, else rizin if it can read the image, else headless Ghidra if one is found |
+
+- `--cfg FILE`: read a ready CFG (`frontier_cfg.py`'s JSON format) instead of running any
+  disassembler — one `--save-cfg FILE` wrote earlier, one exported from the Ghidra GUI with
+  `ExportCfg.java`, or one your own exporter made for a disassembler neither backend covers.
+  With `--cfg` the image flags are not needed.
+- `--save-cfg FILE`: also write the CFG this run built, to reuse with `--cfg` (the analysis
+  is the slow part; the replay is cheap).
+- **No loader option is out of reach.** `--rizin-arg ARG` / `--rizin-cmd CMD` (e.g.
+  `--rizin-cmd 'ahb 16 @ 0x8000'` to mark Thumb, `--rizin-cmd 'e asm.cpu=cortex'`) and
+  `--ghidra-arg ARG` (e.g. `--ghidra-arg -loader-fileOffset --ghidra-arg 0x40`,
+  `--ghidra-arg -cspec ...`) pass straight through to that tool. `--processor LANGID` sets
+  Ghidra's language for a raw image when the default from `--arch` is not the one you want
+  (e.g. `ARM:LE:32:Cortex`).
+- Headless Ghidra is found by `--ghidra-home`, `$GHIDRA_HEADLESS`, `$GHIDRA_HOME` /
+  `$GHIDRA_INSTALL_DIR`, `analyzeHeadless` on `PATH`, or `~/ghidra*` / `/opt/ghidra*`.
+
+The rizin and Ghidra graphs can differ exactly where the site-list generators do — a jump
+table one resolves and the other does not, blocks an analyser splits differently (AVR skips,
+delay slots). The frontier branches and their compare constants are the same.
+
+### Invocation and options
+
+The trailing command is your replay command **minus** the firmware positional and **minus**
+any `-t`/`--fuzz-replay`; the tool adds `-t blocks --fuzz-replay <corpus> --trace-file <tmp>`
+and `--trace-range` from `--range`:
 ```
+# an ELF, CFG from whatever is installed
 python3 fuzz/tools/fuzz_frontier.py <firmware> --corpus SYNC_DIR/main/queue --range <fn> -- \
     build/<board>-run -b <board> --fuzz-begin <sym> --fuzz-crash-pc <sym> --fuzz-input <route>
+
+# a raw bare-metal image, CFG from headless Ghidra (uam-run markers are addresses for a raw
+# image, not symbol names)
+python3 fuzz/tools/fuzz_frontier.py fw.bin --raw --base 0x8000000 --arch arm --bits 32 \
+    --endian little --symbols fw.nm --cfg-from ghidra \
+    --corpus SYNC_DIR/main/queue --range 0x8000100+0x400 -- \
+    build/<board>-run -b <board> --raw-base 0x8000000 --fuzz-begin 0x8000101 \
+    --fuzz-crash-pc 0x8000200 --fuzz-input <route>
 ```
-Options:
 - `--range SYM | LO-HI | LO+LEN` (repeatable): restrict the CFG and the trace to those pcs.
-  A bare `SYM` also matches the compiler's clones (`parse` → `parse.constprop.0`). **Use it**
-  — on a whole firmware the report is large and most of it is library/scheduler noise.
-- `--module NAME:PATH` + `--base NAME=ADDR`: an extra module's ELF and its load base
-  (multi-module images).
-- `--all-functions`: include functions rizin found only by analysis (`fcn.*`), off by
-  default.
+  A bare `SYM` (ELF only) also matches the compiler's clones (`parse` → `parse.constprop.0`).
+  **Use it** — on a whole firmware the report is large and most of it is library/scheduler
+  noise.
+- `--all-functions`: include functions the analyser found on its own (not at a symbol), off
+  by default.
 - `--top N` (default 40; 0 = all); `--json` (a list of records, for machine reading).
 - `--trace FILE`: parse a block trace you already captured instead of replaying (then no
   trailing command). The corpus must be unchanged since: inputs are matched to the trace in
-  ember's replay order (every file not starting with `.`, by name — `.info` files too, if
-  the directory has them). Capture one with `uam-run … -t blocks --trace-file FILE --fuzz-replay
-  <corpus> <firmware>`.
+  ember's replay order (every file not starting with `.`, by name). Capture one with
+  `uam-run … -t blocks --trace-file FILE --fuzz-replay <corpus> <firmware>`.
 
-Needs rizin on `PATH` and `rzpipe` importable; without them it prints why and exits 2. Then
-fall back to reading the firmware yourself (Ghidra MCP, `objdump -d`, the ember-dev-recon
-project) around the pcs your corpus does reach.
+If no CFG source works it prints why and exits 2. Then fall back to reading the firmware
+yourself (Ghidra MCP, `objdump -d`, the ember-dev-recon project) around the pcs your corpus
+does reach.
 
 Records are sorted most-useful first: branches some input already reaches (so a mutation can
 flip them), smallest input first. Those are where to spend effort — you already have an input

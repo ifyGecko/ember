@@ -1,14 +1,26 @@
-# Ghidra Jython ports of ember's site-list and boundary-file generators
+# Ghidra scripts: ember site lists, boundary files and CFGs
 
-These are **Ghidra Jython 2.7** ports of the rizin-based generators one
-directory up. They write the same kinds of file from the program open in
-Ghidra, with **no rizin / rzpipe dependency**:
+These run on the program open in Ghidra, with **no rizin / rzpipe
+dependency**. Two of them are **Jython 2.7** ports of the rizin-based
+generators one directory up; `ExportCfg.java` is a plain Java script (no
+Jython needed) that feeds `fuzz/tools/fuzz_frontier.py`:
 
-| Ghidra script (here) | rizin original (`fuzz/tools/`) | Writes |
+| Ghidra script (here) | counterpart (`fuzz/tools/`) | Writes |
 |----------------------|--------------------------------|--------|
 | `gen_sites.py`       | `gen_sites.py`                 | site list (`UAMS`), for `uam-run --cov-sites` |
 | `gen_boundaries.py`  | `gen_boundaries.py`            | boundary file (`UAMB`), for `uam-run --cov-boundary` |
 | `image_resolve.py`   | `image_resolve.py`             | shared name/address resolver and ELF symbol reader (imported, not run) |
+| `ExportCfg.java`     | `frontier_cfg.py` (rizin route) | a CFG file (JSON) for `fuzz_frontier.py --cfg`, one of its `--cfg-from ghidra` / `ghidra-project` backends |
+
+`ExportCfg.java` is plain Java (`-postScript ExportCfg.java OUT`), so it
+needs no Jython extension and runs from the Script Manager too. It writes
+the control-flow graph — each basic block's successors and last few
+instructions — in the format `fuzz/tools/frontier_cfg.py` documents.
+`fuzz_frontier.py` drives it for you (`--cfg-from ghidra`, a fresh import;
+`--cfg-from ghidra-project`, a program already in a project), or run it by
+hand and pass the file with `--cfg FILE`. Unlike the site-list route it
+reports the graph as the program is loaded (no byte-for-byte match with
+rizin is intended), so it works on anything Ghidra disassembles.
 
 The formats are specified in `docs/fuzz-formats.md` (and `fuzz/formats.h`).
 A script follows the same rules as its rizin original: the site selection
