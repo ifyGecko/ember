@@ -35,6 +35,7 @@ typedef struct piece {
 
 struct uam_heap {
     uam_machine     *m;
+    struct uam_heap *next_all;   /* every heap of every machine (uam_machine_heaps) */
     char            *name, *state_name;
     uint64_t         base, size;
     uint32_t         align, redzone;
@@ -577,6 +578,28 @@ static bool split(uam_heap *h, bool phys, char *err, size_t errlen)
     return true;
 }
 
+static uam_heap *g_heaps;   /* every heap, in the order created */
+
+size_t uam_machine_heaps(const uam_machine *m, uam_heap **out, size_t max)
+{
+    size_t n = 0;
+    for (uam_heap *h = g_heaps; h; h = h->next_all)
+        if (h->m == m) {
+            if (n < max)
+                out[n] = h;
+            n++;
+        }
+    return n;
+}
+
+const char *uam_heap_name(const uam_heap *h) { return h->name; }
+
+void uam_heap_get_arena(const uam_heap *h, uint64_t *base, uint64_t *size)
+{
+    *base = h->base;
+    *size = h->size;
+}
+
 uam_heap *uam_heap_create(uam_machine *m, const uam_heap_opts *o, char *err, size_t errlen)
 {
     if (err && errlen)
@@ -632,6 +655,10 @@ uam_heap *uam_heap_create(uam_machine *m, const uam_heap_opts *o, char *err, siz
             return NULL;
         }
     }
+    uam_heap **tail = &g_heaps;
+    while (*tail)
+        tail = &(*tail)->next_all;
+    *tail = h;
     return h;
 fail:
     if (h) {
@@ -647,6 +674,11 @@ void uam_heap_destroy(uam_heap *h)
 {
     if (!h)
         return;
+    for (uam_heap **p = &g_heaps; *p; p = &(*p)->next_all)
+        if (*p == h) {
+            *p = h->next_all;
+            break;
+        }
     for (uint32_t i = 0; i < h->n_pieces; i++)
         if (h->pieces[i].wid > 0)
             uam_bus_remove_watch(&h->m->bus, h->pieces[i].wid);

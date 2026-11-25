@@ -10,6 +10,7 @@
  *   2 IIR (r) / FCR (w)
  *   3 LCR   4 MCR   5 LSR   6 MSR   7 SCR
  */
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "uam/dev/uart16550.h"
@@ -196,8 +197,25 @@ static void uart_restore(uam_device *d, uam_state_reader *r)
     uam_chardev_accept_input(u->cd);   /* the FIFO's free space changed */
 }
 
+static void uart_describe(uam_device *d, void (*line)(void *ctx, const char *text), void *ctx)
+{
+    const uart *u = to_uart(d);
+    char t[160];
+    snprintf(t, sizeof(t), "ier=0x%02x lcr=0x%02x mcr=0x%02x fcr=0x%02x scr=0x%02x divisor=%u",
+             u->ier, u->lcr, u->mcr, u->fcr, u->scr, (unsigned)u->dll | (unsigned)u->dlm << 8);
+    line(ctx, t);
+    snprintf(t, sizeof(t), "receive fifo: %u of %u bytes; transmit-empty interrupt %s",
+             u->rx_count, (unsigned)RX_CAP, u->thr_pending ? "latched" : "not latched");
+    line(ctx, t);
+    snprintf(t, sizeof(t), "interrupts enabled: %s%s%s%s",
+             u->ier & 1 ? "rx-data " : "", u->ier & 2 ? "tx-empty " : "",
+             u->ier & 4 ? "line-status " : "", (u->ier & 7) ? "" : "none");
+    line(ctx, t);
+}
+
 static const uam_device_ops uart_ops = {
     .type = "16550a-uart",
+    .describe = uart_describe,
     .read = uart_read,
     .write = uart_write,
     .reset = uart_reset,
@@ -208,6 +226,7 @@ static const uam_device_ops uart_ops = {
 static const uam_device_ops uart_be_ops = {
     .type = "16550a-uart",
     .endian = UAM_ACC_BE,
+    .describe = uart_describe,
     .read = uart_read,
     .write = uart_write,
     .reset = uart_reset,

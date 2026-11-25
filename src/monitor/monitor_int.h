@@ -32,4 +32,13 @@ uint64_t         mon_instr_limit(uam_monitor *mon, uint64_t limit);
  * "" if it was only the step over a guard (go on); NULL otherwise. */
 const char      *mon_instr_claim(uam_monitor *mon, uam_stop_reason why);
 
+/* monitor_state.c: snap, reset, devices, dev, heap, irq, cpustate */
+typedef struct mon_state mon_state;
+mon_state      **mon_state_slot(uam_monitor *mon);
+uam_status       mon_add_state_commands(uam_monitor *mon);
+void             mon_state_free(uam_monitor *mon);
+/* The machine was put back (a snapshot, a reset): it is stopped there, also after the
+ * run had ended; `why` is the reason "status" gives. */
+void             mon_revive(uam_monitor *mon, const char *why);
+
 #endif /* UAM_MONITOR_INT_H */

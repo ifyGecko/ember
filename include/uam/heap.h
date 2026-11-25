@@ -127,4 +127,10 @@ typedef struct uam_heap_stats {
 
 void uam_heap_get_stats(const uam_heap *h, uam_heap_stats *out);
 
+/* The heaps of machine m, in the order created (the monitor's "heap"): returns how many
+ * there are, and writes up to max of them to out. */
+size_t      uam_machine_heaps(const struct uam_machine *m, uam_heap **out, size_t max);
+const char *uam_heap_name(const uam_heap *h);
+void        uam_heap_get_arena(const uam_heap *h, uint64_t *base, uint64_t *size);
+
 #endif /* UAM_HEAP_H */

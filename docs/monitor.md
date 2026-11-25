@@ -7,9 +7,10 @@ says why).
 
 Commands so far: run control (`stop`, `cont`, `wait`, `step`, `until`, `run-for`,
 `quit`), the machine's state (`status`, `cpu`, `regs`, `reg`, `map`, `history`, `bt`), its
-memory (`x`, `write`, `load`, `dump`), and live instrumentation (`break`, `guard`, `watch`,
-`rule`, `trace`, `mmio-rule`). Snapshots and I/O commands come in later phases. Boards
-can add their own commands (`uam_monitor_add_command`, below).
+memory (`x`, `write`, `load`, `dump`), live instrumentation (`break`, `guard`, `watch`,
+`rule`, `trace`, `mmio-rule`), and the machine as a whole (`snap`, `reset`, `devices`,
+`dev`, `heap`, `irq`, `cpustate`). I/O commands come in a later phase. Boards can add their
+own commands (`uam_monitor_add_command`, below).
 
 ## Connecting
 
@@ -138,8 +139,32 @@ One command per line: `[#ID ]COMMAND [ARG...]`.
 | `rule add TEXT \| load FILE \| list \| on ID \| off ID \| del ID` | Rules as `--on` and `--on-file` take them (`include/uam/rules.h`), with the image's symbols. A rule's `stop` stops the run into the monitor (`reason: rule NAME`). `list` shows each rule's id, name, whether it is on, and its counts. A deleted rule keeps its id. Rules with `count=` or `delay=` become part of the snapshot state (as `rules-monitor`). |
 | `trace [on LIST \| off LIST \| file PATH\|-]` | The `-t` traces (LIST as `-t` takes it; `off all` turns every one off): on, off, and where they go (`-` is stderr). Without arguments, which are on. `blocks` and `ir` change how code is translated and need the machine stopped; `link` can only be set when the run starts. |
 | `mmio-rule RULE` | Answers an unmodelled register, as `--mmio-rule` does, from now on (above every `--mmio-rule`, below every real device). Not `input`. |
+| `snap save NAME [FILE]` | Keeps the machine as it is now, in memory as NAME (and in FILE, as `--save-snapshot` writes it). |
+| `snap load NAME\|FILE` | Puts the machine back to snapshot NAME, or to the snapshot in FILE (`--save-snapshot`'s files). It is stopped there (`reason: snap`); `cont` goes on. This also works after the run has ended under `--monitor-hold`: the run comes back. A snapshot no longer fits once a device (`mmio-rule`) or a rule with `count=` or `delay=` was added after it; uam-run's log says which part. |
+| `snap list \| write NAME FILE \| read NAME FILE \| drop NAME` | The snapshots kept (pc, icount, time, pages), one written to a file, one read from a file (not restored), one forgotten. |
+| `reset [system\|cpu]` | Resets the machine (devices and processors; RAM stays), or the processors only, as a reset the guest asks for would: the board's reset hook first. Stopped there (`reason: reset`), also after the end of the run. |
+| `devices` | Every device: name, type, regions mapped, and whether it can be read without side effects (`peek`) and describe itself (`describe`). |
+| `dev NAME` | One device: its type, its regions, and what it says of its state (`uam_device_ops.describe`); without that, its registers as it shows them without side effects. |
+| `heap [ADDR]` | The board's guarded heaps (`include/uam/heap.h`): arena and counts. With ADDR, the block it lies in, live or freed, and where it was allocated and freed. |
+| `irq [LINE 0\|1]` | Drives an interrupt input line of the selected processor, as a device would (the next device that drives it decides again). Without arguments, the lines the monitor drove. |
+| `cpustate` | The selected processor's whole state as the ISA dumps it (`-d`): system and control registers too. |
 | `quit [STATUS]` | Ends the run. uam-run exits with STATUS (0-123). Without STATUS: 0, or after the end of the run under `--monitor-hold`, the run's own status. |
 | `json on\|off` | JSON replies and events for this client. |
+
+## A device's description
+
+A device model can say what state it is in for `dev NAME`: `uam_device_ops.describe` is
+called with a function to call once per line of text (no newline). It must change nothing.
+The 16550 UART has one:
+
+```c
+static void uart_describe(uam_device *d, void (*line)(void *ctx, const char *text), void *ctx)
+{
+    char t[160];
+    snprintf(t, sizeof(t), "ier=0x%02x lcr=0x%02x ...", ...);
+    line(ctx, t);
+}
+```
 
 ## A board's own commands
 

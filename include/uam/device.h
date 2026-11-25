@@ -79,6 +79,10 @@ typedef struct uam_device_ops {
     unsigned    flags;                       /* enum uam_device_flag */
     /* Optional: a read without side effects, for debuggers (see above). */
     uam_status (*peek)(uam_device *dev, uint64_t off, unsigned size, uint64_t *val);
+    /* Optional: what state the device is in, for a person (the monitor's "dev NAME"):
+     * one call of `line` per line of text, no newline. Changes nothing. */
+    void       (*describe)(uam_device *dev, void (*line)(void *ctx, const char *text),
+                           void *ctx);
 } uam_device_ops;
 
 struct uam_device {

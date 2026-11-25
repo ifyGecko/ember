@@ -330,7 +330,7 @@ if have_arm
 endif
 
 # The monitor needs no toolchain: its test writes its own few bytes of x86 code.
-test('monitor', python, args: [files('monitor/monitor-check.py'), uam_run, uam_mon],
+test('monitor', python, args: [files('monitor/monitor-check.py'), uam_run, uam_mon, uam_test_run],
   suite: 'monitor', kwargs: std)
 
 # Flat images entered in real mode at 0. The self-test and the AMD SMM test raise SMIs

@@ -93,6 +93,7 @@ struct uam_monitor {
     uam_symbolize_fn   sym;
     void              *sym_ctx;
     mon_instr         *instr;         /* monitor_instr.c */
+    mon_state         *mstate;        /* monitor_state.c */
     char               why_buf[96];   /* stop_why when it is a claimed reason */
 };
 
@@ -438,6 +439,19 @@ uam_symbolize_fn mon_symbolizer(const uam_monitor *mon, void **ctx)
 bool mon_stopped(const uam_monitor *mon) { return mon->state != ST_RUNNING; }
 
 mon_instr **mon_instr_slot(uam_monitor *mon) { return &mon->instr; }
+
+mon_state **mon_state_slot(uam_monitor *mon) { return &mon->mstate; }
+
+void mon_revive(uam_monitor *mon, const char *why)
+{
+    mon->state = ST_STOPPED;
+    mon->stop_why = why;
+    mon->m->exec.stop_request = false;
+    event e = { .kind = "stopped" };
+    ev_add(&e, "reason", "%s", why);
+    ev_where(mon, &e);
+    ev_broadcast(mon, &e);
+}
 
 void uam_monitor_set_rule_symbols(uam_monitor *mon,
                                   bool (*fn)(void *ctx, const char *name, uint64_t *value),
@@ -1393,7 +1407,8 @@ uam_monitor *uam_monitor_create(uam_machine *m, uam_host *h, const uam_monitor_c
             uam_monitor_destroy(mon);
             return NULL;
         }
-    if (mon_add_inspect_commands(mon) != UAM_OK || mon_add_instr_commands(mon) != UAM_OK) {
+    if (mon_add_inspect_commands(mon) != UAM_OK || mon_add_instr_commands(mon) != UAM_OK
+        || mon_add_state_commands(mon) != UAM_OK) {
         uam_monitor_destroy(mon);
         return NULL;
     }
@@ -1406,6 +1421,7 @@ void uam_monitor_destroy(uam_monitor *mon)
         return;
     clear_targets(mon);
     mon_instr_free(mon);
+    mon_state_free(mon);
     for (unsigned i = 0; i < MAX_CLIENTS; i++)
         if (mon->cl[i])
             client_free(mon, mon->cl[i]);
@@ -1522,8 +1538,10 @@ uam_stop_reason uam_monitor_serve(uam_monitor *mon, uint64_t max_insns)
         if (!mon->cfg.hold)
             return why;
         x->stop_request = false;
-        while (!mon->quit && !x->stop_request)
+        while (mon->state == ST_ENDED && !mon->quit && !x->stop_request)
             uam_host_poll(mon->h, -1);
+        if (mon->state == ST_STOPPED && !mon->quit && !x->stop_request)
+            continue;   /* a snapshot or a reset brought the machine back: it goes on */
         if (mon->quit && mon->quit_has_code) {
             x->stop_status = mon->quit_code;
             return UAM_STOP_REQUEST;

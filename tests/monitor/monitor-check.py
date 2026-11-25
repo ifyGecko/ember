@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """monitor-check.py - the monitor (uam-run --monitor), over its ways in.
 
-    monitor-check.py UAM_RUN UAM_MON
+    monitor-check.py UAM_RUN UAM_MON UAM_TEST_RUN
 
 Runs a few bytes of x86 real-mode code on x86_64-ref that print 'A' to COM1 in a
 loop, and checks: the Unix socket (greeting, status, stop and cont, ids, JSON,
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-runner, uam_mon = sys.argv[1:3]
+runner, uam_mon, test_runner = sys.argv[1:4]
 fails = 0
 tmp = tempfile.mkdtemp(prefix="monitor-check.")
 # mov dx,0x3f8; mov al,'A'; out dx,al; mov cx,0x1000; loop $; jmp 0
@@ -496,6 +496,95 @@ for jit in ([], ["--jit"]):
     check(ok is False, "%s: guard del of none" % name)
     m.cmd("quit")
     finish(p)
+
+# ---- phase 3: snap, reset, devices, dev, heap, irq, cpustate -----------------------------
+for jit in ([], ["--jit"]):
+    name = "jit" if jit else "interp"
+    snapf = os.path.join(tmp, "s-%s.snap" % name)
+    p, path = start(*jit, "--monitor-wait", "--monitor-hold", "-n", "20000")
+    m = Mon(path)
+    m.cmd("step 100")
+    ok, out, _ = m.cmd("snap save a " + snapf)
+    st = fields(out)
+    check(ok and st.get("snapshot") == "a" and st.get("icount") == "100" and os.path.exists(snapf),
+          "%s: snap save, to a file too" % name)
+    m.cmd("reg rcx 7")
+    m.cmd("step 50")
+    ok, out, _ = m.cmd("snap list")
+    check(ok and out and out[0].startswith("a pc=0x9 icount=100 "), "%s: snap list (%s)" % (name, out))
+    ok, out, _ = m.cmd("snap load a")
+    ok2, out2, _ = m.cmd("status")
+    ok3, out3, _ = m.cmd("reg rcx")
+    check(ok and fields(out2).get("icount") == "100" and fields(out2).get("reason") == "snap"
+          and fields(out3).get("rcx") != "0x0000000000000007",
+          "%s: snap load puts the machine back (registers too)" % name)
+    ev = m.event("stopped reason=snap")
+    check(ev is not None, "%s: a stopped event for the restore" % name)
+    m.cmd("cont")
+    ok, out, _ = m.cmd("wait")
+    check(fields(out).get("state") == "ended", "%s: the run ends at its limit" % name)
+    ok, out, _ = m.cmd("snap load a")
+    ok2, out2, _ = m.cmd("status")
+    check(ok and fields(out2).get("state") == "stopped" and fields(out2).get("icount") == "100",
+          "%s: snap load after the end brings the run back" % name)
+    m.cmd("step 10")
+    ok, out, _ = m.cmd("status")
+    check(fields(out).get("icount") == "110", "%s: ... and it runs on" % name)
+    ok, out, _ = m.cmd("snap load " + snapf)
+    ok2, out2, _ = m.cmd("status")
+    check(ok and fields(out2).get("icount") == "100", "%s: snap load from a file" % name)
+    m.cmd("snap read b " + snapf)
+    ok, out, _ = m.cmd("snap list")
+    check(len(out) == 2 and out[1].startswith("b "), "%s: snap read" % name)
+    wf = os.path.join(tmp, "w-%s.snap" % name)
+    ok, _, _ = m.cmd("snap write b " + wf)
+    check(ok and os.path.exists(wf), "%s: snap write" % name)
+    m.cmd("snap drop b")
+    ok, out, _ = m.cmd("snap list")
+    check(len(out) == 1, "%s: snap drop" % name)
+    ok, _, err = m.cmd("snap load nosuch")
+    check(ok is False and "no snapshot" in err, "%s: snap load of nothing" % name)
+    m.cmd("step 3")
+    ok, out, _ = m.cmd("reset")
+    ok2, out2, _ = m.cmd("reg rip")
+    check(ok and fields(out).get("pc") == "0x0" and fields(out2).get("rip") == "0x0000000000000000",
+          "%s: reset" % name)
+    ok, out, _ = m.cmd("devices")
+    check(ok and any(l.startswith("com1 16550a-uart regions=1") and l.endswith("describe")
+                     for l in out) and any(l.startswith("pit ") for l in out), "%s: devices" % name)
+    ok, out, _ = m.cmd("dev com1")
+    check(ok and fields(out).get("type") == "16550a-uart" and any(l.startswith("region com1 ") for l in out)
+          and any(l.startswith("ier=0x00 lcr=") for l in out), "%s: dev com1 describes it" % name)
+    ok, out, _ = m.cmd("dev pit")
+    check(ok and any("neither describe" in l for l in out), "%s: dev of a device that cannot" % name)
+    ok, _, err = m.cmd("dev nosuch")
+    check(ok is False and "no device" in err, "%s: dev of none" % name)
+    ok, out, _ = m.cmd("heap")
+    check(ok and out == ["(the board has no guarded heap)"], "%s: heap with none" % name)
+    ok, out, _ = m.cmd("irq 4 1")
+    ok2, out2, _ = m.cmd("irq")
+    check(ok and out2 == ["cpu 0 line 4 level 1"], "%s: irq drives a line, and lists it" % name)
+    m.cmd("irq 4 0")
+    ok, out, _ = m.cmd("cpustate")
+    check(ok and any(l.startswith("cr0=") for l in out), "%s: cpustate (system registers)" % name)
+    m.cmd("quit")
+    finish(p)
+
+# a guarded heap on the RISC-V test board (an arena, no allocator hooked: nothing allocated)
+with open(os.path.join(tmp, "rvspin.bin"), "wb") as f:
+    f.write(bytes.fromhex("6f000000"))   # j .
+hs = os.path.join(tmp, "h.sock")
+p = subprocess.Popen([test_runner, "-b", "rv32-test", "-o", "heap=0x80100000+0x1000",
+                      "--raw-base", "0x80000000", "--monitor", "unix:" + hs, "--monitor-wait",
+                      "-n", "1000", os.path.join(tmp, "rvspin.bin")],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+m = Mon(hs)
+ok, out, _ = m.cmd("heap")
+check(ok and out and out[0].startswith("heap 0x80100000+0x1000 allocs=0 "), "heap: lists the board's (%s)" % out)
+ok, _, err = m.cmd("heap 0x80100010")
+check(ok is False and "no block" in err, "heap ADDR: in no block")
+m.cmd("quit")
+finish(p)
 
 # ---- option checks ----------------------------------------------------------------------
 for args, what in (
